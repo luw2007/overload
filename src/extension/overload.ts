@@ -372,12 +372,14 @@ export default function overload(pi: ExtensionApi): void {
   // minimal session/agent/tool_call registrations below.
   on("agent_start", () => setWorking())
   on("turn_start", () => setWorking())
-  const hasSettled = on("agent_settled", () => settle())
-  if (!hasSettled) on("agent_end", () => settle())
-  else on("agent_end", (event) => {
+  on("agent_settled", () => settle())
+  on("agent_end", (event) => {
     const messages = Array.isArray(event?.messages) ? event.messages : []
     const last = [...messages].reverse().find((message) => message?.role === "assistant")
     if (last) lastAssistantText = textFrom(last)
+    // agent_end is part of the minimal cross-runtime set. Modern hosts may
+    // subsequently emit agent_settled; the working-state guard deduplicates it.
+    settle()
   })
   on("message_end", (event) => {
     if (event?.message?.role === "assistant") lastAssistantText = textFrom(event.message)
