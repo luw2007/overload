@@ -64,21 +64,18 @@ describe("atomic spool ingestion", () => {
 describe("request reducer", () => {
   test("handles pending, terminal-first, idempotency, and source override of orphaned", async () => {
     const { spool, emitterDir, db } = await fixture();
-    const lines = [
+    const firstBatch = [
       event(1, "decision_resolved", { request_id: "terminal-first", state: "timed_out", answer: "late" }),
       event(2, "decision_requested", { request_id: "pending", request_kind: "choice", prompt: "Pick" }),
       event(3, "decision_requested", { request_id: "inferred", request_kind: "confirm" }),
-      event(4, "decision_resolved", { request_id: "inferred", state: "resolved", answer: "yes" }),
     ].map(JSON.stringify).join("\n") + "\n";
-    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), lines);
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), firstBatch);
     await scanOnce(db, spool);
 
-    // Seed the P2 inference result to verify the frozen source-terminal override rule.
-    db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, detail)
-      VALUES (?, ?, ?, ?, ?, ?, 'orphaned', ?, ?)`)
-      .run("local:pi:session-1#pi-42-bootabcd#inferred", "local:pi:session-1", "pi-42-bootabcd", "pi-42-bootabcd", "inferred", "confirm", 1, "{}");
-
-    expect(reduceJournal(db)).toBe(4);
+    // Simulate the P2 inference transition, then prove a later source terminal overrides it.
+    db.query("UPDATE requests SET state='orphaned' WHERE request_id='inferred'").run();
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-1.ndjson"), `${JSON.stringify(event(4, "decision_resolved", { request_id: "inferred", state: "resolved", answer: "yes" }))}\n`);
+    expect((await scanOnce(db, spool)).inserted).toBe(1);
     expect(reduceJournal(db)).toBe(0);
     const states = db.query("SELECT request_id, state FROM requests ORDER BY request_id").all() as Array<{request_id: string; state: string}>;
     expect(states).toEqual([
