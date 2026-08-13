@@ -1,0 +1,5 @@
+digests/
+ledger.db*
+*.ndjson
+node_modules/
+.dispatch/DONE-*
