@@ -293,6 +293,7 @@ export default function overload(pi: ExtensionApi): void {
   let session = safeComponent(randomUUID(), "session")
   let stableId = ""
   let working = false
+  let settledForRun = false
   let lastToolActivity = 0
   let lastAssistantText = ""
   let heartbeat: ReturnType<typeof setInterval> | null = null
@@ -302,6 +303,7 @@ export default function overload(pi: ExtensionApi): void {
   }
 
   function setWorking(): void {
+    settledForRun = false
     if (!working) {
       working = true
       emit("working")
@@ -315,9 +317,19 @@ export default function overload(pi: ExtensionApi): void {
   }
 
   function settle(): void {
-    if (!working) return
+    if (!working || settledForRun) return
     working = false
+    settledForRun = true
     emit("settled", lastAssistantText ? { text: truncateUtf8(lastAssistantText) } : undefined)
+  }
+
+  function settleAgentLifecycle(): void {
+    if (settledForRun) return
+    // Some hosts dispatch the terminal agent event even when an earlier lifecycle
+    // callback was skipped during print-mode setup. Reconstruct the required
+    // transition here rather than silently losing both working and settled.
+    if (!working) setWorking()
+    settle()
   }
 
   function probeHead(cwd: string, observeChange: boolean): void {
@@ -370,16 +382,17 @@ export default function overload(pi: ExtensionApi): void {
 
   // Feature-probe richer lifecycle events; runtimes lacking them retain the
   // minimal session/agent/tool_call registrations below.
+  on("before_agent_start", () => setWorking())
   on("agent_start", () => setWorking())
   on("turn_start", () => setWorking())
-  on("agent_settled", () => settle())
+  on("agent_settled", () => settleAgentLifecycle())
   on("agent_end", (event) => {
     const messages = Array.isArray(event?.messages) ? event.messages : []
     const last = [...messages].reverse().find((message) => message?.role === "assistant")
     if (last) lastAssistantText = textFrom(last)
     // agent_end is part of the minimal cross-runtime set. Modern hosts may
     // subsequently emit agent_settled; the working-state guard deduplicates it.
-    settle()
+    settleAgentLifecycle()
   })
   on("message_end", (event) => {
     if (event?.message?.role === "assistant") lastAssistantText = textFrom(event.message)
