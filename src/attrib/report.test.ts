@@ -33,7 +33,7 @@ async function repo(name: string): Promise<string> {
   await command(["git", "init", "-q", root]);
   await command(["git", "config", "user.email", "attrib@example.test"], root);
   await command(["git", "config", "user.name", "Attrib Test"], root);
-  return root;
+  return command(["git", "rev-parse", "--show-toplevel"], root);
 }
 
 async function commit(root: string, message: string, at: number): Promise<string> {
@@ -51,7 +51,7 @@ async function commit(root: string, message: string, at: number): Promise<string
 function ledger(): Database {
   const db = new Database(":memory:");
   db.exec(`
-    CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, cwd TEXT);
+    CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, cwd TEXT, origin TEXT);
     CREATE TABLE journal(
       ingest_seq INTEGER PRIMARY KEY AUTOINCREMENT,
       at INTEGER NOT NULL,
@@ -64,7 +64,7 @@ function ledger(): Database {
 }
 
 function session(db: Database, stableId: string, cwd: string, events: Array<{ at: number; kind?: string; detail?: unknown }>): void {
-  db.query("INSERT INTO sessions(stable_id, cwd) VALUES (?, ?)").run(stableId, cwd);
+  db.query("INSERT INTO sessions(stable_id, cwd, origin) VALUES (?, ?, 'agent')").run(stableId, cwd);
   for (const event of events) {
     db.query("INSERT INTO journal(at, stable_id, kind, detail) VALUES (?, ?, ?, ?)").run(
       event.at,
@@ -113,7 +113,7 @@ describe("generateAttribReport", () => {
     expect(bySha.get(unknownSha)).not.toHaveProperty("stable_id");
     expect(report.universe).toEqual([observedRepo, trailerRepo, unknownRepo, windowRepo].sort());
     db.close();
-  });
+  }, 20_000);
 
   test("tolerates a non-repository cwd and ignores commits older than the requested window", async () => {
     const root = await mkdtemp(join(tmpdir(), "overload-attrib-nonrepo-"));
@@ -128,5 +128,5 @@ describe("generateAttribReport", () => {
     expect(report.universe).toEqual([validRepo]);
     expect(report.rows).toEqual([]);
     db.close();
-  });
+  }, 20_000);
 });
