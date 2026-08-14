@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>works.earendil.overload.pull</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-lc</string>
+    <string>exec "$HOME/.bun/bin/bun" "$HOME/ai/overload/src/pull/pull.ts" --once</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/tmp/overload-pull.log</string>
+  <key>StandardErrorPath</key><string>/tmp/overload-pull.err</string>
+</dict></plist>
