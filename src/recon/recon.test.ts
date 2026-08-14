@@ -48,7 +48,7 @@ async function events(spool: string) {
   const host = join(spool, "local");
   const emitters = await Array.fromAsync(new Bun.Glob("*/active-*.ndjson").scan({ cwd: host, absolute: true }));
   const lines = (await Promise.all(emitters.map((path) => readFile(path, "utf8"))))
-    .flatMap((text) => text.trim().split("\n").filter(Boolean));
+    .flatMap((text) => text.trim().split("\n").filter((line) => line.startsWith("{")));
   return lines.map((line) => JSON.parse(line));
 }
 
