@@ -345,7 +345,13 @@ export default function overload(pi: ExtensionApi): void {
     try {
       pi.on(event, (value, ctx) => {
         try {
-          return handler(value, ctx)
+          const result = handler(value, ctx)
+          // Async handlers reject instead of throwing synchronously; swallow
+          // both paths so telemetry can never propagate into the host.
+          if (result && typeof (result as Promise<unknown>).catch === "function") {
+            return (result as Promise<unknown>).catch(() => {})
+          }
+          return result
         } catch {
           // Telemetry must never throw out of an extension handler.
         }
@@ -420,6 +426,9 @@ export default function overload(pi: ExtensionApi): void {
     const selected = selectedOption(event.result)
     emit("decision_resolved", {
       request_id: event.toolCallId,
+      // Explicit terminal state: ask erroring out (user escape/abort) is a
+      // cancellation, never a successful resolution (review B1).
+      state: event.isError ? "cancelled" : "resolved",
       ...(selected ? { selected } : {}),
       ...(event.isError ? { error: true } : {}),
     })

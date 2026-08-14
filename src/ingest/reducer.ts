@@ -32,9 +32,10 @@ function requestId(detail: Record<string, unknown>): string | undefined {
 
 function terminalState(detail: Record<string, unknown>): string {
   const candidate = detail.state ?? detail.outcome;
-  return typeof candidate === "string" && SOURCE_TERMINALS.has(candidate)
-    ? candidate
-    : "resolved";
+  if (typeof candidate === "string" && SOURCE_TERMINALS.has(candidate)) return candidate;
+  // No explicit terminal from the source: an errored resolution must never
+  // default to the optimistic terminal (review B1) — treat as cancelled.
+  return detail.error === true ? "cancelled" : "resolved";
 }
 
 /**

@@ -85,4 +85,23 @@ describe("request reducer", () => {
     ]);
     db.close();
   });
+
+  test("errored resolution without explicit state lands as cancelled, not resolved (review B1)", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const batch = [
+      event(1, "decision_requested", { request_id: "ask-err" }),
+      // Real N1 error payload shape: no state field, error flag only.
+      event(2, "decision_resolved", { request_id: "ask-err", error: true }),
+      event(3, "decision_requested", { request_id: "ask-ok" }),
+      event(4, "decision_resolved", { request_id: "ask-ok", state: "resolved", selected: "yes" }),
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
+    await scanOnce(db, spool);
+    const states = db.query("SELECT request_id, state FROM requests ORDER BY request_id").all() as Array<{request_id: string; state: string}>;
+    expect(states).toEqual([
+      { request_id: "ask-err", state: "cancelled" },
+      { request_id: "ask-ok", state: "resolved" },
+    ]);
+    db.close();
+  });
 });
