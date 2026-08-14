@@ -1,15 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { openLedgerP2 } from "./lib/p2/schema";
 
 const reportPath = join(process.cwd(), "src/attrib/report.ts");
 const available = await Bun.file(reportPath).exists();
 
 describe.skipIf(!available)("P4 attribution grades", () => {
   test("fixture commits cover all grades and trailer precedence", async () => {
-    const root = mkdtempSync(join(tmpdir(), "overload-p4-attrib-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "overload-p4-attrib-")));
     try {
       execFileSync("git", ["init", "-q", root]);
       execFileSync("git", ["-C", root, "config", "user.email", "test@example.invalid"]);
@@ -22,9 +23,9 @@ describe.skipIf(!available)("P4 attribution grades", () => {
       expect(typeof mod.generateAttribReport).toBe("function");
       // The report must preserve the frozen grade vocabulary and trailer wins
       // over an otherwise matching observed-head record.
-      const db = new (await import("bun:sqlite")).Database(":memory:");
-      const result = mod.generateAttribReport(db, { repos: [root], sinceMs: 0 });
-      expect(result.universe).toContain(root);
+      const db = openLedgerP2(join(root, "ledger.db"));
+      const result = await mod.generateAttribReport(db, { repos: [root], sinceMs: 0 });
+      expect(result.universe.map((u: string) => realpathSync(u))).toContain(root);
       expect(result.rows.every((r: any) => ["trailer", "head_observed", "window_correlated", "unattributed"].includes(r.grade))).toBe(true);
       if (result.rows.some((r: any) => r.sha === commit)) expect(result.rows.find((r: any) => r.sha === commit).grade).toBe("trailer");
       db.close();

@@ -101,10 +101,10 @@ describe("P2 reducer and classifier", () => {
   test("classifier is pure and emits deterministic queue changes", () => {
     const before = { stable_id: "local:pi:s", state: "idle", origin: "unknown", queue: "q3", q5_reason: null };
     const event = { ingest_seq: 9, at: 99, kind: "session_ended", detail: {} };
-    expect(CLASSIFIER_VERSION).toBe(1);
+    expect(CLASSIFIER_VERSION).toBe(2);
     expect(classify(before, event)).toEqual([
-      { subject: "local:pi:s", queue: "q3", direction: "left", at: 99, source_seq: 9, classifier_version: 1 },
-      { subject: "local:pi:s", queue: "q2", direction: "entered", at: 99, source_seq: 9, classifier_version: 1 },
+      { subject: "local:pi:s", queue: "q3", direction: "left", at: 99, source_seq: 9, classifier_version: 2 },
+      { subject: "local:pi:s", queue: "q2", direction: "entered", at: 99, source_seq: 9, classifier_version: 2 },
     ]);
     expect(before).toEqual({ stable_id: "local:pi:s", state: "idle", origin: "unknown", queue: "q3", q5_reason: null });
   });
@@ -124,7 +124,8 @@ describe("P2 reducer and classifier", () => {
     await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
     await scanOnce(db, spool);
 
-    expect(db.query("SELECT state, origin, queue, q5_reason FROM current").get()).toEqual({ state: "done", origin: "agent", queue: "q2", q5_reason: null });
+    // v2: agent-origin done session with zero change evidence is read-only → q4 (was q2 under v1).
+    expect(db.query("SELECT state, origin, queue, q5_reason FROM current").get()).toEqual({ state: "done", origin: "agent", queue: "q4", q5_reason: null });
     expect(db.query("SELECT platform, binding, valid FROM attachments").get()).toEqual({ platform: "orca", binding: "wt-7", valid: 1 });
     const count = (db.query("SELECT count(*) n FROM queue_transitions").get() as { n: number }).n;
     db.query("UPDATE reducer_cursor SET journal_seq=0 WHERE id=1").run();

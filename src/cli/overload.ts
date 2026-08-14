@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { runDigestOnce } from "../digest/digest";
+import { generateAttribReport } from "../attrib/report";
 
 const path = process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
 type SessionRow = { stable_id: string; host: string | null; runtime: string | null; session: string | null; origin: string | null; cwd: string | null; branch: string | null; created_at: number | null };
@@ -80,14 +81,9 @@ function sinceMs(value: string): number | undefined {
 }
 async function attrib(db: Database, value?: string): Promise<void> {
   if (value && sinceMs(value) == null) usage();
-  try {
-    const modulePath = "../attrib/" + "report.ts";
-    const module = await import(modulePath) as { generateAttribReport?: (db: Database, opts: { sinceMs?: number }) => { rows: Array<{ sha: string; repo: string; at: number; grade: string; stable_id?: string }>; universe: string[] } };
-    if (!module.generateAttribReport) throw new Error("absent");
-    const report = module.generateAttribReport(db, { ...(value ? { sinceMs: sinceMs(value) } : {}) });
-    console.log(`Attribution universe: ${report.universe.join(", ") || "(empty)"}`);
-    for (const row of report.rows) console.log(`${row.sha}\t${row.grade}\t${row.stable_id ?? "-"}\t${row.repo}\t${time(row.at)}`);
-  } catch { console.log("attrib module not available"); }
+  const report = await generateAttribReport(db, { ...(value ? { sinceMs: sinceMs(value)! } : {}) });
+  console.log(`Attribution universe: ${report.universe.join(", ") || "(empty)"}`);
+  for (const row of report.rows) console.log(`${row.sha}\t${row.grade}\t${row.stable_id ?? "-"}\t${row.repo}\t${time(row.at)}`);
 }
 
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {

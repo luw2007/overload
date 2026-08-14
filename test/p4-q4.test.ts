@@ -11,31 +11,30 @@ describe("P4 Q4 predicate matrix", () => {
 });
 
 describe.skipIf(!HAS_V2)("classifier v2 Q4 matrix", () => {
+  const base = { stable_id: "local:pi:s", q5_reason: null as string | null, queue: "q3" as string | null };
+  const ended = { ingest_seq: 7, at: 1_800_000_000_000, kind: "session_ended", detail: {} };
   test("read-only agent session enters q4", async () => {
-    const c = await import("../src/ingest/classifier");
-    const fn = (c as any).queueForSession ?? (c as any).classifySession;
-    expect(typeof fn).toBe("function");
-    const result = fn({ stable_id: "local:pi:readonly", state: "done", origin: "agent", last_heartbeat_at: 0, queue: null }, 1_800_000_000_000);
-    expect(result.queue ?? result).toBe("q4");
+    const { classify } = await import("../src/ingest/classifier");
+    const rows = classify({ ...base, state: "idle", origin: "agent", has_change_evidence: false }, ended);
+    expect(rows.some((r) => r.queue === "q4" && r.direction === "entered")).toBe(true);
+    expect(rows.some((r) => r.queue === "q2" && r.direction === "entered")).toBe(false);
   });
   test("commit_observed keeps an otherwise identical session in q2", async () => {
-    const c = await import("../src/ingest/classifier");
-    const fn = (c as any).queueForSession ?? (c as any).classifySession;
-    const result = fn({ stable_id: "local:pi:changed", state: "done", origin: "agent", last_heartbeat_at: 0, queue: null, has_commit_observed: true, mutation_evidence: true }, 1_800_000_000_000);
-    expect(result.queue ?? result).toBe("q2");
+    const { classify } = await import("../src/ingest/classifier");
+    const rows = classify({ ...base, state: "idle", origin: "agent", has_change_evidence: true }, ended);
+    expect(rows.some((r) => r.queue === "q2" && r.direction === "entered")).toBe(true);
+    expect(rows.some((r) => r.queue === "q4")).toBe(false);
   });
   test("unknown origin never enters q4", async () => {
-    const c = await import("../src/ingest/classifier");
-    const fn = (c as any).queueForSession ?? (c as any).classifySession;
-    const result = fn({ stable_id: "local:pi:unknown", state: "done", origin: "unknown", last_heartbeat_at: 0, queue: null }, 1_800_000_000_000);
-    expect(result.queue ?? result).not.toBe("q4");
+    const { classify } = await import("../src/ingest/classifier");
+    const rows = classify({ ...base, state: "idle", origin: "unknown", has_change_evidence: false }, ended);
+    expect(rows.some((r) => r.queue === "q4")).toBe(false);
+    expect(rows.some((r) => r.queue === "q2" && r.direction === "entered")).toBe(true);
   });
   test("v1 transitions remain versioned and historical", async () => {
     const c = await import("../src/ingest/classifier");
-    expect((c as any).CLASSIFIER_VERSION).toBe(2);
-    if (typeof (c as any).classify === "function") {
-      const rows = (c as any).classify({ stable_id: "s", state: "idle", origin: "agent", queue: "q3", q5_reason: null }, { ingest_seq: 7, at: 10, kind: "session_ended", detail: {} });
-      expect(rows.every((r: any) => r.classifier_version >= 1)).toBe(true);
-    }
+    expect(c.CLASSIFIER_VERSION).toBe(2);
+    const rows = c.classify({ ...base, state: "idle", origin: "agent", has_change_evidence: true }, ended);
+    expect(rows.every((r) => r.classifier_version === 2)).toBe(true);
   });
 });

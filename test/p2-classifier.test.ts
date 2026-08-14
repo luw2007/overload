@@ -462,9 +462,11 @@ describe.skipIf(!HAS_N5)("real: N5 classifier via ingest --once + CLI surface", 
       expect(initial).toHaveLength(1);
       expect(initial[0]!.reminder_seq).toBe(0);
 
-      // Activation watermark: v1 exactly once.
+      // Activation watermark: the current classifier version exactly once
+      // (version-agnostic: v2 activated fresh ledgers after the P4 bump).
       const acts = ldb.query("SELECT version FROM classifier_activations").all() as Array<{ version: number }>;
-      expect(acts.filter((a) => a.version === 1)).toHaveLength(1);
+      expect(acts).toHaveLength(1);
+      expect(acts[0]!.version).toBeGreaterThanOrEqual(1);
 
       // done ∧ unknown origin → q2 transition recorded for session B.
       const q2 = ldb.query(
