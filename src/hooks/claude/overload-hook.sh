@@ -122,23 +122,23 @@ case "$event" in
       '{request_id:$id,tool_name:$tool,tool_input:$input}') || exit 0
     write_event decision_requested "$requested" || exit 0
 
+    # Review P3 B1: this hook has NO channel to observe the async decision
+    # (unlike cmux's socket-bridged semaphore). Never block: if the payload
+    # already embeds a decision (response-side invocation on hook APIs that
+    # provide one), record it; otherwise exit immediately — the request stays
+    # pending and is closed by the session-end orphan rule (§2.2), keeping
+    # telemetry honest instead of fabricating timed_out after a sleep.
     decision=$(printf '%s' "$payload" | jq -r '
       (.permission_decision // .decision // .permission_response.behavior // .hookSpecificOutput.decision.behavior // empty) |
       if type == "string" then ascii_downcase else empty end
     ' 2>/dev/null)
-    if [ -z "$decision" ]; then
-      timeout_seconds=${OVERLOAD_PERMISSION_TIMEOUT_SECONDS:-30}
-      case "$timeout_seconds" in *[!0-9]*|'') timeout_seconds=30 ;; esac
-      [ "$timeout_seconds" -eq 0 ] || sleep "$timeout_seconds"
-      state=timed_out
-    else
-      case "$decision" in
-        allow|approve|approved|resolved) state=resolved ;;
-        deny|denied|cancel|cancelled|canceled) state=cancelled ;;
-        timeout|timed_out) state=timed_out ;;
-        *) state=resolved ;;
-      esac
-    fi
+    [ -n "$decision" ] || exit 0
+    case "$decision" in
+      allow|approve|approved|resolved) state=resolved ;;
+      deny|denied|cancel|cancelled|canceled) state=cancelled ;;
+      timeout|timed_out) state=timed_out ;;
+      *) state=resolved ;;
+    esac
     resolved=$(jq -cn --arg id "$request_id" --arg state "$state" '{request_id:$id,state:$state}') || exit 0
     write_event decision_resolved "$resolved" || exit 0
     ;;

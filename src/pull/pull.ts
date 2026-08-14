@@ -40,14 +40,16 @@ export class Puller {
       const deadline = Date.now() + this.config.timeout_ms;
       await secureDirectory(this.config.dest);
       await runCommand(commandWords(this.config.ssh_cmd), [
-        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", this.config.remote, "true",
+        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", this.config.remote, "true",
       ], remainingTimeout(deadline));
       const source = this.config.remote === "local"
         ? `${this.config.remote_spool.replace(/\/$/, "")}/`
         : `${this.config.remote}:${this.config.remote_spool.replace(/\/$/, "")}/`;
       const output = await runCommand(commandWords(this.config.rsync_cmd), [
         "-a", "--out-format=%n|%l", "--include=*/", "--include=seg-*.ndjson",
-        "--include=active-*.ndjson", "--exclude=*", source, `${this.config.dest.replace(/\/$/, "")}/`,
+        // Review P3 M1: "--" terminates option parsing so leading-dash
+        // remote/dest config values cannot inject rsync options.
+        "--include=active-*.ndjson", "--exclude=*", "--", source, `${this.config.dest.replace(/\/$/, "")}/`,
       ], remainingTimeout(deadline));
       const transferred = parseTransferOutput(output);
       const openOutage = state.outage_reported || this.sourceOutageOpen();
@@ -179,6 +181,11 @@ function positiveInteger(raw: string | undefined, fallback: number): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`expected positive integer, got: ${raw}`);
   return value;
 }
+function rejectLeadingDash(value: string, flag: string): string {
+  if (value.startsWith("-")) { console.error(`pull: --${flag} must not start with '-': ${value}`); process.exit(2); }
+  return value;
+}
+
 
 export async function loadConfig(args: string[]): Promise<{ config: PullConfig; once: boolean; locked: boolean }> {
   const values = new Map<string, string>();
@@ -193,9 +200,9 @@ export async function loadConfig(args: string[]): Promise<{ config: PullConfig; 
   }
   const overload = join(homedir(), ".overload");
   return { once, locked, config: {
-    remote: values.get("remote") ?? "devbox",
-    remote_spool: values.get("remote-spool") ?? "~/.overload/spool/devbox",
-    dest: values.get("dest") ?? join(overload, "spool", "devbox"),
+    remote: rejectLeadingDash(values.get("remote") ?? "devbox", "remote"),
+    remote_spool: rejectLeadingDash(values.get("remote-spool") ?? "~/.overload/spool/devbox", "remote-spool"),
+    dest: rejectLeadingDash(values.get("dest") ?? join(overload, "spool", "devbox"), "dest"),
     ssh_cmd: values.get("ssh-cmd") ?? "ssh",
     rsync_cmd: values.get("rsync-cmd") ?? "rsync",
     fail_threshold: positiveInteger(values.get("fail-threshold"), 4),
