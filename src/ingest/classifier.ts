@@ -2,7 +2,7 @@ import { appendFileSync, chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const CLASSIFIER_VERSION = 1;
+export const CLASSIFIER_VERSION = 2;
 
 export type ClassifiableCurrent = {
   stable_id: string;
@@ -10,6 +10,8 @@ export type ClassifiableCurrent = {
   origin: string;
   queue: string | null;
   q5_reason: string | null;
+  /** True when this session has a commit or a bash/write/edit tool event. */
+  has_change_evidence?: boolean;
 };
 
 export type ClassifierEvent = {
@@ -51,6 +53,9 @@ function desiredQueue(current: ClassifiableCurrent, event: ClassifierEvent): { q
     case "emitter_drained": reason = "orphaned_request"; break;
   }
   if (reason) return { queue: "q5", reason };
+  if (state === "done" && normalizeOrigin(current.origin) === "agent" && current.has_change_evidence === false) {
+    return { queue: "q4", reason: null };
+  }
   if (state === "done" && normalizeOrigin(current.origin) !== "human") return { queue: "q2", reason: null };
   if (state === "working" || state === "idle") return { queue: "q3", reason: null };
   return { queue: null, reason: null };

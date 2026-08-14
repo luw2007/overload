@@ -37,6 +37,20 @@ function ensureCurrent(db: Database, stableId: string, writerId: string, row: Jo
   return db.query("SELECT * FROM current WHERE stable_id=?").get(stableId) as CurrentRow;
 }
 
+/** Q4 is deliberately conservative: any recorded change-capable tool or commit
+ * keeps the completed session in Q2. Unknown tool details are not evidence. */
+function hasChangeEvidence(db: Database, stableId: string, throughSeq: number): boolean {
+  const rows = db.query(`SELECT kind, detail FROM journal
+    WHERE stable_id=? AND ingest_seq<=? AND kind IN ('commit_observed','tool_call','tool_activity')`)
+    .all(stableId, throughSeq) as Array<{ kind: string; detail: string | null }>;
+  return rows.some((candidate) => {
+    if (candidate.kind === "commit_observed") return true;
+    const tool = stringDetail(objectDetail(candidate.detail), "tool")
+      ?? stringDetail(objectDetail(candidate.detail), "tool_name");
+    return tool != null && /^(bash|write|edit)$/i.test(tool);
+  });
+}
+
 export function reduceJournal(db: Database, batchSize = 500, notifySink = "osascript"): number {
   let processed = 0;
   const transaction = db.transaction(() => {
@@ -123,9 +137,10 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   else if (row.kind === "session_ended") state = "done";
   else if (row.kind === "session_vanished") state = "vanished";
 
-  const view = { ...current, stable_id: stableId, state, origin };
+  const changeEvidence = hasChangeEvidence(db, stableId, row.ingest_seq);
+  const view = { ...current, stable_id: stableId, state, origin, has_change_evidence: changeEvidence };
   const classifierEvent: ClassifierEvent = { ingest_seq: row.ingest_seq, at: row.at, kind: row.kind, detail };
-  for (const transition of classify(current, classifierEvent)) {
+  for (const transition of classify({ ...current, has_change_evidence: changeEvidence }, classifierEvent)) {
     db.query(`INSERT OR IGNORE INTO queue_transitions(subject, queue, direction, at, source_seq, classifier_version)
       VALUES (?, ?, ?, ?, ?, ?)`).run(transition.subject, transition.queue, transition.direction, transition.at, transition.source_seq, transition.classifier_version);
   }
