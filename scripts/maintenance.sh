@@ -7,7 +7,11 @@ BUN=${OVERLOAD_BUN:-"${HOME}/.bun/bin/bun"}
 
 recon_status=0
 if [ -f "${ROOT}/src/recon/recon.ts" ]; then
-  "$BUN" "${ROOT}/src/recon/recon.ts" --once || recon_status=$?
+  "$BUN" "${ROOT}/src/recon/recon.ts" --once || {
+    recon_status=$?
+    # review P2 m6: surface recon failure without suppressing watchdog.
+    osascript -e 'display notification "Overload recon failed; review maintenance logs" with title "Overload"' >/dev/null 2>&1 || true
+  }
 fi
 "${ROOT}/scripts/watchdog.sh"
 watchdog_status=$?
