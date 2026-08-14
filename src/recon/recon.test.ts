@@ -76,7 +76,7 @@ describe("ReconDaemon", () => {
     expect(output.every((event) => event.runtime === "overload" && event.dropped_total === 0 && event.write_error_total === 0)).toBe(true);
   });
 
-  test("joins visible native sessions by cwd and reports an unmatched live session once per hour", async () => {
+  test("joins visible native sessions by cwd and includes stable_id in a rate-limited telemetry gap", async () => {
     const f = await fixture();
     await writeFile(f.herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[{\"terminal_id\":\"term-1\",\"agent_status\":\"working\",\"cwd\":\"/repo\"},{\"terminal_id\":\"term-gap\",\"agent_status\":\"working\",\"cwd\":\"/missing\"}]}}'\n", { mode: 0o700 });
     const emitter = `pi-${process.pid}-feedface`;
@@ -85,6 +85,7 @@ describe("ReconDaemon", () => {
     await writeFile(join(sourceDir, `active-${emitter}-0.ndjson`), "\n");
     const db = new Database(f.ledger);
     db.query("INSERT INTO sessions VALUES (?, 'local', 'pi', 's1', '/repo')").run("local:pi:s1");
+    db.query("INSERT INTO sessions VALUES (?, 'local', 'claude', 'gap', '/missing')").run("local:claude:gap");
     db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', ?, 'feedface00', 1, ?)").run("local:pi:s1", emitter, process.pid, Date.now());
     db.query("INSERT INTO journal VALUES (1, 'local', ?, 1, ?, ?, ?, 'heartbeat', '{}')").run(emitter, Date.now(), "local:pi:s1", emitter);
     db.close();
@@ -92,12 +93,14 @@ describe("ReconDaemon", () => {
     const daemon = new ReconDaemon(f.config);
     const first = await daemon.runOnce();
     const second = await daemon.runOnce();
-    expect(first.byKind.attachment_observed).toBe(1);
+    expect(first.byKind.attachment_observed).toBe(2);
     expect(first.byKind.telemetry_gap).toBe(1);
     expect(second.byKind.telemetry_gap ?? 0).toBe(0);
     const output = await events(f.spool);
     expect(output.find((event) => event.kind === "attachment_observed")?.detail.binding).toBe("term-1");
-    expect(output.find((event) => event.kind === "telemetry_gap")?.detail.native_id).toBe("term-gap");
+    expect(output.find((event) => event.kind === "telemetry_gap")?.detail).toMatchObject({
+      platform: "herdr", native_id: "term-gap", cwd: "/missing", stable_id: "local:claude:gap",
+    });
   });
 
   test("aggregates a source outage and emits recovery without source-derived findings", async () => {
