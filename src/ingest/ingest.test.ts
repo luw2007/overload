@@ -108,8 +108,8 @@ describe("P2 reducer and classifier", () => {
     ].map(JSON.stringify).join("\n") + "\n";
     await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
     await scanOnce(db, spool);
-    expect(db.query("SELECT stable_id, state, queue, q5_reason FROM current").all()).toEqual([
-      { stable_id: "local:pi:session-1", state: "working", queue: "q5", q5_reason: "telemetry_gap" },
+    expect(db.query("SELECT stable_id, writer_id, state, queue, q5_reason FROM current").all()).toEqual([
+      { stable_id: "local:pi:session-1", writer_id: "pi-42-bootabcd", state: "working", queue: "q5", q5_reason: "telemetry_gap" },
     ]);
     db.close();
   });

@@ -101,8 +101,12 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   // Re-reduction retains derived tables. A row already reflected by this
   // subject must not classify against its later state and invent transitions.
   if (current.last_ingest_seq != null && row.ingest_seq <= current.last_ingest_seq) return;
+  const reconFinding = RECON_EVENTS.has(row.kind);
   const newerWriter = current.writer_id !== row.writer_id && row.kind === "session_started";
-  if (current.writer_id !== row.writer_id && !newerWriter) return;
+  // Recon uses an admin writer while projecting evidence onto the target's
+  // incarnation. Preserve that incarnation instead of rejecting the finding.
+  if (current.writer_id !== row.writer_id && !newerWriter && !reconFinding) return;
+  const projectedWriter = reconFinding ? current.writer_id ?? row.writer_id : row.writer_id;
   if (SESSION_TERMINALS.has(current.state) && !newerWriter) return;
 
   let state = newerWriter ? "idle" : current.state;
@@ -123,7 +127,7 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   const queue = queueAfter(view, classifierEvent);
   const heartbeat = row.kind === "heartbeat" || row.kind === "tool_activity" || row.kind === "working" ? row.at : current.last_heartbeat_at;
   db.query(`UPDATE current SET writer_id=?, state=?, queue=?, q5_reason=?, origin=?, last_ingest_seq=?,
-    last_event_at=?, last_heartbeat_at=? WHERE stable_id=?`).run(row.writer_id, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, row.at, heartbeat, stableId);
+    last_event_at=?, last_heartbeat_at=? WHERE stable_id=?`).run(projectedWriter, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, row.at, heartbeat, stableId);
 }
 
 function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
