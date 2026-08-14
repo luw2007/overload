@@ -223,13 +223,15 @@ export class ReconDaemon {
           this.attachments.set(attachmentKey, native.native_id);
         }
       }
-      if (native.visible && !matches.some((match) => this.sessionHasLiveWriter(db, match.stable_id, liveWriters))) {
+      if (native.visible && matches.length > 0 &&
+          !matches.some((match) => this.sessionHasLiveWriter(db, match.stable_id, liveWriters))) {
         const key = `${platform}:${native.native_id}`;
         const journalAt = this.latestTelemetryGapAt(db, native.native_id);
         const latestAt = Math.max(this.gaps.get(key) ?? 0, journalAt ?? 0);
         if (now - latestAt >= GAP_RATE_LIMIT_MS) {
           await this.emit(summary, "telemetry_gap", "admin", now, {
             platform, native_id: native.native_id, cwd: native.cwd,
+            stable_id: matches[0]!.stable_id,
           });
           this.gaps.set(key, now);
         }
