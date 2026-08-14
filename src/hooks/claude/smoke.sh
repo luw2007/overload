@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-ROOT=$(CDPATH= cd -- "$HERE/../../.." && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH='' cd -- "$HERE/../../.." && pwd)
 HOOK="$HERE/overload-hook.sh"
 INSTALLER="$ROOT/scripts/install-claude-hooks.sh"
 TMP=${TMPDIR:-/tmp}/overload-claude-smoke-$$
@@ -32,6 +32,8 @@ files=$(find "$TMP/home/.overload/spool" -type f -name 'seg-*.ndjson' | wc -l | 
 [ "$files" -eq 7 ]
 [ "$(find "$TMP/home/.overload/spool" -type f -name 'active-*.ndjson' | wc -l | tr -d ' ')" -eq 0 ]
 
+# Generated spool paths contain only the fixed emitter alphabet.
+# shellcheck disable=SC2046
 jq -s '
   ([.[] | select(.kind == "decision_requested")] | length) == 3 and
   ([.[] | select(.kind == "decision_resolved")] | length) == 3 and
