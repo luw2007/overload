@@ -8,8 +8,8 @@ usage() {
 Usage: install-claude-hooks.sh [--settings <path>] [--uninstall]
 
 Merges Overload command hooks into Claude Code settings. Existing settings and
-hooks are preserved. The first install/update in each invocation writes
-<settings>.bak before replacing the settings file atomically.
+hooks are preserved. The first replacement preserves the original settings in
+<settings>.bak; later install/update/uninstall runs never overwrite that backup.
 EOF
 }
 
@@ -98,7 +98,7 @@ chmod 600 "$tmp"
 if [ -f "$settings" ] && cmp -s "$settings" "$tmp"; then
   exit 0
 fi
-if [ -f "$settings" ]; then
+if [ -f "$settings" ] && [ ! -e "$settings.bak" ]; then
   cp -p "$settings" "$settings.bak"
   chmod 600 "$settings.bak" 2>/dev/null || true
 fi
