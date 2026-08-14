@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { initializeLedger, scanOnce } from "./ingest";
 import { reduceJournal } from "./reducer";
+import { CLASSIFIER_VERSION, classify } from "./classifier";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -57,6 +58,76 @@ describe("atomic spool ingestion", () => {
 
     expect((await scanOnce(db, spool)).inserted).toBe(1);
     expect((db.query("SELECT count(*) AS n FROM journal").get() as { n: number }).n).toBe(1);
+    db.close();
+  });
+});
+
+describe("P2 reducer and classifier", () => {
+  test("classifier is pure and emits deterministic queue changes", () => {
+    const before = { stable_id: "local:pi:s", state: "idle", origin: "unknown", queue: "q3", q5_reason: null };
+    const event = { ingest_seq: 9, at: 99, kind: "session_ended", detail: {} };
+    expect(CLASSIFIER_VERSION).toBe(1);
+    expect(classify(before, event)).toEqual([
+      { subject: "local:pi:s", queue: "q3", direction: "left", at: 99, source_seq: 9, classifier_version: 1 },
+      { subject: "local:pi:s", queue: "q2", direction: "entered", at: 99, source_seq: 9, classifier_version: 1 },
+    ]);
+    expect(before).toEqual({ stable_id: "local:pi:s", state: "idle", origin: "unknown", queue: "q3", q5_reason: null });
+  });
+
+  test("tracks state, terminal stickiness, precedence, attachments, and idempotent transitions", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const batch = [
+      event(1, "session_started", { pid: 42, parent: "agent" }),
+      event(2, "working"),
+      event(3, "emitter_stalled", { stable_id: "local:pi:session-1", emitter_id: "pi-42-bootabcd" }),
+      event(4, "settled"),
+      event(5, "attachment_observed", { stable_id: "local:pi:session-1", platform: "orca", binding: "wt-7" }),
+      event(6, "session_ended"),
+      event(7, "working"),
+      event(8, "session_vanished", { stable_id: "local:pi:session-1", platform: "pi" }),
+    ].map(JSON.stringify).join("\n") + "\n";
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
+    await scanOnce(db, spool);
+
+    expect(db.query("SELECT state, origin, queue, q5_reason FROM current").get()).toEqual({ state: "done", origin: "agent", queue: "q2", q5_reason: null });
+    expect(db.query("SELECT platform, binding, valid FROM attachments").get()).toEqual({ platform: "orca", binding: "wt-7", valid: 1 });
+    const count = (db.query("SELECT count(*) n FROM queue_transitions").get() as { n: number }).n;
+    db.query("UPDATE reducer_cursor SET journal_seq=0 WHERE id=1").run();
+    reduceJournal(db);
+    expect((db.query("SELECT count(*) n FROM queue_transitions").get() as { n: number }).n).toBe(count);
+    db.close();
+  });
+
+  test("freezes source sessions during incidents and recovers without per-session judgments", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const batch = [
+      event(1, "session_started"),
+      event(2, "working"),
+      event(3, "source_outage", { source: "pi" }),
+      event(4, "session_vanished", { stable_id: "local:pi:session-1", platform: "pi" }),
+      event(5, "source_recovered", { source: "pi" }),
+      event(6, "session_vanished", { stable_id: "local:pi:session-1", platform: "pi" }),
+    ].map(JSON.stringify).join("\n") + "\n";
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
+    await scanOnce(db, spool);
+    expect(db.query("SELECT state, frozen FROM current").get()).toEqual({ state: "vanished", frozen: 0 });
+    expect(db.query("SELECT source, closed_at FROM incidents").get()).toEqual({ source: "pi", closed_at: event(5, "x").at });
+    db.close();
+  });
+
+  test("enqueues initial notification atomically and orphans only when emitter is drained", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const batch = [
+      event(1, "session_started"),
+      event(2, "decision_requested", { request_id: "ask-1" }),
+      event(3, "emitter_dead", { stable_id: "local:pi:session-1", emitter_id: "pi-42-bootabcd" }),
+      event(4, "emitter_drained", { stable_id: "local:pi:session-1", emitter_id: "pi-42-bootabcd" }),
+    ].map(JSON.stringify).join("\n") + "\n";
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
+    await scanOnce(db, spool);
+    expect(db.query("SELECT state FROM requests WHERE request_id='ask-1'").get()).toEqual({ state: "orphaned" });
+    expect(db.query("SELECT kind, state, reminder_seq FROM notifications").get()).toEqual({ kind: "initial", state: "pending", reminder_seq: 0 });
+    expect(db.query("SELECT emitter_id, reason, to_at FROM coverage_gaps").get()).toEqual({ emitter_id: "pi-42-bootabcd", reason: "emitter_drained", to_at: event(4, "x").at });
     db.close();
   });
 });
