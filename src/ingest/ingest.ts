@@ -7,6 +7,7 @@ import { basename, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { reduceJournal } from "./reducer";
 import { appendClassifierActivated, CLASSIFIER_VERSION } from "./classifier";
+import { scanCmux } from "./cmux";
 
 const DEFAULT_SCAN_INTERVAL_MS = 2_000;
 const DEFAULT_REDUCER_BATCH_SIZE = 500;
@@ -18,6 +19,7 @@ export type IngestConfig = {
   reducer_batch_size: number;
   /** Sink id stamped on reducer-enqueued initial notification rows (configurable, default osascript). */
   notify_sink: string;
+  cmux_workstream_path: string;
 };
 
 type Envelope = {
@@ -54,6 +56,8 @@ export async function loadConfig(path = join(homedir(), ".overload", "config.jso
     scan_interval_ms: positiveInteger(value.scan_interval_ms, DEFAULT_SCAN_INTERVAL_MS),
     reducer_batch_size: positiveInteger(value.reducer_batch_size, DEFAULT_REDUCER_BATCH_SIZE),
     notify_sink: typeof value.notify_sink === "string" && value.notify_sink.length > 0 ? value.notify_sink : "osascript",
+    cmux_workstream_path: typeof value.cmux_workstream_path === "string" && value.cmux_workstream_path.length > 0
+      ? value.cmux_workstream_path : join(homedir(), ".cmuxterm", "workstream.jsonl"),
   };
 }
 
@@ -98,7 +102,7 @@ export function activateClassifier(db: Database, home = homedir(), spoolRoot = j
   return true;
 }
 
-export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overload", "spool"), reducerBatchSize = DEFAULT_REDUCER_BATCH_SIZE, notifySink = "osascript"): Promise<{ files: number; inserted: number }> {
+export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overload", "spool"), reducerBatchSize = DEFAULT_REDUCER_BATCH_SIZE, notifySink = "osascript", cmuxWorkstreamPath?: string): Promise<{ files: number; inserted: number }> {
   const files = await discoverSpoolFiles(spoolRoot);
   const pending: PendingFile[] = [];
   for (const path of files) {
@@ -121,6 +125,7 @@ export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overl
   transaction.immediate();
 
   while (reduceJournal(db, reducerBatchSize, notifySink) === reducerBatchSize) { /* drain */ }
+  if (cmuxWorkstreamPath) inserted += (await scanCmux(db, cmuxWorkstreamPath, reducerBatchSize, notifySink)).inserted;
   return { files: pending.length, inserted };
 }
 
@@ -241,7 +246,7 @@ async function main(): Promise<void> {
   activateClassifier(db, homedir(), join(home, "spool"));
   const heartbeatPath = join(home, "ingest.heartbeat");
   const run = async () => {
-    const result = await scanOnce(db, join(home, "spool"), config.reducer_batch_size, config.notify_sink);
+    const result = await scanOnce(db, join(home, "spool"), config.reducer_batch_size, config.notify_sink, config.cmux_workstream_path);
     // Watchdog liveness contract (review P2 m4): the ingest loop owns this touch.
     try { await Bun.write(heartbeatPath, String(Date.now())); } catch { /* watchdog will alarm */ }
     if (once) console.log(`ingested ${result.inserted} new event(s) from ${result.files} file(s)`);

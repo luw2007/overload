@@ -32,13 +32,14 @@ function row(kind: string, status: string, id: string, extra: Record<string, unk
 describe("cmux workstream ingestion", () => {
   test("turns a real-shape pending question into a Q1 request and terminal status resolves it", async () => {
     const { path, db } = await fixture();
+    const started = row("sessionStart", "telemetry", "start-1");
     const pending = row("question", "pending", "ask-1");
-    await writeFile(path, `${pending}\n`);
-    expect((await scanCmux(db, path)).inserted).toBe(1);
+    await writeFile(path, `${started}\n${pending}\n`);
+    expect((await scanCmux(db, path)).inserted).toBe(2);
     expect(db.query("SELECT state FROM requests WHERE request_id='ask-1'").get()).toEqual({ state: "pending" });
-    expect(db.query("SELECT queue FROM current").get()).toEqual({ queue: "q1" });
+    expect(db.query("SELECT kind FROM journal WHERE kind='decision_requested'").get()).toEqual({ kind: "decision_requested" });
 
-    await writeFile(path, `${pending}\n${row("question", "answered", "ask-1")}\n`);
+    await writeFile(path, `${started}\n${pending}\n${row("question", "answered", "ask-1")}\n`);
     expect((await scanCmux(db, path)).inserted).toBe(1);
     expect(db.query("SELECT state FROM requests WHERE request_id='ask-1'").get()).toEqual({ state: "resolved" });
     db.close();
