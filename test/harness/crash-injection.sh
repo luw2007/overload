@@ -204,10 +204,11 @@ if [[ "$ROWS_B" -ne "$EMIT_COMPLETE" ]]; then
 fi
 
 # Cursor for this active file must point at the end of the last COMPLETE line,
-# i.e. strictly before EOF (the partial bytes remain unconsumed). Cursor is
-# keyed by unique filename (§2.1) — basename, not path.
+# i.e. strictly before EOF (the partial bytes remain unconsumed). Ingest keys
+# cursors by spool-root-relative path (src/ingest/ingest.ts scanOnce).
 FILE_B="active-${EMITTER_B}-1.ndjson"
-CUR_BYTES=$(q "SELECT bytes FROM cursors WHERE file_name='$FILE_B';")
+CUR_KEY="local/${EMITTER_B}/${FILE_B}"
+CUR_BYTES=$(q "SELECT bytes FROM cursors WHERE file_name='$CUR_KEY';")
 FILE_SIZE=$(wc -c < "$STATE/spool/local/$EMITTER_B/$FILE_B" | tr -d ' ')
 if [[ -z "$CUR_BYTES" || -z "$FILE_SIZE" ]]; then
   echo "FAIL B: cursor/file size missing (cursor=$CUR_BYTES size=$FILE_SIZE)"; B_PASS=0
