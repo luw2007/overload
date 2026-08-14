@@ -38,7 +38,7 @@ function escapeMarkdown(value: string): string { return value.replace(/([\\`*_{}
 
 async function compressWithPi(raw: string, model: string): Promise<string> {
   try {
-    const process = Bun.spawn(["pi", "-p", "--no-session", "--model", model,
+    const process = Bun.spawn(["pi", "-p", "--no-session", "--no-tools", "--model", model,
       `Compress this ledger-derived session summary to one factual line. Do not add facts:\n${raw}`],
       { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
     const output = oneLine(await new Response(process.stdout).text());
