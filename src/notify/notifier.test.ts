@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { claimNext, createFileSink, enqueueReminders, markFailed, markSent } from "./notifier";
+import { claimNext, createFileSink, enqueueReminders, markFailed, markSent, pruneObsolete } from "./notifier";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -38,6 +38,25 @@ describe("notifier outbox", () => {
     markSent(db, row!.notification_uid, 2_001);
     expect(db.query("SELECT state,sent_at FROM notifications").get()).toEqual({ state: "sent", sent_at: 2_001 });
     expect(JSON.parse((await readFile(join(root, "deliveries.ndjson"), "utf8")).trim()).request_uid).toBe("req-1");
+    db.close();
+  });
+
+  test("prunes undelivered notifications for requests that are no longer pending", () => {
+    const db = ledger();
+    db.query("INSERT INTO requests VALUES (?, ?, 'resolved', NULL, '{}')").run("req-2", "local:pi:s2");
+    db.query("INSERT INTO requests VALUES (?, ?, 'orphaned', NULL, '{}')").run("req-3", "local:pi:s3");
+    for (const uid of ["req-1", "req-2", "req-3"]) {
+      db.query("INSERT INTO notifications(request_uid,sink,kind,state) VALUES (?,?,'initial','pending')").run(uid, "file:test");
+    }
+    db.query("INSERT INTO notifications(request_uid,sink,kind,state,sent_at) VALUES (?,?,'reminder','sent',5)").run("req-2", "file:test");
+
+    expect(pruneObsolete(db)).toBe(2);
+    // Pending request keeps its queue entry; delivered history rows survive.
+    const rows = db.query("SELECT request_uid, state FROM notifications ORDER BY notification_uid").all();
+    expect(rows).toEqual([
+      { request_uid: "req-1", state: "pending" },
+      { request_uid: "req-2", state: "sent" },
+    ]);
     db.close();
   });
 

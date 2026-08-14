@@ -146,7 +146,21 @@ end run`;
   };
 }
 
+/** Drop undelivered notifications whose request is no longer pending: delivering
+ *  them would notify about already-answered or orphaned asks (loop-1 E2). The
+ *  requests journal keeps the truth; the outbox row has no remaining purpose. */
+export function pruneObsolete(db: Database): number {
+  let removed = 0;
+  db.transaction(() => {
+    const result = db.query(`DELETE FROM notifications WHERE state IN ('pending','attempting')
+      AND request_uid IN (SELECT request_uid FROM requests WHERE state!='pending')`).run();
+    removed = Number(result.changes);
+  }).immediate();
+  return removed;
+}
+
 export async function runOnce(db: Database, sinkName: string, sink: NotificationSink, now = Date.now()): Promise<number> {
+  pruneObsolete(db);
   enqueueReminders(db, now);
   let delivered = 0;
   for (;;) {

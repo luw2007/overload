@@ -28,6 +28,14 @@ export type QueueTransition = {
   classifier_version: number;
 };
 
+/** §2.4a origin normalization: any non-empty lineage that is not literally
+ *  "human" (e.g. "orca:wt-123", parent stable ids) proves an agent launch;
+ *  empty/unknown is treated as agent for Q2 (loop-1 E8). */
+function normalizeOrigin(raw: string | null | undefined): "agent" | "human" | "unknown" {
+  if (!raw || raw === "unknown") return "unknown";
+  return raw === "human" ? "human" : "agent";
+}
+
 function desiredQueue(current: ClassifiableCurrent, event: ClassifierEvent): { queue: string | null; reason: string | null } {
   let state = current.state;
   let reason = current.q5_reason;
@@ -43,7 +51,7 @@ function desiredQueue(current: ClassifiableCurrent, event: ClassifierEvent): { q
     case "emitter_drained": reason = "orphaned_request"; break;
   }
   if (reason) return { queue: "q5", reason };
-  if (state === "done" && (current.origin === "agent" || current.origin === "unknown")) return { queue: "q2", reason: null };
+  if (state === "done" && normalizeOrigin(current.origin) !== "human") return { queue: "q2", reason: null };
   if (state === "working" || state === "idle") return { queue: "q3", reason: null };
   return { queue: null, reason: null };
 }

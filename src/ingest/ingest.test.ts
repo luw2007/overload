@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { initializeLedger, scanOnce } from "./ingest";
 import { reduceJournal } from "./reducer";
-import { CLASSIFIER_VERSION, classify } from "./classifier";
+import { CLASSIFIER_VERSION, classify, queueAfter } from "./classifier";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -59,6 +59,41 @@ describe("atomic spool ingestion", () => {
     expect((await scanOnce(db, spool)).inserted).toBe(1);
     expect((db.query("SELECT count(*) AS n FROM journal").get() as { n: number }).n).toBe(1);
     db.close();
+  });
+
+  test("stores the incarnation pid from the nested session_started lease (loop-1 E1)", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const line = JSON.stringify(event(1, "session_started", {
+      lease: { pid: 4242, proc_boot_id: "bootfeedface" }, cwd: "/repo",
+    }));
+    await writeFile(join(emitterDir, "active-pi-42-bootabcd-0.ndjson"), `${line}\n`);
+    await scanOnce(db, spool);
+    expect(db.query("SELECT pid, proc_boot_id FROM session_incarnations").get())
+      .toEqual({ pid: 4242, proc_boot_id: "bootfeedface" });
+    db.close();
+  });
+
+  test("stamps reducer-enqueued initial notifications with the configured sink (loop-1 E3)", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const lines = [
+      JSON.stringify(event(1, "session_started", { lease: { pid: 1 } })),
+      JSON.stringify(event(2, "decision_requested", { request_id: "ask-1" })),
+    ].join("\n");
+    await writeFile(join(emitterDir, "active-pi-42-bootabcd-0.ndjson"), `${lines}\n`);
+    await scanOnce(db, spool, 500, "file:/tmp/audit.ndjson");
+    expect(db.query("SELECT sink, state FROM notifications").get())
+      .toEqual({ sink: "file:/tmp/audit.ndjson", state: "pending" });
+    db.close();
+  });
+
+  test("q2 accepts done sessions with lineage origins, not just the literal 'agent' (loop-1 E8)", () => {
+    const done = { ingest_seq: 9, at: 9, kind: "session_ended", detail: {} };
+    for (const origin of ["agent", "unknown", "orca:wt-123", "local:pi:parent-session"]) {
+      const current = { stable_id: "local:pi:s", state: "idle", origin, queue: "q3", q5_reason: null };
+      expect(queueAfter({ ...current, state: "done" }, done).queue).toBe("q2");
+    }
+    const human = { stable_id: "local:pi:s", state: "done", origin: "human", queue: null, q5_reason: null };
+    expect(queueAfter(human, done).queue).toBeNull();
   });
 });
 

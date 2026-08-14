@@ -357,10 +357,17 @@ async function commandSnapshot(command: string, timeoutMs: number,
   } finally { clearTimeout(timer); }
 }
 
+/** Peels an optional {result: {...}} envelope; a JSON error response (result
+ *  absent, e.g. herdr server_not_running) falls through and fails the array()
+ *  check below — correctly treated as a source outage. */
+function resultEnvelope(root: Record<string, unknown>): Record<string, unknown> {
+  return root.result && typeof root.result === "object" && !Array.isArray(root.result)
+    ? root.result as Record<string, unknown> : root;
+}
+
 function parseHerdr(value: unknown): SourceSnapshot {
   const root = record(value);
-  const result = record(root.result);
-  const agents = array(result.agents ?? root.agents);
+  const agents = array(resultEnvelope(root).agents);
   return { sessions: agents.map((item) => {
     const row = record(item);
     return {
@@ -371,7 +378,8 @@ function parseHerdr(value: unknown): SourceSnapshot {
 }
 
 function parseOrca(value: unknown): SourceSnapshot {
-  const rows = array(Array.isArray(value) ? value : (value as Record<string, unknown>).worktrees ?? (value as Record<string, unknown>).result);
+  const rows = Array.isArray(value) ? value
+    : array(resultEnvelope(record(value)).worktrees);
   return { sessions: rows.map((item) => {
     const row = record(item);
     const status = optionalString(row.status);
@@ -463,7 +471,8 @@ async function loadConfig(args: string[]): Promise<{ config: ReconConfig; once: 
     host: host as HostId,
     ledger: values.get("ledger") ?? join(home, "ledger.db"),
     spool: values.get("spool") ?? join(home, "spool"),
-    herdr_cmd: values.get("herdr-cmd") ?? "herdr agent list --json",
+    // herdr prints JSON by default and rejects a --json flag (loop-1 E4).
+    herdr_cmd: values.get("herdr-cmd") ?? "herdr agent list",
     orca_cmd: values.get("orca-cmd") ?? "orca worktree ps --json",
     cmux_sessions_file: values.get("cmux-sessions-file") ?? join(homedir(), ".cmuxterm", "*-hook-sessions.json"),
   } };
