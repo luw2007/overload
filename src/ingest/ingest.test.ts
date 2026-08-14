@@ -98,20 +98,37 @@ describe("P2 reducer and classifier", () => {
     db.close();
   });
 
-  test("freezes source sessions during incidents and recovers without per-session judgments", async () => {
+  test("projects attributable telemetry gaps and ignores unattributable gaps", async () => {
     const { spool, emitterDir, db } = await fixture();
     const batch = [
       event(1, "session_started"),
       event(2, "working"),
-      event(3, "source_outage", { source: "pi" }),
-      event(4, "session_vanished", { stable_id: "local:pi:session-1", platform: "pi" }),
-      event(5, "source_recovered", { source: "pi" }),
-      event(6, "session_vanished", { stable_id: "local:pi:session-1", platform: "pi" }),
+      event(3, "telemetry_gap", { stable_id: "local:pi:session-1", platform: "pi" }),
+      event(4, "telemetry_gap", { platform: "herdr", native_id: "unbound" }),
+    ].map(JSON.stringify).join("\n") + "\n";
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
+    await scanOnce(db, spool);
+    expect(db.query("SELECT stable_id, writer_id, state, queue, q5_reason FROM current").all()).toEqual([
+      { stable_id: "local:pi:session-1", writer_id: "pi-42-bootabcd", state: "working", queue: "q5", q5_reason: "telemetry_gap" },
+    ]);
+    db.close();
+  });
+
+  test("freezes runtime and attachment-bound sessions during incidents", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const batch = [
+      event(1, "session_started"),
+      event(2, "working"),
+      event(3, "attachment_observed", { stable_id: "local:pi:session-1", platform: "herdr", binding: "thread-1" }),
+      event(4, "source_outage", { source: "herdr" }),
+      event(5, "session_vanished", { stable_id: "local:pi:session-1", platform: "herdr" }),
+      event(6, "source_recovered", { source: "herdr" }),
+      event(7, "session_vanished", { stable_id: "local:pi:session-1", platform: "herdr" }),
     ].map(JSON.stringify).join("\n") + "\n";
     await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
     await scanOnce(db, spool);
     expect(db.query("SELECT state, frozen FROM current").get()).toEqual({ state: "vanished", frozen: 0 });
-    expect(db.query("SELECT source, closed_at FROM incidents").get()).toEqual({ source: "pi", closed_at: event(5, "x").at });
+    expect(db.query("SELECT source, closed_at FROM incidents").get()).toEqual({ source: "herdr", closed_at: event(6, "x").at });
     db.close();
   });
 

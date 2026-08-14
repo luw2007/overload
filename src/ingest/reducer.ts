@@ -70,10 +70,12 @@ function applyIncident(db: Database, row: JournalRow, detail: Record<string, unk
   if (!source) return;
   if (row.kind === "source_outage") {
     if (!isIncidentOpen(db, source)) db.query("INSERT OR IGNORE INTO incidents(source, opened_at, detail) VALUES (?, ?, ?)").run(source, row.at, row.detail);
-    db.query("UPDATE current SET frozen=1 WHERE stable_id LIKE ?").run(`%:${source}:%`);
+    db.query(`UPDATE current SET frozen=1 WHERE stable_id LIKE ? OR stable_id IN
+      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(`%:${source}:%`, source);
   } else {
     db.query("UPDATE incidents SET closed_at=? WHERE source=? AND closed_at IS NULL").run(row.at, source);
-    db.query("UPDATE current SET frozen=0 WHERE stable_id LIKE ?").run(`%:${source}:%`);
+    db.query(`UPDATE current SET frozen=0 WHERE stable_id LIKE ? OR stable_id IN
+      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(`%:${source}:%`, source);
   }
 }
 
@@ -90,14 +92,21 @@ function applyAttachment(db: Database, row: JournalRow, detail: Record<string, u
 function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
   const relevant = new Set(["session_started", "working", "settled", "decision_requested", "session_ended", "session_vanished", "emitter_dead", "emitter_drained", "emitter_stalled", "telemetry_gap", "heartbeat", "tool_activity"]);
   if (!relevant.has(row.kind)) return;
+  // A platform process without an attributable session is health evidence only;
+  // never create a synthetic overload-admin current row for it.
+  if (row.kind === "telemetry_gap" && !stringDetail(detail, "stable_id")) return;
   const stableId = targetStableId(row, detail);
   if (RECON_EVENTS.has(row.kind) && isIncidentOpen(db, stringDetail(detail, "platform") ?? platformFor(stableId))) return;
   const current = ensureCurrent(db, stableId, row.writer_id, row);
   // Re-reduction retains derived tables. A row already reflected by this
   // subject must not classify against its later state and invent transitions.
   if (current.last_ingest_seq != null && row.ingest_seq <= current.last_ingest_seq) return;
+  const reconFinding = RECON_EVENTS.has(row.kind);
   const newerWriter = current.writer_id !== row.writer_id && row.kind === "session_started";
-  if (current.writer_id !== row.writer_id && !newerWriter) return;
+  // Recon uses an admin writer while projecting evidence onto the target's
+  // incarnation. Preserve that incarnation instead of rejecting the finding.
+  if (current.writer_id !== row.writer_id && !newerWriter && !reconFinding) return;
+  const projectedWriter = reconFinding ? current.writer_id ?? row.writer_id : row.writer_id;
   if (SESSION_TERMINALS.has(current.state) && !newerWriter) return;
 
   let state = newerWriter ? "idle" : current.state;
@@ -118,7 +127,7 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   const queue = queueAfter(view, classifierEvent);
   const heartbeat = row.kind === "heartbeat" || row.kind === "tool_activity" || row.kind === "working" ? row.at : current.last_heartbeat_at;
   db.query(`UPDATE current SET writer_id=?, state=?, queue=?, q5_reason=?, origin=?, last_ingest_seq=?,
-    last_event_at=?, last_heartbeat_at=? WHERE stable_id=?`).run(row.writer_id, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, row.at, heartbeat, stableId);
+    last_event_at=?, last_heartbeat_at=? WHERE stable_id=?`).run(projectedWriter, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, row.at, heartbeat, stableId);
 }
 
 function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
