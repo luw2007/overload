@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { reduceJournal } from "./reducer";
+import { appendClassifierActivated, CLASSIFIER_VERSION } from "./classifier";
 
 const DEFAULT_SCAN_INTERVAL_MS = 2_000;
 const DEFAULT_REDUCER_BATCH_SIZE = 500;
@@ -82,6 +83,16 @@ export function initializeLedger(db: Database): void {
 
 function requireText(path: string): string {
   return readFileSync(path, "utf8");
+}
+
+export function activateClassifier(db: Database, home = homedir(), spoolRoot = join(home, ".overload", "spool"), at = Date.now()): boolean {
+  const existing = db.query("SELECT 1 FROM classifier_activations WHERE version=?").get(CLASSIFIER_VERSION);
+  if (existing) return false;
+  const watermark = (db.query("SELECT COALESCE(MAX(ingest_seq), 0) AS seq FROM journal").get() as { seq: number }).seq;
+  appendClassifierActivated(CLASSIFIER_VERSION, at, home, spoolRoot);
+  db.query("INSERT INTO classifier_activations(version, activated_at_journal_seq, activated_at) VALUES (?, ?, ?)")
+    .run(CLASSIFIER_VERSION, watermark, at);
+  return true;
 }
 
 export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overload", "spool"), reducerBatchSize = DEFAULT_REDUCER_BATCH_SIZE): Promise<{ files: number; inserted: number }> {
@@ -219,6 +230,7 @@ async function main(): Promise<void> {
   const home = join(homedir(), ".overload");
   const config = await loadConfig(join(home, "config.json"));
   const db = await openLedger(join(home, "ledger.db"));
+  activateClassifier(db, homedir(), join(home, "spool"));
   const run = async () => {
     const result = await scanOnce(db, join(home, "spool"), config.reducer_batch_size);
     if (once) console.log(`ingested ${result.inserted} new event(s) from ${result.files} file(s)`);
