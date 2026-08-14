@@ -117,6 +117,7 @@ watchdog（launchd 独立脚本，monotonic + 唤醒感知）
 ### 2.9 cmux 源代际契约（N-2 终解）
 
 - `workstream.jsonl` 是外部 append-only 文件但可被 `cmux feed clear` 清空：ingest 维护 `source_generations(path, dev_inode, head_fp, fp_len, first_seen, generation_uuid)`。**head_fp 锚定不可变前缀**（R3-B3 修正）：仅当文件出现第一个完整行时建立，`head_fp = hash(首行)`、`fp_len = 首行字节长`——append-only 下首行永不再变，正常增长零误判；建立前 cursor 恒为 0，无可丢数据。**新代际判定：inode 变更 ∨ size 回退 ∨ 已建立的 (fp_len 前缀) 哈希不匹配**——truncate-and-regrow ABA 由首行内容变化捕获（新内容首行必含新时间戳/id）。代际、cursor、head_fp/fp_len 持久于 ledger 并随备份恢复。
+- **实施状态（2026-08-15 P3 审查后决策）**：本节代际/双指纹契约在 P1-P3 未实现（v1 本机 cmux 审批可见性由 cmux 自身 Feed 承担，见非目标"过渡路径 C"）；workstream.jsonl 入账排入 P4 实施。契约本身经 sol R5/R6 对齐，实施时照此执行。
 - **双指纹闭合 ABA**（R5-B4）：不依赖"clear 后首行必不同"的未证不变量。cursor 推进时同步持久 `cursor_tail_fp = hash(cursor 前最后一条已消费行)`；每轮扫描先回读该行比对——truncate-and-regrow 要静默跳过数据需同时满足：同 inode ∧ size ≥ 旧 cursor ∧ 首行逐字节相同 ∧ cursor 前一行逐字节相同。workstream 行携带唯一 id 与时间戳，双指纹同时碰撞不具备构造可能；任一不匹配 → 新代际、cursor 归零。P2 验收补一项：`cmux feed clear` 后回归验证新代际检出（同时实证首行时间戳不变量，作为纵深而非依赖）。
 - **journal 身份**：cmux 源事件 = `(source=cmux, generation_uuid, byte_start)`（UNIQUE）——与 spool 同等重放稳定；备份恢复后重读同代际同偏移，去重成立。
 - 请求关联用行内原生 `workstreamId`+`requestId` 映射 `request_uid`；同 requestId 的多条 status 行是多个 journal 事件、幂等迁移同一 request 行（§2.2）。
