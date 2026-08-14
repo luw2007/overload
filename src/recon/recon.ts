@@ -98,8 +98,9 @@ export class ReconDaemon {
             });
             this.deadReported.add(incarnation.writer_id);
           }
+          const graceOrigin = incarnation.last_event_at ?? incarnation.last_seen_at ?? incarnation.started_at ?? firstDeadAt;
           if (!this.drained.has(incarnation.writer_id) &&
-              now - firstDeadAt >= this.config.drain_grace_ms &&
+              now - graceOrigin >= this.config.drain_grace_ms &&
               await this.spoolAtEof(db, incarnation.writer_id) &&
               !this.wasDrained(db, incarnation.writer_id)) {
             await this.emit(summary, "emitter_drained", incarnation.session ?? "admin", now, {
@@ -132,13 +133,13 @@ export class ReconDaemon {
         try {
           snapshot = await load();
         } catch {
-          if (!this.outages.has(source)) {
+          if (!this.outages.has(source) && !this.sourceOutageOpen(db, source)) {
             await this.emit(summary, "source_outage", "admin", now, { source });
             this.outages.add(source);
           }
           continue;
         }
-        if (this.outages.delete(source)) {
+        if (this.outages.delete(source) || this.sourceOutageOpen(db, source)) {
           await this.emit(summary, "source_recovered", "admin", now, { source });
         }
         await this.reconcileSource(db, source, snapshot, liveWriters, summary, now);
@@ -157,6 +158,14 @@ export class ReconDaemon {
       WHERE i.liveness_domain='process'
         AND NOT EXISTS (SELECT 1 FROM journal e WHERE e.stable_id=i.stable_id
           AND e.writer_id=i.writer_id AND e.kind='session_ended')`);
+  }
+
+  private sourceOutageOpen(db: Database, source: string): boolean {
+    const row = safeGet(db, `SELECT kind FROM journal
+      WHERE kind IN ('source_outage','source_recovered')
+        AND json_extract(detail, '$.source')=?
+      ORDER BY ingest_seq DESC LIMIT 1`, source);
+    return row?.kind === "source_outage";
   }
 
   private wasDead(db: Database, emitterId: string): boolean {
@@ -207,7 +216,7 @@ export class ReconDaemon {
         const match = matches[0]!;
         const attachmentKey = `${platform}:${match.stable_id}`;
         const knownBinding = this.attachments.get(attachmentKey) ?? this.ledgerBinding(db, match.stable_id, platform);
-        if (knownBinding !== native.native_id) {
+        if (knownBinding !== native.native_id || this.sessionStillVanished(db, match.stable_id, platform)) {
           await this.emit(summary, "attachment_observed", sessionPart(match.stable_id), now, {
             stable_id: match.stable_id, platform, binding: native.native_id,
           });
@@ -216,7 +225,9 @@ export class ReconDaemon {
       }
       if (native.visible && !matches.some((match) => this.sessionHasLiveWriter(db, match.stable_id, liveWriters))) {
         const key = `${platform}:${native.native_id}`;
-        if (now - (this.gaps.get(key) ?? 0) >= GAP_RATE_LIMIT_MS) {
+        const journalAt = this.latestTelemetryGapAt(db, native.native_id);
+        const latestAt = Math.max(this.gaps.get(key) ?? 0, journalAt ?? 0);
+        if (now - latestAt >= GAP_RATE_LIMIT_MS) {
           await this.emit(summary, "telemetry_gap", "admin", now, {
             platform, native_id: native.native_id, cwd: native.cwd,
           });
@@ -229,7 +240,8 @@ export class ReconDaemon {
       "SELECT stable_id, platform, binding FROM attachments WHERE valid=1 AND platform=?", platform);
     for (const attachment of attachments) {
       const key = `${platform}:${attachment.stable_id}:${attachment.binding}`;
-      if (!visibleBindings.has(attachment.binding) && !this.vanished.has(key)) {
+      if (!visibleBindings.has(attachment.binding) &&
+          !this.vanished.has(key) && !this.sessionStillVanished(db, attachment.stable_id, platform)) {
         await this.emit(summary, "session_vanished", sessionPart(attachment.stable_id), now, {
           stable_id: attachment.stable_id, platform,
         });
@@ -238,6 +250,21 @@ export class ReconDaemon {
         this.vanished.delete(key);
       }
     }
+  }
+
+  private latestTelemetryGapAt(db: Database, nativeId: string): number | undefined {
+    const row = safeGet(db, `SELECT at FROM journal WHERE kind='telemetry_gap'
+      AND json_extract(detail, '$.native_id')=? ORDER BY ingest_seq DESC LIMIT 1`, nativeId);
+    return typeof row?.at === "number" ? row.at : undefined;
+  }
+
+  private sessionStillVanished(db: Database, stableId: string, platform: string): boolean {
+    const row = safeGet(db, `SELECT kind FROM journal
+      WHERE kind IN ('session_vanished','attachment_observed')
+        AND json_extract(detail, '$.stable_id')=?
+        AND json_extract(detail, '$.platform')=?
+      ORDER BY ingest_seq DESC LIMIT 1`, stableId, platform);
+    return row?.kind === "session_vanished";
   }
 
   private ledgerBinding(db: Database, stableId: string, platform: string): string | undefined {
