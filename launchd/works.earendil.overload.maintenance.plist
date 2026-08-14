@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>works.earendil.overload.maintenance</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-lc</string>
+    <string>exec "$HOME/ai/overload/scripts/maintenance.sh"</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/tmp/overload-maintenance.log</string>
+  <key>StandardErrorPath</key><string>/tmp/overload-maintenance.err</string>
+</dict></plist>
