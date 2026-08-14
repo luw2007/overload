@@ -70,10 +70,12 @@ function applyIncident(db: Database, row: JournalRow, detail: Record<string, unk
   if (!source) return;
   if (row.kind === "source_outage") {
     if (!isIncidentOpen(db, source)) db.query("INSERT OR IGNORE INTO incidents(source, opened_at, detail) VALUES (?, ?, ?)").run(source, row.at, row.detail);
-    db.query("UPDATE current SET frozen=1 WHERE stable_id LIKE ?").run(`%:${source}:%`);
+    db.query(`UPDATE current SET frozen=1 WHERE stable_id LIKE ? OR stable_id IN
+      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(`%:${source}:%`, source);
   } else {
     db.query("UPDATE incidents SET closed_at=? WHERE source=? AND closed_at IS NULL").run(row.at, source);
-    db.query("UPDATE current SET frozen=0 WHERE stable_id LIKE ?").run(`%:${source}:%`);
+    db.query(`UPDATE current SET frozen=0 WHERE stable_id LIKE ? OR stable_id IN
+      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(`%:${source}:%`, source);
   }
 }
 
@@ -90,6 +92,9 @@ function applyAttachment(db: Database, row: JournalRow, detail: Record<string, u
 function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
   const relevant = new Set(["session_started", "working", "settled", "decision_requested", "session_ended", "session_vanished", "emitter_dead", "emitter_drained", "emitter_stalled", "telemetry_gap", "heartbeat", "tool_activity"]);
   if (!relevant.has(row.kind)) return;
+  // A platform process without an attributable session is health evidence only;
+  // never create a synthetic overload-admin current row for it.
+  if (row.kind === "telemetry_gap" && !stringDetail(detail, "stable_id")) return;
   const stableId = targetStableId(row, detail);
   if (RECON_EVENTS.has(row.kind) && isIncidentOpen(db, stringDetail(detail, "platform") ?? platformFor(stableId))) return;
   const current = ensureCurrent(db, stableId, row.writer_id, row);

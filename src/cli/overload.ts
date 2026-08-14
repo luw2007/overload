@@ -50,8 +50,18 @@ function q2(db: Database): void {
 }
 function zombie(db: Database): void {
   const rows = db.query("SELECT stable_id, q5_reason, last_event_at FROM current WHERE queue='q5' ORDER BY q5_reason, last_event_at, stable_id").all() as Array<{ stable_id: string; q5_reason: string; last_event_at: number }>;
-  if (!rows.length) { console.log("Q5: no zombie sessions."); return; }
-  let group = ""; for (const row of rows) { if (row.q5_reason !== group) { group = row.q5_reason; console.log(`${group}:`); } console.log(`  ${row.stable_id}\t${time(row.last_event_at)}`); }
+  const orphaned = db.query(`SELECT request_uid, stable_id, resolved_at FROM requests WHERE state='orphaned'
+    ORDER BY resolved_at, request_uid`).all() as Array<{ request_uid: string; stable_id: string; resolved_at: number | null }>;
+  if (!rows.length && !orphaned.length) { console.log("Q5: no zombie sessions."); return; }
+  let group = "";
+  for (const row of rows.filter((row) => row.q5_reason !== "orphaned_request")) {
+    if (row.q5_reason !== group) { group = row.q5_reason; console.log(`${group}:`); }
+    console.log(`  ${row.stable_id}\t${time(row.last_event_at)}`);
+  }
+  if (orphaned.length) {
+    console.log("orphaned_request:");
+    for (const row of orphaned) console.log(`  ${row.request_uid}\t${row.stable_id}\t${time(row.resolved_at)}`);
+  }
 }
 function health(db: Database): void {
   const incidents = db.query("SELECT source, opened_at, detail FROM incidents WHERE closed_at IS NULL ORDER BY opened_at").all() as Array<{ source: string; opened_at: number; detail: string | null }>;
