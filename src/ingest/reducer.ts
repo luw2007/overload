@@ -37,14 +37,14 @@ function ensureCurrent(db: Database, stableId: string, writerId: string, row: Jo
   return db.query("SELECT * FROM current WHERE stable_id=?").get(stableId) as CurrentRow;
 }
 
-export function reduceJournal(db: Database, batchSize = 500): number {
+export function reduceJournal(db: Database, batchSize = 500, notifySink = "osascript"): number {
   let processed = 0;
   const transaction = db.transaction(() => {
     db.query("INSERT OR IGNORE INTO reducer_cursor(id, journal_seq) VALUES (1, 0)").run();
     const cursor = (db.query("SELECT journal_seq FROM reducer_cursor WHERE id=1").get() as { journal_seq: number }).journal_seq;
     const rows = db.query(`SELECT ingest_seq, at, stable_id, writer_id, emitter_id, kind, detail
       FROM journal WHERE ingest_seq > ? ORDER BY ingest_seq LIMIT ?`).all(cursor, batchSize) as JournalRow[];
-    for (const row of rows) applyEvent(db, row);
+    for (const row of rows) applyEvent(db, row, notifySink);
     if (rows.length) db.query("UPDATE reducer_cursor SET journal_seq=? WHERE id=1").run(rows.at(-1)!.ingest_seq);
     processed = rows.length;
   });
@@ -52,7 +52,7 @@ export function reduceJournal(db: Database, batchSize = 500): number {
   return processed;
 }
 
-function applyEvent(db: Database, row: JournalRow): void {
+function applyEvent(db: Database, row: JournalRow, notifySink: string): void {
   const detail = objectDetail(row.detail);
   if (row.kind === "classifier_activated") {
     const version = typeof detail.version === "number" ? detail.version : CLASSIFIER_VERSION;
@@ -61,7 +61,7 @@ function applyEvent(db: Database, row: JournalRow): void {
   }
   if (row.kind === "source_outage" || row.kind === "source_recovered") { applyIncident(db, row, detail); return; }
   if (row.kind === "attachment_observed") applyAttachment(db, row, detail);
-  applyRequestEvent(db, row, detail);
+  applyRequestEvent(db, row, detail, notifySink);
   applySessionEvent(db, row, detail);
 }
 
@@ -135,7 +135,7 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
     last_event_at=?, last_heartbeat_at=? WHERE stable_id=?`).run(projectedWriter, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, row.at, heartbeat, stableId);
 }
 
-function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
+function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>, notifySink: string): void {
   if (row.kind === "emitter_drained") { orphanDrainedEmitter(db, row, detail); return; }
   if (row.kind === "session_ended") {
     db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE stable_id=? AND writer_id=? AND state='pending'").run(row.at, row.stable_id, row.writer_id);
@@ -151,7 +151,7 @@ function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string,
       db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, next_reminder_at, detail)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`).run(uid, row.stable_id, row.writer_id, row.emitter_id, id, kind, row.at, row.at, row.detail);
       db.query(`INSERT OR IGNORE INTO notifications(request_uid, sink, kind, reminder_seq, state)
-        VALUES (?, 'osascript', 'initial', 0, 'pending')`).run(uid);
+        VALUES (?, ?, 'initial', 0, 'pending')`).run(uid, notifySink);
     }
     return;
   }

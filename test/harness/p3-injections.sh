@@ -14,7 +14,12 @@ pass=0; fail=0; skip=0
 record(){ printf '%s %s: %s\n' "$2" "$1" "$3"; case "$2" in PASS) ((pass+=1));; FAIL) ((fail+=1));; SKIP) ((skip+=1));; esac; }
 wanted(){ [[ ",$ONLY," == *",$1,"* ]]; }
 missing(){ for p in "$@"; do [[ -f "$p" ]] || { echo "$p"; return; }; done; }
-new(){ W="$(mktemp -d -t overload-p3-XXXXXX)"; export HOME="$W"; mkdir -p "$W/.overload/spool" "$W/remote/spool/devbox"; trap '[[ "$KEEP" == 1 ]] || rm -rf "$W"' RETURN; }
+CLEANUP_DIRS=()
+cleanup_all(){ [[ "${KEEP:-0}" == 1 ]] || for d in "${CLEANUP_DIRS[@]:-}"; do [[ -n "$d" ]] && rm -rf "$d"; done; }
+trap cleanup_all EXIT
+# NOTE: a RETURN trap here would delete the workdir the moment new() returns
+# (bash RETURN fires on function exit) — cleanup must be deferred to EXIT.
+new(){ W="$(mktemp -d -t overload-p3-XXXXXX)"; export HOME="$W"; mkdir -p "$W/.overload/spool" "$W/remote/spool/devbox"; printf '{"notify_sink":"file:%s/sink"}\n' "$W" > "$W/.overload/config.json"; CLEANUP_DIRS+=("$W"); }
 envline(){ bun -e 'console.log(JSON.stringify({v:1,at:Date.now(),host:"devbox",runtime:"pi",session:"p3-session",emitter_id:"pi-p3-fake",writer_id:"pi-p3-fake",seq:1,kind:"decision_requested",dropped_total:0,write_error_total:0,detail:{request_id:"p3-request",request_kind:"decision"}}))'; }
 make_cmds(){
   mkdir -p "$W/bin"; SSH="$W/bin/ssh"; RSYNC="$W/bin/rsync";

@@ -16,6 +16,8 @@ const SEGMENT_FILE = /^(?:active|seg)-[A-Za-z0-9._-]+-\d+(?:-recovered)?\.ndjson
 export type IngestConfig = {
   scan_interval_ms: number;
   reducer_batch_size: number;
+  /** Sink id stamped on reducer-enqueued initial notification rows (configurable, default osascript). */
+  notify_sink: string;
 };
 
 type Envelope = {
@@ -51,6 +53,7 @@ export async function loadConfig(path = join(homedir(), ".overload", "config.jso
   return {
     scan_interval_ms: positiveInteger(value.scan_interval_ms, DEFAULT_SCAN_INTERVAL_MS),
     reducer_batch_size: positiveInteger(value.reducer_batch_size, DEFAULT_REDUCER_BATCH_SIZE),
+    notify_sink: typeof value.notify_sink === "string" && value.notify_sink.length > 0 ? value.notify_sink : "osascript",
   };
 }
 
@@ -95,7 +98,7 @@ export function activateClassifier(db: Database, home = homedir(), spoolRoot = j
   return true;
 }
 
-export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overload", "spool"), reducerBatchSize = DEFAULT_REDUCER_BATCH_SIZE): Promise<{ files: number; inserted: number }> {
+export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overload", "spool"), reducerBatchSize = DEFAULT_REDUCER_BATCH_SIZE, notifySink = "osascript"): Promise<{ files: number; inserted: number }> {
   const files = await discoverSpoolFiles(spoolRoot);
   const pending: PendingFile[] = [];
   for (const path of files) {
@@ -117,7 +120,7 @@ export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overl
   });
   transaction.immediate();
 
-  while (reduceJournal(db, reducerBatchSize) === reducerBatchSize) { /* drain */ }
+  while (reduceJournal(db, reducerBatchSize, notifySink) === reducerBatchSize) { /* drain */ }
   return { files: pending.length, inserted };
 }
 
@@ -205,10 +208,15 @@ function insertEnvelope(db: Database, envelope: Envelope, spoolRef: string): boo
       .run(stableId, envelope.host, envelope.runtime, envelope.session, origin,
         stringOrNull(detail.cwd), stringOrNull(detail.branch), envelope.at, envelope.at);
     const domain = envelope.runtime === "claude" ? "lifecycle" : "process";
+    // Contract (types.ts session_started): the incarnation lease is nested as
+    // detail.lease = {pid, proc_boot_id}; flat detail.pid kept for admin/harness emitters.
+    const lease = detail.lease && typeof detail.lease === "object" && !Array.isArray(detail.lease)
+      ? detail.lease as Record<string, unknown> : {};
     db.query(`INSERT INTO session_incarnations(stable_id, writer_id, liveness_domain, pid, proc_boot_id, started_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(stable_id, writer_id) DO UPDATE SET last_seen_at=MAX(last_seen_at, excluded.last_seen_at)`)
-      .run(stableId, envelope.writer_id, domain, integerOrNull(detail.pid), stringOrNull(detail.proc_boot_id), envelope.at, envelope.at);
+      .run(stableId, envelope.writer_id, domain, integerOrNull(lease.pid ?? detail.pid),
+        stringOrNull(lease.proc_boot_id ?? detail.proc_boot_id), envelope.at, envelope.at);
   } else {
     db.query("UPDATE session_incarnations SET last_seen_at=MAX(last_seen_at, ?) WHERE stable_id=? AND writer_id=?")
       .run(envelope.at, stableId, envelope.writer_id);
@@ -233,7 +241,7 @@ async function main(): Promise<void> {
   activateClassifier(db, homedir(), join(home, "spool"));
   const heartbeatPath = join(home, "ingest.heartbeat");
   const run = async () => {
-    const result = await scanOnce(db, join(home, "spool"), config.reducer_batch_size);
+    const result = await scanOnce(db, join(home, "spool"), config.reducer_batch_size, config.notify_sink);
     // Watchdog liveness contract (review P2 m4): the ingest loop owns this touch.
     try { await Bun.write(heartbeatPath, String(Date.now())); } catch { /* watchdog will alarm */ }
     if (once) console.log(`ingested ${result.inserted} new event(s) from ${result.files} file(s)`);
