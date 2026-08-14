@@ -70,12 +70,14 @@ function applyIncident(db: Database, row: JournalRow, detail: Record<string, unk
   if (!source) return;
   if (row.kind === "source_outage") {
     if (!isIncidentOpen(db, source)) db.query("INSERT OR IGNORE INTO incidents(source, opened_at, detail) VALUES (?, ?, ?)").run(source, row.at, row.detail);
-    db.query(`UPDATE current SET frozen=1 WHERE stable_id LIKE ? OR stable_id IN
-      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(`%:${source}:%`, source);
+    // Freeze scope = attachment-bound sessions only (review P2 M1: a LIKE on
+    // ":<source>:" wrongly swept every cmux-runtime session on a cmux outage).
+    db.query(`UPDATE current SET frozen=1 WHERE stable_id IN
+      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(source);
   } else {
     db.query("UPDATE incidents SET closed_at=? WHERE source=? AND closed_at IS NULL").run(row.at, source);
-    db.query(`UPDATE current SET frozen=0 WHERE stable_id LIKE ? OR stable_id IN
-      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(`%:${source}:%`, source);
+    db.query(`UPDATE current SET frozen=0 WHERE stable_id IN
+      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(source);
   }
 }
 
@@ -87,6 +89,9 @@ function applyAttachment(db: Database, row: JournalRow, detail: Record<string, u
     .run(stableId, platform, binding, row.at);
   db.query("UPDATE sessions SET origin=CASE WHEN origin='unknown' AND ?='orca' THEN 'agent' ELSE origin END WHERE stable_id=?").run(platform, stableId);
   db.query("UPDATE current SET origin=CASE WHEN origin='unknown' AND ?='orca' THEN 'agent' ELSE origin END WHERE stable_id=?").run(platform, stableId);
+  // Review P2 M2: a session bound while its platform's incident is open must
+  // enter the freeze immediately, not wait for the next outage event.
+  if (isIncidentOpen(db, platform)) db.query("UPDATE current SET frozen=1 WHERE stable_id=?").run(stableId);
 }
 
 function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
@@ -164,6 +169,10 @@ function orphanDrainedEmitter(db: Database, row: JournalRow, detail: Record<stri
   const stableId = stringDetail(detail, "stable_id") ?? null;
   db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE origin_emitter_id=? AND state='pending'").run(row.at, emitterId);
   const last = db.query("SELECT seq, at FROM journal WHERE emitter_id=? AND ingest_seq<? ORDER BY ingest_seq DESC LIMIT 1").get(emitterId, row.ingest_seq) as { seq: number; at: number } | null;
+  // Review P2 M3: duplicate emitter_drained findings (recon restart + ingest
+  // lag) must not create duplicate tail gaps — one drained tail per emitter.
   db.query(`INSERT INTO coverage_gaps(stable_id, emitter_id, from_seq, from_at, to_at, reason)
-    VALUES (?, ?, ?, ?, ?, 'emitter_drained')`).run(stableId, emitterId, last?.seq ?? null, last?.at ?? null, row.at);
+    SELECT ?, ?, ?, ?, ?, 'emitter_drained'
+    WHERE NOT EXISTS (SELECT 1 FROM coverage_gaps WHERE emitter_id=? AND reason='emitter_drained')`)
+    .run(stableId, emitterId, last?.seq ?? null, last?.at ?? null, row.at, emitterId);
 }

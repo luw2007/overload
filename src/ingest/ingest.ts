@@ -231,8 +231,11 @@ async function main(): Promise<void> {
   const config = await loadConfig(join(home, "config.json"));
   const db = await openLedger(join(home, "ledger.db"));
   activateClassifier(db, homedir(), join(home, "spool"));
+  const heartbeatPath = join(home, "ingest.heartbeat");
   const run = async () => {
     const result = await scanOnce(db, join(home, "spool"), config.reducer_batch_size);
+    // Watchdog liveness contract (review P2 m4): the ingest loop owns this touch.
+    try { await Bun.write(heartbeatPath, String(Date.now())); } catch { /* watchdog will alarm */ }
     if (once) console.log(`ingested ${result.inserted} new event(s) from ${result.files} file(s)`);
   };
   try {
