@@ -111,13 +111,10 @@ case "$event" in
     request_id=$(new_uuid) || exit 0
     [ -n "$request_id" ] || exit 0
     tool_name=$(printf '%s' "$payload" | jq -r '(.tool_name // "unknown") | if type == "string" then . else "unknown" end' 2>/dev/null)
+    # Summarize structure only: command text and arguments may contain secrets.
     tool_summary=$(printf '%s' "$payload" | jq -c '
       (.tool_input // {}) |
-      if type == "object" then
-        if .command? then {command:(.command|tostring|.[0:300])}
-        elif .file_path? then {file_path:(.file_path|tostring|.[0:300])}
-        elif .path? then {path:(.path|tostring|.[0:300])}
-        else {keys:(keys_unsorted[0:10])} end
+      if type == "object" then {keys:(keys_unsorted[0:10])}
       else {type:(type)} end
     ' 2>/dev/null)
     [ -n "$tool_summary" ] || tool_summary='{}'
