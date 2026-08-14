@@ -9,7 +9,7 @@ export const ENVELOPE_VERSION = 1;
 /** From ~/.overload/host config file; never hostname. */
 export type HostId = "local" | "devbox";
 
-export type Runtime = "pi" | "omp" | "prime" | "claude" | "cmux";
+export type Runtime = "pi" | "omp" | "prime" | "claude" | "cmux" | "overload"; // "overload" = admin/recon self-events
 
 /** <host_id>:<runtime>:<session-uuid> */
 export type StableId = string;
@@ -25,13 +25,36 @@ export type EventKind =
   | "working"              // agent_start/turn_start (throttled: no resend on unchanged state)
   | "settled"              // agent_end/agent_settled (+ last assistant text ≤500B, UTF-8-safe pre-serialization truncation)
   | "decision_requested"   // ask tool_call; request_id = SDK toolCallId
-  | "decision_resolved"    // ask tool_execution_end (+ selected option)
+  | "decision_resolved"    // ask tool_execution_end (+ state: resolved|cancelled, selected option)
   | "tool_activity"        // sampled heartbeat payload (≥5s interval)
   | "heartbeat"            // ≤60s in working state (turn timer covers long model calls)
   | "commit_observed"      // HEAD change after bash tool_result: {sha, repo}
   | "session_ended"        // session_shutdown
   | "events_dropped"       // {n} from resident counter
-  | "classifier_activated"; // admin spool only: {version}
+  | "classifier_activated" // admin spool only: {version}
+  // ── P2 reconciliation findings (admin spool, runtime="overload", emitter=recon process) ──
+  | "emitter_dead"         // {emitter_id, stable_id, pid, verified: "kill0"|"comm_mismatch"|"lease"}
+  | "emitter_drained"      // {emitter_id, stable_id} — verified dead + 5min grace + ingest cursors at EOF for all its files; SOLE trigger for orphaning
+  | "emitter_stalled"      // {emitter_id, stable_id, silent_ms} — heartbeat silence beyond profile ∧ pid alive
+  | "telemetry_gap"        // {platform, native_id, cwd?} — live agent process observed with no/silent spool writer
+  | "session_vanished"     // {stable_id, platform} — ONLY after a COMPLETE platform snapshot proves absence
+  | "source_outage"        // {source} — platform CLI/host unreachable (aggregated: one event per outage start)
+  | "source_recovered"     // {source}
+  | "attachment_observed"; // {stable_id, platform, binding} — jump-target binding refresh
+
+// ── P2 state vocabulary (frozen) ──
+export type SessionState = "working" | "idle" | "awaiting_human" | "done" | "failed" | "vanished";
+export type QueueName = "q1" | "q2" | "q3" | "q5";           // Q4 closed until P4
+export type Q5Reason = "stalled" | "dead_incarnation" | "telemetry_gap" | "orphaned_request";
+export type NotificationState = "pending" | "attempting" | "sent" | "failed_permanent";
+export type NotificationKind = "initial" | "reminder";
+/** Retry backoff for sink failures (minutes), then failed_permanent. */
+export const SINK_BACKOFF_MIN = [1, 5, 15, 15, 15] as const;
+export const REMINDER_INTERVAL_MS = 15 * 60_000;
+export const DRAIN_GRACE_MS = 5 * 60_000;
+export const ATTEMPTING_RETRY_GRACE_MS = 30_000;
+/** Heartbeat-silence profiles (§2.4): narrow default, wide for long tasks. */
+export const STALL_PROFILE_MS = { narrow: 30 * 60_000, wide: 120 * 60_000 } as const;
 
 export interface EventEnvelope {
   v: typeof ENVELOPE_VERSION;
