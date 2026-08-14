@@ -155,15 +155,16 @@ make_fakes() { # sets FAKE_DIR, HERDR, ORCA, CMUX
   CMUX="$FAKE_DIR/cmux-sessions.json"
   printf '{}\n' > "$CMUX"
   HERDR="$FAKE_DIR/herdr"
-  cat > "$HERDR" <<SH
+  cat > "$HERDR" <<'SH'
 #!/bin/sh
-# fake herdr agent list --json (probe findings §1 shape); MODE file = outage
-if [ -f "\$FAKE_DIR/herdr.down" ]; then
+# fake herdr agent list --json (probe findings §1 shape); MODE file = outage.
+# Values expand at RUN time from env passed through run_recon.
+if [ -f "$FAKE_DIR/herdr.down" ]; then
   echo "fake herdr: unreachable" >&2
   exit 1
 fi
-cat <<'EOF'
-{"result":{"agents":[{"terminal_id":"$HERDR_TID","agent_status":"$HERDR_STATUS","pane_id":"%5","tab_id":"tab-1","workspace_id":"ws-1","cwd":"$HERDR_CWD","revision":1,"state_change_seq":1}]}}
+cat <<EOF
+{"result":{"agents":[{"terminal_id":"${HERDR_TID:-herdr-x}","agent_status":"${HERDR_STATUS:-idle}","pane_id":"%5","tab_id":"tab-1","workspace_id":"ws-1","cwd":"${HERDR_CWD:-/tmp}","revision":1,"state_change_seq":1}]}}
 EOF
 SH
   chmod +x "$HERDR"
@@ -181,6 +182,7 @@ herdr_up()   { rm -f "$FAKE_DIR/herdr.down"; }
 
 run_recon() { # one --once pass with fully injected sources; never real CLIs
   env HOME="$WORK" OVERLOAD_DRAIN_GRACE_MS=2000 \
+      FAKE_DIR="$FAKE_DIR" HERDR_TID="${HERDR_TID:-}" HERDR_STATUS="${HERDR_STATUS:-}" HERDR_CWD="${HERDR_CWD:-}" \
     bun "$RECON" --once \
       --herdr-cmd "$HERDR" \
       --orca-cmd "$ORCA" \
