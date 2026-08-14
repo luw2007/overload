@@ -243,7 +243,7 @@ describe.skipIf(!HAS_N7)("real: N7 notifier --once --sink file:<path>", () => {
     cleanupTempDir(rootReal);
   });
 
-  function craftPendingRequest(suffix: string): { requestUid: string; notifUid: number } {
+  function craftPendingRequest(suffix: string, sink = `file:${sinkFile}`): { requestUid: string; notifUid: number } {
     const db = openLedgerP2(ledger);
     const r = {
       request_uid: `local:pi:s#${suffix}#req-${suffix}`,
@@ -252,7 +252,7 @@ describe.skipIf(!HAS_N7)("real: N7 notifier --once --sink file:<path>", () => {
       origin_emitter_id: "pi-1-aaaa0001",
       request_id: `req-${suffix}`,
     };
-    insertPendingRequestWithInitial(db, r, `file:${sinkFile}`, NOW);
+    insertPendingRequestWithInitial(db, r, sink, NOW);
     const row = db.query("SELECT notification_uid FROM notifications WHERE request_uid=?").get(r.request_uid) as
       | { notification_uid: number }
       | undefined;
@@ -269,7 +269,7 @@ describe.skipIf(!HAS_N7)("real: N7 notifier --once --sink file:<path>", () => {
     });
     const out = await new Response(proc.stdout).text();
     const err = await new Response(proc.stderr).text();
-    return { code: proc.exitCode, out, err };
+    return { code: await proc.exited, out, err };
   }
 
   function notifRow(notifUid: number) {
@@ -338,8 +338,8 @@ describe.skipIf(!HAS_N7)("real: N7 notifier --once --sink file:<path>", () => {
   });
 
   test("forced sink failure: backoff-gated retries then failed_permanent on the 6th", async () => {
-    const { notifUid } = craftPendingRequest("r4");
     const badSink = `file:${join(roDir, "sink.out")}`;
+    const { notifUid } = craftPendingRequest("r4", badSink);
     const windows: Array<[number, number, number]> = [];
     for (let i = 1; i <= 6; i++) {
       const t0 = Date.now();

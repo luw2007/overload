@@ -412,6 +412,9 @@ describe.skipIf(!HAS_N6)("real: N6 recon --once against fake CLIs", () => {
     rLedger = join(home, ".overload", "ledger.db");
     rSpool = join(home, ".overload", "spool");
     rFakes = join(home, "fakes");
+    mkdirSync(join(home, ".overload"), { recursive: true });
+    mkdirSync(rSpool, { recursive: true });
+    mkdirSync(rFakes, { recursive: true });
   });
   afterEach(() => cleanupTempDir(home));
 
@@ -433,7 +436,7 @@ describe.skipIf(!HAS_N6)("real: N6 recon --once against fake CLIs", () => {
     );
     const out = await new Response(proc.stdout).text();
     await new Response(proc.stderr).text();
-    return { code: proc.exitCode, out };
+    return { code: await proc.exited, out };
   }
 
   async function runIngest(): Promise<number> {
@@ -445,7 +448,7 @@ describe.skipIf(!HAS_N6)("real: N6 recon --once against fake CLIs", () => {
     });
     await new Response(proc.stdout).text();
     await new Response(proc.stderr).text();
-    return proc.exitCode;
+    return await proc.exited;
   }
 
   function journalCount(kind: string, detailLike = "%"): number {

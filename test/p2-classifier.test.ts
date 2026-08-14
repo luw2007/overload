@@ -373,7 +373,7 @@ describe.skipIf(!HAS_N5)("real: N5 classifier via ingest --once + CLI surface", 
 
   beforeEach(() => {
     home = makeTempDir(`n8-cls-real-${nextCounter()}`);
-    spoolRoot = join(home, ".overload", "spool");
+    spoolRoot = join(home, ".overload"); // lib spoolDir() appends "spool/<host>/<emitter>" itself
     ledgerPath = join(home, ".overload", "ledger.db");
   });
   afterEach(() => cleanupTempDir(home));
@@ -411,7 +411,7 @@ describe.skipIf(!HAS_N5)("real: N5 classifier via ingest --once + CLI surface", 
     });
     await new Response(proc.stdout).text();
     await new Response(proc.stderr).text();
-    return proc.exitCode;
+    return await proc.exited;
   }
 
   async function runCli(sub: string): Promise<{ code: number; out: string }> {
@@ -423,7 +423,7 @@ describe.skipIf(!HAS_N5)("real: N5 classifier via ingest --once + CLI surface", 
     });
     const out = await new Response(proc.stdout).text();
     await new Response(proc.stderr).text();
-    return { code: proc.exitCode, out };
+    return { code: await proc.exited, out };
   }
 
   test("q1 from a pending request; q2 for done+unknown; initial row same-txn; idempotent re-reduce", async () => {
