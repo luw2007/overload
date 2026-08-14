@@ -55,3 +55,14 @@ CREATE TABLE IF NOT EXISTS coverage_gaps(
   from_seq INTEGER, from_at INTEGER, to_at INTEGER NOT NULL, reason TEXT NOT NULL);
 -- requests.next_reminder_at is part of the P1 base DDL above, so the frozen
 -- `ALTER TABLE requests ADD COLUMN next_reminder_at INTEGER` migration is skipped.
+
+-- P4 (owner-frozen): cmux workstream source generations (tech-solution §2.9)
+CREATE TABLE IF NOT EXISTS source_generations(
+  path TEXT NOT NULL,
+  generation_uuid TEXT PRIMARY KEY,
+  dev_inode TEXT,
+  head_fp TEXT, fp_len INTEGER,
+  cursor_bytes INTEGER NOT NULL DEFAULT 0,
+  cursor_tail_fp TEXT,
+  first_seen INTEGER NOT NULL,
+  retired INTEGER NOT NULL DEFAULT 0);
