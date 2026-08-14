@@ -1,4 +1,7 @@
 // @overload-event-source
+// Approval gate v0 is a local, deterministic pre-tool denylist. It is disabled by
+// default, never waits for a remote decision, and fails open (with one warning) if
+// its session-start configuration cannot be parsed or compiled.
 // Intentionally has no package imports: pi, omp, and prime-agent expose compatible
 // extension APIs under different package names.
 import { constants } from "node:fs"
@@ -39,6 +42,11 @@ type Envelope = {
 type ExtensionApi = {
   on: (event: string, handler: (event: any, ctx: any) => unknown) => void
   exec?: (command: string, args: string[], options?: Record<string, unknown>) => Promise<{ stdout?: string; code?: number }>
+}
+
+type ApprovalGate = {
+  bash: Array<{ source: string; pattern: RegExp }>
+  writePaths: string[]
 }
 
 function processName(value: unknown): string {
@@ -297,9 +305,68 @@ export default function overload(pi: ExtensionApi): void {
   let lastToolActivity = 0
   let lastAssistantText = ""
   let heartbeat: ReturnType<typeof setInterval> | null = null
+  let approvalGate: ApprovalGate | null = null
+  let gateWarned = false
 
   function emit(kind: Kind, detail?: Record<string, unknown>): void {
     spool.enqueue({ session, kind, ...(detail ? { detail } : {}) })
+  }
+
+  function warnAndDisableGate(error: unknown): void {
+    approvalGate = null
+    if (gateWarned) return
+    gateWarned = true
+    console.warn("[overload] invalid approval_gate configuration; gate disabled:", (error as Error)?.message || error)
+  }
+
+  async function loadApprovalGate(): Promise<void> {
+    approvalGate = null
+    try {
+      let raw: string
+      try {
+        raw = await readFile(join(homedir(), ".overload", "config.json"), "utf8")
+      } catch (error: any) {
+        if (error?.code === "ENOENT") return
+        throw error
+      }
+      const config = JSON.parse(raw)
+      const gate = config?.approval_gate
+      if (gate === undefined) return
+      if (!gate || typeof gate !== "object" || typeof gate.enabled !== "boolean") {
+        throw new Error("approval_gate must contain a boolean enabled field")
+      }
+      if (!Array.isArray(gate.block_bash_patterns) || !gate.block_bash_patterns.every((value: unknown) => typeof value === "string")) {
+        throw new Error("block_bash_patterns must be an array of strings")
+      }
+      if (!Array.isArray(gate.block_write_paths) || !gate.block_write_paths.every((value: unknown) => typeof value === "string")) {
+        throw new Error("block_write_paths must be an array of strings")
+      }
+      if (!gate.enabled) return
+      approvalGate = {
+        bash: gate.block_bash_patterns.map((source: string) => ({ source, pattern: new RegExp(source) })),
+        writePaths: [...gate.block_write_paths],
+      }
+    } catch (error) {
+      warnAndDisableGate(error)
+    }
+  }
+
+  function gateRule(event: any): string | undefined {
+    const gate = approvalGate
+    if (!gate) return undefined
+    if (event?.toolName === "bash" && typeof event?.input?.command === "string") {
+      for (const rule of gate.bash) {
+        rule.pattern.lastIndex = 0
+        if (rule.pattern.test(event.input.command)) return rule.source
+      }
+      return undefined
+    }
+    if ((event?.toolName === "write" || event?.toolName === "edit") && typeof event?.input?.path === "string") {
+      for (const path of gate.writePaths) {
+        if (event.input.path.startsWith(path)) return path
+      }
+    }
+    return undefined
   }
 
   function setWorking(): void {
@@ -369,7 +436,7 @@ export default function overload(pi: ExtensionApi): void {
     try {
       // Hosts await session_start handlers, preserving lifecycle order while all
       // subsequent handlers themselves remain non-blocking.
-      await spool.ready
+      await Promise.all([spool.ready, loadApprovalGate()])
       stableId = `${spool.host}:${runtime}:${session}`
       const detail: Record<string, unknown> = {
         lease: { pid: process.pid, proc_boot_id: procBootId },
@@ -413,6 +480,13 @@ export default function overload(pi: ExtensionApi): void {
     if (event?.toolName === "ask" && typeof event.toolCallId === "string") {
       pendingAsk.add(event.toolCallId)
       emit("decision_requested", { request_id: event.toolCallId })
+    }
+    const rule = gateRule(event)
+    if (rule !== undefined && typeof event?.toolCallId === "string") {
+      const detail = { request_id: event.toolCallId, gated: true }
+      emit("decision_requested", detail)
+      emit("decision_resolved", { ...detail, state: "cancelled" })
+      return { block: true, reason: `overload approval gate: ${rule}` }
     }
     if (event?.toolName !== "bash" || !event.input || typeof event.input.command !== "string") return
     const command = event.input.command
