@@ -106,8 +106,11 @@ export function enqueueReminders(db: Database, now = Date.now()): number {
         (request_uid,sink,kind,reminder_seq,state) VALUES (?,?,'reminder',?,'pending')`)
         .run(row.request_uid, row.sink, row.previous_seq + 1);
       if (Number(result.changes) === 0) continue;
-      db.query("UPDATE requests SET next_reminder_at=next_reminder_at+? WHERE request_uid=?")
-        .run(REMINDER_INTERVAL_MS, row.request_uid);
+      // Catch-up storm guard (dogfooding finding): schedule from NOW, never
+      // by accumulating from a stale next_reminder_at — a request pending
+      // since long ago must produce one reminder per real 15min window.
+      db.query("UPDATE requests SET next_reminder_at=? WHERE request_uid=?")
+        .run(now + REMINDER_INTERVAL_MS, row.request_uid);
       inserted++;
     }
   }).immediate();

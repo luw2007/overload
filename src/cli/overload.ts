@@ -14,7 +14,7 @@ type Output = (line: string) => void;
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: string | null): string { if (!value || value === "{}") return ""; try { return ` ${JSON.stringify(JSON.parse(value))}`; } catch { return ` ${value}`; } }
-function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q2 | q4 | zombie | health | digest [--llm pi] | attrib [--since <Nh|Nd>]"); process.exit(2); }
+function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q2 | q4 | zombie | health | ack <request_uid> | digest [--llm pi] | attrib [--since <Nh|Nd>]"); process.exit(2); }
 
 function listSessions(db: Database): void {
   const rows = db.query(`SELECT stable_id, runtime, origin, created_at FROM sessions ORDER BY first_seen_at, stable_id`).all() as Array<Pick<SessionRow, "stable_id" | "runtime" | "origin" | "created_at">>;
@@ -91,7 +91,18 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const simple = new Set(["sessions", "q1", "q2", "q4", "zombie", "health"]);
   const validDigest = command === "digest" && ((argument == null && !extra.length) || (argument === "--llm" && extra.length === 1 && extra[0] === "pi"));
   const validAttrib = command === "attrib" && ((argument == null && !extra.length) || (argument === "--since" && extra.length === 1));
-  if (!command || (simple.has(command) && (argument || extra.length)) || (command === "show" && (!argument || extra.length)) || (!simple.has(command) && command !== "show" && !validDigest && !validAttrib)) usage();
+  const validAck = command === "ack" && argument != null && !extra.length;
+  if (!command || (simple.has(command) && (argument || extra.length)) || (command === "show" && (!argument || extra.length)) || (!simple.has(command) && command !== "show" && !validDigest && !validAttrib && !validAck)) usage();
+  if (validAck) {
+    // Human acknowledgement is a source terminal (the operator IS the decision
+    // authority here): cancels the request and thereby stops reminders.
+    const rw = new Database(path);
+    try {
+      const result = rw.query("UPDATE requests SET state='cancelled', resolved_at=? WHERE request_uid=? AND state='pending'").run(Date.now(), argument!);
+      console.log(Number(result.changes) === 1 ? `acked ${argument}` : `no pending request matches ${argument}`);
+    } finally { rw.close(); }
+    return;
+  }
   let db: Database; try { db = new Database(path, { readonly: true }); } catch (error) { console.error(`Unable to open ledger ${path}: ${(error as Error).message}`); process.exit(1); }
   try {
     if (command === "sessions") listSessions(db); else if (command === "show") showSession(db, argument!); else if (command === "q1") q1(db); else if (command === "q2") q2(db);
