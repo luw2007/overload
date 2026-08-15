@@ -41,12 +41,15 @@ function ensureCurrent(db: Database, stableId: string, writerId: string, row: Jo
  * keeps the completed session in Q2. Unknown tool details are not evidence. */
 function hasChangeEvidence(db: Database, stableId: string, throughSeq: number): boolean {
   const rows = db.query(`SELECT kind, detail FROM journal
-    WHERE stable_id=? AND ingest_seq<=? AND kind IN ('commit_observed','tool_call','tool_activity')`)
+    WHERE stable_id=? AND ingest_seq<=? AND kind IN ('commit_observed','tool_activity','settled','session_ended')`)
     .all(stableId, throughSeq) as Array<{ kind: string; detail: string | null }>;
   return rows.some((candidate) => {
     if (candidate.kind === "commit_observed") return true;
-    const tool = stringDetail(objectDetail(candidate.detail), "tool")
-      ?? stringDetail(objectDetail(candidate.detail), "tool_name");
+    const detail = objectDetail(candidate.detail);
+    // Review P4 B1: resident flag flushed on settle/end, plus unthrottled
+    // change-marked tool_activity, replace the dead 'tool_call' branch.
+    if (detail.change === true || detail.change_evidence === true) return true;
+    const tool = stringDetail(detail, "tool") ?? stringDetail(detail, "tool_name");
     return tool != null && /^(bash|write|edit)$/i.test(tool);
   });
 }

@@ -303,6 +303,7 @@ export default function overload(pi: ExtensionApi): void {
   let working = false
   let settledForRun = false
   let lastToolActivity = 0
+  let changeEvidenceSeen = false
   let lastAssistantText = ""
   let heartbeat: ReturnType<typeof setInterval> | null = null
   let approvalGate: ApprovalGate | null = null
@@ -335,13 +336,15 @@ export default function overload(pi: ExtensionApi): void {
       if (!gate || typeof gate !== "object" || typeof gate.enabled !== "boolean") {
         throw new Error("approval_gate must contain a boolean enabled field")
       }
+      // Review P4 m3: a disabled gate is inert by definition — never validate
+      // (and thus never warn about) rule shapes the gate will not use.
+      if (!gate.enabled) return
       if (!Array.isArray(gate.block_bash_patterns) || !gate.block_bash_patterns.every((value: unknown) => typeof value === "string")) {
         throw new Error("block_bash_patterns must be an array of strings")
       }
       if (!Array.isArray(gate.block_write_paths) || !gate.block_write_paths.every((value: unknown) => typeof value === "string")) {
         throw new Error("block_write_paths must be an array of strings")
       }
-      if (!gate.enabled) return
       approvalGate = {
         bash: gate.block_bash_patterns.map((source: string) => ({ source, pattern: new RegExp(source) })),
         writePaths: [...gate.block_write_paths],
@@ -387,7 +390,12 @@ export default function overload(pi: ExtensionApi): void {
     if (!working || settledForRun) return
     working = false
     settledForRun = true
-    emit("settled", lastAssistantText ? { text: truncateUtf8(lastAssistantText) } : undefined)
+    emit("settled", {
+      ...(lastAssistantText ? { text: truncateUtf8(lastAssistantText) } : {}),
+      // Review P4 B1: resident change flag flushed with every settle so the
+      // classifier never depends on a throttled tool_activity row alone.
+      change_evidence: changeEvidenceSeen,
+    })
   }
 
   function settleAgentLifecycle(): void {
@@ -473,9 +481,18 @@ export default function overload(pi: ExtensionApi): void {
 
   on("tool_call", (event) => {
     const now = Date.now()
-    if (now - lastToolActivity >= TOOL_ACTIVITY_INTERVAL_MS) {
+    const tool = String(event?.toolName || "unknown")
+    // Review P4 B1: the 5s throttle must never suppress CHANGE evidence —
+    // the first change-capable call always emits (unthrottled) and latches a
+    // resident flag that is also flushed with settled/session_ended details.
+    const changeCapable = /^(bash|write|edit)$/i.test(tool)
+    if (changeCapable && !changeEvidenceSeen) {
+      changeEvidenceSeen = true
       lastToolActivity = now
-      emit("tool_activity", { tool: truncateUtf8(event?.toolName || "unknown", 80) })
+      emit("tool_activity", { tool: truncateUtf8(tool, 80), change: true })
+    } else if (now - lastToolActivity >= TOOL_ACTIVITY_INTERVAL_MS) {
+      lastToolActivity = now
+      emit("tool_activity", { tool: truncateUtf8(tool, 80), ...(changeCapable ? { change: true } : {}) })
     }
     if (event?.toolName === "ask" && typeof event.toolCallId === "string") {
       pendingAsk.add(event.toolCallId)

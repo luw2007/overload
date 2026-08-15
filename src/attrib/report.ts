@@ -169,7 +169,9 @@ function trailerStableId(value: string): string {
 
 async function git(argv: string[]): Promise<{ ok: boolean; stdout: string }> {
   try {
-    const proc = Bun.spawn(["git", ...argv], { stdout: "pipe", stderr: "pipe" });
+    // Review P4 m5: bounded like the extension's execGit — a hung network
+    // mount must not wedge the on-demand report.
+    const proc = Bun.spawn(["git", ...argv], { stdout: "pipe", stderr: "pipe", timeout: 5_000, killSignal: "SIGKILL" });
     const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     return { ok: exitCode === 0, stdout };
   } catch {

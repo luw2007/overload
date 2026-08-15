@@ -40,7 +40,9 @@ async function compressWithPi(raw: string, model: string): Promise<string> {
   try {
     const process = Bun.spawn(["pi", "-p", "--no-session", "--no-tools", "--model", model,
       `Compress this ledger-derived session summary to one factual line. Do not add facts:\n${raw}`],
-      { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+      // Review P4 M1: a hung provider must not block digest generation —
+      // bounded per-item timeout keeps the fail-open-to-raw promise real.
+      { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 30_000, killSignal: "SIGKILL" });
     const output = oneLine(await new Response(process.stdout).text());
     return await process.exited === 0 && output ? output : raw;
   } catch { return raw; }
