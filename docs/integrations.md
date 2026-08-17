@@ -12,11 +12,20 @@ Use `scripts/install-claude-hooks.sh`. It merges only marker-owned Overload hook
 
 Claude hook events may record pending permission requests, but the hook has no durable response channel. A local Q1 acknowledgement does not decide the Claude permission prompt.
 
+On session start the hook records parent lineage when available: a subagent
+transcript path (`…/<parent-session>/subagents/agent-*.jsonl`) yields the
+parent Claude session's stable id, else a non-empty `OVERLOAD_PARENT`
+environment value is recorded verbatim.
+
 ## cmux, herdr, and orca
 
 Recon and jump support depend on the installed CLI/file contracts for these tools. A missing CLI or unavailable source is surfaced as a source incident rather than treated as an empty session list.
 
 The dashboard's **Open** action may focus a local terminal through `herdr`, `cmux`, or `orca`. If it cannot, the UI falls back to copying the opaque attachment binding. Treat bindings as identifiers, not commands to paste into a shell.
+
+Orca worktrees carrying `parentWorktreeId` contribute `orca:<id>` lineage:
+a session whose origin is still `unknown` at attachment time adopts it as
+its origin, so agent-spawned worktrees classify as agent work.
 
 ## Remote spool pull
 
