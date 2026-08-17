@@ -59,6 +59,13 @@ actually live (cross-checked against `telemetry_gap` evidence — the
 signature of a missing extension), and `~/.overload` permissions. Each line
 is `OK`, `WARN`, or `FAIL`; the command exits 1 if anything is `FAIL`.
 
+`health` and the digest header include an attention line: notifications
+delivered in the trailing 24h (each priced at `refocus_cost_min`, default
+20 minutes of lost focus), pending decisions with average wait, and the
+number of distinct sessions currently demanding human attention (pending
+asks plus Q2/Q5). Rising interruptions or open contexts mean the fleet is
+spending your focus budget, not just its own compute.
+
 ## Backup and reset
 
 Stop the LaunchAgents before copying `~/.overload/ledger.db` and spool data. SQLite WAL state matters, so copy `ledger.db`, `ledger.db-wal`, and `ledger.db-shm` together when present. Retain sealed NDJSON segments as the source-event replay record.

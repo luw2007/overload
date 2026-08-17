@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { runDigestOnce } from "../digest/digest";
-import { ackRequest, queryHealth, queryQ1, queryQ2, querySession, querySessions, queryZombie } from "../shared/queries";
+import { ackRequest, configRefocusCostMin, formatAttention, queryAttention, queryHealth, queryQ1, queryQ2, querySession, querySessions, queryZombie } from "../shared/queries";
 import { runDoctor, defaultDoctorDeps } from "./doctor";
 
 const path = process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
@@ -60,6 +60,7 @@ function zombie(db: Database): void {
 function health(db: Database): void {
   const view = queryHealth(db);
   console.log(`Health: open_incidents=${view.open_incidents.length} coverage_gaps=${view.coverage_gaps} telemetry_gaps=${view.telemetry_gaps}`);
+  console.log(`Attention: ${formatAttention(queryAttention(db, Date.now(), configRefocusCostMin()))}`);
   for (const row of view.open_incidents) console.log(`  incident ${row.source} since ${time(row.opened_at)}${detail(row.detail)}`);
 }
 function sinceMs(value: string): number | undefined {

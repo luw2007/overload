@@ -1,4 +1,7 @@
 import type { Database } from "bun:sqlite";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export type SessionSummary = { stable_id: string; runtime: string | null; origin: string | null; created_at: number | null };
 export type IncarnationRow = { writer_id: string; liveness_domain: string; pid: number | null; proc_boot_id: string | null; started_at: number | null; last_seen_at: number | null };
@@ -105,4 +108,51 @@ export function queryHealth(db: Database): HealthView {
 export function ackRequest(db: Database, requestUid: string): { changes: number } {
   const result = db.query("UPDATE requests SET state='cancelled', resolved_at=? WHERE request_uid=? AND state='pending'").run(Date.now(), requestUid);
   return { changes: Number(result.changes) };
+}
+
+export type AttentionView = {
+  /** Notifications delivered to the human in the trailing 24h — each one is a flexibility trigger. */
+  interruptions_24h: number;
+  /** interruptions_24h x refocus cost (Gloria Mark: ~20min to regain focus after an interruption). */
+  refocus_cost_min: number;
+  pending_decisions: number;
+  pending_decision_avg_wait_ms: number | null;
+  /** Distinct sessions currently demanding human attention (pending asks + q2/q5). */
+  open_contexts: number;
+};
+
+export const DEFAULT_REFOCUS_COST_MIN = 20;
+const DAY_MS = 86_400_000;
+
+export function queryAttention(db: Database, now = Date.now(), refocusCostMin = DEFAULT_REFOCUS_COST_MIN): AttentionView {
+  // bun:sqlite rows are untyped; named-const casts document the aggregate shapes.
+  const interruptions = db.query("SELECT count(*) n FROM notifications WHERE state='sent' AND sent_at >= ?").get(now - DAY_MS) as { n: number };
+  const pending = db.query("SELECT count(*) n, avg(? - created_at) w FROM requests WHERE state='pending'").get(now) as { n: number; w: number | null };
+  const contexts = db.query(`SELECT count(*) n FROM (
+    SELECT stable_id FROM requests WHERE state='pending'
+    UNION SELECT stable_id FROM current WHERE queue IN ('q2','q5'))`).get() as { n: number };
+  return {
+    interruptions_24h: interruptions.n,
+    refocus_cost_min: interruptions.n * refocusCostMin,
+    pending_decisions: pending.n,
+    pending_decision_avg_wait_ms: pending.w == null ? null : Math.round(pending.w),
+    open_contexts: contexts.n,
+  };
+}
+
+/** refocus_cost_min from ~/.overload/config.json; invalid/missing falls back to 20. */
+export function configRefocusCostMin(): number {
+  try {
+    const raw: unknown = JSON.parse(readFileSync(join(homedir(), ".overload", "config.json"), "utf8"));
+    if (raw && typeof raw === "object" && "refocus_cost_min" in raw) {
+      const value = raw.refocus_cost_min;
+      if (typeof value === "number" && value > 0) return value;
+    }
+  } catch { /* fall through to default */ }
+  return DEFAULT_REFOCUS_COST_MIN;
+}
+
+export function formatAttention(view: AttentionView): string {
+  const wait = view.pending_decision_avg_wait_ms == null ? "-" : `${Math.round(view.pending_decision_avg_wait_ms / 60_000)}m`;
+  return `interruptions(24h)=${view.interruptions_24h} (~${view.refocus_cost_min}min refocus) · pending decisions=${view.pending_decisions} avg_wait=${wait} · open contexts=${view.open_contexts}`;
 }

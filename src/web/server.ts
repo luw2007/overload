@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ackRequest, queryHealth, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie } from "../shared/queries";
+import { ackRequest, configRefocusCostMin, queryAttention, queryHealth, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie } from "../shared/queries";
 import { performJump } from "./jump";
 
 const DEFAULT_WEB_PORT = 4870;
@@ -82,7 +82,7 @@ export function startWebServer(options: { ledgerPath?: string; port?: number } =
         if (request.method === "GET" && url.pathname === "/api/q1") return json(withReadonlyDb(ledgerPath, queryQ1).map(({ platform: _platform, ...row }) => row));
         if (request.method === "GET" && url.pathname === "/api/q2") return json(withReadonlyDb(ledgerPath, queryQ2));
         if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyDb(ledgerPath, queryZombie));
-        if (request.method === "GET" && url.pathname === "/api/health") return json(withReadonlyDb(ledgerPath, queryHealth));
+        if (request.method === "GET" && url.pathname === "/api/health") return json(withReadonlyDb(ledgerPath, (db) => ({ ...queryHealth(db), attention: queryAttention(db, Date.now(), configRefocusCostMin()) })));
         if (request.method === "GET" && url.pathname.startsWith("/api/sessions/")) {
           const stableId = routeParameter(url.pathname.slice("/api/sessions/".length));
           const result = withReadonlyDb(ledgerPath, (db) => querySession(db, stableId));

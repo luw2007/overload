@@ -15,7 +15,8 @@ function fixture() {
   db.run("CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, host TEXT)");
   db.run("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, stable_id TEXT, at INTEGER, kind TEXT, detail TEXT)");
   db.run("CREATE TABLE attachments(stable_id TEXT, binding TEXT, observed_at INTEGER, valid INTEGER)");
-  db.run("CREATE TABLE notifications(request_uid TEXT, state TEXT)");
+  db.run("CREATE TABLE notifications(request_uid TEXT, state TEXT, sent_at INTEGER)");
+  db.run("CREATE TABLE requests(request_uid TEXT, stable_id TEXT, state TEXT, created_at INTEGER)");
   db.run("CREATE TABLE incidents(source TEXT, closed_at INTEGER)");
   db.run("CREATE TABLE coverage_gaps(id INTEGER)");
   return { root, db, out: join(root, "digests") };
@@ -38,6 +39,7 @@ describe("digest generation", () => {
     expect(markdown.indexOf("q5-one")).toBeLessThan(markdown.indexOf("q2-one"));
     expect(markdown.indexOf("q2-one")).toBeLessThan(markdown.indexOf("q4-"));
     expect(markdown).toContain("summary q5-one");
+    expect(markdown).toContain("Attention: interruptions(24h)=0");
     db.close();
   });
 

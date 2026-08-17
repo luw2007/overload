@@ -14,6 +14,7 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 | `stall_profile_ms` | recon | Session-stall threshold. |
 | `command_timeout_ms` | recon | External adapter command timeout. |
 | `digest_model` | digest | Model used only by `overload digest --llm pi`. |
+| `refocus_cost_min` | digest, cli, web | Estimated minutes of lost focus per delivered notification in the attention line; default `20`. |
 
 Remote pull settings are command-line flags to `src/pull/pull.ts`: `--remote`, `--remote-spool`, `--dest`, `--ssh-cmd`, `--rsync-cmd`, `--fail-threshold`, and `--timeout-ms`. Run `bun src/pull/pull.ts --once` with invalid input to print the accepted contract.
 

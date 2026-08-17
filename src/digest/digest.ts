@@ -3,12 +3,14 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { configRefocusCostMin, DEFAULT_REFOCUS_COST_MIN, formatAttention, queryAttention } from "../shared/queries";
 
 export type DigestOptions = {
   outputDir?: string;
   now?: Date;
   llm?: "pi";
   model?: string;
+  refocusCostMin?: number;
   /** Test-only crash seam immediately after the complete tmp file is written. */
   beforeRename?: () => void;
 };
@@ -92,7 +94,8 @@ export async function generateDigest(db: Database, options: DigestOptions = {}):
     const model = options.model ?? "glm_anthropic/glm-5.2";
     for (const item of items) item.summary = await compressWithPi(item.summary, model);
   }
-  const lines = ["# Overload digest", "", `Generated: ${now.toISOString()}`, `Health: ${healthLine(db)}`, ""];
+  const attention = formatAttention(queryAttention(db, now.getTime(), options.refocusCostMin ?? DEFAULT_REFOCUS_COST_MIN));
+  const lines = ["# Overload digest", "", `Generated: ${now.toISOString()}`, `Health: ${healthLine(db)}`, `Attention: ${attention}`, ""];
   for (const item of items) {
     lines.push(`## ${item.queue.toUpperCase()} · ${escapeMarkdown(item.stable_id)}`);
     lines.push(`- Summary: ${escapeMarkdown(item.summary)}`);
@@ -119,5 +122,5 @@ function configModel(): string {
 }
 
 export async function runDigestOnce(db: Database, llm?: "pi"): Promise<string> {
-  return generateDigest(db, { llm, model: configModel() });
+  return generateDigest(db, { llm, model: configModel(), refocusCostMin: configRefocusCostMin() });
 }
