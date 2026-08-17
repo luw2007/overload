@@ -55,7 +55,6 @@ See [docs/integrations.md](docs/integrations.md) for adapter-specific behavior a
 ```sh
 bun src/cli/overload.ts sessions
 bun src/cli/overload.ts q1
-bun src/cli/overload.ts health
 bun src/cli/overload.ts doctor
 bun src/cli/overload.ts digest
 ```

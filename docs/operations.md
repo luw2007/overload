@@ -43,10 +43,9 @@ over SSH rather than a local copy).
 `install-extension.sh`, and (best-effort, skipped without `jq`)
 `install-claude-hooks.sh` in one pass.
 
-## Health and diagnosis
+## Diagnosis
 
 ```sh
-bun src/cli/overload.ts health
 bun src/cli/overload.ts q1
 bun src/cli/overload.ts doctor
 ```
