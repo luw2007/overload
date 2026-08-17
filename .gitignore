@@ -1,5 +1,7 @@
 digests/
+.dispatch/
 ledger.db*
 *.ndjson
 node_modules/
 .dispatch/DONE-*
+.superpowers/
