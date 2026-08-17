@@ -40,7 +40,7 @@ export type EventKind =
   | "session_vanished"     // {stable_id, platform} — ONLY after a COMPLETE platform snapshot proves absence
   | "source_outage"        // {source} — platform CLI/host unreachable (aggregated: one event per outage start)
   | "source_recovered"     // {source}
-  | "attachment_observed"; // {stable_id, platform, binding} — jump-target binding refresh
+  | "attachment_observed"; // {stable_id, platform, binding, parent?} — jump-target binding refresh; parent = platform lineage (e.g. "orca:<parentWorktreeId>")
 
 // ── P2 state vocabulary (frozen) ──
 export type SessionState = "working" | "idle" | "awaiting_human" | "done" | "failed" | "vanished";
