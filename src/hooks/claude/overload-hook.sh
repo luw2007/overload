@@ -96,7 +96,26 @@ write_event() {
 
 case "$event" in
   SessionStart)
-    write_event session_started "$(jq -cn --arg event "$event" '{hook_event_name:$event}')" || exit 0
+    parent_uuid=$(printf '%s' "$payload" | jq -r '
+      (.transcript_path // empty) |
+      if type == "string" then
+        try capture("/(?<parent>[0-9a-fA-F-]{36})/subagents/agent-[^/]+\\.jsonl$").parent catch empty
+      else empty end
+    ' 2>/dev/null)
+    if [ -n "$parent_uuid" ]; then
+      parent="$host:claude:$parent_uuid"
+    elif [ -n "${OVERLOAD_PARENT-}" ]; then
+      parent=$(LC_ALL=C printf '%.200s' "$OVERLOAD_PARENT" 2>/dev/null)
+    else
+      parent=''
+    fi
+    if [ -n "$parent" ]; then
+      detail=$(jq -cn --arg event "$event" --arg parent "$parent" \
+        '{hook_event_name:$event,parent:$parent}') || exit 0
+    else
+      detail=$(jq -cn --arg event "$event" '{hook_event_name:$event}') || exit 0
+    fi
+    write_event session_started "$detail" || exit 0
     ;;
   Stop|SessionEnd|SessionStop)
     write_event session_ended "$(jq -cn --arg event "$event" '{hook_event_name:$event}')" || exit 0
