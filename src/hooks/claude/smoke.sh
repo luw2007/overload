@@ -14,10 +14,15 @@ chmod 600 "$TMP/home/.overload/host"
 
 run_hook() {
   payload=$1
-  printf '%s\n' "$payload" | HOME="$TMP/home" OVERLOAD_PERMISSION_TIMEOUT_SECONDS=0 "$HOOK"
+  parent=${2-}
+  printf '%s\n' "$payload" | HOME="$TMP/home" OVERLOAD_PARENT="$parent" OVERLOAD_PERMISSION_TIMEOUT_SECONDS=0 "$HOOK"
 }
 
 run_hook '{"hook_event_name":"SessionStart","session_id":"session-smoke"}'
+run_hook '{"hook_event_name":"SessionStart","session_id":"session-path-parent","transcript_path":"/Users/test/.claude/projects/example/0b198322-1234-4abc-8def-1234567890ab/subagents/agent-worker.jsonl"}' 'env:must-not-win'
+run_hook '{"hook_event_name":"SessionStart","session_id":"session-env-parent","transcript_path":"/Users/test/.claude/projects/example/session.jsonl"}' 'orca:parent-worktree'
+run_hook '{"hook_event_name":"SessionStart","session_id":"session-no-parent"}'
+run_hook '{"hook_event_name":"SessionStart","session_id":"session-malformed-parent","transcript_path":"/Users/test/.claude/projects/example/0b198322-1234-4abc-8def-1234567890ab /subagents/agent bad.jsonl"}'
 run_hook '{"hook_event_name":"Notification","session_id":"session-smoke"}'
 run_hook '{"hook_event_name":"SubagentStop","session_id":"session-smoke"}'
 run_hook '{"hook_event_name":"Stop","session_id":"session-smoke"}'
@@ -29,15 +34,18 @@ run_hook '{"hook_event_name":"PermissionRequest","session_id":"session-response"
 bun "$ROOT/test/harness/validate-envelope.ts" --spool "$TMP/home/.overload"
 
 files=$(find "$TMP/home/.overload/spool" -type f -name 'seg-*.ndjson' | wc -l | tr -d ' ')
-[ "$files" -eq 7 ]
+[ "$files" -eq 11 ]
 [ "$(find "$TMP/home/.overload/spool" -type f -name 'active-*.ndjson' | wc -l | tr -d ' ')" -eq 0 ]
 
 # Generated spool paths contain only the fixed emitter alphabet.
 # shellcheck disable=SC2046
 jq -s '
   ([.[] | select(.kind == "decision_requested")] | length) == 3 and
-  ([.[] | select(.kind == "decision_resolved")] | length) == 3 and
-  ([.[] | select(.kind == "decision_resolved" and .detail.state == "timed_out")] | length) == 1 and
+  ([.[] | select(.kind == "decision_resolved")] | length) == 2 and
+  ([.[] | select(.session == "session-path-parent" and .detail.parent == "devbox:claude:0b198322-1234-4abc-8def-1234567890ab")] | length) == 1 and
+  ([.[] | select(.session == "session-env-parent" and .detail.parent == "orca:parent-worktree")] | length) == 1 and
+  ([.[] | select(.session == "session-no-parent" and (.detail | has("parent")))] | length) == 0 and
+  ([.[] | select(.session == "session-malformed-parent" and (.detail | has("parent")))] | length) == 0 and
   (group_by(.emitter_id) | all(
     if ([.[] | select(.kind == "decision_requested")] | length) == 1
     then ([.[].detail.request_id] | unique | length) == 1
