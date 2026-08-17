@@ -1,6 +1,6 @@
 # pi/omp 插件侧谱系注入设计（EXT-19 提案）
 
-状态：设计定稿，待批准实现。前置：N28（claude hook parent）、N29（orca parent ingest）已合并。
+状态：已实现（EXT-19，test/ext-lineage.test.ts 5/5；已部署 ~/.pi 与 ~/.omp extension 目录，重启 runtime 生效）。
 
 ## 问题
 

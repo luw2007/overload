@@ -507,9 +507,19 @@ export default function overload(pi: ExtensionApi): void {
     }
     if (event?.toolName !== "bash" || !event.input || typeof event.input.command !== "string") return
     const command = event.input.command
-    if (!/^git commit\b/.test(command) || /[|;&`$()\n\r]/.test(command)) return
-    const trailer = `Overload-Session: ${stableId}#${spool.writerId}`
-    event.input.command = `${command} --trailer "${trailer}"`
+    // Shared guard: never rewrite compound commands (quoting hazards); the
+    // dispatch templates own env injection for those (EXT-19 non-goal #2).
+    if (/[|;&`$()\n\r]/.test(command)) return
+    if (/^git commit\b/.test(command)) {
+      const trailer = `Overload-Session: ${stableId}#${spool.writerId}`
+      event.input.command = `${command} --trailer "${trailer}"`
+      return
+    }
+    // EXT-19: cross-process agent spawns inherit this session as parent
+    // lineage; children read OVERLOAD_PARENT (EXT-03 / CLH-09).
+    if (/^(pi|omp|prime-agent|claude)\b/.test(command) && stableId && !command.includes("OVERLOAD_PARENT")) {
+      event.input.command = `OVERLOAD_PARENT=${stableId} ${command}`
+    }
   })
 
   on("tool_execution_end", (event) => {

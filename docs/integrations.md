@@ -6,6 +6,12 @@
 
 The extension is observational. Its optional local pre-tool denylist is disabled by default; Overload never remotely approves or resumes an agent.
 
+When a session's bash tool spawns another agent CLI (`pi`, `omp`,
+`prime-agent`, `claude`) as a simple command, the extension prefixes
+`OVERLOAD_PARENT=<stable_id>` so the child records this session as its
+parent. Compound commands (pipes, substitution, quoting wrappers) are
+never rewritten; dispatch templates own env injection there.
+
 ## Claude Code
 
 Use `scripts/install-claude-hooks.sh`. It merges only marker-owned Overload hook entries into `~/.claude/settings.json`, keeps a `.bak` before the first change, and removes only those entries with `--uninstall`.
