@@ -54,7 +54,7 @@ type Incarnation = {
   last_event_at: number | null;
 };
 
-type NativeSession = { native_id: string; cwd?: string; visible: boolean };
+type NativeSession = { native_id: string; cwd?: string; visible: boolean; parent?: string };
 type SourceSnapshot = { sessions: NativeSession[] };
 type AttachmentRow = { stable_id: string; platform: string; binding: string };
 type SessionRow = { stable_id: string; cwd: string | null };
@@ -217,8 +217,11 @@ export class ReconDaemon {
         const attachmentKey = `${platform}:${match.stable_id}`;
         const knownBinding = this.attachments.get(attachmentKey) ?? this.ledgerBinding(db, match.stable_id, platform);
         if (knownBinding !== native.native_id || this.sessionStillVanished(db, match.stable_id, platform)) {
+          // Dedup remains binding-keyed: parent lineage only piggybacks when a
+          // binding emission occurs, so a parent-only change is not re-emitted.
           await this.emit(summary, "attachment_observed", sessionPart(match.stable_id), now, {
             stable_id: match.stable_id, platform, binding: native.native_id,
+            ...(native.parent ? { parent: native.parent } : {}),
           });
           this.attachments.set(attachmentKey, native.native_id);
         }
@@ -383,9 +386,11 @@ function parseOrca(value: unknown): SourceSnapshot {
   return { sessions: rows.map((item) => {
     const row = record(item);
     const status = optionalString(row.status);
+    const parentWorktreeId = optionalString(row.parentWorktreeId);
     return {
       native_id: requiredString(row.worktreeInstanceId), cwd: optionalString(row.path),
       visible: status === "active" || status === "working",
+      ...(parentWorktreeId ? { parent: `orca:${parentWorktreeId}` } : {}),
     };
   }) };
 }
