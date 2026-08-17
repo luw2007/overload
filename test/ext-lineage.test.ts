@@ -1,16 +1,17 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { homedir as realHomedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import overload from "../src/extension/overload";
 
-// EXT-19 behavioral test: the extension mutates bash tool_call commands that
-// spawn agent CLIs, injecting this session's stable id as OVERLOAD_PARENT.
-// HOME is redirected before the extension boots so the spool never touches
-// the real ~/.overload (established host-sim convention).
+// EXT-19/EXT-20 behavioral tests against the real extension. Bun's os.homedir()
+// ignores process.env.HOME (verified: returns the passwd entry), so isolation
+// MUST mock node:os — a plain HOME redirect silently pollutes the real
+// ~/.overload spool and, via the 2s ingest daemon, the real ledger.
 
 const home = mkdtempSync(join(tmpdir(), "overload-ext-lineage-"));
-process.env.HOME = home;
+const realSpool = join(realHomedir(), ".overload", "spool", "local");
+
+mock.module("node:os", () => ({ homedir: () => home, tmpdir }));
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 const handlers = new Map<string, Handler[]>();
@@ -26,6 +27,10 @@ function mutate(command: string): string {
 }
 
 beforeAll(async () => {
+  process.env.OVERLOAD_PARENT = "outer-parent";
+  // Dynamic import required: the node:os mock above must be registered before
+  // the extension module evaluates; a static import would hoist past it.
+  const { default: overload } = await import("../src/extension/overload");
   overload({
     on: (name: string, handler: Handler) => {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
@@ -37,9 +42,18 @@ beforeAll(async () => {
   }));
 });
 
-afterAll(async () => {
-  try { await Promise.all(dispatch("session_shutdown", { reason: "test_end" })); } catch { /* fail-open */ }
+afterAll(() => {
+  // Sentinel: this test process must never have written to the real spool.
+  if (existsSync(realSpool)) {
+    expect(readdirSync(realSpool).filter((name) => name.includes(`-${process.pid}-`))).toEqual([]);
+  }
   rmSync(home, { recursive: true, force: true });
+});
+
+describe("EXT-20 env parent export", () => {
+  test("session_start exports this session's stable id for descendants", () => {
+    expect(process.env.OVERLOAD_PARENT).toMatch(/^local:(pi|omp|prime):11111111-2222-3333-4444-555555555555$/);
+  });
 });
 
 describe("EXT-19 spawn lineage injection", () => {
@@ -67,5 +81,22 @@ describe("EXT-19 spawn lineage injection", () => {
   test("git commit trailer injection (EXT-11) still works after the refactor", () => {
     const result = mutate('git commit -m "msg"');
     expect(result).toMatch(/^git commit -m "msg" --trailer "Overload-Session: local:(pi|omp|prime):11111111-2222-3333-4444-555555555555#/);
+  });
+});
+
+// Last describe: sealing ends the session, so mutation tests run before it.
+describe("EXT-20 spool record", () => {
+  test("the session's OWN parent (pre-start env value) reached the spool", async () => {
+    // session_shutdown drains the write queue and seals the segment (EXT-13),
+    // making the read deterministic without timers.
+    await Promise.all(dispatch("session_shutdown", { reason: "test_end" }));
+    const hostDir = join(home, ".overload", "spool", "local");
+    const spoolFiles = readdirSync(hostDir, { recursive: true }) as string[];
+    const sealed = spoolFiles.find((name) => name.includes("seg-"));
+    expect(sealed).toBeDefined();
+    const first = readFileSync(join(hostDir, sealed!), "utf8").split("\n")[0]!;
+    const envelope = JSON.parse(first) as { kind: string; detail?: { parent?: string } };
+    expect(envelope.kind).toBe("session_started");
+    expect(envelope.detail?.parent).toBe("outer-parent");
   });
 });

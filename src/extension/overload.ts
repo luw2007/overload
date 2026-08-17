@@ -455,6 +455,9 @@ export default function overload(pi: ExtensionApi): void {
       const branch = await execGit(cwd, ["branch", "--show-current"])
       if (branch) detail.branch = truncateUtf8(branch)
       emit("session_started", detail)
+      // EXT-20: own parent recorded above; from here on, every child process
+      // this session spawns inherits THIS session as its parent lineage.
+      process.env.OVERLOAD_PARENT = stableId
       probeHead(cwd, false)
     } catch {
       // Initialization already disables and warns once; never affect the host.
