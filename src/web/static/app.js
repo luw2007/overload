@@ -87,23 +87,26 @@
     try {
       await navigator.clipboard.writeText(binding);
       status.textContent = "已复制";
+      setTimeout(() => { status.textContent = ""; }, 2000);
+      return true;
     } catch {
       status.textContent = "复制失败";
+      setTimeout(() => { status.textContent = ""; }, 2000);
+      return false;
     }
-    setTimeout(() => { status.textContent = ""; }, 2000);
   }
 
   async function jump(button) {
     const status = button.closest("tr").querySelector(".jump-status");
+    const fallback = async () => {
+      const copied = await copyBinding(button.dataset.binding, status);
+      status.textContent = copied ? "打开失败，已复制跳转标识" : "打开失败，复制跳转标识失败";
+    };
     try {
       const result = await fetchJson(`/api/jump/${encodeURIComponent(button.dataset.id)}`, { method: "POST" });
-      if (!result.opened) {
-        await copyBinding(button.dataset.binding, status);
-        status.textContent = "打开失败，已退回复制";
-      }
-    } catch (error) {
-      await copyBinding(button.dataset.binding, status);
-      status.textContent = "打开失败，已退回复制";
+      if (!result.opened) await fallback();
+    } catch {
+      await fallback();
     }
   }
 
