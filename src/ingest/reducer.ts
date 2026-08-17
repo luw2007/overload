@@ -104,8 +104,14 @@ function applyAttachment(db: Database, row: JournalRow, detail: Record<string, u
   db.query(`INSERT INTO attachments(stable_id, platform, binding, observed_at, valid) VALUES (?, ?, ?, ?, 1)
     ON CONFLICT(stable_id, platform) DO UPDATE SET binding=excluded.binding, observed_at=excluded.observed_at, valid=1`)
     .run(stableId, platform, binding, row.at);
-  db.query("UPDATE sessions SET origin=CASE WHEN origin='unknown' AND ?='orca' THEN 'agent' ELSE origin END WHERE stable_id=?").run(platform, stableId);
-  db.query("UPDATE current SET origin=CASE WHEN origin='unknown' AND ?='orca' THEN 'agent' ELSE origin END WHERE stable_id=?").run(platform, stableId);
+  const parent = stringDetail(detail, "parent");
+  if (parent) {
+    db.query("UPDATE sessions SET origin=? WHERE stable_id=? AND origin='unknown'").run(parent, stableId);
+    db.query("UPDATE current SET origin=? WHERE stable_id=? AND origin='unknown'").run(parent, stableId);
+  } else {
+    db.query("UPDATE sessions SET origin=CASE WHEN origin='unknown' AND ?='orca' THEN 'agent' ELSE origin END WHERE stable_id=?").run(platform, stableId);
+    db.query("UPDATE current SET origin=CASE WHEN origin='unknown' AND ?='orca' THEN 'agent' ELSE origin END WHERE stable_id=?").run(platform, stableId);
+  }
   // Review P2 M2: a session bound while its platform's incident is open must
   // enter the freeze immediately, not wait for the next outage event.
   if (isIncidentOpen(db, platform)) db.query("UPDATE current SET frozen=1 WHERE stable_id=?").run(stableId);

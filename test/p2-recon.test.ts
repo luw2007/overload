@@ -38,6 +38,8 @@ import {
 } from "./lib/p2/fakes";
 import { makeTempDir, cleanupTempDir, nextCounter } from "./lib/util";
 import { DRAIN_GRACE_MS, STALL_PROFILE_MS } from "../src/shared/types";
+import { classify } from "../src/ingest/classifier";
+import { reduceJournal } from "../src/ingest/reducer";
 
 const REPO = process.cwd();
 const N6_RECON = join(REPO, "src/recon/recon.ts");
@@ -571,5 +573,96 @@ describe.skipIf(!HAS_N6)("real: N6 recon --once against fake CLIs", () => {
     await runRecon(makeFailingCli(rFakes, "herdr-down"));
     await runIngest();
     expect(journalCount("session_vanished", '%herdr%')).toBe(1);
+  });
+
+  test("orca maps a non-empty parentWorktreeId and omits a null parent", async () => {
+    const childCwd = join(home, "child");
+    const rootCwd = join(home, "root");
+    const db = openLedgerP2(rLedger);
+    for (const [stableId, cwd] of [["local:pi:child", childCwd], ["local:pi:root", rootCwd]]) {
+      db.query(
+        `INSERT INTO sessions(stable_id, host, runtime, session, origin, cwd, created_at, first_seen_at)
+         VALUES(?, 'local', 'pi', ?, 'unknown', ?, ?, ?)`,
+      ).run(stableId, stableId.split(":").at(-1), cwd, NOW, NOW);
+    }
+    db.close();
+    const orca = makeFakeCli(rFakes, "orca-parent", JSON.stringify({ result: { worktrees: [
+      orcaWorktree("wt-child", childCwd, { parentWorktreeId: "parent-uuid" }),
+      orcaWorktree("wt-root", rootCwd, { parentWorktreeId: null }),
+    ] } }));
+
+    expect((await runRecon(herdrPath("herdr-parent", []), orca)).code).toBe(0);
+    const attachments = scanSpoolFindings(rSpool).filter((event) => event.kind === "attachment_observed");
+    expect(attachments.map((event) => event.detail)).toContainEqual({
+      stable_id: "local:pi:child", platform: "orca", binding: "wt-child", parent: "orca:parent-uuid",
+    });
+    expect(attachments.map((event) => event.detail)).toContainEqual({
+      stable_id: "local:pi:root", platform: "orca", binding: "wt-root",
+    });
+  });
+});
+
+function seedAttachmentReduction(db: Database, stableId: string, origin: string, detail: Record<string, unknown>, seq: number): void {
+  db.query(
+    `INSERT INTO sessions(stable_id, host, runtime, session, origin, cwd, created_at, first_seen_at)
+     VALUES(?, 'local', 'pi', ?, ?, '/tmp/project', ?, ?)`,
+  ).run(stableId, stableId.split(":").at(-1), origin, NOW, NOW);
+  db.query(
+    `INSERT INTO current(stable_id, writer_id, state, origin, last_ingest_seq, last_event_at)
+     VALUES(?, 'writer', 'idle', ?, NULL, ?)`,
+  ).run(stableId, origin, NOW);
+  db.query(
+    `INSERT INTO journal(ingest_seq, host, emitter_id, seq, at, stable_id, writer_id, kind, detail)
+     VALUES(?, 'local', 'overload-recon', ?, ?, ?, 'overload-recon', 'attachment_observed', ?)`,
+  ).run(seq, seq, NOW + seq, stableId, JSON.stringify(detail));
+}
+
+describe("real: orca attachment lineage reduction", () => {
+  test("parent upgrades unknown origins in sessions and current", () => {
+    const db = openLedgerP2(ledger);
+    seedAttachmentReduction(db, "local:pi:child", "unknown", {
+      stable_id: "local:pi:child", platform: "orca", binding: "wt-child", parent: "orca:parent-uuid",
+    }, 1);
+    expect(reduceJournal(db)).toBe(1);
+    expect(db.query("SELECT origin FROM sessions WHERE stable_id='local:pi:child'").get()).toEqual({ origin: "orca:parent-uuid" });
+    expect(db.query("SELECT origin FROM current WHERE stable_id='local:pi:child'").get()).toEqual({ origin: "orca:parent-uuid" });
+    db.close();
+  });
+
+  test("parent never overwrites agent or another lineage", () => {
+    const db = openLedgerP2(ledger);
+    seedAttachmentReduction(db, "local:pi:agent", "agent", {
+      platform: "orca", binding: "wt-agent", parent: "orca:new-parent",
+    }, 1);
+    seedAttachmentReduction(db, "local:pi:lineage", "claude:existing-parent", {
+      platform: "orca", binding: "wt-lineage", parent: "orca:new-parent",
+    }, 2);
+    expect(reduceJournal(db)).toBe(2);
+    expect(db.query("SELECT origin FROM sessions WHERE stable_id='local:pi:agent'").get()).toEqual({ origin: "agent" });
+    expect(db.query("SELECT origin FROM current WHERE stable_id='local:pi:agent'").get()).toEqual({ origin: "agent" });
+    expect(db.query("SELECT origin FROM sessions WHERE stable_id='local:pi:lineage'").get()).toEqual({ origin: "claude:existing-parent" });
+    expect(db.query("SELECT origin FROM current WHERE stable_id='local:pi:lineage'").get()).toEqual({ origin: "claude:existing-parent" });
+    db.close();
+  });
+
+  test("orca attachment without parent retains the unknown to agent fallback", () => {
+    const db = openLedgerP2(ledger);
+    seedAttachmentReduction(db, "local:pi:root", "unknown", {
+      platform: "orca", binding: "wt-root",
+    }, 1);
+    expect(reduceJournal(db)).toBe(1);
+    expect(db.query("SELECT origin FROM sessions WHERE stable_id='local:pi:root'").get()).toEqual({ origin: "agent" });
+    expect(db.query("SELECT origin FROM current WHERE stable_id='local:pi:root'").get()).toEqual({ origin: "agent" });
+    db.close();
+  });
+
+  test("a done orca-lineage session with change evidence still enters q2", () => {
+    const transitions = classify(
+      { stable_id: "local:pi:child", state: "idle", origin: "orca:parent-uuid", queue: "q3", q5_reason: null, has_change_evidence: true },
+      { ingest_seq: 9, at: NOW, kind: "session_ended", detail: {} },
+    );
+    expect(transitions).toContainEqual({
+      subject: "local:pi:child", queue: "q2", direction: "entered", at: NOW, source_seq: 9, classifier_version: 2,
+    });
   });
 });
