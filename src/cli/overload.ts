@@ -3,15 +3,15 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { runDigestOnce } from "../digest/digest";
-import { generateAttribReport } from "../attrib/report";
 import { ackRequest, queryHealth, queryQ1, queryQ2, querySession, querySessions, queryZombie } from "../shared/queries";
+import { runDoctor, defaultDoctorDeps } from "./doctor";
 
 const path = process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
 type Output = (line: string) => void;
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q2 | q4 | zombie | health | ack <request_uid> | digest [--llm pi] | attrib [--since <Nh|Nd>]"); process.exit(2); }
+function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q2 | q4 | zombie | health | doctor | ack <request_uid> | digest [--llm pi] | attrib [--since <Nh|Nd>]"); process.exit(2); }
 
 function listSessions(db: Database): void {
   const rows = querySessions(db);
@@ -79,7 +79,8 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const validDigest = command === "digest" && ((argument == null && !extra.length) || (argument === "--llm" && extra.length === 1 && extra[0] === "pi"));
   const validAttrib = command === "attrib" && ((argument == null && !extra.length) || (argument === "--since" && extra.length === 1));
   const validAck = command === "ack" && argument != null && !extra.length;
-  if (!command || (simple.has(command) && (argument || extra.length)) || (command === "show" && (!argument || extra.length)) || (!simple.has(command) && command !== "show" && !validDigest && !validAttrib && !validAck)) usage();
+  const validDoctor = command === "doctor" && argument == null && !extra.length;
+  if (!command || (simple.has(command) && (argument || extra.length)) || (command === "show" && (!argument || extra.length)) || (!simple.has(command) && command !== "show" && !validDigest && !validAttrib && !validAck && !validDoctor)) usage();
   if (validAck) {
     // Human acknowledgement is a source terminal (the operator IS the decision
     // authority here): cancels the request and thereby stops reminders.
@@ -88,6 +89,12 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
       const result = ackRequest(rw, argument!);
       console.log(result.changes === 1 ? `acked ${argument}` : `no pending request matches ${argument}`);
     } finally { rw.close(); }
+    return;
+  }
+  if (validDoctor) {
+    const { checks, exitCode } = await runDoctor(defaultDoctorDeps());
+    for (const check of checks) console.log(`[${check.status}] ${check.label}: ${check.detail}`);
+    process.exitCode = exitCode;
     return;
   }
   let db: Database; try { db = new Database(path, { readonly: true }); } catch (error) { console.error(`Unable to open ledger ${path}: ${(error as Error).message}`); process.exit(1); }
