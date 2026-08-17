@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE — throwaway UI exploration for docs/plans/overload-20260816-island-web-design.md §2.2.
+  Answers: "what should the Google-style web dashboard look like?"
+  Three structurally different variants, switchable via ?variant=a|b|c and the
+  floating bottom bar. Mock data only — no ledger wiring, read-only, no persistence.
+  Fold the winner into src/web/server.ts; do not promote this file to production.
+-->
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Overload dashboard — prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --blue: #1a73e8; --blue-dark: #1557b0; --red: #d93025; --red-bg: #fef7f6; --red-border: #fce8e6;
+    --gray-900: #202124; --gray-700: #3c4043; --gray-500: #5f6368; --gray-300: #dadce0; --gray-100: #f1f3f4; --gray-50: #f8f9fa;
+    --surface: #fff; --shadow: 0 1px 2px rgba(60,64,67,.3), 0 1px 3px 1px rgba(60,64,67,.15);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: Roboto, Arial, sans-serif; color: var(--gray-900); background: var(--gray-50); }
+  h1, h2, .brand { font-family: "Google Sans", Roboto, Arial, sans-serif; }
+  .app-bar { display:flex; align-items:center; gap:16px; padding:10px 20px; background:var(--surface); border-bottom:1px solid var(--gray-300); position:sticky; top:0; z-index:5; }
+  .brand { font-size:20px; color:var(--gray-700); }
+  .health-pill { margin-left:auto; font-size:12px; color:#137333; background:#e6f4ea; padding:6px 12px; border-radius:16px; display:flex; align-items:center; gap:6px; }
+  .health-pill.warn { color:#b06000; background:#fef7e0; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#188038; }
+  .warn .dot { background:#f9ab00; }
+  button { font-family: inherit; cursor: pointer; }
+  .btn { border-radius: 6px; padding: 8px 16px; font-size:13px; font-weight:500; border:1px solid var(--gray-300); background:#fff; color:var(--gray-700); }
+  .btn.primary { background: var(--blue); color:#fff; border:none; }
+  .btn.primary:hover { background: var(--blue-dark); }
+  .btn.danger { color: var(--red); }
+  .btn:hover { background: var(--gray-100); }
+  .btn.primary:hover { background: var(--blue-dark); }
+  .chip { font-size:11px; padding:3px 8px; border-radius:10px; background:var(--gray-100); color:var(--gray-700); font-family: ui-monospace, monospace; }
+  .variant { display:none; }
+  .variant.active { display:block; }
+
+  /* ---- Variant A: nav rail + list + inline expand (Gmail-esque) ---- */
+  .a-shell { display:flex; min-height: calc(100vh - 57px); }
+  .a-rail { width:220px; padding:12px 8px; background:var(--surface); border-right:1px solid var(--gray-300); flex-shrink:0; }
+  .a-item { display:flex; align-items:center; gap:12px; padding:10px 16px; border-radius:0 20px 20px 0; font-size:14px; color:var(--gray-700); margin-bottom:2px; }
+  .a-item.active { background:#e8f0fe; color:var(--blue); font-weight:500; }
+  .a-item .count { margin-left:auto; font-size:12px; color:var(--gray-500); }
+  .a-main { flex:1; padding:16px 24px; max-width: 920px; }
+  .a-row { background:var(--surface); border:1px solid var(--gray-300); border-radius:8px; margin-bottom:8px; overflow:hidden; }
+  .a-row-head { display:flex; align-items:center; gap:12px; padding:14px 16px; cursor:pointer; }
+  .a-row-head:hover { background: var(--gray-50); }
+  .a-row.failed { border-color: var(--red-border); background: var(--red-bg); }
+  .a-avatar { width:32px; height:32px; border-radius:50%; background:var(--blue); color:#fff; display:flex; align-items:center; justify-content:center; font-size:13px; flex-shrink:0; }
+  .a-row.failed .a-avatar { background: var(--red); }
+  .a-title { font-size:14px; font-weight:500; }
+  .a-meta { font-size:12px; color:var(--gray-500); margin-top:2px; }
+  .a-spacer { flex:1; }
+  .a-detail { display:none; padding:0 16px 16px 60px; border-top:1px solid var(--gray-100); font-size:13px; color:var(--gray-700); }
+  .a-row.open .a-detail { display:block; padding-top:12px; }
+  .a-actions { display:flex; gap:8px; margin-top:10px; }
+
+  /* ---- Variant B: stat tiles + tabs + data table + bulk toolbar ---- */
+  .b-wrap { padding: 20px 28px; max-width: 1100px; margin: 0 auto; }
+  .b-tiles { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:20px; }
+  .b-tile { background:var(--surface); border-radius:8px; padding:16px 18px; box-shadow: var(--shadow); border-left:4px solid var(--blue); }
+  .b-tile.alert { border-left-color: var(--red); }
+  .b-tile .num { font-size:28px; font-weight:700; font-family:"Google Sans",sans-serif; }
+  .b-tile .label { font-size:12px; color:var(--gray-500); margin-top:4px; }
+  .b-tabs { display:flex; gap:4px; border-bottom:1px solid var(--gray-300); margin-bottom:0; }
+  .b-tab { padding:12px 18px; font-size:14px; color:var(--gray-500); border-bottom:3px solid transparent; }
+  .b-tab.active { color:var(--blue); border-bottom-color:var(--blue); font-weight:500; }
+  .b-table-wrap { background:var(--surface); box-shadow:var(--shadow); border-radius: 0 0 8px 8px; overflow:hidden; }
+  table.b-table { width:100%; border-collapse:collapse; font-size:13px; }
+  table.b-table th { text-align:left; padding:12px 16px; color:var(--gray-500); font-weight:500; font-size:12px; border-bottom:1px solid var(--gray-300); }
+  table.b-table td { padding:12px 16px; border-bottom:1px solid var(--gray-100); vertical-align:middle; }
+  table.b-table tr:hover td { background: var(--gray-50); }
+  table.b-table tr.failed td:first-child { border-left: 3px solid var(--red); }
+  .b-toolbar { display:none; align-items:center; gap:12px; padding:10px 16px; background:#e8f0fe; font-size:13px; }
+  .b-toolbar.show { display:flex; }
+
+  /* ---- Variant C: single-column triage feed + slide-over ---- */
+  .c-segment { display:flex; justify-content:center; padding:14px 0; background:var(--surface); border-bottom:1px solid var(--gray-300); }
+  .c-seg-group { display:flex; background:var(--gray-100); border-radius:20px; padding:3px; }
+  .c-seg { padding:7px 18px; font-size:13px; border-radius:18px; color:var(--gray-700); }
+  .c-seg.active { background:#fff; box-shadow:var(--shadow); color:var(--blue); font-weight:500; }
+  .c-feed { max-width:640px; margin:24px auto; padding:0 16px; display:flex; flex-direction:column; gap:16px; }
+  .c-card { background:var(--surface); border-radius:12px; box-shadow:var(--shadow); padding:20px 22px; }
+  .c-card.failed { border-left:4px solid var(--red); }
+  .c-card .c-kind { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--gray-500); font-weight:500; }
+  .c-card.failed .c-kind { color: var(--red); }
+  .c-card .c-question { font-size:16px; font-weight:500; margin:6px 0 4px; }
+  .c-card .c-meta { font-size:12px; color:var(--gray-500); margin-bottom:14px; }
+  .c-card .c-actions { display:flex; gap:10px; }
+  .c-overlay { position:fixed; inset:0; background:rgba(0,0,0,.25); display:none; z-index:20; }
+  .c-overlay.show { display:block; }
+  .c-panel { position:fixed; top:0; right:0; bottom:0; width:380px; background:#fff; box-shadow:-2px 0 12px rgba(0,0,0,.15); transform:translateX(100%); transition:transform .2s ease; z-index:21; padding:20px; overflow-y:auto; }
+  .c-panel.show { transform:translateX(0); }
+  .c-panel h3 { margin-top:0; }
+  .c-panel .kv { display:flex; justify-content:space-between; font-size:13px; padding:6px 0; border-bottom:1px solid var(--gray-100); }
+
+  .switcher { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#202124; color:#fff; border-radius:24px; padding:8px 6px 8px 14px; display:flex; align-items:center; gap:10px; box-shadow:0 4px 16px rgba(0,0,0,.3); z-index:50; font-size:13px; }
+  .switcher button { background:rgba(255,255,255,.12); border:none; color:#fff; width:28px; height:28px; border-radius:50%; font-size:14px; }
+  .switcher button:hover { background:rgba(255,255,255,.22); }
+  .switcher .label { min-width:190px; text-align:center; }
+</style>
+</head>
+<body>
+
+<!-- ============ Variant A: nav rail + inline-expand list (Gmail-esque) ============ -->
+<div class="variant" id="variant-a">
+  <div class="app-bar"><span class="brand">Overload</span><span class="health-pill"><span class="dot"></span>health OK</span></div>
+  <div class="a-shell">
+    <div class="a-rail">
+      <div class="a-item active">Q1 决策<span class="count">3</span></div>
+      <div class="a-item">Q2 已完成<span class="count">5</span></div>
+      <div class="a-item">Sessions</div>
+      <div class="a-item">Zombie<span class="count">2</span></div>
+      <div class="a-item">Health</div>
+    </div>
+    <div class="a-main">
+      <h2 style="font-size:18px;margin:8px 0 16px;">Q1 · 待你决策</h2>
+      <div class="a-row failed" onclick="this.classList.toggle('open')">
+        <div class="a-row-head">
+          <div class="a-avatar">⚠</div>
+          <div><div class="a-title">[DELIVERY FAILED] confirm rebase onto master</div><div class="a-meta">devbox:cmux-42 · 18 分钟前</div></div>
+          <div class="a-spacer"></div>
+          <span class="chip">jump: cmux-42-wt</span>
+        </div>
+        <div class="a-detail">通知投递失败（连续 6 次重试）。origin=agent，kind=decision。<div class="a-actions"><button class="btn primary" onclick="event.stopPropagation()">Ack</button><button class="btn" onclick="event.stopPropagation()">复制跳转标识</button></div></div>
+      </div>
+      <div class="a-row" onclick="this.classList.toggle('open')">
+        <div class="a-row-head">
+          <div class="a-avatar">?</div>
+          <div><div class="a-title">是否覆盖 schema.sql？</div><div class="a-meta">orca:wt-118 · pi · 3 分钟前</div></div>
+          <div class="a-spacer"></div>
+          <span class="chip">jump: wt-118</span>
+        </div>
+        <div class="a-detail">tool_input: {"path":"src/ingest/schema.sql"}<div class="a-actions"><button class="btn primary" onclick="event.stopPropagation()">Ack</button><button class="btn" onclick="event.stopPropagation()">复制跳转标识</button></div></div>
+      </div>
+      <div class="a-row" onclick="this.classList.toggle('open')">
+        <div class="a-row-head">
+          <div class="a-avatar">?</div>
+          <div><div class="a-title">选择部署目标环境</div><div class="a-meta">local:pi:sess-9f2 · 41 分钟前</div></div>
+          <div class="a-spacer"></div>
+          <span class="chip">jump: -</span>
+        </div>
+        <div class="a-detail">tool_input: {"options":["staging","prod"]}<div class="a-actions"><button class="btn primary" onclick="event.stopPropagation()">Ack</button><button class="btn" onclick="event.stopPropagation()">复制跳转标识</button></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Variant B: stat tiles + tabs + bulk-select table (Cloud Console-esque) ============ -->
+<div class="variant" id="variant-b">
+  <div class="app-bar"><span class="brand">Overload</span><span class="health-pill warn"><span class="dot"></span>1 open incident</span></div>
+  <div class="b-wrap">
+    <div class="b-tiles">
+      <div class="b-tile alert"><div class="num">3</div><div class="label">Q1 待决策</div></div>
+      <div class="b-tile"><div class="num">5</div><div class="label">Q2 已完成</div></div>
+      <div class="b-tile"><div class="num">2</div><div class="label">Zombie</div></div>
+      <div class="b-tile"><div class="num">1</div><div class="label">Open incidents</div></div>
+    </div>
+    <div class="b-tabs">
+      <div class="b-tab active">Q1 决策</div><div class="b-tab">Q2 完成</div><div class="b-tab">Zombie</div><div class="b-tab">Health</div>
+    </div>
+    <div class="b-toolbar" id="b-toolbar"><span id="b-count">1 项已选</span><button class="btn primary">批量 Ack</button><button class="btn" onclick="document.querySelectorAll('.b-table input[type=checkbox]').forEach(c=>c.checked=false); document.getElementById('b-toolbar').classList.remove('show')">取消</button></div>
+    <div class="b-table-wrap">
+      <table class="b-table">
+        <thead><tr><th style="width:36px;"><input type="checkbox" onclick="document.querySelectorAll('.b-table tbody input').forEach(c=>c.checked=this.checked); document.getElementById('b-toolbar').classList.toggle('show', this.checked)"></th><th>请求</th><th>会话</th><th>类型</th><th>时间</th><th>跳转标识</th><th></th></tr></thead>
+        <tbody>
+          <tr class="failed"><td><input type="checkbox" onclick="document.getElementById('b-toolbar').classList.toggle('show', document.querySelectorAll('.b-table tbody input:checked').length>0)"></td><td>[DELIVERY FAILED] confirm rebase</td><td>devbox:cmux-42</td><td>decision</td><td>18m</td><td class="chip">cmux-42-wt</td><td><button class="btn danger">Ack</button></td></tr>
+          <tr><td><input type="checkbox" checked onclick="document.getElementById('b-toolbar').classList.toggle('show', document.querySelectorAll('.b-table tbody input:checked').length>0)"></td><td>是否覆盖 schema.sql？</td><td>orca:wt-118</td><td>decision</td><td>3m</td><td class="chip">wt-118</td><td><button class="btn">Ack</button></td></tr>
+          <tr><td><input type="checkbox" onclick="document.getElementById('b-toolbar').classList.toggle('show', document.querySelectorAll('.b-table tbody input:checked').length>0)"></td><td>选择部署目标环境</td><td>local:pi:sess-9f2</td><td>decision</td><td>41m</td><td class="chip">-</td><td><button class="btn">Ack</button></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Variant C: single-column triage feed + slide-over detail (Search Console-esque) ============ -->
+<div class="variant" id="variant-c">
+  <div class="c-segment">
+    <div class="c-seg-group">
+      <div class="c-seg active">Q1 · 3</div><div class="c-seg">Q2 · 5</div><div class="c-seg">Zombie · 2</div><div class="c-seg">Health</div>
+    </div>
+  </div>
+  <div class="c-feed">
+    <div class="c-card failed">
+      <div class="c-kind">⚠ 投递失败</div>
+      <div class="c-question">confirm rebase onto master</div>
+      <div class="c-meta">devbox:cmux-42 · 18 分钟前 · connection 连续失败 6 次</div>
+      <div class="c-actions"><button class="btn primary" onclick="openPanel('confirm rebase onto master','devbox:cmux-42')">Ack</button><button class="btn" onclick="openPanel('confirm rebase onto master','devbox:cmux-42')">详情</button></div>
+    </div>
+    <div class="c-card">
+      <div class="c-kind">决策</div>
+      <div class="c-question">是否覆盖 schema.sql？</div>
+      <div class="c-meta">orca:wt-118 · pi · 3 分钟前</div>
+      <div class="c-actions"><button class="btn primary" onclick="openPanel('是否覆盖 schema.sql？','orca:wt-118')">Ack</button><button class="btn" onclick="openPanel('是否覆盖 schema.sql？','orca:wt-118')">详情</button></div>
+    </div>
+    <div class="c-card">
+      <div class="c-kind">决策</div>
+      <div class="c-question">选择部署目标环境</div>
+      <div class="c-meta">local:pi:sess-9f2 · 41 分钟前</div>
+      <div class="c-actions"><button class="btn primary" onclick="openPanel('选择部署目标环境','local:pi:sess-9f2')">Ack</button><button class="btn" onclick="openPanel('选择部署目标环境','local:pi:sess-9f2')">详情</button></div>
+    </div>
+  </div>
+  <div class="c-overlay" id="c-overlay" onclick="closePanel()"></div>
+  <div class="c-panel" id="c-panel">
+    <h3 id="c-panel-title">—</h3>
+    <div class="kv"><span>Session</span><span id="c-panel-session">—</span></div>
+    <div class="kv"><span>Runtime</span><span>pi</span></div>
+    <div class="kv"><span>Created</span><span>2026-08-16T09:12:00Z</span></div>
+    <div class="kv"><span>Jump binding</span><span class="chip">wt-118</span></div>
+    <button class="btn primary" style="margin-top:16px;width:100%;">Ack this request</button>
+  </div>
+</div>
+
+<div class="switcher">
+  <button onclick="cycle(-1)">←</button>
+  <span class="label" id="switch-label">A — 导航栏 + 内联展开</span>
+  <button onclick="cycle(1)">→</button>
+</div>
+
+<script>
+  const variants = ['a','b','c'];
+  const names = { a: 'A — 导航栏 + 内联展开（Gmail 风格）', b: 'B — 统计卡 + 数据表 + 批量操作（Cloud Console 风格）', c: 'C — 单列分诊卡片 + 侧滑详情（Search Console 风格）' };
+  function currentVariant() {
+    const p = new URLSearchParams(location.search).get('variant');
+    return variants.includes(p) ? p : 'a';
+  }
+  function render() {
+    const v = currentVariant();
+    variants.forEach(k => document.getElementById('variant-' + k).classList.toggle('active', k === v));
+    document.getElementById('switch-label').textContent = names[v];
+  }
+  function cycle(delta) {
+    const idx = variants.indexOf(currentVariant());
+    const next = variants[(idx + delta + variants.length) % variants.length];
+    const url = new URL(location); url.searchParams.set('variant', next);
+    history.replaceState(null, '', url); render();
+  }
+  document.addEventListener('keydown', (e) => {
+    if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
+    if (e.key === 'ArrowLeft') cycle(-1);
+    if (e.key === 'ArrowRight') cycle(1);
+  });
+  function openPanel(title, session) {
+    document.getElementById('c-panel-title').textContent = title;
+    document.getElementById('c-panel-session').textContent = session;
+    document.getElementById('c-overlay').classList.add('show');
+    document.getElementById('c-panel').classList.add('show');
+  }
+  function closePanel() {
+    document.getElementById('c-overlay').classList.remove('show');
+    document.getElementById('c-panel').classList.remove('show');
+  }
+  render();
+</script>
+</body>
+</html>

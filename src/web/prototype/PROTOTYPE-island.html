@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE — throwaway UI exploration for docs/plans/overload-20260816-island-web-design.md §2.3.
+  Answers: "what should the Island floating panel look like?"
+  Rendered over a fake desktop backdrop so floating/overlap reads honestly.
+  Island stays glance + copy-jump only (no Ack button — confirmed non-goal).
+  Three structurally different variants, switchable via ?variant=a|b|c and the
+  floating bottom bar.
+
+  Interaction = HOVER-to-expand, ported from the real reference product
+  ~/ai/claude_space/flux-desktop/src/island/ (Electron):
+    • mouseenter starts a 200ms open debounce   (HOVER_OPEN_DELAY_MS,
+      src/island/renderer/src/island/IslandApp.tsx:54)
+    • mouseleave starts a 300ms close grace     (MOUSE_LEAVE_CLOSE_DELAY_MS,
+      src/island/renderer/src/island/IslandApp.tsx:55)
+    • each handler cancels the other's pending timer, so fast back-and-forth
+      across the boundary never flickers (IslandApp.tsx:623-626 / 658-661)
+    • open easing cubic-bezier(0.34,1.56,0.64,1) 0.5s, close ease-out 0.3s
+      (animations/useIslandAnimation.ts:9-10)
+
+  Variant A (the chosen direction) is ONE continuous shape (.a-island) that
+  resizes/re-corners between pill and panel — matching both the real reference
+  product's Dynamic Island morph and native/island's actual NSPanel structure
+  (single NSVisualEffectView, not two separate windows/views). Earlier drafts
+  used a separate pill + a `margin-top` card below it across all three
+  variants; user feedback ("悬浮在岛上，而不是上岛" — content floating above
+  the island rather than living inside it) flagged that A specifically read as
+  a disconnected dropdown, not a single morphing island. B/C intentionally
+  keep the separate pill/badge + dropdown-card pattern — that's the correct
+  idiom for those two directions (Material widget / menu-bar badge), not a bug.
+  Fold the winner into native/island; do not promote this file to production.
+-->
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Overload Island — prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; height:100vh; overflow:hidden; font-family: Roboto, -apple-system, Arial, sans-serif; }
+  /* ---- fake desktop backdrop, so "floats over everything" reads honestly ---- */
+  .desktop { position:fixed; inset:0; background: linear-gradient(160deg,#3a3d6b,#1c1e3a 60%,#0d0e1f); }
+  .win { position:absolute; border-radius:10px; box-shadow:0 20px 50px rgba(0,0,0,.4); overflow:hidden; }
+  .win .bar { height:26px; background:#e8e8ea; display:flex; align-items:center; gap:6px; padding:0 10px; }
+  .win .bar span { width:11px; height:11px; border-radius:50%; }
+  .win .body { background:#fff; height:calc(100% - 26px); }
+  .win1 { top:80px; left:60px; width:640px; height:420px; }
+  .win2 { top:160px; right:80px; width:520px; height:500px; }
+  .win .body { background: repeating-linear-gradient(#f4f4f5 0 18px, #ececed 18px 19px); }
+
+  .island-stage { position:fixed; top:0; left:0; right:0; display:flex; justify-content:center; padding-top:14px; z-index:10; }
+
+  /* ---- hover expand/collapse animation, easing borrowed from flux-desktop ----
+     useIslandAnimation.ts:9  open  → cubic-bezier(0.34,1.56,0.64,1) 0.5s (spring overshoot)
+     useIslandAnimation.ts:10 close → ease-out 0.3s
+     The card is always in the DOM; .is-open drives the transition so mouseenter
+     on the card itself keeps the hover region alive (no gap/flicker). */
+  /* The hoverzone box grows to include the (always-present) card, so it must NOT be
+     hit-testable itself — otherwise hovering the invisible collapsed card area would
+     open the island. Only the pill and the *open* card take pointer events; mouseenter
+     still fires on the pointer-events:none ancestor when a live descendant is entered.
+     Column-centered + width:max-content pills so the collapsed pill keeps its own
+     shrink-to-fit width instead of stretching to the (in-flow) card's width. */
+  .hoverzone { display:flex; flex-direction:column; align-items:center; pointer-events:none; }
+  .a-pill, .b-pill, .c-badge { pointer-events:auto; width:max-content; }
+  .card { position:relative; opacity:0; transform: translateY(-8px) scaleY(.92); transform-origin: top center; pointer-events:none;
+          transition: opacity .3s ease-out, transform .3s ease-out; }
+  .card.is-open { opacity:1; transform:none; pointer-events:auto;
+          transition: opacity .5s cubic-bezier(0.34,1.56,0.64,1), transform .5s cubic-bezier(0.34,1.56,0.64,1); }
+  /* Invisible bridge over the pill→card gap (margin-top:10px on A/B, top:32px on C).
+     Without it the pointer crosses dead space on its way down and fires a spurious
+     mouseleave; the 300ms grace would still catch it, but bridging removes the race
+     entirely so slow downward travel never flickers. */
+  .card.is-open::before { content:""; position:absolute; left:0; right:0; top:-14px; height:14px; }
+
+  /* ---- Variant A: dark glass "Dynamic Island" — ONE continuous shape that
+     morphs from pill to panel (matches the real native/island NSPanel, which
+     is a single NSVisualEffectView resizing + changing cornerRadius, not two
+     separate elements). Collapsed/expanded content cross-fade inside the same
+     box; there is no second floating element and no pill→card gap. */
+  .a-island { position:relative; width:230px; height:40px; border-radius:999px; overflow:hidden;
+    background:rgba(28,28,30,.82); backdrop-filter: blur(20px); color:#f5f5f7;
+    box-shadow:0 10px 30px rgba(0,0,0,.5); cursor:default;
+    transition: width .3s ease-out, height .3s ease-out, border-radius .3s ease-out; }
+  .a-island.is-open { width:340px; height:220px; border-radius:20px;
+    transition: width .5s cubic-bezier(0.34,1.56,0.64,1), height .5s cubic-bezier(0.34,1.56,0.64,1), border-radius .5s cubic-bezier(0.34,1.56,0.64,1); }
+  .a-collapsed, .a-expanded { position:absolute; inset:0; transition: opacity .2s ease-out; }
+  .a-collapsed { display:flex; align-items:center; gap:10px; padding:0 20px; font-size:13px; white-space:nowrap; opacity:1; }
+  .a-island.is-open .a-collapsed { opacity:0; pointer-events:none; }
+  .a-expanded { padding:14px; opacity:0; pointer-events:none; }
+  .a-island.is-open .a-expanded { opacity:1; pointer-events:auto; transition-delay:.15s; }
+  .a-dot { width:8px; height:8px; border-radius:50%; background:#ff453a; box-shadow:0 0 6px #ff453a; flex-shrink:0; }
+  .a-hd { font-size:11px; opacity:.55; margin-bottom:8px; text-transform:uppercase; letter-spacing:.04em; }
+  .a-row { display:flex; justify-content:space-between; align-items:center; padding:9px 10px; background:rgba(255,255,255,.08); border-radius:12px; margin-bottom:6px; }
+  .a-row.failed .a-t { color:#ff9f0a; }
+  .a-t { font-size:13px; }
+  .a-m { font-size:11px; opacity:.5; margin-top:2px; }
+  .a-jump { font-size:11px; background:#0a84ff; padding:5px 10px; border-radius:8px; flex-shrink:0; margin-left:8px; }
+
+  /* ---- Variant B: light Material widget (consistent with web dashboard) ---- */
+  .b-pill { display:flex; align-items:center; gap:10px; background:#fff; color:#3c4043; border-radius:24px; padding:9px 18px; font-size:13px; box-shadow:0 2px 10px rgba(0,0,0,.18); cursor:default; font-family:"Google Sans",Roboto,sans-serif; }
+  .b-dot { width:8px; height:8px; border-radius:50%; background:#d93025; }
+  .b-card { width:360px; background:#fff; border-radius:14px; padding:6px; box-shadow:0 8px 28px rgba(0,0,0,.28); margin-top:10px; font-family:"Google Sans",Roboto,sans-serif; }
+  .b-card .hd { font-size:11px; color:#5f6368; padding:8px 12px 4px; }
+  .b-row { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-radius:8px; }
+  .b-row:hover { background:#f1f3f4; }
+  .b-row.failed .b-t { color:#d93025; }
+  .b-t { font-size:13px; color:#3c4043; font-weight:500; }
+  .b-m { font-size:11px; color:#5f6368; margin-top:2px; }
+  .b-jump { font-size:11px; color:#1a73e8; border:1px solid #dadce0; padding:5px 10px; border-radius:6px; flex-shrink:0; margin-left:8px; }
+
+  /* ---- Variant C: minimal monochrome status badge, top-right anchored ---- */
+  .c-stage { justify-content:flex-end; padding-right:16px; }
+  .c-badge { display:flex; align-items:center; gap:6px; background:rgba(0,0,0,.55); color:#fff; border-radius:14px; padding:5px 10px 5px 8px; font-size:12px; cursor:default; }
+  .c-count { background:#fff; color:#000; border-radius:8px; padding:0 6px; font-size:11px; font-weight:700; }
+  .c-sheet { position:absolute; top:32px; right:0; width:300px; background:#1c1c1e; color:#f5f5f7; border-radius:10px; padding:10px; box-shadow:0 10px 26px rgba(0,0,0,.5); font-size:12px; }
+  .c-row { display:flex; justify-content:space-between; padding:7px 6px; border-bottom:1px solid rgba(255,255,255,.08); }
+  .c-row:last-child { border-bottom:none; }
+  .c-row.failed span:first-child { color:#ff9f0a; }
+  .c-copy { color:#0a84ff; }
+
+  .variant { display:none; }
+  .variant.active { display:block; }
+
+  .switcher { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#202124; color:#fff; border-radius:24px; padding:8px 6px 8px 14px; display:flex; align-items:center; gap:10px; box-shadow:0 4px 16px rgba(0,0,0,.3); z-index:50; font-size:13px; font-family: Roboto, sans-serif; }
+  .switcher button { background:rgba(255,255,255,.12); border:none; color:#fff; width:28px; height:28px; border-radius:50%; font-size:14px; cursor:pointer; }
+  .switcher button:hover { background:rgba(255,255,255,.22); }
+  .switcher .label { min-width:230px; text-align:center; }
+  .hint { position:fixed; bottom:64px; left:50%; transform:translateX(-50%); color:rgba(255,255,255,.55); font-size:11px; z-index:50; }
+</style>
+</head>
+<body>
+<div class="desktop">
+  <div class="win win1"><div class="bar"><span style="background:#ff5f57"></span><span style="background:#febc2e"></span><span style="background:#28c840"></span></div><div class="body"></div></div>
+  <div class="win win2"><div class="bar"><span style="background:#ff5f57"></span><span style="background:#febc2e"></span><span style="background:#28c840"></span></div><div class="body"></div></div>
+</div>
+
+<!-- Variant A -->
+<div class="variant" id="variant-a">
+  <div class="island-stage">
+    <div class="a-island" id="a-island">
+      <div class="a-collapsed">
+        <span class="a-dot"></span><span>Q1 · 2 待决策</span><span style="opacity:.4">|</span><span style="opacity:.7">Q2 · 5</span>
+      </div>
+      <div class="a-expanded">
+        <div class="a-hd">待你决策 · 2</div>
+        <div class="a-row failed"><div><div class="a-t">[DELIVERY FAILED] confirm rebase</div><div class="a-m">devbox:cmux-42 · 18m</div></div><div class="a-jump">复制跳转标识</div></div>
+        <div class="a-row"><div><div class="a-t">是否覆盖 schema.sql？</div><div class="a-m">orca:wt-118 · 3m</div></div><div class="a-jump">复制跳转标识</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Variant B -->
+<div class="variant" id="variant-b">
+  <div class="island-stage">
+    <div class="hoverzone" data-hover="b-card">
+      <div class="b-pill">
+        <span class="b-dot"></span><span>Q1 · 2 待决策</span><span style="color:#dadce0">|</span><span style="color:#5f6368">Q2 · 5</span>
+      </div>
+      <div class="b-card card" id="b-card">
+        <div class="hd">待你决策 · 2</div>
+        <div class="b-row failed"><div><div class="b-t">[DELIVERY FAILED] confirm rebase</div><div class="b-m">devbox:cmux-42 · 18m</div></div><div class="b-jump">复制跳转标识</div></div>
+        <div class="b-row"><div><div class="b-t">是否覆盖 schema.sql？</div><div class="b-m">orca:wt-118 · 3m</div></div><div class="b-jump">复制跳转标识</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Variant C -->
+<div class="variant" id="variant-c">
+  <div class="island-stage c-stage">
+    <div class="hoverzone" data-hover="c-sheet" style="position:relative;">
+      <div class="c-badge">
+        <span class="c-count">2</span><span>Q1</span>
+      </div>
+      <div class="c-sheet card" id="c-sheet">
+        <div class="c-row failed"><span>⚠ confirm rebase</span><span class="c-copy">复制</span></div>
+        <div class="c-row"><span>覆盖 schema.sql？</span><span class="c-copy">复制</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="hint">悬停胶囊/徽标 200ms 后展开；移开 300ms 后收起（flux-desktop IslandApp.tsx:54-55）</div>
+<div class="switcher">
+  <button onclick="cycle(-1)">←</button>
+  <span class="label" id="switch-label">A — 暗色玻璃胶囊（灵动岛原生质感）</span>
+  <button onclick="cycle(1)">→</button>
+</div>
+
+<script>
+  const variants = ['a','b','c'];
+  const names = { a: 'A — 暗色玻璃胶囊（灵动岛原生质感）', b: 'B — 浅色 Material 挂件（与 web 视觉一致）', c: 'C — 极简右上角徽标（菜单栏风格）' };
+
+  // ---- hover-to-expand, ported from flux-desktop src/island/renderer/src/island/IslandApp.tsx ----
+  // HOVER_OPEN_DELAY_MS = 200        (IslandApp.tsx:54)  debounce before hover opens
+  // MOUSE_LEAVE_CLOSE_DELAY_MS = 300 (IslandApp.tsx:55)  grace period before leave closes
+  // Mutual cancellation (enter clears the close timer, leave clears the open timer) is what
+  // makes fast back-and-forth across the boundary non-flickering — IslandApp.tsx:623-626 / 658-661.
+  const HOVER_OPEN_DELAY_MS = 200;
+  const MOUSE_LEAVE_CLOSE_DELAY_MS = 300;
+
+  function attachHover(zone, card) {
+    let openTimer = null;
+    let closeTimer = null;
+
+    zone.addEventListener('mouseenter', () => {
+      if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }   // cancel pending close
+      if (openTimer || card.classList.contains('is-open')) return;
+      openTimer = setTimeout(() => {
+        openTimer = null;
+        card.classList.add('is-open');
+      }, HOVER_OPEN_DELAY_MS);
+    });
+
+    zone.addEventListener('mouseleave', () => {
+      if (openTimer) { clearTimeout(openTimer); openTimer = null; }      // cancel pending open
+      if (!card.classList.contains('is-open')) return;
+      closeTimer = setTimeout(() => {
+        closeTimer = null;
+        card.classList.remove('is-open');
+      }, MOUSE_LEAVE_CLOSE_DELAY_MS);
+    });
+  }
+
+  // Variant A is a single continuous shape: the hover zone and the thing that
+  // gets .is-open are the SAME element, so hovering the (now-larger) expanded
+  // area naturally stays inside the hover target — no separate bridge needed.
+  attachHover(document.getElementById('a-island'), document.getElementById('a-island'));
+
+  // Variants B/C: separate pill/badge (zone) + card/sheet (data-hover target),
+  // bridged by the pointer-events trick documented above `.hoverzone`.
+  document.querySelectorAll('.hoverzone').forEach((zone) => {
+    attachHover(zone, document.getElementById(zone.dataset.hover));
+  });
+
+  function resetHoverState() {
+    document.querySelectorAll('.card, .a-island').forEach((c) => c.classList.remove('is-open'));
+  }
+
+  function currentVariant() {
+    const p = new URLSearchParams(location.search).get('variant');
+    return variants.includes(p) ? p : 'a';
+  }
+  function render() {
+    const v = currentVariant();
+    variants.forEach(k => document.getElementById('variant-' + k).classList.toggle('active', k === v));
+    document.getElementById('switch-label').textContent = names[v];
+  }
+  function cycle(delta) {
+    const idx = variants.indexOf(currentVariant());
+    const next = variants[(idx + delta + variants.length) % variants.length];
+    const url = new URL(location); url.searchParams.set('variant', next);
+    history.replaceState(null, '', url); resetHoverState(); render();
+  }
+  document.addEventListener('keydown', (e) => {
+    if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
+    if (e.key === 'ArrowLeft') cycle(-1);
+    if (e.key === 'ArrowRight') cycle(1);
+  });
+  render();
+</script>
+</body>
+</html>
