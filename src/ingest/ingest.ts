@@ -35,7 +35,7 @@ type Envelope = {
   detail?: Record<string, unknown>;
 };
 
-type PendingFile = {
+export type PendingFile = {
   key: string;
   path: string;
   end: number;
@@ -155,8 +155,19 @@ async function discoverSpoolFiles(root: string): Promise<string[]> {
   return found;
 }
 
-async function readCompleteLines(path: string, key: string, cursor: number): Promise<PendingFile | null> {
-  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+export async function readCompleteLines(path: string, key: string, cursor: number): Promise<PendingFile | null> {
+  let handle;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    // The emitter can seal (rename active-*.ndjson -> seg-*.ndjson) between
+    // discoverSpoolFiles listing this path and this open call. The sealed
+    // file reappears under its new name on the next scan; content and the
+    // (host, emitter_id, seq) unique constraint make re-reading it from
+    // scratch idempotent, so a vanished active file is a skip, not a crash.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
   try {
     const stat = await handle.stat();
     const start = stat.size < cursor ? 0 : cursor;

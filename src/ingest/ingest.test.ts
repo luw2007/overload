@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { initializeLedger, scanOnce } from "./ingest";
+import { initializeLedger, readCompleteLines, scanOnce } from "./ingest";
 import { reduceJournal } from "./reducer";
 import { CLASSIFIER_VERSION, classify, queueAfter } from "./classifier";
 
@@ -58,6 +58,20 @@ describe("atomic spool ingestion", () => {
 
     expect((await scanOnce(db, spool)).inserted).toBe(1);
     expect((db.query("SELECT count(*) AS n FROM journal").get() as { n: number }).n).toBe(1);
+    db.close();
+  });
+
+  test("tolerates a spool file that vanishes between discovery and read (seal race)", async () => {
+    // The emitter can rename active-*.ndjson -> seg-*.ndjson (seal) between
+    // discoverSpoolFiles listing a path and readCompleteLines opening it.
+    // Regression: this used to throw ENOENT and crash the whole scanOnce
+    // batch, losing every other file's inserts collected in the same tick.
+    const { spool, emitterDir, db } = await fixture();
+    await writeFile(join(emitterDir, "active-pi-42-bootabcd-0.ndjson"), `${JSON.stringify(event(1, "heartbeat"))}\n`);
+    await rm(join(emitterDir, "active-pi-42-bootabcd-0.ndjson"));
+
+    expect(await readCompleteLines(join(emitterDir, "active-pi-42-bootabcd-0.ndjson"), "local/pi-42-bootabcd/active-pi-42-bootabcd-0.ndjson", 0)).toBeNull();
+    expect(await scanOnce(db, spool)).toEqual({ files: 0, inserted: 0 });
     db.close();
   });
 
