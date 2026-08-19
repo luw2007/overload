@@ -13,6 +13,50 @@ function scripted(results: ScriptedResult[]) {
 }
 
 describe("performJump", () => {
+  test("focuses a Ghostty terminal by its session id", async () => {
+    const fake = scripted([{ ok: true, stdout: "focused" }]);
+
+    expect(await performJump({ source: "host", platform: "ghostty", binding: "terminal-7", tty: "/dev/ttys007", host: "local" }, fake.exec)).toEqual({ opened: true });
+    expect(fake.calls).toEqual([{ command: "osascript", args: ["-e", `tell application "Ghostty"
+  repeat with aWindow in windows
+    repeat with aTab in tabs of aWindow
+      repeat with aTerminal in terminals of aTab
+        if (id of aTerminal as text) is "terminal-7" then
+          focus aTerminal
+          return "focused"
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell`], timeoutMs: 5000 }]);
+  });
+
+  test("focuses a cmux host terminal by its surface id", async () => {
+    const fake = scripted([{ ok: true, stdout: "focused" }]);
+
+    expect(await performJump({ source: "host", platform: "cmux", binding: "surface-7", tty: "/dev/ttys007", host: "local" }, fake.exec)).toEqual({ opened: true });
+    expect(fake.calls).toEqual([{ command: "osascript", args: ["-e", `tell application "cmux"
+  repeat with aWindow in windows
+    repeat with aTab in tabs of aWindow
+      repeat with aTerminal in terminals of aTab
+        if (id of aTerminal as text) is "surface-7" then
+          focus aTerminal
+          return "focused"
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell`], timeoutMs: 5000 }]);
+  });
+
+  test("reports a stale binding when the target terminal is gone", async () => {
+    // osascript exits 0 even when no terminal matches — must not be mistaken for success.
+    const fake = scripted([{ ok: true, stdout: "" }]);
+
+    expect(await performJump({ source: "host", platform: "cmux", binding: "surface-7", tty: null, host: "local" }, fake.exec))
+      .toEqual({ opened: false, error: "target terminal not found (may have closed)" });
+  });
+
   test("focuses a herdr terminal by binding", async () => {
     const fake = scripted([{ ok: true }]);
 

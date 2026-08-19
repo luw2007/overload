@@ -61,13 +61,44 @@ function failed(result: { ok: boolean; error?: string }): JumpResult {
   return { opened: false, error: result.error ?? "command failed" };
 }
 
+
+function terminalFocusScript(application: "Ghostty" | "cmux", sessionId: string | null, tty: string | null): string | null {
+  const condition = sessionId ? `(id of aTerminal as text) is "${sessionId.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`
+    : tty ? `(tty of aTerminal as text) is "${tty.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"` : null;
+  if (!condition) return null;
+  return `tell application "${application}"
+  repeat with aWindow in windows
+    repeat with aTab in tabs of aWindow
+      repeat with aTerminal in terminals of aTab
+        if ${condition} then
+          focus aTerminal
+          return "focused"
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell`;
+}
+
 /** Pure dispatcher for platform-specific terminal focus. Never throws. */
 export async function performJump(
-  input: { platform: string | null; binding: string | null; host: string | null },
+  input: { source?: "host" | "attachment"; platform: string | null; binding: string | null; tty?: string | null; host: string | null },
   exec: Executor = defaultExecutor,
 ): Promise<JumpResult> {
   try {
     if (!input.binding) return { opened: false };
+    if (input.source === "host" && (input.platform === "ghostty" || input.platform === "cmux")) {
+      const application = input.platform === "ghostty" ? "Ghostty" : "cmux";
+      const script = terminalFocusScript(application, input.binding, input.tty);
+      if (!script) return { opened: false };
+      const result = await exec("osascript", ["-e", script], JUMP_TIMEOUT_MS);
+      if (!result.ok) return failed(result);
+      // osascript exits 0 whether or not a terminal matched — a clean run
+      // with no "focused" marker means the binding is stale (tab closed).
+      return result.stdout?.includes("focused")
+        ? { opened: true }
+        : { opened: false, error: "target terminal not found (may have closed)" };
+    }
 
     if (input.platform === "herdr") {
       const result = await exec("herdr", ["agent", "focus", input.binding], JUMP_TIMEOUT_MS);

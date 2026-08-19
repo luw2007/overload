@@ -27,6 +27,9 @@ function mutate(command: string): string {
 }
 
 beforeAll(async () => {
+  process.env.CMUX_SURFACE_ID = "test-cmux-surface";
+  process.env.TERM_PROGRAM = "ghostty";
+  process.env.TERM_SESSION_ID = "test-terminal-session";
   process.env.OVERLOAD_PARENT = "outer-parent";
   // Dynamic import required: the node:os mock above must be registered before
   // the extension module evaluates; a static import would hoist past it.
@@ -95,8 +98,9 @@ describe("EXT-20 spool record", () => {
     const sealed = spoolFiles.find((name) => name.includes("seg-"));
     expect(sealed).toBeDefined();
     const first = readFileSync(join(hostDir, sealed!), "utf8").split("\n")[0]!;
-    const envelope = JSON.parse(first) as { kind: string; detail?: { parent?: string } };
+    const envelope = JSON.parse(first) as { kind: string; detail?: { parent?: string; host?: { app?: string; session_id?: string } } };
     expect(envelope.kind).toBe("session_started");
     expect(envelope.detail?.parent).toBe("outer-parent");
+    expect(envelope.detail?.host).toEqual({ app: "cmux", session_id: "test-cmux-surface" });
   });
 });

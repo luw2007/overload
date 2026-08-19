@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS attachments(
   stable_id TEXT NOT NULL, platform TEXT NOT NULL, binding TEXT NOT NULL,
   observed_at INTEGER NOT NULL, valid INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(stable_id, platform));
+CREATE TABLE IF NOT EXISTS session_hosts(
+  stable_id TEXT PRIMARY KEY, app TEXT NOT NULL, session_id TEXT, tty TEXT,
+  observed_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS incidents(
   id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, opened_at INTEGER NOT NULL,
   closed_at INTEGER, detail TEXT, UNIQUE(source, opened_at));

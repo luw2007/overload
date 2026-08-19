@@ -147,6 +147,19 @@ describe("P2 reducer and classifier", () => {
     expect((db.query("SELECT count(*) n FROM queue_transitions").get() as { n: number }).n).toBe(count);
     db.close();
   });
+  test("projects session-start host context without creating an external attachment", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), `${JSON.stringify(event(1, "session_started", {
+      host: { app: "Ghostty", session_id: "terminal-1", tty: "/dev/ttys003" },
+    }))}\n`);
+
+    await scanOnce(db, spool);
+
+    expect(db.query("SELECT app, session_id, tty FROM session_hosts").get())
+      .toEqual({ app: "Ghostty", session_id: "terminal-1", tty: "/dev/ttys003" });
+    expect(db.query("SELECT count(*) n FROM attachments").get()).toEqual({ n: 0 });
+    db.close();
+  });
 
   test("projects attributable telemetry gaps and ignores unattributable gaps", async () => {
     const { spool, emitterDir, db } = await fixture();

@@ -9,7 +9,7 @@ import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { randomUUID } from "node:crypto"
-import { execFile } from "node:child_process"
+import { execFile, execFileSync } from "node:child_process"
 
 const SEGMENT_MAX_AGE_MS = 30_000
 const SEGMENT_MAX_BYTES = 1_048_576
@@ -115,6 +115,33 @@ function selectedOption(result: unknown, depth = 0): string | undefined {
   }
   const visible = textFrom(record)
   return visible ? truncateUtf8(visible) : undefined
+}
+
+function hostContext(): Record<string, string> | undefined {
+  let environment = { ...process.env } as Record<string, string | undefined>;
+  const directHost = environment.CMUX_SURFACE_ID ? "cmux" : undefined;
+  let pid = process.ppid;
+  for (let depth = 0; !directHost && depth < 6; depth++) {
+    try {
+      const output = execFileSync("/bin/ps", ["eww", "-p", String(pid)], { timeout: 50, stdio: ["ignore", "pipe", "ignore"] }).toString();
+      const match = output.match(/CMUX_SURFACE_ID=([^\s]+)/);
+      if (match?.[1]) {
+        environment = { CMUX_SURFACE_ID: match[1] };
+        break;
+      }
+      const parent = execFileSync("/bin/ps", ["-p", String(pid), "-o", "ppid="], { timeout: 50, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+      pid = Number(parent);
+      if (!Number.isSafeInteger(pid) || pid < 2) break;
+    } catch { break; }
+  }
+  const sessionId = environment.CMUX_SURFACE_ID;
+  if (!sessionId) return undefined;
+  let tty: string | undefined;
+  try {
+    const value = execFileSync("/usr/bin/tty", [], { timeout: 50, stdio: ["inherit", "pipe", "ignore"] }).toString().trim();
+    if (value.startsWith("/dev/")) tty = value;
+  } catch { /* no controlling terminal */ }
+  return { app: "cmux", session_id: sessionId, ...(tty ? { tty } : {}) };
 }
 
 function execGit(cwd: string, args: string[]): Promise<string | null> {
@@ -451,6 +478,8 @@ export default function overload(pi: ExtensionApi): void {
         cwd,
         reason: event?.reason || "startup",
       }
+      const host = hostContext()
+      if (host) detail.host = host
       if (process.env.OVERLOAD_PARENT) detail.parent = truncateUtf8(process.env.OVERLOAD_PARENT)
       const branch = await execGit(cwd, ["branch", "--show-current"])
       if (branch) detail.branch = truncateUtf8(branch)

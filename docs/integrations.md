@@ -23,11 +23,13 @@ transcript path (`…/<parent-session>/subagents/agent-*.jsonl`) yields the
 parent Claude session's stable id, else a non-empty `OVERLOAD_PARENT`
 environment value is recorded verbatim.
 
-## cmux, herdr, and orca
+## Terminal hosts and Recon platforms
 
-Recon and jump support depend on the installed CLI/file contracts for these tools. A missing CLI or unavailable source is surfaced as a source incident rather than treated as an empty session list.
+The pi-family extension records a local cmux host at session start when `CMUX_SURFACE_ID` is available, retaining its opaque surface ID and `/dev/tty` fallback. The dashboard uses that host target before any Recon attachment, so direct pi/OMP sessions launched in cmux do not depend on a cwd match.
 
-The dashboard's **Open** action may focus a local terminal through `herdr`, `cmux`, or `orca`. If it cannot, the UI falls back to copying the opaque attachment binding. Treat bindings as identifiers, not commands to paste into a shell.
+Recon still discovers Orca, HerdR, and cmux platform sessions. Those attachment bindings are external-platform evidence used for liveness and outage handling; they are separate from terminal hosts and remain the dashboard fallback when no host context exists.
+
+The dashboard's **Open** action focuses a local cmux host pane by its opaque surface ID. Sessions without a supported, precise target show `暂无可跳转目标`; the UI does not present a nonfunctional Open action. Treat all identifiers as opaque.
 
 Orca worktrees carrying `parentWorktreeId` contribute `orca:<id>` lineage:
 a session whose origin is still `unknown` at attachment time adopts it as

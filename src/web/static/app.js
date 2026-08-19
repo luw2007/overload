@@ -35,7 +35,7 @@
 
   function renderQ1() {
     $("table-head").innerHTML = "<tr><th style='width:42px'><input id='select-all' type='checkbox' aria-label='全选'></th><th>请求</th><th>会话</th><th>类型</th><th>时间</th><th>跳转标识</th><th>操作</th></tr>";
-    $("table-body").innerHTML = state.q1.length ? state.q1.map((row) => `<tr class="${row.failed ? "failed" : ""}"><td>${rowCheckbox(row.request_uid)}</td><td>${row.failed ? "[DELIVERY FAILED] " : ""}${escapeHtml(row.request_uid)}</td><td>${escapeHtml(row.stable_id)}</td><td>${escapeHtml(row.kind)}</td><td>${escapeHtml(formatTime(row.created_at))}</td><td><span class="chip">${escapeHtml(bindingFor(row))}</span> <button class="btn copy-jump" data-binding="${escapeHtml(bindingFor(row))}">复制</button><span class="jump-status" aria-live="polite"></span></td><td><button class="btn primary jump" data-id="${escapeHtml(row.request_uid)}" data-binding="${escapeHtml(bindingFor(row))}">打开</button> <button class="btn ${row.failed ? "danger" : ""} ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></td></tr>`).join("") : "<tr><td class='empty' colspan='7'>没有待决策请求</td></tr>";
+    $("table-body").innerHTML = state.q1.length ? state.q1.map((row) => `<tr class="${row.failed ? "failed" : ""}"><td>${rowCheckbox(row.request_uid)}</td><td>${row.failed ? "[DELIVERY FAILED] " : ""}${escapeHtml(row.request_uid)}</td><td>${escapeHtml(row.stable_id)}</td><td>${escapeHtml(row.kind)}</td><td>${escapeHtml(formatTime(row.created_at))}</td><td><span class="chip">${escapeHtml(bindingFor(row))}</span>${row.binding ? ` <button class="btn copy-jump" data-binding="${escapeHtml(row.binding)}">复制</button>` : ""}<span class="jump-status" aria-live="polite"></span></td><td>${row.binding ? `<button class="btn primary jump" data-id="${escapeHtml(row.request_uid)}" data-binding="${escapeHtml(row.binding)}">打开</button>` : "<span>暂无可跳转目标</span>"} <button class="btn ${row.failed ? "danger" : ""} ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></td></tr>`).join("") : "<tr><td class='empty' colspan='7'>没有待决策请求</td></tr>";
     const selectAll = $("select-all");
     selectAll.checked = state.q1.length > 0 && state.q1.every((row) => state.selected.has(row.request_uid));
     selectAll.addEventListener("change", () => {
@@ -98,13 +98,18 @@
 
   async function jump(button) {
     const status = button.closest("tr").querySelector(".jump-status");
-    const fallback = async () => {
+    const fallback = async (reason) => {
       const copied = await copyBinding(button.dataset.binding, status);
-      status.textContent = copied ? "打开失败，已复制跳转标识" : "打开失败，复制跳转标识失败";
+      const suffix = reason ? `（${reason}）` : "";
+      status.textContent = copied ? `打开失败${suffix}，已复制跳转标识` : `打开失败${suffix}，复制跳转标识失败`;
     };
     try {
       const result = await fetchJson(`/api/jump/${encodeURIComponent(button.dataset.id)}`, { method: "POST" });
-      if (!result.opened) await fallback();
+      if (!result.opened) await fallback(result.error);
+      else {
+        status.textContent = "已打开并聚焦目标终端";
+        setTimeout(() => { status.textContent = ""; }, 2000);
+      }
     } catch {
       await fallback();
     }

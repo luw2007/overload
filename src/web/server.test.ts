@@ -26,6 +26,7 @@ function seedLedger(): string {
     CREATE TABLE current(stable_id TEXT PRIMARY KEY, writer_id TEXT, state TEXT, queue TEXT, q5_reason TEXT, origin TEXT, last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER, frozen INTEGER DEFAULT 0);
     CREATE TABLE notifications(notification_uid INTEGER PRIMARY KEY, request_uid TEXT, sink TEXT, kind TEXT, reminder_seq INTEGER, state TEXT, attempt_at INTEGER, sent_at INTEGER, retry_count INTEGER);
     CREATE TABLE attachments(stable_id TEXT, platform TEXT, binding TEXT, observed_at INTEGER, valid INTEGER);
+    CREATE TABLE session_hosts(stable_id TEXT PRIMARY KEY, app TEXT, session_id TEXT, tty TEXT, observed_at INTEGER);
     CREATE TABLE incidents(id INTEGER PRIMARY KEY, source TEXT, opened_at INTEGER, closed_at INTEGER, detail TEXT);
     CREATE TABLE coverage_gaps(id INTEGER PRIMARY KEY, stable_id TEXT, emitter_id TEXT, from_seq INTEGER, from_at INTEGER, to_at INTEGER, reason TEXT);
   `);
@@ -33,6 +34,7 @@ function seedLedger(): string {
   db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)", ["req-1", "remote:pi:alpha", "writer", "emitter", "one", "decision", 1_700_000_001_000, JSON.stringify({ question: "ship?" })]);
   db.run("INSERT INTO notifications VALUES (1, 'req-1', 'osascript', 'initial', 0, 'failed_permanent', NULL, NULL, 6)");
   db.run("INSERT INTO attachments VALUES ('remote:pi:alpha', 'cmux', 'workspace-42', 1700000002000, 1)");
+  db.run("INSERT INTO session_hosts VALUES ('remote:pi:alpha', 'cmux', 'terminal-7', '/dev/ttys007', 1700000003000)");
   db.run("INSERT INTO current VALUES ('done:pi:beta', 'writer', 'done', 'q2', NULL, 'agent', 2, 1700000003000, NULL, 0)");
   db.run("INSERT INTO incidents VALUES (1, 'notifier', 1700000004000, NULL, ?)", [JSON.stringify({ retries: 6 })]);
   db.run("INSERT INTO coverage_gaps VALUES (1, 'remote:pi:alpha', 'emitter', 1, 1, 2, 'missing_seq')");
@@ -41,8 +43,8 @@ function seedLedger(): string {
   return path;
 }
 
-async function runningServer(path: string) {
-  const server = startWebServer({ ledgerPath: path, port: 0 });
+async function runningServer(path: string, jump?: (target: { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null }) => Promise<{ opened: boolean }>) {
+  const server = startWebServer({ ledgerPath: path, port: 0, jump });
   servers.push(server);
   return { server, base: `http://127.0.0.1:${server.port}` };
 }
@@ -68,10 +70,34 @@ describe("web API", () => {
       created_at: 1_700_000_001_000,
       detail: { question: "ship?" },
       failed: true,
-      binding: "workspace-42",
+      binding: "terminal-7",
     }]);
   });
 
+  test("prefers a structured host target over a reconciliation attachment", async () => {
+    let target: unknown;
+    const { base } = await runningServer(seedLedger(), async (input) => {
+      target = input;
+      return { opened: true };
+    });
+    const response = await fetch(`${base}/api/jump/req-1`, { method: "POST" });
+    expect(await response.json()).toEqual({ opened: true });
+    expect(target).toEqual({ source: "host", platform: "cmux", binding: "terminal-7", tty: "/dev/ttys007", host: "buildbox" });
+  });
+  test("exposes host context as the Q1 jump identifier", async () => {
+    const { base } = await runningServer(seedLedger());
+    const response = await fetch(`${base}/api/q1`);
+    expect((await response.json())[0].binding).toBe("terminal-7");
+  });
+  test("omits a jump binding when the host lacks a precise session id", async () => {
+    const path = seedLedger();
+    const db = new Database(path);
+    db.run("UPDATE session_hosts SET session_id=NULL, tty='/dev/ttys007' WHERE stable_id='remote:pi:alpha'");
+    db.run("DELETE FROM attachments WHERE stable_id='remote:pi:alpha'");
+    db.close();
+    const { base } = await runningServer(path);
+    expect((await (await fetch(`${base}/api/q1`)).json())[0].binding).toBeNull();
+  });
   test("ack cancels a pending request and is idempotent", async () => {
     const path = seedLedger();
     const { base } = await runningServer(path);

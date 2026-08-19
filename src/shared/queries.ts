@@ -14,7 +14,7 @@ export type SessionDetail = {
   events: EventRow[];
 };
 export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; failed: boolean; binding: string | null; platform: string | null };
-export type JumpTarget = { platform: string | null; binding: string | null; host: string | null };
+export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null };
 export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
 export type ZombieView = {
   groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number }> }>;
@@ -63,8 +63,10 @@ export function querySession(db: Database, stableId: string): SessionDetail | nu
 export function queryQ1(db: Database): Q1Row[] {
   const rows = db.query(`SELECT r.request_uid, r.stable_id, s.host, r.kind, r.created_at, r.detail,
     EXISTS(SELECT 1 FROM notifications n WHERE n.request_uid=r.request_uid AND n.state='failed_permanent') failed,
-    (SELECT binding FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1) binding,
-    (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1) platform
+    COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL),
+      (SELECT binding FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding,
+    COALESCE((SELECT lower(app) FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL),
+      (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) platform
     FROM requests r LEFT JOIN sessions s ON s.stable_id=r.stable_id
     WHERE r.state='pending' ORDER BY failed DESC, r.created_at, r.request_uid`).all() as Array<Omit<Q1Row, "detail" | "failed"> & JsonRow & { failed: number }>;
   return rows.map((row) => ({ ...withParsedDetail(row), failed: !!row.failed }));
@@ -72,9 +74,14 @@ export function queryQ1(db: Database): Q1Row[] {
 
 export function queryJumpTarget(db: Database, requestUid: string): JumpTarget | null {
   return db.query(`SELECT s.host,
-    (SELECT binding FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1) binding,
-    (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1) platform
+    CASE WHEN h.stable_id IS NOT NULL THEN 'host' ELSE 'attachment' END source,
+    COALESCE(lower(h.app), a.platform) platform,
+    COALESCE(h.session_id, h.tty, a.binding) binding,
+    h.tty
     FROM requests r JOIN sessions s ON s.stable_id=r.stable_id
+    LEFT JOIN session_hosts h ON h.stable_id=r.stable_id AND h.session_id IS NOT NULL
+    LEFT JOIN attachments a ON a.stable_id=r.stable_id AND a.valid=1
+      AND a.observed_at=(SELECT MAX(observed_at) FROM attachments WHERE stable_id=r.stable_id AND valid=1)
     WHERE r.request_uid=?`).get(requestUid) as JumpTarget | null;
 }
 

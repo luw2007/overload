@@ -4,8 +4,8 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ackRequest, configRefocusCostMin, queryAttention, queryHealth, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie } from "../shared/queries";
-import { performJump } from "./jump";
+import { ackRequest, configRefocusCostMin, queryAttention, queryHealth, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, type JumpTarget } from "../shared/queries";
+import { performJump, type JumpResult } from "./jump";
 
 const DEFAULT_WEB_PORT = 4870;
 let warnedInvalidConfig = false;
@@ -62,7 +62,7 @@ function routeParameter(value: string): string {
   try { return decodeURIComponent(value); } catch { return value; }
 }
 
-export function startWebServer(options: { ledgerPath?: string; port?: number } = {}) {
+export function startWebServer(options: { ledgerPath?: string; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult> } = {}) {
   const ledgerPath = options.ledgerPath ?? process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
   return Bun.serve({
     // Loopback is the v1 trust boundary. Add authentication before supporting
@@ -91,7 +91,7 @@ export function startWebServer(options: { ledgerPath?: string; port?: number } =
         if (request.method === "POST" && url.pathname.startsWith("/api/jump/")) {
           const requestUid = routeParameter(url.pathname.slice("/api/jump/".length));
           const target = withReadonlyDb(ledgerPath, (db) => queryJumpTarget(db, requestUid));
-          return target ? json(await performJump(target)) : json({ error: "request not found" }, { status: 404 });
+          return target ? json(await (options.jump ?? performJump)(target)) : json({ error: "request not found" }, { status: 404 });
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/ack/")) {
           const requestUid = routeParameter(url.pathname.slice("/api/ack/".length));

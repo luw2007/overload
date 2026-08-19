@@ -77,6 +77,7 @@ function applyEvent(db: Database, row: JournalRow, notifySink: string): void {
     return;
   }
   if (row.kind === "source_outage" || row.kind === "source_recovered") { applyIncident(db, row, detail); return; }
+  if (row.kind === "session_started") applyHost(db, row, detail);
   if (row.kind === "attachment_observed") applyAttachment(db, row, detail);
   applyRequestEvent(db, row, detail, notifySink);
   applySessionEvent(db, row, detail);
@@ -96,6 +97,19 @@ function applyIncident(db: Database, row: JournalRow, detail: Record<string, unk
     db.query(`UPDATE current SET frozen=0 WHERE stable_id IN
       (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(source);
   }
+}
+
+function applyHost(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
+  const host = detail.host;
+  if (!host || typeof host !== "object" || Array.isArray(host)) return;
+  const app = stringDetail(host as Record<string, unknown>, "app");
+  if (!app) return;
+  const sessionId = stringDetail(host as Record<string, unknown>, "session_id");
+  const tty = stringDetail(host as Record<string, unknown>, "tty");
+  db.query(`INSERT INTO session_hosts(stable_id, app, session_id, tty, observed_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(stable_id) DO UPDATE SET app=excluded.app, session_id=excluded.session_id,
+    tty=excluded.tty, observed_at=excluded.observed_at`)
+    .run(row.stable_id, app, sessionId, tty, row.at);
 }
 
 function applyAttachment(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
