@@ -38,7 +38,7 @@ const HEALTHY_LAUNCHD = launchctlOf({
 });
 
 /** Every dimension defaults to healthy; each test overrides only what it probes. */
-function baseDeps(overrides: { exec?: Executor; ledgerPath?: string; extraFiles?: Record<string, StatInfo>; now?: () => number } = {}): DoctorDeps {
+function baseDeps(overrides: { exec?: Executor; ledgerPath?: string; extraFiles?: Record<string, StatInfo>; claudeSettings?: string | null; now?: () => number } = {}): DoctorDeps {
   const ledgerPath = overrides.ledgerPath ?? seededLedger().path;
   const files: Record<string, StatInfo> = {
     "/tmp/pi-ext.ts": { mtimeMs: NOW, mode: 0o100600 },
@@ -49,13 +49,17 @@ function baseDeps(overrides: { exec?: Executor; ledgerPath?: string; extraFiles?
     [ledgerPath]: { mtimeMs: NOW, mode: 0o100600 },
     ...overrides.extraFiles,
   };
+  const claudeSettingsPath = "/tmp/claude-settings.json";
+  const claudeSettings = "claudeSettings" in overrides ? overrides.claudeSettings : '{"hooks":{"PermissionRequest":[{"hooks":[{"command":"OVERLOAD_CLAUDE_HOOK=1 hook.sh"}]}]}}';
   return {
     ledgerPath,
     overloadRoot: OVERLOAD_ROOT,
     extensionTargets: [{ label: "pi", path: "/tmp/pi-ext.ts" }, { label: "omp", path: "/tmp/omp-ext.ts" }],
+    claudeSettingsPath,
     uid: "502",
     exec: overrides.exec ?? HEALTHY_LAUNCHD,
     stat: async (path) => files[path] ?? null,
+    readText: async (path) => path === claudeSettingsPath ? claudeSettings : null,
     now: overrides.now ?? (() => NOW),
   };
 }
@@ -67,6 +71,7 @@ describe("runDoctor", () => {
     expect(checks.every((check) => check.status !== "FAIL")).toBe(true);
     expect(checks.find((check) => check.label === "ledger")?.status).toBe("OK");
     expect(checks.find((check) => check.label === "telemetry:liveness")?.status).toBe("OK");
+    expect(checks.find((check) => check.label === "claude:hook")?.status).toBe("OK");
   });
 
   test("fails when the ledger cannot be opened, but still runs independent checks", async () => {
@@ -86,6 +91,24 @@ describe("runDoctor", () => {
     const pi = checks.find((check) => check.label === "extension:pi")!;
     expect(pi.status).toBe("WARN");
     expect(pi.detail).toContain("install-extension.sh");
+    expect(exitCode).toBe(0);
+  });
+
+  test("warns (not fails) when the Claude Code hook is not installed", async () => {
+    const deps = baseDeps({ claudeSettings: '{"hooks":{"PermissionRequest":[{"hooks":[{"command":"/other/hook.sh"}]}]}}' });
+    const { checks, exitCode } = await runDoctor(deps);
+    const hook = checks.find((check) => check.label === "claude:hook")!;
+    expect(hook.status).toBe("WARN");
+    expect(hook.detail).toContain("install-claude-hooks.sh");
+    expect(exitCode).toBe(0);
+  });
+
+  test("warns (not fails) when Claude Code has no settings.json at all", async () => {
+    const deps = baseDeps({ claudeSettings: null });
+    const { checks, exitCode } = await runDoctor(deps);
+    const hook = checks.find((check) => check.label === "claude:hook")!;
+    expect(hook.status).toBe("WARN");
+    expect(hook.detail).toContain("no Claude Code settings");
     expect(exitCode).toBe(0);
   });
 
