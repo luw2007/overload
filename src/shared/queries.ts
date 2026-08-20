@@ -118,7 +118,10 @@ export function ackRequest(db: Database, requestUid: string): { changes: number 
 }
 
 export type AttentionView = {
-  /** Notifications delivered to the human in the trailing 24h — each one is a flexibility trigger. */
+  /** Distinct interruption episodes in the trailing 24h: initial notifications delivered to the
+   *  human, with bursts inside EPISODE_GAP_MS collapsed into one. Reminders re-nag an
+   *  already-pending request the human has not engaged yet — no fresh context is destroyed —
+   *  so they never count as new interruptions. */
   interruptions_24h: number;
   /** interruptions_24h x refocus cost (Gloria Mark: ~20min to regain focus after an interruption). */
   refocus_cost_min: number;
@@ -129,11 +132,16 @@ export type AttentionView = {
 };
 
 export const DEFAULT_REFOCUS_COST_MIN = 20;
+/** Notifications sent within this gap collapse into one interruption episode. */
+export const EPISODE_GAP_MS = 300_000;
 const DAY_MS = 86_400_000;
 
 export function queryAttention(db: Database, now = Date.now(), refocusCostMin = DEFAULT_REFOCUS_COST_MIN): AttentionView {
   // bun:sqlite rows are untyped; named-const casts document the aggregate shapes.
-  const interruptions = db.query("SELECT count(*) n FROM notifications WHERE state='sent' AND sent_at >= ?").get(now - DAY_MS) as { n: number };
+  const interruptions = db.query(`WITH sent AS (
+      SELECT sent_at FROM notifications WHERE state='sent' AND kind='initial' AND sent_at >= ?),
+    gaps AS (SELECT sent_at - LAG(sent_at) OVER (ORDER BY sent_at) gap FROM sent)
+    SELECT count(*) n FROM gaps WHERE gap IS NULL OR gap > ?`).get(now - DAY_MS, EPISODE_GAP_MS) as { n: number };
   const pending = db.query("SELECT count(*) n, avg(? - created_at) w FROM requests WHERE state='pending'").get(now) as { n: number; w: number | null };
   const contexts = db.query(`SELECT count(*) n FROM (
     SELECT stable_id FROM requests WHERE state='pending'

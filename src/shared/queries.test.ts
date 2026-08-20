@@ -7,7 +7,7 @@ const HOUR = 3_600_000;
 
 function fixture(): Database {
   const db = new Database(":memory:");
-  db.run("CREATE TABLE notifications(request_uid TEXT, state TEXT, sent_at INTEGER)");
+  db.run("CREATE TABLE notifications(request_uid TEXT, kind TEXT, state TEXT, sent_at INTEGER)");
   db.run("CREATE TABLE requests(request_uid TEXT, stable_id TEXT, state TEXT, created_at INTEGER)");
   db.run("CREATE TABLE current(stable_id TEXT PRIMARY KEY, queue TEXT)");
   return db;
@@ -26,13 +26,15 @@ describe("queryAttention", () => {
     expect(formatAttention(view)).toBe("interruptions(24h)=0 (~0min refocus) · pending decisions=0 avg_wait=- · open contexts=0");
   });
 
-  test("counts only sent notifications inside the trailing 24h and prices them", () => {
+  test("counts initial-notification episodes inside the trailing 24h and prices them", () => {
     const db = fixture();
-    db.run("INSERT INTO notifications VALUES ('r1','sent',?)", [NOW - HOUR]);
-    db.run("INSERT INTO notifications VALUES ('r2','sent',?)", [NOW - 23 * HOUR]);
-    db.run("INSERT INTO notifications VALUES ('r3','sent',?)", [NOW - 25 * HOUR]); // outside window
-    db.run("INSERT INTO notifications VALUES ('r4','pending',NULL)"); // undelivered
-    db.run("INSERT INTO notifications VALUES ('r5','failed_permanent',NULL)");
+    db.run("INSERT INTO notifications VALUES ('r1','initial','sent',?)", [NOW - HOUR]);
+    db.run("INSERT INTO notifications VALUES ('r1b','initial','sent',?)", [NOW - HOUR + 60_000]); // burst: same episode as r1
+    db.run("INSERT INTO notifications VALUES ('r1','reminder','sent',?)", [NOW - HOUR + 120_000]); // nag, not a new interruption
+    db.run("INSERT INTO notifications VALUES ('r2','initial','sent',?)", [NOW - 23 * HOUR]);
+    db.run("INSERT INTO notifications VALUES ('r3','initial','sent',?)", [NOW - 25 * HOUR]); // outside window
+    db.run("INSERT INTO notifications VALUES ('r4','initial','pending',NULL)"); // undelivered
+    db.run("INSERT INTO notifications VALUES ('r5','initial','failed_permanent',NULL)");
     const view = queryAttention(db, NOW, 20);
     expect(view.interruptions_24h).toBe(2);
     expect(view.refocus_cost_min).toBe(40);
