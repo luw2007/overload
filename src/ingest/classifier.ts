@@ -2,9 +2,9 @@ import { appendFileSync, chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-/** Version 2 remains active: decision_resolved was already a journal event in
- *  this version; the fix closes its incomplete projection rather than adding a
- *  new source-event interpretation or replay epoch. */
+/** Version 2 remains active: the drained-emitter fix adds reducer-produced
+ *  evidence about a request mutation; it does not reinterpret the journal
+ *  event by itself or introduce a new replay epoch. */
 export const CLASSIFIER_VERSION = 2;
 
 export type ClassifiableCurrent = {
@@ -15,6 +15,8 @@ export type ClassifiableCurrent = {
   q5_reason: string | null;
   /** True when this session has a commit or a bash/write/edit tool event. */
   has_change_evidence?: boolean;
+  /** True when the current emitter_drained event orphaned a pending request. */
+  orphaned_request?: boolean;
 };
 
 export type ClassifierEvent = {
@@ -56,7 +58,7 @@ function desiredQueue(current: ClassifiableCurrent, event: ClassifierEvent): { q
     case "dead_connection": reason = "dead_connection"; break;
     case "emitter_dead": reason = "dead_incarnation"; break;
     case "telemetry_gap": reason = "telemetry_gap"; break;
-    case "emitter_drained": reason = "orphaned_request"; break;
+    case "emitter_drained": if (current.orphaned_request === true) reason = "orphaned_request"; break;
   }
   if (reason) return { queue: "q5", reason };
   if (state === "done" && normalizeOrigin(current.origin) === "agent" && current.has_change_evidence === false) {

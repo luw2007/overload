@@ -258,7 +258,7 @@ describe("P2 reducer and classifier", () => {
     db.close();
   });
 
-  test("orphans a pending request only when its emitter is drained", async () => {
+  test("labels a drained emitter only when it actually orphans a pending request", async () => {
     const { spool, emitterDir, db } = await fixture();
     const batch = [
       event(1, "session_started"),
@@ -269,7 +269,26 @@ describe("P2 reducer and classifier", () => {
     await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
     await scanOnce(db, spool);
     expect(db.query("SELECT state FROM requests WHERE request_id='ask-1'").get()).toEqual({ state: "orphaned" });
+    expect(db.query("SELECT queue, q5_reason FROM current").get()).toEqual({ queue: "q5", q5_reason: "orphaned_request" });
     expect(db.query("SELECT emitter_id, reason, to_at FROM coverage_gaps").get()).toEqual({ emitter_id: "pi-42-bootabcd", reason: "emitter_drained", to_at: event(4, "x").at });
+
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-1.ndjson"),
+      `${JSON.stringify(event(5, "emitter_drained", { stable_id: "local:pi:session-1", emitter_id: "pi-42-bootabcd" }))}\n`);
+    await scanOnce(db, spool);
+    expect(db.query("SELECT queue, q5_reason FROM current").get()).toEqual({ queue: "q5", q5_reason: "orphaned_request" });
+    db.close();
+  });
+
+  test("does not label a drained emitter with no pending request as a zombie", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const batch = [
+      event(1, "session_started"),
+      event(2, "emitter_drained", { stable_id: "local:pi:session-1", emitter_id: "pi-42-bootabcd" }),
+    ].map(JSON.stringify).join("\n") + "\n";
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
+    await scanOnce(db, spool);
+
+    expect(db.query("SELECT queue, q5_reason FROM current").get()).toEqual({ queue: "q3", q5_reason: null });
     db.close();
   });
 });

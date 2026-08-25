@@ -80,8 +80,8 @@ function applyEvent(db: Database, row: JournalRow): void {
   if (row.kind === "source_outage" || row.kind === "source_recovered") { applyIncident(db, row, detail); return; }
   if (row.kind === "session_started") applyHost(db, row, detail);
   if (row.kind === "attachment_observed") applyAttachment(db, row, detail);
-  applyRequestEvent(db, row, detail);
-  applySessionEvent(db, row, detail);
+  const orphanedRequest = applyRequestEvent(db, row, detail);
+  applySessionEvent(db, row, detail, orphanedRequest);
 }
 
 function applyIncident(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
@@ -123,7 +123,7 @@ function applyAttachment(db: Database, row: JournalRow, detail: Record<string, u
   }
 }
 
-function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
+function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>, orphanedRequest: boolean): void {
   const relevant = new Set(["session_started", "working", "settled", "decision_requested", "decision_resolved", "session_ended", "session_vanished", "emitter_dead", "emitter_drained", "emitter_stalled", "turn_hung", "dead_connection", "telemetry_gap", "heartbeat", "tool_activity"]);
   if (!relevant.has(row.kind)) return;
   // A platform process without an attributable session is health evidence only;
@@ -154,9 +154,10 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   else if (row.kind === "session_vanished") state = "vanished";
 
   const changeEvidence = hasChangeEvidence(db, stableId, row.ingest_seq);
-  const view = { ...current, stable_id: stableId, state, origin, has_change_evidence: changeEvidence };
+  const classificationFacts = { has_change_evidence: changeEvidence, orphaned_request: orphanedRequest };
+  const view = { ...current, stable_id: stableId, state, origin, ...classificationFacts };
   const classifierEvent: ClassifierEvent = { ingest_seq: row.ingest_seq, at: row.at, kind: row.kind, detail };
-  for (const transition of classify({ ...current, has_change_evidence: changeEvidence }, classifierEvent)) {
+  for (const transition of classify({ ...current, ...classificationFacts }, classifierEvent)) {
     db.query(`INSERT OR IGNORE INTO queue_transitions(subject, queue, direction, at, source_seq, classifier_version)
       VALUES (?, ?, ?, ?, ?, ?)`).run(transition.subject, transition.queue, transition.direction, transition.at, transition.source_seq, transition.classifier_version);
   }
@@ -170,14 +171,14 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
     last_event_at=?, last_heartbeat_at=?, last_progress_at=? WHERE stable_id=?`).run(projectedWriter, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, lastEventAt, heartbeat, progress, stableId);
 }
 
-function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
-  if (row.kind === "emitter_drained") { orphanDrainedEmitter(db, row, detail); return; }
+function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): boolean {
+  if (row.kind === "emitter_drained") return orphanDrainedEmitter(db, row, detail);
   if (row.kind === "session_ended" || (row.kind === "settled" && platformFor(row.stable_id) === "cmux")) {
     db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE stable_id=? AND writer_id=? AND state='pending'").run(row.at, row.stable_id, row.writer_id);
-    return;
+    return false;
   }
-  if (row.kind !== "decision_requested" && row.kind !== "decision_resolved") return;
-  const id = requestId(detail); if (!id) return;
+  if (row.kind !== "decision_requested" && row.kind !== "decision_resolved") return false;
+  const id = requestId(detail); if (!id) return false;
   const uid = `${row.stable_id}#${row.writer_id}#${id}`;
   const existing = db.query("SELECT state FROM requests WHERE request_uid=?").get(uid) as RequestRow | null;
   const kind = stringDetail(detail, "request_kind") ?? stringDetail(detail, "kind") ?? "decision";
@@ -186,7 +187,7 @@ function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string,
       db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, detail)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(uid, row.stable_id, row.writer_id, row.emitter_id, id, kind, row.at, row.detail);
     }
-    return;
+    return false;
   }
   const state = terminalState(detail);
   if (!existing) {
@@ -195,12 +196,13 @@ function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string,
   } else if (existing.state === "pending" || existing.state === "orphaned" || existing.state === "acked") {
     db.query("UPDATE requests SET state=?, resolved_at=?, detail=? WHERE request_uid=?").run(state, row.at, row.detail, uid);
   }
+  return false;
 }
 
-function orphanDrainedEmitter(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
-  const emitterId = stringDetail(detail, "emitter_id"); if (!emitterId) return;
+function orphanDrainedEmitter(db: Database, row: JournalRow, detail: Record<string, unknown>): boolean {
+  const emitterId = stringDetail(detail, "emitter_id"); if (!emitterId) return false;
   const stableId = stringDetail(detail, "stable_id") ?? null;
-  db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE origin_emitter_id=? AND state='pending'").run(row.at, emitterId);
+  const orphaned = db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE origin_emitter_id=? AND state='pending'").run(row.at, emitterId).changes > 0;
   const last = db.query("SELECT seq, at FROM journal WHERE emitter_id=? AND ingest_seq<? ORDER BY ingest_seq DESC LIMIT 1").get(emitterId, row.ingest_seq) as { seq: number; at: number } | null;
   // Review P2 M3: duplicate emitter_drained findings (recon restart + ingest
   // lag) must not create duplicate tail gaps — one drained tail per emitter.
@@ -208,4 +210,5 @@ function orphanDrainedEmitter(db: Database, row: JournalRow, detail: Record<stri
     SELECT ?, ?, ?, ?, ?, 'emitter_drained'
     WHERE NOT EXISTS (SELECT 1 FROM coverage_gaps WHERE emitter_id=? AND reason='emitter_drained')`)
     .run(stableId, emitterId, last?.seq ?? null, last?.at ?? null, row.at, emitterId);
+  return orphaned;
 }
