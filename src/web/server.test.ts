@@ -124,7 +124,7 @@ describe("web API", () => {
     const view = await detail.json();
     expect(view.session).toMatchObject({
       stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung",
-      last_progress_at: 1_700_000_005_000, binding: "terminal-7",
+      last_progress_at: 1_700_000_005_000, app: "cmux", binding: "terminal-7",
     });
     // Newest first, heartbeat-free: the top row must be what the turn last did.
     expect(view.events.map((row: { kind: string }) => row.kind)).toEqual(["tool_activity", "telemetry_gap"]);

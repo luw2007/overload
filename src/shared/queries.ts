@@ -6,7 +6,7 @@ export type PendingRequestRow = { request_uid: string; kind: string; created_at:
 export type EventRow = { ingest_seq: number; at: number; emitter_id: string; writer_id: string; kind: string; detail: Record<string, unknown> | null };
 export type SessionDetail = {
   session: {
-    stable_id: string; origin: string | null; runtime: string | null; created_at: number | null;
+    stable_id: string; origin: string | null; runtime: string | null; app: string | null; created_at: number | null;
     cwd: string | null; branch: string | null; state: string | null; queue: string | null; q5_reason: string | null;
     last_event_at: number | null; last_heartbeat_at: number | null; last_progress_at: number | null;
     binding: string | null;
@@ -57,11 +57,12 @@ export function querySessions(db: Database, limit = -1): SessionSummary[] {
 }
 
 export function querySession(db: Database, stableId: string, eventLimit = 200): SessionDetail | null {
-  const session = db.query(`SELECT s.stable_id, s.origin, s.runtime, s.created_at, s.cwd, s.branch,
+  const session = db.query(`SELECT s.stable_id, s.origin, s.runtime, h.app, s.created_at, s.cwd, s.branch,
     c.state, c.queue, c.q5_reason, c.last_event_at, c.last_heartbeat_at, c.last_progress_at,
     COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=s.stable_id AND h.session_id IS NOT NULL),
       (SELECT binding FROM attachments a WHERE a.stable_id=s.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding
     FROM sessions s LEFT JOIN current c ON c.stable_id=s.stable_id
+    LEFT JOIN session_hosts h ON h.stable_id=s.stable_id AND h.session_id IS NOT NULL
     WHERE s.stable_id=?`).get(stableId) as SessionDetail["session"] | null;
   if (!session) return null;
   const incarnations = db.query(`SELECT writer_id, liveness_domain, pid, proc_boot_id, started_at, last_seen_at FROM session_incarnations WHERE stable_id=? ORDER BY started_at, writer_id`).all(stableId) as IncarnationRow[];

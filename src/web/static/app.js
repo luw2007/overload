@@ -90,6 +90,7 @@
       ["会话", escapeHtml(s.stable_id)],
       ["状态", `${escapeHtml(s.state)}${s.queue ? ` <span class="chip">${escapeHtml(s.q5_reason ? `${s.queue}/${s.q5_reason}` : s.queue)}</span>` : ""}`],
       ["运行时 / 来源", `${escapeHtml(s.runtime)} / ${escapeHtml(s.origin)}`],
+      ["宿主 App", escapeHtml(s.app ?? "-")],
       ["工作区", `${escapeHtml(s.cwd)}${s.branch ? ` (${escapeHtml(s.branch)})` : ""}`],
       ["时钟", escapeHtml(clocks)],
       ["跳转", s.binding ? `<span class="chip">${escapeHtml(s.binding)}</span> <button class="btn primary jump" data-route="jump-session" data-id="${escapeHtml(s.stable_id)}" data-binding="${escapeHtml(s.binding)}">打开</button><span class="jump-status" aria-live="polite"></span>` : "暂无可跳转目标"],

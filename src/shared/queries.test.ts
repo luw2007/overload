@@ -9,7 +9,7 @@ function sessionFixture(): Database {
   const db = new Database(":memory:");
   db.run("CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, origin TEXT, runtime TEXT, created_at INTEGER, cwd TEXT, branch TEXT, first_seen_at INTEGER)");
   db.run("CREATE TABLE current(stable_id TEXT PRIMARY KEY, state TEXT, queue TEXT, q5_reason TEXT, last_event_at INTEGER, last_heartbeat_at INTEGER, last_progress_at INTEGER)");
-  db.run("CREATE TABLE session_hosts(stable_id TEXT, session_id TEXT)");
+  db.run("CREATE TABLE session_hosts(stable_id TEXT, app TEXT, session_id TEXT)");
   db.run("CREATE TABLE attachments(stable_id TEXT, binding TEXT, observed_at INTEGER, valid INTEGER)");
   db.run("CREATE TABLE session_incarnations(stable_id TEXT, writer_id TEXT, liveness_domain TEXT, pid INTEGER, proc_boot_id TEXT, started_at INTEGER, last_seen_at INTEGER)");
   db.run("CREATE TABLE requests(stable_id TEXT, request_uid TEXT, kind TEXT, created_at INTEGER, resolved_at INTEGER, detail TEXT, state TEXT)");
@@ -35,7 +35,7 @@ describe("querySession", () => {
     const db = sessionFixture();
     const target = "local:omp:session-a";
     db.run("INSERT INTO sessions VALUES (?, 'local', 'omp', ?, '/tmp', 'main', ?)", [target, NOW, NOW]);
-    db.run("INSERT INTO journal VALUES (1, ?, ?, 'omp', 'writer', 'tool_activity', '{}')", [target, NOW]);
+    db.run("INSERT INTO session_hosts VALUES (?, 'cmux', 'surface-7')", [target]);
     db.run("INSERT INTO journal VALUES (2, ?, ?, 'omp', 'writer', 'heartbeat', '{}')", [target, NOW + 1]);
     db.run("INSERT INTO journal VALUES (3, 'local:overload:session-a', ?, 'recon', 'recon', 'turn_hung', ?)",
       [NOW + 2, JSON.stringify({ stable_id: target, reason: "no progress" })]);
@@ -49,6 +49,7 @@ describe("querySession", () => {
 
     const detail = querySession(db, target, 3);
 
+    expect(detail?.session.app).toBe("cmux");
     expect(detail?.events.map((event) => event.ingest_seq)).toEqual([6, 4, 3]);
     expect(detail?.events[2]).toMatchObject({
       kind: "turn_hung",
