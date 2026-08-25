@@ -2,6 +2,7 @@
 import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { generateAttribReport } from "../attrib/report";
 import { ackRequest, queryHealth, queryHung, queryQ1, queryQ2, querySession, querySessions, queryZombie } from "../shared/queries";
 import { runDoctor, defaultDoctorDeps } from "./doctor";
 
