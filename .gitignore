@@ -1,7 +1,9 @@
 digests/
-.dispatch/
 ledger.db*
 *.ndjson
 node_modules/
-.dispatch/DONE-*
 .superpowers/
+# Orchestration scratch: a dispatch projection is owner-written and read-only,
+# and a done marker names a candidate SHA. Neither is repository history.
+.dispatch/
+.done/
