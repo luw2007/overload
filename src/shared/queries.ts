@@ -66,7 +66,9 @@ export function querySession(db: Database, stableId: string, eventLimit = 200): 
   // Heartbeats are liveness, not history: 900 of them would bury the one
   // tool_activity that says where the turn actually stopped.
   const events = db.query(`SELECT ingest_seq, at, emitter_id, writer_id, kind, detail FROM journal
-    WHERE stable_id=? AND kind<>'heartbeat' ORDER BY ingest_seq DESC LIMIT ?`).all(stableId, eventLimit) as Array<EventRow & JsonRow>;
+    WHERE kind<>'heartbeat' AND (stable_id=? OR
+      (kind IN ('turn_hung','dead_connection') AND json_extract(detail, '$.stable_id')=?))
+    ORDER BY ingest_seq DESC LIMIT ?`).all(stableId, stableId, eventLimit) as Array<EventRow & JsonRow>;
   return {
     session,
     incarnations,
