@@ -105,13 +105,13 @@ describe("web API", () => {
     const { base } = await runningServer(path);
     expect((await (await fetch(`${base}/api/q1`)).json())[0].binding).toBeNull();
   });
-  test("ack cancels a pending request and is idempotent", async () => {
+  test("ack moves a pending request to the acked terminal and is idempotent", async () => {
     const path = seedLedger();
     const { base } = await runningServer(path);
     const first = await fetch(`${base}/api/ack/req-1`, { method: "POST" });
     expect(await first.json()).toEqual({ acked: true });
     const db = new Database(path, { readonly: true });
-    expect(db.query("SELECT state FROM requests WHERE request_uid='req-1'").get()).toEqual({ state: "cancelled" });
+    expect(db.query("SELECT state FROM requests WHERE request_uid='req-1'").get()).toEqual({ state: "acked" });
     db.close();
     const second = await fetch(`${base}/api/ack/req-1`, { method: "POST" });
     expect(await second.json()).toEqual({ acked: false });
