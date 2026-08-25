@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ackRequest, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
-import { performJump, type JumpResult } from "./jump";
+import { performJump, type JumpResult } from "../shared/jump";
 
 const DEFAULT_WEB_PORT = 4870;
 /** The list is a launchpad for drill-down, not an inventory: 1000 rows serve nobody. */

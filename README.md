@@ -50,10 +50,18 @@ See [docs/integrations.md](docs/integrations.md) for adapter-specific behavior a
 bun src/cli/overload.ts sessions
 bun src/cli/overload.ts q1
 bun src/cli/overload.ts hung
+bun src/cli/overload.ts jump <stable_id|request_uid>
+bun src/cli/overload.ts ack <request_uid>...
 bun src/cli/overload.ts doctor
 ```
 
-Q1 **Ack** changes only Overload's local request state to `cancelled`. Pending decisions are shown in the loopback dashboard; it does not emit macOS notifications or approve, deny, answer, resume, or otherwise unblock the originating agent.
+The CLI covers the same decision path as the dashboard: list what needs a human,
+reach that terminal, and acknowledge. Rows go to stdout and headings to stderr,
+so `q1 2>/dev/null | cut -f1 | xargs ... ack` is the shell equivalent of the
+dashboard's multi-select 批量 Ack.
+
+Q1 **Ack** changes only Overload's local request state to `acked`. Pending decisions are shown in the loopback dashboard; it does not emit macOS notifications or approve, deny, answer, resume, or otherwise unblock the originating agent.
+
 ## Data and privacy
 
 Overload stores runtime state under `~/.overload/`, including a SQLite ledger and NDJSON spool. Depending on enabled adapters, this can contain local working directories, branch names, session summaries, request metadata, tool activity, commit SHAs, and terminal bindings.

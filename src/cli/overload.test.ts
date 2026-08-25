@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLASSIFIER_VERSION, queueAfter } from "../ingest/classifier";
 import { reduceJournal } from "../ingest/reducer";
-import { printQ4 } from "./overload";
+import { ackAll, jumpTo, printQ4 } from "./overload";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -52,15 +52,107 @@ describe("reducer Q4 projection", () => {
 });
 
 describe("overload q4", () => {
-  test("prints auto-verified read-only sessions", () => {
+  test("keeps rows on the data sink and the heading off it", () => {
     const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
     const db = new Database(join(root, "ledger.db"));
     db.run("CREATE TABLE current(stable_id TEXT, origin TEXT, last_event_at INTEGER, queue TEXT)");
     db.run("INSERT INTO current VALUES ('local:pi:read-only', 'agent', 1700000000000, 'q4')");
-    const lines: string[] = [];
-    printQ4(db, (line) => lines.push(line));
-    expect(lines.join("\n")).toContain("Q4 auto-verified read-only sessions:");
-    expect(lines.join("\n")).toContain("local:pi:read-only\tagent");
+    const rows: string[] = []; const headings: string[] = [];
+    printQ4(db, (line) => rows.push(line), (line) => headings.push(line));
+    // A heading on stdout becomes a bogus id the moment the list is piped into `ack`.
+    expect(rows).toEqual(["local:pi:read-only\tagent\t2023-11-14T22:13:20.000Z"]);
+    expect(headings).toEqual(["Q4 auto-verified read-only sessions:"]);
     db.close();
+  });
+});
+
+function ledgerWithRequest(root: string): Database {
+  const db = new Database(join(root, "ledger.db"));
+  db.run("CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, host TEXT, origin TEXT, runtime TEXT, created_at INTEGER, cwd TEXT, branch TEXT, first_seen_at INTEGER)");
+  db.run("CREATE TABLE requests(request_uid TEXT PRIMARY KEY, stable_id TEXT, kind TEXT, state TEXT, created_at INTEGER, resolved_at INTEGER, detail TEXT)");
+  db.run("CREATE TABLE session_hosts(stable_id TEXT PRIMARY KEY, app TEXT, session_id TEXT, tty TEXT)");
+  db.run("CREATE TABLE attachments(stable_id TEXT, platform TEXT, binding TEXT, valid INTEGER, observed_at INTEGER)");
+  db.run("INSERT INTO sessions VALUES ('local:pi:one', 'local', 'agent', 'pi', 1, '/tmp', NULL, 1)");
+  db.run("INSERT INTO session_hosts VALUES ('local:pi:one', 'cmux', 'surface-uuid', 'ttys001')");
+  db.run("INSERT INTO requests VALUES ('local:pi:one#e#r1', 'local:pi:one', 'decision', 'pending', 5, NULL, NULL)");
+  db.run("INSERT INTO requests VALUES ('local:pi:one#e#r2', 'local:pi:one', 'decision', 'pending', 6, NULL, NULL)");
+  db.run("INSERT INTO sessions VALUES ('local:pi:unbound', 'local', 'agent', 'pi', 1, '/tmp', NULL, 1)");
+  return db;
+}
+
+describe("overload ack", () => {
+  test("acks every uid it is given, matching the web bulk selection", () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
+    const db = ledgerWithRequest(root);
+    ackAll(db, ["local:pi:one#e#r1", "local:pi:one#e#r2"]);
+    expect(db.query("SELECT state FROM requests ORDER BY request_uid").all()).toEqual([{ state: "acked" }, { state: "acked" }]);
+    expect(process.exitCode ?? 0).toBe(0);
+    db.close();
+  });
+
+  test("a uid that matched nothing does not exit 0 and read as done", () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
+    const db = ledgerWithRequest(root);
+    try {
+      ackAll(db, ["local:pi:one#e#r1", "no-such-request"]);
+      expect(process.exitCode).toBe(1);
+      // The real uid still lands: a bad neighbour must not veto a valid ack.
+      expect(db.query("SELECT state FROM requests WHERE request_uid='local:pi:one#e#r1'").get()).toEqual({ state: "acked" });
+    } finally { process.exitCode = 0; db.close(); }
+  });
+});
+
+describe("overload jump", () => {
+  test("resolves a request uid to its session and jumps to the recorded binding", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
+    const db = ledgerWithRequest(root);
+    const seen: Array<Record<string, unknown>> = [];
+    await jumpTo(db, "local:pi:one#e#r1", async (target) => { seen.push(target as Record<string, unknown>); return { opened: true }; });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ source: "host", platform: "cmux", binding: "surface-uuid" });
+    expect(process.exitCode ?? 0).toBe(0);
+    db.close();
+  });
+
+  test("accepts a stable id directly because a hung turn has no request to jump from", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
+    const db = ledgerWithRequest(root);
+    let called = false;
+    await jumpTo(db, "local:pi:one", async () => { called = true; return { opened: true }; });
+    expect(called).toBe(true);
+    db.close();
+  });
+
+  test("a target that did not respond fails loudly instead of reporting success", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
+    const db = ledgerWithRequest(root);
+    try {
+      await jumpTo(db, "local:pi:one", async () => ({ opened: false, error: "target terminal not found (may have closed)" }));
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = 0; db.close(); }
+  });
+
+  test("an unknown id never reaches the jump executor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
+    const db = ledgerWithRequest(root);
+    let called = false;
+    try {
+      await jumpTo(db, "local:pi:missing", async () => { called = true; return { opened: true }; });
+      expect(called).toBe(false);
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = 0; db.close(); }
+  });
+
+  test("a session with no recorded binding is nothing-to-try, not a failed attempt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
+    const db = ledgerWithRequest(root);
+    let called = false;
+    try {
+      // performJump would also return opened:false here, but "never observed a terminal"
+      // and "the terminal did not answer" are different facts and must not share a message.
+      await jumpTo(db, "local:pi:unbound", async () => { called = true; return { opened: false }; });
+      expect(called).toBe(false);
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = 0; db.close(); }
   });
 });

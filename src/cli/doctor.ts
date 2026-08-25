@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { STALL_PROFILE_MS } from "../shared/types";
-import { defaultExecutor, type Executor } from "../web/jump";
+import { defaultExecutor, type Executor } from "../shared/jump";
 
 export type Status = "OK" | "WARN" | "FAIL";
 export type CheckResult = { status: Status; label: string; detail: string };

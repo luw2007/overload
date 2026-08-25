@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Executor } from "../web/jump";
+import type { Executor } from "../shared/jump";
 import { runDoctor, type DoctorDeps, type StatInfo } from "./doctor";
 
 const roots: string[] = [];

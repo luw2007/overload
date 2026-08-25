@@ -48,6 +48,20 @@ bun src/cli/overload.ts hung
 bun src/cli/overload.ts doctor
 ```
 
+Every list command writes rows to stdout and headings to stderr, so a selection
+can be filtered and piped straight back into `ack`, which takes any number of
+request uids and exits non-zero if one of them matched nothing:
+
+```sh
+bun src/cli/overload.ts q1 2>/dev/null | cut -f1 | xargs bun src/cli/overload.ts ack
+```
+
+`jump <stable_id|request_uid>` focuses the recorded terminal from the shell, the
+same action the dashboard's 打开 button performs. It accepts either id because a
+pending decision is addressed as a request while a hung turn has no request to
+jump from. A session with no recorded binding reports that nothing was ever
+observed rather than a failed attempt.
+
 The watchdog relies on `~/.overload/ingest.heartbeat`. Service stdout and stderr are in `/tmp/overload-*.{log,err}`. An unavailable remote source or integration becomes a visible incident; do not delete ledger rows to clear it.
 
 Recon checks process liveness directly for sessions owned by its own host and
