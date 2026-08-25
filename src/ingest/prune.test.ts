@@ -71,13 +71,19 @@ describe("pruneSpool", () => {
     expect(existsSync(join(f.spool, "local", "omp-999999-cccc"))).toBe(false);
   });
 
-  test("never touches a pulled host tree, because rsync would refetch it", async () => {
+  test("reconciles missing cursors only for the local host tree", async () => {
     const f = await fixture();
     const remote = await segment(f.spool, "devbox", "pi-2-dddd", "seg-pi-2-dddd-0.ndjson", "{}\n", 30 * DAY);
     markConsumed(f.db, f.spool, "devbox/pi-2-dddd/seg-pi-2-dddd-0.ndjson", remote);
+    f.db.run("INSERT INTO cursors VALUES (?, ?)", ["local/pi-1-aaaa/active-pi-1-aaaa-0.ndjson", 10]);
+    f.db.run("INSERT INTO cursors VALUES (?, ?)", ["devbox/pi-2-dddd/missing.ndjson", 10]);
 
     const summary = await pruneSpool(f.db, f.spool, { host: "local", retentionMs: DAY });
     expect(summary.files).toBe(0);
     expect(existsSync(remote)).toBe(true);
+    expect(f.db.query("SELECT file_name FROM cursors ORDER BY file_name").all()).toEqual([
+      { file_name: "devbox/pi-2-dddd/missing.ndjson" },
+      { file_name: "devbox/pi-2-dddd/seg-pi-2-dddd-0.ndjson" },
+    ]);
   });
 });

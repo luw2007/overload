@@ -95,17 +95,21 @@ export function initializeLedger(db: Database): void {
   const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
   db.exec(requireText(schemaPath));
   migrateProgressColumn(db);
-  dropNotificationOutbox(db);
+  dropRetiredColumns(db);
   db.query("INSERT OR IGNORE INTO reducer_cursor(id, journal_seq) VALUES (1, 0)").run();
 }
 
-/** The outbox had no delivery daemon and no reader; its rows and the reminder
- *  clock that fed it are unreachable state, so they leave with it. */
-function dropNotificationOutbox(db: Database): void {
+/** Retire unreachable notification and incident-projection state while
+ *  preserving migrations for ledgers created by earlier releases. */
+function dropRetiredColumns(db: Database): void {
   db.exec("DROP TABLE IF EXISTS notifications");
-  const columns = db.query("PRAGMA table_info(requests)").all() as Array<{ name: string }>;
-  if (columns.some((column) => column.name === "next_reminder_at")) {
+  const requestColumns = db.query("PRAGMA table_info(requests)").all() as Array<{ name: string }>;
+  if (requestColumns.some((column) => column.name === "next_reminder_at")) {
     db.exec("ALTER TABLE requests DROP COLUMN next_reminder_at");
+  }
+  const currentColumns = db.query("PRAGMA table_info(current)").all() as Array<{ name: string }>;
+  if (currentColumns.some((column) => column.name === "frozen")) {
+    db.exec("ALTER TABLE current DROP COLUMN frozen");
   }
 }
 

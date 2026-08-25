@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { lstat, readdir, rmdir, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 
 const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
@@ -21,10 +22,15 @@ export async function pruneSpool(db: Database, spoolRoot: string,
   let emitters;
   try { emitters = await readdir(hostPath, { withFileTypes: true }); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return summary;
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    emitters = [];
   }
 
+  const localPattern = `${options.host.replaceAll("_", "\\_")}/%`;
+  const localCursors = db.query("SELECT file_name FROM cursors WHERE file_name LIKE ? ESCAPE '\\'").all(localPattern) as Array<{ file_name: string }>;
+  const missingKeys = localCursors
+    .map((cursor) => cursor.file_name)
+    .filter((key) => !existsSync(join(resolve(spoolRoot), ...key.split("/"))));
   const consumedCursor = db.query("SELECT bytes FROM cursors WHERE file_name=?");
   const dropCursor = db.query("DELETE FROM cursors WHERE file_name=?");
   for (const emitter of emitters) {
@@ -55,6 +61,9 @@ export async function pruneSpool(db: Database, spoolRoot: string,
     if (remaining === 0) {
       try { await rmdir(emitterPath); summary.directories++; } catch { /* raced or not empty */ }
     }
+  }
+  if (missingKeys.length) {
+    db.transaction(() => { for (const key of missingKeys) dropCursor.run(key); }).immediate();
   }
   return summary;
 }

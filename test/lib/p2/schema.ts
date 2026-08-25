@@ -20,7 +20,7 @@ export const P2_DDL_SQL = `
 CREATE TABLE IF NOT EXISTS current(
   stable_id TEXT PRIMARY KEY, writer_id TEXT, state TEXT NOT NULL,
   queue TEXT, q5_reason TEXT, origin TEXT NOT NULL DEFAULT 'unknown',
-  last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER, frozen INTEGER DEFAULT 0);
+  last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER);
 CREATE TABLE IF NOT EXISTS queue_transitions(
   id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL, queue TEXT NOT NULL,
   direction TEXT NOT NULL CHECK(direction IN('entered','left')), at INTEGER NOT NULL,
@@ -56,7 +56,7 @@ export function openLedgerP2(path: string): Database {
 export const FROZEN_P2_TABLES: Record<string, string[]> = {
   current: [
     "stable_id", "writer_id", "state", "queue", "q5_reason", "origin",
-    "last_ingest_seq", "last_event_at", "last_heartbeat_at", "frozen",
+    "last_ingest_seq", "last_event_at", "last_heartbeat_at",
   ],
   queue_transitions: [
     "id", "subject", "queue", "direction", "at", "source_seq", "classifier_version",

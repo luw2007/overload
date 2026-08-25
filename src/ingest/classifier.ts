@@ -2,8 +2,9 @@ import { appendFileSync, chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-/** Unchanged at 2: turn_hung/dead_connection are new event kinds, so every
- *  input that could exist under v2 still classifies identically. */
+/** Version 2 remains active: decision_resolved was already a journal event in
+ *  this version; the fix closes its incomplete projection rather than adding a
+ *  new source-event interpretation or replay epoch. */
 export const CLASSIFIER_VERSION = 2;
 
 export type ClassifiableCurrent = {
@@ -47,6 +48,7 @@ function desiredQueue(current: ClassifiableCurrent, event: ClassifierEvent): { q
     case "working": state = "working"; reason = null; break;
     case "settled": state = "idle"; reason = null; break;
     case "decision_requested": state = "awaiting_human"; break;
+    case "decision_resolved": state = "idle"; reason = null; break;
     case "session_ended": state = "done"; reason = null; break;
     case "session_vanished": state = "vanished"; reason = null; break;
     case "emitter_stalled": reason = "stalled"; break;

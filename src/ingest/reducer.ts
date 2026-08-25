@@ -8,7 +8,7 @@ const RECON_EVENTS = new Set(["emitter_dead", "emitter_drained", "emitter_stalle
 
 type JournalRow = { ingest_seq: number; at: number; stable_id: string; writer_id: string; emitter_id: string; kind: string; detail: string | null };
 type RequestRow = { state: string };
-type CurrentRow = ClassifiableCurrent & { writer_id: string | null; last_ingest_seq: number | null; last_event_at: number | null; last_heartbeat_at: number | null; last_progress_at: number | null; frozen: number };
+type CurrentRow = ClassifiableCurrent & { writer_id: string | null; last_ingest_seq: number | null; last_event_at: number | null; last_heartbeat_at: number | null; last_progress_at: number | null };
 
 function objectDetail(value: string | null): Record<string, unknown> {
   if (!value) return {};
@@ -89,14 +89,8 @@ function applyIncident(db: Database, row: JournalRow, detail: Record<string, unk
   if (!source) return;
   if (row.kind === "source_outage") {
     if (!isIncidentOpen(db, source)) db.query("INSERT OR IGNORE INTO incidents(source, opened_at, detail) VALUES (?, ?, ?)").run(source, row.at, row.detail);
-    // Freeze scope = attachment-bound sessions only (review P2 M1: a LIKE on
-    // ":<source>:" wrongly swept every cmux-runtime session on a cmux outage).
-    db.query(`UPDATE current SET frozen=1 WHERE stable_id IN
-      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(source);
   } else {
     db.query("UPDATE incidents SET closed_at=? WHERE source=? AND closed_at IS NULL").run(row.at, source);
-    db.query(`UPDATE current SET frozen=0 WHERE stable_id IN
-      (SELECT stable_id FROM attachments WHERE platform=? AND valid=1)`).run(source);
   }
 }
 
@@ -127,13 +121,10 @@ function applyAttachment(db: Database, row: JournalRow, detail: Record<string, u
     db.query("UPDATE sessions SET origin=CASE WHEN origin='unknown' AND ?='orca' THEN 'agent' ELSE origin END WHERE stable_id=?").run(platform, stableId);
     db.query("UPDATE current SET origin=CASE WHEN origin='unknown' AND ?='orca' THEN 'agent' ELSE origin END WHERE stable_id=?").run(platform, stableId);
   }
-  // Review P2 M2: a session bound while its platform's incident is open must
-  // enter the freeze immediately, not wait for the next outage event.
-  if (isIncidentOpen(db, platform)) db.query("UPDATE current SET frozen=1 WHERE stable_id=?").run(stableId);
 }
 
 function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
-  const relevant = new Set(["session_started", "working", "settled", "decision_requested", "session_ended", "session_vanished", "emitter_dead", "emitter_drained", "emitter_stalled", "turn_hung", "dead_connection", "telemetry_gap", "heartbeat", "tool_activity"]);
+  const relevant = new Set(["session_started", "working", "settled", "decision_requested", "decision_resolved", "session_ended", "session_vanished", "emitter_dead", "emitter_drained", "emitter_stalled", "turn_hung", "dead_connection", "telemetry_gap", "heartbeat", "tool_activity"]);
   if (!relevant.has(row.kind)) return;
   // A platform process without an attributable session is health evidence only;
   // never create a synthetic overload-admin current row for it.
@@ -158,6 +149,7 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   if (row.kind === "working") state = "working";
   else if (row.kind === "settled") state = "idle";
   else if (row.kind === "decision_requested") state = "awaiting_human";
+  else if (row.kind === "decision_resolved") state = "idle";
   else if (row.kind === "session_ended") state = "done";
   else if (row.kind === "session_vanished") state = "vanished";
 
@@ -180,7 +172,7 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
 
 function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
   if (row.kind === "emitter_drained") { orphanDrainedEmitter(db, row, detail); return; }
-  if (row.kind === "session_ended") {
+  if (row.kind === "session_ended" || (row.kind === "settled" && platformFor(row.stable_id) === "cmux")) {
     db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE stable_id=? AND writer_id=? AND state='pending'").run(row.at, row.stable_id, row.writer_id);
     return;
   }

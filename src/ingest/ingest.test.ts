@@ -31,6 +31,34 @@ function event(seq: number, kind: string, detail: Record<string, unknown> = {}) 
   };
 }
 
+describe("ledger schema migrations", () => {
+  test("fresh schema does not recreate the retired request reminder column", async () => {
+    const schema = await readFile(new URL("./schema.sql", import.meta.url), "utf8");
+    expect(schema).not.toContain("next_reminder_at");
+
+    const db = new Database(":memory:");
+    initializeLedger(db);
+    const columns = db.query("PRAGMA table_info(requests)").all() as Array<{ name: string }>;
+    expect(columns.some((column) => column.name === "next_reminder_at")).toBe(false);
+    db.close();
+  });
+
+  test("drops the retired current frozen column from existing ledgers", () => {
+    const db = new Database(":memory:");
+    db.exec(`CREATE TABLE current(
+      stable_id TEXT PRIMARY KEY, writer_id TEXT, state TEXT NOT NULL,
+      queue TEXT, q5_reason TEXT, origin TEXT NOT NULL DEFAULT 'unknown',
+      last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER,
+      last_progress_at INTEGER, frozen INTEGER DEFAULT 0)`);
+
+    initializeLedger(db);
+
+    const columns = db.query("PRAGMA table_info(current)").all() as Array<{ name: string }>;
+    expect(columns.some((column) => column.name === "frozen")).toBe(false);
+    db.close();
+  });
+});
+
 describe("atomic spool ingestion", () => {
   test("consumes only newline-terminated valid envelopes and resumes by byte cursor", async () => {
     const { spool, emitterDir, db } = await fixture();
@@ -211,7 +239,7 @@ describe("P2 reducer and classifier", () => {
     db.close();
   });
 
-  test("freezes runtime and attachment-bound sessions during incidents", async () => {
+  test("gates recon findings while their source incident is open", async () => {
     const { spool, emitterDir, db } = await fixture();
     const batch = [
       event(1, "session_started"),
@@ -224,7 +252,7 @@ describe("P2 reducer and classifier", () => {
     ].map(JSON.stringify).join("\n") + "\n";
     await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
     await scanOnce(db, spool);
-    expect(db.query("SELECT state, frozen FROM current").get()).toEqual({ state: "vanished", frozen: 0 });
+    expect(db.query("SELECT state FROM current").get()).toEqual({ state: "vanished" });
     expect(db.query("SELECT source, closed_at FROM incidents").get()).toEqual({ source: "herdr", closed_at: event(6, "x").at });
     db.close();
   });
@@ -246,6 +274,40 @@ describe("P2 reducer and classifier", () => {
 });
 
 describe("request reducer", () => {
+  test("cmux settle orphans only cmux pending requests", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const cmuxAsk = { ...event(1, "decision_requested", { request_id: "cmux-ask" }), runtime: "cmux" };
+    const cmuxSettle = { ...event(2, "settled"), runtime: "cmux" };
+    const piAsk = event(3, "decision_requested", { request_id: "pi-ask" });
+    const piSettle = event(4, "settled");
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"),
+      [cmuxAsk, cmuxSettle, piAsk, piSettle].map(JSON.stringify).join("\n") + "\n");
+
+    await scanOnce(db, spool);
+
+    expect(db.query("SELECT request_id, state FROM requests ORDER BY request_id").all()).toEqual([
+      { request_id: "cmux-ask", state: "orphaned" },
+      { request_id: "pi-ask", state: "pending" },
+    ]);
+    db.close();
+  });
+
+  test("decision resolution returns an awaiting session to idle without losing request terminal state", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const batch = [
+      event(1, "session_started"),
+      event(2, "decision_requested", { request_id: "ask-1" }),
+      event(3, "decision_resolved", { request_id: "ask-1", state: "resolved" }),
+    ].map(JSON.stringify).join("\n") + "\n";
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
+
+    await scanOnce(db, spool);
+
+    expect(db.query("SELECT state, queue FROM current").get()).toEqual({ state: "idle", queue: "q3" });
+    expect(db.query("SELECT state FROM requests WHERE request_id='ask-1'").get()).toEqual({ state: "resolved" });
+    db.close();
+  });
+
   test("handles pending, terminal-first, idempotency, and source override of orphaned", async () => {
     const { spool, emitterDir, db } = await fixture();
     const firstBatch = [
