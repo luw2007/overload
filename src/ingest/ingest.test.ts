@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { initializeLedger, readCompleteLines, scanOnce } from "./ingest";
 import { reduceJournal } from "./reducer";
 import { CLASSIFIER_VERSION, classify, queueAfter } from "./classifier";
+import { ackRequest } from "../shared/queries";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -305,6 +306,24 @@ describe("request reducer", () => {
 
     expect(db.query("SELECT state, queue FROM current").get()).toEqual({ state: "idle", queue: "q3" });
     expect(db.query("SELECT state FROM requests WHERE request_id='ask-1'").get()).toEqual({ state: "resolved" });
+    db.close();
+  });
+
+  test("source resolution overrides a local acked terminal", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"),
+      `${JSON.stringify(event(1, "decision_requested", { request_id: "acked-then-resolved" }))}\n`);
+    await scanOnce(db, spool);
+    const request = db.query("SELECT request_uid FROM requests WHERE request_id='acked-then-resolved'").get() as { request_uid: string };
+
+    expect(ackRequest(db, request.request_uid).changes).toBe(1);
+    expect(db.query("SELECT state FROM requests WHERE request_uid=?").get(request.request_uid)).toEqual({ state: "acked" });
+
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-1.ndjson"),
+      `${JSON.stringify(event(2, "decision_resolved", { request_id: "acked-then-resolved", state: "resolved", answer: "yes" }))}\n`);
+    await scanOnce(db, spool);
+
+    expect(db.query("SELECT state FROM requests WHERE request_uid=?").get(request.request_uid)).toEqual({ state: "resolved" });
     db.close();
   });
 

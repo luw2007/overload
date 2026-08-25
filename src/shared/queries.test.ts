@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { queryHealth, queryHung, querySession } from "./queries";
+import { ackRequest, queryHealth, queryHung, querySession } from "./queries";
 
 const NOW = 1_755_000_000_000;
 const HOUR = 3_600_000;
@@ -12,10 +12,23 @@ function sessionFixture(): Database {
   db.run("CREATE TABLE session_hosts(stable_id TEXT, session_id TEXT)");
   db.run("CREATE TABLE attachments(stable_id TEXT, binding TEXT, observed_at INTEGER, valid INTEGER)");
   db.run("CREATE TABLE session_incarnations(stable_id TEXT, writer_id TEXT, liveness_domain TEXT, pid INTEGER, proc_boot_id TEXT, started_at INTEGER, last_seen_at INTEGER)");
-  db.run("CREATE TABLE requests(stable_id TEXT, request_uid TEXT, kind TEXT, created_at INTEGER, detail TEXT, state TEXT)");
+  db.run("CREATE TABLE requests(stable_id TEXT, request_uid TEXT, kind TEXT, created_at INTEGER, resolved_at INTEGER, detail TEXT, state TEXT)");
   db.run("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, stable_id TEXT, at INTEGER, emitter_id TEXT, writer_id TEXT, kind TEXT, detail TEXT)");
   return db;
 }
+
+describe("ackRequest", () => {
+  test("uses a distinct acked terminal without rewriting source cancellation", () => {
+    const db = sessionFixture();
+    db.run("INSERT INTO requests(request_uid, state) VALUES ('local-ack', 'pending'), ('source-cancel', 'cancelled')");
+
+    expect(ackRequest(db, "local-ack").changes).toBe(1);
+    expect(db.query("SELECT request_uid, state FROM requests ORDER BY request_uid").all()).toEqual([
+      { request_uid: "local-ack", state: "acked" },
+      { request_uid: "source-cancel", state: "cancelled" },
+    ]);
+  });
+});
 
 describe("querySession", () => {
   test("merges addressed events with recon findings that point at the session", () => {

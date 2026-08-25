@@ -192,7 +192,7 @@ function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string,
   if (!existing) {
     db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, resolved_at, detail)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(uid, row.stable_id, row.writer_id, row.emitter_id, id, kind, state, row.at, row.at, row.detail);
-  } else if (existing.state === "pending" || existing.state === "orphaned") {
+  } else if (existing.state === "pending" || existing.state === "orphaned" || existing.state === "acked") {
     db.query("UPDATE requests SET state=?, resolved_at=?, detail=? WHERE request_uid=?").run(state, row.at, row.detail, uid);
   }
 }

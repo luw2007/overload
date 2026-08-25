@@ -91,7 +91,7 @@ export const SEGMENT_MAX_BYTES = 1_048_576;
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const WRITE_QUEUE_LIMIT = 1000;
 
-export type RequestState = "pending" | "resolved" | "cancelled" | "timed_out" | "orphaned";
+export type RequestState = "pending" | "resolved" | "cancelled" | "timed_out" | "orphaned" | "acked";
 
 /** request_uid = `${stable_id}#${writer_id}#${request_id}` */
 export type RequestUid = string;

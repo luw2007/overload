@@ -161,7 +161,9 @@ export function queryHealth(db: Database): HealthView {
 }
 
 export function ackRequest(db: Database, requestUid: string): { changes: number } {
-  const result = db.query("UPDATE requests SET state='cancelled', resolved_at=? WHERE request_uid=? AND state='pending'").run(Date.now(), requestUid);
+  // Historical cancelled rows are intentionally left unchanged: their local-vs-source
+  // origin cannot be recovered reliably, so only future local acknowledgements use acked.
+  const result = db.query("UPDATE requests SET state='acked', resolved_at=? WHERE request_uid=? AND state='pending'").run(Date.now(), requestUid);
   return { changes: Number(result.changes) };
 }
 
