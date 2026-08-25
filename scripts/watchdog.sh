@@ -55,7 +55,5 @@ elif [ "$heartbeat_mtime" -eq 0 ]; then
 else
   message="Overload ingest heartbeat is stale (${age}s)"
 fi
-osascript -e 'on run argv
-  display notification (item 1 of argv) with title "Overload watchdog"
-end run' "$message" >/dev/null 2>&1 || :
+printf '%s\n' "overload watchdog: $message" >&2
 exit 1

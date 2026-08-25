@@ -14,9 +14,10 @@ never rewritten; dispatch templates own env injection there.
 
 ## Claude Code
 
-Use `scripts/install-claude-hooks.sh`. It merges only marker-owned Overload hook entries into `~/.claude/settings.json`, keeps a `.bak` before the first change, and removes only those entries with `--uninstall`.
-
-Claude hook events may record pending permission requests, but the hook has no durable response channel. A local Q1 acknowledgement does not decide the Claude permission prompt.
+Claude Code sessions are observed only through cmux's workstream file. The
+dedicated Claude Code hook was removed: it could record a permission request
+but had no durable response channel, so a local Q1 acknowledgement never
+decided the prompt.
 
 On session start the hook records parent lineage when available: a subagent
 transcript path (`…/<parent-session>/subagents/agent-*.jsonl`) yields the

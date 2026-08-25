@@ -1,21 +1,25 @@
 import type { Database } from "bun:sqlite";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 
-export type SessionSummary = { stable_id: string; runtime: string | null; origin: string | null; created_at: number | null };
+export type SessionSummary = { stable_id: string; runtime: string | null; origin: string | null; created_at: number | null; state: string | null; queue: string | null; q5_reason: string | null; last_event_at: number | null };
 export type IncarnationRow = { writer_id: string; liveness_domain: string; pid: number | null; proc_boot_id: string | null; started_at: number | null; last_seen_at: number | null };
 export type PendingRequestRow = { request_uid: string; kind: string; created_at: number; detail: Record<string, unknown> | null };
 export type EventRow = { ingest_seq: number; at: number; emitter_id: string; writer_id: string; kind: string; detail: Record<string, unknown> | null };
 export type SessionDetail = {
-  session: { stable_id: string; origin: string | null; runtime: string | null; created_at: number | null; cwd: string | null; branch: string | null };
+  session: {
+    stable_id: string; origin: string | null; runtime: string | null; created_at: number | null;
+    cwd: string | null; branch: string | null; state: string | null; queue: string | null; q5_reason: string | null;
+    last_event_at: number | null; last_heartbeat_at: number | null; last_progress_at: number | null;
+    binding: string | null;
+  };
   incarnations: IncarnationRow[];
   pending_requests: PendingRequestRow[];
+  /** Newest first and heartbeat-free: the question is what the turn last did. */
   events: EventRow[];
 };
-export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; failed: boolean; binding: string | null; platform: string | null };
+export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null };
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null };
 export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
+export type HungRow = { stable_id: string; q5_reason: string; state: string; host: string | null; since: number | null; hung_ms: number; binding: string | null; detail: Record<string, unknown> | null };
 export type ZombieView = {
   groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number }> }>;
   orphaned_requests: Array<{ request_uid: string; stable_id: string; resolved_at: number | null }>;
@@ -42,16 +46,27 @@ function withParsedDetail<T extends JsonRow>(row: T): Omit<T, "detail"> & { deta
   return { ...row, detail: parseDetail(row.detail) };
 }
 
-export function querySessions(db: Database): SessionSummary[] {
-  return db.query(`SELECT stable_id, runtime, origin, created_at FROM sessions ORDER BY first_seen_at, stable_id`).all() as SessionSummary[];
+export function querySessions(db: Database, limit = -1): SessionSummary[] {
+  return db.query(`SELECT s.stable_id, s.runtime, s.origin, s.created_at,
+    c.state, c.queue, c.q5_reason, COALESCE(c.last_event_at, s.first_seen_at) last_event_at
+    FROM sessions s LEFT JOIN current c ON c.stable_id=s.stable_id
+    ORDER BY last_event_at DESC, s.stable_id LIMIT ?`).all(limit) as SessionSummary[];
 }
 
-export function querySession(db: Database, stableId: string): SessionDetail | null {
-  const session = db.query("SELECT stable_id, origin, runtime, created_at, cwd, branch FROM sessions WHERE stable_id=?").get(stableId) as SessionDetail["session"] | null;
+export function querySession(db: Database, stableId: string, eventLimit = 200): SessionDetail | null {
+  const session = db.query(`SELECT s.stable_id, s.origin, s.runtime, s.created_at, s.cwd, s.branch,
+    c.state, c.queue, c.q5_reason, c.last_event_at, c.last_heartbeat_at, c.last_progress_at,
+    COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=s.stable_id AND h.session_id IS NOT NULL),
+      (SELECT binding FROM attachments a WHERE a.stable_id=s.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding
+    FROM sessions s LEFT JOIN current c ON c.stable_id=s.stable_id
+    WHERE s.stable_id=?`).get(stableId) as SessionDetail["session"] | null;
   if (!session) return null;
   const incarnations = db.query(`SELECT writer_id, liveness_domain, pid, proc_boot_id, started_at, last_seen_at FROM session_incarnations WHERE stable_id=? ORDER BY started_at, writer_id`).all(stableId) as IncarnationRow[];
   const pending = db.query(`SELECT request_uid, kind, created_at, detail FROM requests WHERE stable_id=? AND state='pending' ORDER BY created_at, request_uid`).all(stableId) as Array<PendingRequestRow & JsonRow>;
-  const events = db.query(`SELECT ingest_seq, at, emitter_id, writer_id, kind, detail FROM journal WHERE stable_id=? ORDER BY ingest_seq`).all(stableId) as Array<EventRow & JsonRow>;
+  // Heartbeats are liveness, not history: 900 of them would bury the one
+  // tool_activity that says where the turn actually stopped.
+  const events = db.query(`SELECT ingest_seq, at, emitter_id, writer_id, kind, detail FROM journal
+    WHERE stable_id=? AND kind<>'heartbeat' ORDER BY ingest_seq DESC LIMIT ?`).all(stableId, eventLimit) as Array<EventRow & JsonRow>;
   return {
     session,
     incarnations,
@@ -62,27 +77,46 @@ export function querySession(db: Database, stableId: string): SessionDetail | nu
 
 export function queryQ1(db: Database): Q1Row[] {
   const rows = db.query(`SELECT r.request_uid, r.stable_id, s.host, r.kind, r.created_at, r.detail,
-    EXISTS(SELECT 1 FROM notifications n WHERE n.request_uid=r.request_uid AND n.state='failed_permanent') failed,
     COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL),
       (SELECT binding FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding,
     COALESCE((SELECT lower(app) FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL),
       (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) platform
     FROM requests r LEFT JOIN sessions s ON s.stable_id=r.stable_id
-    WHERE r.state='pending' ORDER BY failed DESC, r.created_at, r.request_uid`).all() as Array<Omit<Q1Row, "detail" | "failed"> & JsonRow & { failed: number }>;
-  return rows.map((row) => ({ ...withParsedDetail(row), failed: !!row.failed }));
+    WHERE r.state='pending' ORDER BY r.created_at, r.request_uid`).all() as Array<Omit<Q1Row, "detail"> & JsonRow>;
+  return rows.map(withParsedDetail);
 }
 
-export function queryJumpTarget(db: Database, requestUid: string): JumpTarget | null {
+/** Keyed by session, not request: a hung turn has no pending request to jump from. */
+export function queryJumpTarget(db: Database, stableId: string): JumpTarget | null {
   return db.query(`SELECT s.host,
     CASE WHEN h.stable_id IS NOT NULL THEN 'host' ELSE 'attachment' END source,
     COALESCE(lower(h.app), a.platform) platform,
     COALESCE(h.session_id, h.tty, a.binding) binding,
     h.tty
-    FROM requests r JOIN sessions s ON s.stable_id=r.stable_id
-    LEFT JOIN session_hosts h ON h.stable_id=r.stable_id AND h.session_id IS NOT NULL
-    LEFT JOIN attachments a ON a.stable_id=r.stable_id AND a.valid=1
-      AND a.observed_at=(SELECT MAX(observed_at) FROM attachments WHERE stable_id=r.stable_id AND valid=1)
-    WHERE r.request_uid=?`).get(requestUid) as JumpTarget | null;
+    FROM sessions s
+    LEFT JOIN session_hosts h ON h.stable_id=s.stable_id AND h.session_id IS NOT NULL
+    LEFT JOIN attachments a ON a.stable_id=s.stable_id AND a.valid=1
+      AND a.observed_at=(SELECT MAX(observed_at) FROM attachments WHERE stable_id=s.stable_id AND valid=1)
+    WHERE s.stable_id=?`).get(stableId) as JumpTarget | null;
+}
+
+export function requestSession(db: Database, requestUid: string): string | null {
+  const row = db.query("SELECT stable_id FROM requests WHERE request_uid=?").get(requestUid) as { stable_id: string } | null;
+  return row?.stable_id ?? null;
+}
+
+/** Q5 sessions whose turn is provably stuck: heartbeat alive, progress frozen. */
+export function queryHung(db: Database, now = Date.now()): HungRow[] {
+  const rows = db.query(`SELECT c.stable_id, c.q5_reason, c.state, s.host,
+    COALESCE(c.last_progress_at, c.last_event_at) since,
+    (SELECT j.detail FROM journal j WHERE j.kind=c.q5_reason
+       AND json_extract(j.detail, '$.stable_id')=c.stable_id ORDER BY j.ingest_seq DESC LIMIT 1) detail,
+    COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=c.stable_id AND h.session_id IS NOT NULL),
+      (SELECT binding FROM attachments a WHERE a.stable_id=c.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding
+    FROM current c LEFT JOIN sessions s ON s.stable_id=c.stable_id
+    WHERE c.q5_reason IN ('turn_hung','dead_connection')
+    ORDER BY since, c.stable_id`).all() as Array<Omit<HungRow, "detail" | "hung_ms"> & JsonRow>;
+  return rows.map((row) => ({ ...withParsedDetail(row), hung_ms: row.since ? Math.max(0, now - row.since) : 0 }));
 }
 
 export function queryQ2(db: Database): Q2Row[] {
@@ -93,7 +127,8 @@ export function queryZombie(db: Database): ZombieView {
   const rows = db.query("SELECT stable_id, q5_reason, last_event_at FROM current WHERE queue='q5' ORDER BY q5_reason, last_event_at, stable_id").all() as Array<{ stable_id: string; q5_reason: string; last_event_at: number }>;
   const groups: ZombieView["groups"] = [];
   for (const row of rows) {
-    if (row.q5_reason === "orphaned_request") continue;
+    // Hung turns have their own surface; counting them twice inflates Zombie.
+    if (row.q5_reason === "orphaned_request" || row.q5_reason === "turn_hung" || row.q5_reason === "dead_connection") continue;
     let group = groups.at(-1);
     if (!group || group.q5_reason !== row.q5_reason) {
       group = { q5_reason: row.q5_reason, rows: [] };
@@ -107,9 +142,13 @@ export function queryZombie(db: Database): ZombieView {
 
 export function queryHealth(db: Database): HealthView {
   const incidents = db.query("SELECT source, opened_at, detail FROM incidents WHERE closed_at IS NULL ORDER BY opened_at").all() as Array<HealthView["open_incidents"][number] & JsonRow>;
-  const coverage_gaps = (db.query("SELECT count(*) n FROM coverage_gaps").get() as { n: number }).n;
-  const telemetry_gaps = (db.query("SELECT count(*) n FROM journal WHERE kind='telemetry_gap'").get() as { n: number }).n;
-  return { open_incidents: incidents.map(withParsedDetail), coverage_gaps, telemetry_gaps };
+  // Distinct subjects, not event rows: recon re-reports the same gap hourly, so
+  // a raw count says how long a problem has existed, never how many there are.
+  // bun:sqlite returns untyped rows; these aggregates are shaped by their SQL.
+  const coverage = db.query("SELECT count(DISTINCT COALESCE(stable_id, emitter_id)) n FROM coverage_gaps").get() as { n: number };
+  const telemetry = db.query(`SELECT count(DISTINCT json_extract(detail, '$.native_id')) n
+    FROM journal WHERE kind='telemetry_gap'`).get() as { n: number };
+  return { open_incidents: incidents.map(withParsedDetail), coverage_gaps: coverage.n, telemetry_gaps: telemetry.n };
 }
 
 export function ackRequest(db: Database, requestUid: string): { changes: number } {
@@ -117,57 +156,3 @@ export function ackRequest(db: Database, requestUid: string): { changes: number 
   return { changes: Number(result.changes) };
 }
 
-export type AttentionView = {
-  /** Distinct interruption episodes in the trailing 24h: initial notifications delivered to the
-   *  human, with bursts inside EPISODE_GAP_MS collapsed into one. Reminders re-nag an
-   *  already-pending request the human has not engaged yet — no fresh context is destroyed —
-   *  so they never count as new interruptions. */
-  interruptions_24h: number;
-  /** interruptions_24h x refocus cost (Gloria Mark: ~20min to regain focus after an interruption). */
-  refocus_cost_min: number;
-  pending_decisions: number;
-  pending_decision_avg_wait_ms: number | null;
-  /** Distinct sessions currently demanding human attention (pending asks + q2/q5). */
-  open_contexts: number;
-};
-
-export const DEFAULT_REFOCUS_COST_MIN = 20;
-/** Notifications sent within this gap collapse into one interruption episode. */
-export const EPISODE_GAP_MS = 300_000;
-const DAY_MS = 86_400_000;
-
-export function queryAttention(db: Database, now = Date.now(), refocusCostMin = DEFAULT_REFOCUS_COST_MIN): AttentionView {
-  // bun:sqlite rows are untyped; named-const casts document the aggregate shapes.
-  const interruptions = db.query(`WITH sent AS (
-      SELECT sent_at FROM notifications WHERE state='sent' AND kind='initial' AND sent_at >= ?),
-    gaps AS (SELECT sent_at - LAG(sent_at) OVER (ORDER BY sent_at) gap FROM sent)
-    SELECT count(*) n FROM gaps WHERE gap IS NULL OR gap > ?`).get(now - DAY_MS, EPISODE_GAP_MS) as { n: number };
-  const pending = db.query("SELECT count(*) n, avg(? - created_at) w FROM requests WHERE state='pending'").get(now) as { n: number; w: number | null };
-  const contexts = db.query(`SELECT count(*) n FROM (
-    SELECT stable_id FROM requests WHERE state='pending'
-    UNION SELECT stable_id FROM current WHERE queue IN ('q2','q5'))`).get() as { n: number };
-  return {
-    interruptions_24h: interruptions.n,
-    refocus_cost_min: interruptions.n * refocusCostMin,
-    pending_decisions: pending.n,
-    pending_decision_avg_wait_ms: pending.w == null ? null : Math.round(pending.w),
-    open_contexts: contexts.n,
-  };
-}
-
-/** refocus_cost_min from ~/.overload/config.json; invalid/missing falls back to 20. */
-export function configRefocusCostMin(): number {
-  try {
-    const raw: unknown = JSON.parse(readFileSync(join(homedir(), ".overload", "config.json"), "utf8"));
-    if (raw && typeof raw === "object" && "refocus_cost_min" in raw) {
-      const value = raw.refocus_cost_min;
-      if (typeof value === "number" && value > 0) return value;
-    }
-  } catch { /* fall through to default */ }
-  return DEFAULT_REFOCUS_COST_MIN;
-}
-
-export function formatAttention(view: AttentionView): string {
-  const wait = view.pending_decision_avg_wait_ms == null ? "-" : `${Math.round(view.pending_decision_avg_wait_ms / 60_000)}m`;
-  return `interruptions(24h)=${view.interruptions_24h} (~${view.refocus_cost_min}min refocus) · pending decisions=${view.pending_decisions} avg_wait=${wait} · open contexts=${view.open_contexts}`;
-}

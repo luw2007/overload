@@ -6,8 +6,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/install-launchd.sh [--install|--uninstall] [--project-dir PATH] [--dry-run]
 
-Installs or removes the supported Overload LaunchAgents for the current user.
-Island is intentionally excluded because it is not release-ready.
+Installs or removes the four supported Overload LaunchAgents for the current user.
+Pending decisions are surfaced in the loopback web dashboard; Overload does not emit macOS notifications.
 EOF
 }
 
@@ -42,7 +42,8 @@ bun_path=$(command -v bun) || { printf 'bun is required; install it before runni
 bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- "$bun_path")
 
 agents_dir=$HOME/Library/LaunchAgents
-labels='ingest notifier maintenance pull web'
+labels='ingest maintenance pull web'
+retired_labels='notifier'
 uid=$(id -u)
 xml_escape() {
   printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&apos;/g'
@@ -53,7 +54,6 @@ write_plist() {
   target=$agents_dir/works.earendil.overload.$name.plist
   case "$name" in
     ingest) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/ingest/ingest.ts")</string>"; schedule='<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>' ;;
-    notifier) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/notify/notifier.ts")</string><string>--sink</string><string>osascript</string>"; schedule='<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>' ;;
     maintenance) arguments="<string>$(xml_escape "$project_dir/scripts/maintenance.sh")</string>"; schedule='<key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>' ;;
     pull) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/pull/pull.ts")</string><string>--once</string>"; schedule='<key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>' ;;
     web) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/web/server.ts")</string>"; schedule='<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>' ;;
@@ -76,10 +76,16 @@ EOF
 
 if [ "$dry_run" -eq 1 ]; then
   for name in $labels; do printf '%s %s %s\n' "$mode" "works.earendil.overload.$name" "$agents_dir/works.earendil.overload.$name.plist"; done
+  for name in $retired_labels; do printf 'remove %s %s\n' "works.earendil.overload.$name" "$agents_dir/works.earendil.overload.$name.plist"; done
   exit 0
 fi
 
 mkdir -p "$agents_dir"
+for name in $retired_labels; do
+  target=$agents_dir/works.earendil.overload.$name.plist
+  launchctl bootout "gui/$uid" "$target" >/dev/null 2>&1 || true
+  rm -f "$target"
+done
 if [ "$mode" = install ]; then
   for name in $labels; do
     target=$agents_dir/works.earendil.overload.$name.plist

@@ -23,8 +23,7 @@ function seedLedger(): string {
     CREATE TABLE session_incarnations(stable_id TEXT, writer_id TEXT, liveness_domain TEXT, pid INTEGER, proc_boot_id TEXT, started_at INTEGER, last_seen_at INTEGER);
     CREATE TABLE requests(request_uid TEXT PRIMARY KEY, stable_id TEXT, writer_id TEXT, origin_emitter_id TEXT, request_id TEXT, kind TEXT, state TEXT, created_at INTEGER, resolved_at INTEGER, detail TEXT);
     CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, at INTEGER, stable_id TEXT, writer_id TEXT, emitter_id TEXT, kind TEXT, detail TEXT);
-    CREATE TABLE current(stable_id TEXT PRIMARY KEY, writer_id TEXT, state TEXT, queue TEXT, q5_reason TEXT, origin TEXT, last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER, frozen INTEGER DEFAULT 0);
-    CREATE TABLE notifications(notification_uid INTEGER PRIMARY KEY, request_uid TEXT, sink TEXT, kind TEXT, reminder_seq INTEGER, state TEXT, attempt_at INTEGER, sent_at INTEGER, retry_count INTEGER);
+    CREATE TABLE current(stable_id TEXT PRIMARY KEY, writer_id TEXT, state TEXT, queue TEXT, q5_reason TEXT, origin TEXT, last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER, last_progress_at INTEGER, frozen INTEGER DEFAULT 0);
     CREATE TABLE attachments(stable_id TEXT, platform TEXT, binding TEXT, observed_at INTEGER, valid INTEGER);
     CREATE TABLE session_hosts(stable_id TEXT PRIMARY KEY, app TEXT, session_id TEXT, tty TEXT, observed_at INTEGER);
     CREATE TABLE incidents(id INTEGER PRIMARY KEY, source TEXT, opened_at INTEGER, closed_at INTEGER, detail TEXT);
@@ -32,13 +31,15 @@ function seedLedger(): string {
   `);
   db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["remote:pi:alpha", "buildbox", "pi", "alpha", "agent", "/repo", "main", 1_700_000_000_000, 1_700_000_000_000]);
   db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)", ["req-1", "remote:pi:alpha", "writer", "emitter", "one", "decision", 1_700_000_001_000, JSON.stringify({ question: "ship?" })]);
-  db.run("INSERT INTO notifications VALUES (1, 'req-1', 'osascript', 'initial', 0, 'failed_permanent', NULL, NULL, 6)");
   db.run("INSERT INTO attachments VALUES ('remote:pi:alpha', 'cmux', 'workspace-42', 1700000002000, 1)");
   db.run("INSERT INTO session_hosts VALUES ('remote:pi:alpha', 'cmux', 'terminal-7', '/dev/ttys007', 1700000003000)");
-  db.run("INSERT INTO current VALUES ('done:pi:beta', 'writer', 'done', 'q2', NULL, 'agent', 2, 1700000003000, NULL, 0)");
-  db.run("INSERT INTO incidents VALUES (1, 'notifier', 1700000004000, NULL, ?)", [JSON.stringify({ retries: 6 })]);
+  db.run("INSERT INTO current VALUES ('done:pi:beta', 'writer', 'done', 'q2', NULL, 'agent', 2, 1700000003000, NULL, NULL, 0)");
+  db.run("INSERT INTO incidents VALUES (1, 'recon', 1700000004000, NULL, ?)", [JSON.stringify({ reason: "adapter unavailable" })]);
   db.run("INSERT INTO coverage_gaps VALUES (1, 'remote:pi:alpha', 'emitter', 1, 1, 2, 'missing_seq')");
-  db.run("INSERT INTO journal VALUES (1, 1700000000000, 'remote:pi:alpha', 'writer', 'emitter', 'telemetry_gap', '{}')");
+  db.run("INSERT INTO journal VALUES (1, 1700000000000, 'remote:pi:alpha', 'writer', 'emitter', 'telemetry_gap', ?)", [JSON.stringify({ platform: "cmux", native_id: "term-9" })]);
+  db.run("INSERT INTO current VALUES ('remote:pi:alpha', 'writer', 'working', 'q5', 'turn_hung', 'agent', 9, 1700000009000, 1700000009000, 1700000005000, 0)");
+  db.run("INSERT INTO journal VALUES (2, 1700000005000, 'remote:pi:alpha', 'writer', 'emitter', 'tool_activity', ?)", [JSON.stringify({ tool: "bash" })]);
+  db.run("INSERT INTO journal VALUES (3, 1700000009000, 'remote:pi:alpha', 'writer', 'emitter', 'heartbeat', '{}')");
   db.close();
   return path;
 }
@@ -55,7 +56,7 @@ describe("web API", () => {
     expect(server.hostname).toBe("127.0.0.1");
     const response = await fetch(`${base}/api/summary`);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ q1: 1, q2: 1, open_incidents: 1, coverage_gaps: 1, telemetry_gaps: 1 });
+    expect(await response.json()).toEqual({ q1: 1, q2: 1, hung: 1, open_incidents: 1, coverage_gaps: 1, telemetry_gaps: 1 });
   });
 
   test("Q1 JSON preserves the CLI query semantics", async () => {
@@ -69,9 +70,14 @@ describe("web API", () => {
       kind: "decision",
       created_at: 1_700_000_001_000,
       detail: { question: "ship?" },
-      failed: true,
       binding: "terminal-7",
     }]);
+  });
+
+  test("surfaces a pending decision", async () => {
+    const { base } = await runningServer(seedLedger());
+    const response = await fetch(`${base}/api/summary`);
+    expect(await response.json()).toMatchObject({ q1: 1 });
   });
 
   test("prefers a structured host target over a reconciliation attachment", async () => {
@@ -114,8 +120,22 @@ describe("web API", () => {
     const { base } = await runningServer(seedLedger());
     const detail = await fetch(`${base}/api/sessions/${encodeURIComponent("remote:pi:alpha")}`);
     expect(detail.status).toBe(200);
-    expect((await detail.json()).session.stable_id).toBe("remote:pi:alpha");
+    const view = await detail.json();
+    expect(view.session).toMatchObject({
+      stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung",
+      last_progress_at: 1_700_000_005_000, binding: "terminal-7",
+    });
+    // Newest first, heartbeat-free: the top row must be what the turn last did.
+    expect(view.events.map((row: { kind: string }) => row.kind)).toEqual(["tool_activity", "telemetry_gap"]);
+    expect(view.pending_requests).toHaveLength(1);
     expect((await fetch(`${base}/api/sessions/missing`)).status).toBe(404);
     expect((await fetch(`${base}/nope`)).status).toBe(404);
+  });
+
+  test("bounds the session list and carries queue state for drill-down", async () => {
+    const { base } = await runningServer(seedLedger());
+    const rows = await (await fetch(`${base}/api/sessions`)).json();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung" });
   });
 });

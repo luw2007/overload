@@ -8,11 +8,10 @@ usage() {
 Usage: setup.sh [--dry-run]
 
 Runs, in order:
-  1. install-launchd.sh --install    (ingest, notifier, maintenance, pull, web)
+  1. install-launchd.sh --install    (ingest, maintenance, pull, web)
   2. install-extension.sh --install  (pi, omp lifecycle telemetry)
-  3. install-claude-hooks.sh         (best-effort; skipped without jq)
 
-Run `bun src/cli/overload.ts doctor` afterward to confirm everything is healthy.
+Run `bun src/cli/overload.ts doctor` afterward to confirm the services are healthy.
 EOF
 }
 
@@ -31,13 +30,5 @@ install_flag=--install
 
 "$root/scripts/install-launchd.sh" "$install_flag"
 "$root/scripts/install-extension.sh" "$install_flag"
-
-if [ "$dry_run" -eq 1 ]; then
-  printf 'would run: install-claude-hooks.sh (best-effort; skipped without jq)\n'
-elif command -v jq >/dev/null 2>&1; then
-  "$root/scripts/install-claude-hooks.sh" || printf 'Claude Code hooks: install-claude-hooks.sh failed; run it manually if you use Claude Code\n' >&2
-else
-  printf 'Claude Code hooks: skipped (jq not found)\n'
-fi
 
 [ "$dry_run" -eq 1 ] || printf '\nSetup complete. Verify with:\n  bun %s/src/cli/overload.ts doctor\n' "$root"

@@ -35,11 +35,14 @@ describe("portable launchd installer", () => {
     Bun.spawnSync(["mkdir", "-p", join(project, "src", "ingest"), join(project, "scripts")]);
     writeFileSync(join(project, "src", "ingest", "ingest.ts"), "");
     writeFileSync(join(project, "scripts", "maintenance.sh"), "");
+    const legacyNotifier = join(root, "home", "Library", "LaunchAgents", "works.earendil.overload.notifier.plist");
+    Bun.spawnSync(["mkdir", "-p", join(root, "home", "Library", "LaunchAgents")]);
+    writeFileSync(legacyNotifier, "legacy notifier");
     const installed = await run(root, ["--install", "--project-dir", project]);
     expect(installed).toMatchObject({ exitCode: 0, stderr: "" });
 
     const agents = join(root, "home", "Library", "LaunchAgents");
-    const names = ["ingest", "notifier", "maintenance", "pull", "web"];
+    const names = ["ingest", "maintenance", "pull", "web"];
     for (const name of names) {
       const path = join(agents, `works.earendil.overload.${name}.plist`);
       expect(existsSync(path)).toBe(true);
@@ -48,6 +51,7 @@ describe("portable launchd installer", () => {
       expect(value).not.toContain("$HOME/ai/overload");
       expect(value).not.toContain("operator");
     }
+    expect(existsSync(legacyNotifier)).toBe(false);
     expect(readFileSync(join(root, "launchctl.log"), "utf8")).toContain("bootstrap");
 
     const removed = await run(root, ["--uninstall", "--project-dir", project]);

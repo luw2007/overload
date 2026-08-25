@@ -28,13 +28,6 @@ CREATE TABLE IF NOT EXISTS queue_transitions(
   UNIQUE(subject, queue, direction, source_seq, classifier_version));
 CREATE TABLE IF NOT EXISTS classifier_activations(
   version INTEGER PRIMARY KEY, activated_at_journal_seq INTEGER NOT NULL, activated_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS notifications(
-  notification_uid INTEGER PRIMARY KEY AUTOINCREMENT, request_uid TEXT NOT NULL,
-  sink TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN('initial','reminder')),
-  reminder_seq INTEGER NOT NULL DEFAULT 0,
-  state TEXT NOT NULL CHECK(state IN('pending','attempting','sent','failed_permanent')),
-  attempt_at INTEGER, sent_at INTEGER, retry_count INTEGER NOT NULL DEFAULT 0,
-  UNIQUE(request_uid, sink, kind, reminder_seq));
 CREATE TABLE IF NOT EXISTS attachments(
   stable_id TEXT NOT NULL, platform TEXT NOT NULL, binding TEXT NOT NULL,
   observed_at INTEGER NOT NULL, valid INTEGER NOT NULL DEFAULT 1,
@@ -57,7 +50,9 @@ export function openLedgerP2(path: string): Database {
   return db;
 }
 
-/** Frozen column lists per P2 table (drift assertions; p2-freeze.md order). */
+/** Frozen column lists per P2 table (drift assertions; p2-freeze.md order).
+ *  The notification outbox was removed after P4: it had no delivery daemon and
+ *  no reader, so the baseline is re-frozen without it. */
 export const FROZEN_P2_TABLES: Record<string, string[]> = {
   current: [
     "stable_id", "writer_id", "state", "queue", "q5_reason", "origin",
@@ -67,10 +62,6 @@ export const FROZEN_P2_TABLES: Record<string, string[]> = {
     "id", "subject", "queue", "direction", "at", "source_seq", "classifier_version",
   ],
   classifier_activations: ["version", "activated_at_journal_seq", "activated_at"],
-  notifications: [
-    "notification_uid", "request_uid", "sink", "kind", "reminder_seq", "state",
-    "attempt_at", "sent_at", "retry_count",
-  ],
   attachments: ["stable_id", "platform", "binding", "observed_at", "valid"],
   incidents: ["id", "source", "opened_at", "closed_at", "detail"],
   coverage_gaps: ["id", "stable_id", "emitter_id", "from_seq", "from_at", "to_at", "reason"],
@@ -79,7 +70,6 @@ export const FROZEN_P2_TABLES: Record<string, string[]> = {
 /** Frozen UNIQUE keys per P2 table (as column tuples). */
 export const FROZEN_P2_UNIQUES: Record<string, string[][]> = {
   queue_transitions: [["subject", "queue", "direction", "source_seq", "classifier_version"]],
-  notifications: [["request_uid", "sink", "kind", "reminder_seq"]],
   attachments: [], // PRIMARY KEY(stable_id, platform) composite
   incidents: [["source", "opened_at"]],
 };

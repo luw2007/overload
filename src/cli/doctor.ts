@@ -17,11 +17,9 @@ export type DoctorDeps = {
   ledgerPath: string;
   overloadRoot: string;
   extensionTargets: Array<{ label: string; path: string }>;
-  claudeSettingsPath: string;
   uid: string;
   exec: Executor;
   stat: (path: string) => Promise<StatInfo>;
-  readText: (path: string) => Promise<string | null>;
   now: () => number;
 };
 
@@ -36,7 +34,6 @@ export function defaultDoctorDeps(): DoctorDeps {
       { label: "pi", path: join(homedir(), ".pi", "agent", "extensions", "overload.ts") },
       { label: "omp", path: join(homedir(), ".omp", "agent", "extensions", "overload.ts") },
     ],
-    claudeSettingsPath: join(homedir(), ".claude", "settings.json"),
     uid: String(process.getuid?.() ?? 0),
     exec: defaultExecutor,
     stat: async (path) => {
@@ -47,19 +44,12 @@ export function defaultDoctorDeps(): DoctorDeps {
         return null;
       }
     },
-    readText: async (path) => {
-      try {
-        return await Bun.file(path).text();
-      } catch {
-        return null;
-      }
-    },
     now: () => Date.now(),
   };
 }
 
 const LAUNCHD_LABEL_PREFIX = "works.earendil.overload.";
-const KEEPALIVE_LABELS = ["ingest", "notifier", "web"];
+const KEEPALIVE_LABELS = ["ingest", "web"];
 const INGEST_HEARTBEAT_MAX_AGE_MS = 30_000;
 const PULL_HEARTBEAT_MAX_AGE_MS = 90_000; // pull.plist runs every 60s; allow one missed tick
 // Event kinds a live session actually emits. Admin/self-observation kinds
@@ -85,19 +75,6 @@ async function checkExtension(deps: DoctorDeps, target: { label: string; path: s
   return info
     ? { status: "OK", label: `extension:${target.label}`, detail: target.path }
     : { status: "WARN", label: `extension:${target.label}`, detail: `missing at ${target.path} (run scripts/install-extension.sh --install)` };
-}
-
-async function checkClaudeHook(deps: DoctorDeps): Promise<CheckResult> {
-  const settings = await deps.readText(deps.claudeSettingsPath);
-  if (settings === null) {
-    return { status: "WARN", label: "claude:hook", detail: `no Claude Code settings at ${deps.claudeSettingsPath} (skip if you don't use Claude Code)` };
-  }
-  return settings.includes("OVERLOAD_CLAUDE_HOOK=1")
-    ? { status: "OK", label: "claude:hook", detail: "installed" }
-    : {
-        status: "WARN", label: "claude:hook",
-        detail: "not installed — Claude Code permission/approval requests will not be detected (run scripts/install-claude-hooks.sh)",
-      };
 }
 
 async function launchctlPrint(deps: DoctorDeps, label: string): Promise<{ ok: boolean; state: string | null; lastExit: number | null; error?: string }> {
@@ -176,7 +153,6 @@ export async function runDoctor(deps: DoctorDeps): Promise<{ checks: CheckResult
   const { result: ledgerResult, db } = await checkLedger(deps);
   const checks: CheckResult[] = [ledgerResult];
   for (const target of deps.extensionTargets) checks.push(await checkExtension(deps, target));
-  checks.push(await checkClaudeHook(deps));
   for (const label of KEEPALIVE_LABELS) checks.push(await checkKeepAlive(deps, label));
   checks.push(await checkInterval(deps, "maintenance", "FAIL"));
   checks.push(await checkInterval(deps, "pull", "WARN"));

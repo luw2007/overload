@@ -1,13 +1,14 @@
 import { Database } from "bun:sqlite";
 import { CLASSIFIER_VERSION, classify, queueAfter, type ClassifiableCurrent, type ClassifierEvent } from "./classifier";
+import { PROGRESS_KINDS } from "../shared/types";
 
 const SOURCE_TERMINALS = new Set(["resolved", "cancelled", "timed_out"]);
 const SESSION_TERMINALS = new Set(["done", "failed", "vanished"]);
-const RECON_EVENTS = new Set(["emitter_dead", "emitter_drained", "emitter_stalled", "telemetry_gap", "session_vanished"]);
+const RECON_EVENTS = new Set(["emitter_dead", "emitter_drained", "emitter_stalled", "telemetry_gap", "session_vanished", "turn_hung", "dead_connection"]);
 
 type JournalRow = { ingest_seq: number; at: number; stable_id: string; writer_id: string; emitter_id: string; kind: string; detail: string | null };
 type RequestRow = { state: string };
-type CurrentRow = ClassifiableCurrent & { writer_id: string | null; last_ingest_seq: number | null; last_event_at: number | null; last_heartbeat_at: number | null; frozen: number };
+type CurrentRow = ClassifiableCurrent & { writer_id: string | null; last_ingest_seq: number | null; last_event_at: number | null; last_heartbeat_at: number | null; last_progress_at: number | null; frozen: number };
 
 function objectDetail(value: string | null): Record<string, unknown> {
   if (!value) return {};
@@ -54,14 +55,14 @@ function hasChangeEvidence(db: Database, stableId: string, throughSeq: number): 
   });
 }
 
-export function reduceJournal(db: Database, batchSize = 500, notifySink = "osascript"): number {
+export function reduceJournal(db: Database, batchSize = 500): number {
   let processed = 0;
   const transaction = db.transaction(() => {
     db.query("INSERT OR IGNORE INTO reducer_cursor(id, journal_seq) VALUES (1, 0)").run();
     const cursor = (db.query("SELECT journal_seq FROM reducer_cursor WHERE id=1").get() as { journal_seq: number }).journal_seq;
     const rows = db.query(`SELECT ingest_seq, at, stable_id, writer_id, emitter_id, kind, detail
       FROM journal WHERE ingest_seq > ? ORDER BY ingest_seq LIMIT ?`).all(cursor, batchSize) as JournalRow[];
-    for (const row of rows) applyEvent(db, row, notifySink);
+    for (const row of rows) applyEvent(db, row);
     if (rows.length) db.query("UPDATE reducer_cursor SET journal_seq=? WHERE id=1").run(rows.at(-1)!.ingest_seq);
     processed = rows.length;
   });
@@ -69,7 +70,7 @@ export function reduceJournal(db: Database, batchSize = 500, notifySink = "osasc
   return processed;
 }
 
-function applyEvent(db: Database, row: JournalRow, notifySink: string): void {
+function applyEvent(db: Database, row: JournalRow): void {
   const detail = objectDetail(row.detail);
   if (row.kind === "classifier_activated") {
     const version = typeof detail.version === "number" ? detail.version : CLASSIFIER_VERSION;
@@ -79,7 +80,7 @@ function applyEvent(db: Database, row: JournalRow, notifySink: string): void {
   if (row.kind === "source_outage" || row.kind === "source_recovered") { applyIncident(db, row, detail); return; }
   if (row.kind === "session_started") applyHost(db, row, detail);
   if (row.kind === "attachment_observed") applyAttachment(db, row, detail);
-  applyRequestEvent(db, row, detail, notifySink);
+  applyRequestEvent(db, row, detail);
   applySessionEvent(db, row, detail);
 }
 
@@ -132,7 +133,7 @@ function applyAttachment(db: Database, row: JournalRow, detail: Record<string, u
 }
 
 function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
-  const relevant = new Set(["session_started", "working", "settled", "decision_requested", "session_ended", "session_vanished", "emitter_dead", "emitter_drained", "emitter_stalled", "telemetry_gap", "heartbeat", "tool_activity"]);
+  const relevant = new Set(["session_started", "working", "settled", "decision_requested", "session_ended", "session_vanished", "emitter_dead", "emitter_drained", "emitter_stalled", "turn_hung", "dead_connection", "telemetry_gap", "heartbeat", "tool_activity"]);
   if (!relevant.has(row.kind)) return;
   // A platform process without an attributable session is health evidence only;
   // never create a synthetic overload-admin current row for it.
@@ -169,11 +170,15 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   }
   const queue = queueAfter(view, classifierEvent);
   const heartbeat = row.kind === "heartbeat" || row.kind === "tool_activity" || row.kind === "working" ? row.at : current.last_heartbeat_at;
+  const progress = PROGRESS_KINDS[row.kind] ? row.at : current.last_progress_at;
+  // A recon finding is an observation *about* the session, not activity *by*
+  // it: letting it stamp last_event_at hides how long the session has been out.
+  const lastEventAt = reconFinding ? current.last_event_at ?? row.at : row.at;
   db.query(`UPDATE current SET writer_id=?, state=?, queue=?, q5_reason=?, origin=?, last_ingest_seq=?,
-    last_event_at=?, last_heartbeat_at=? WHERE stable_id=?`).run(projectedWriter, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, row.at, heartbeat, stableId);
+    last_event_at=?, last_heartbeat_at=?, last_progress_at=? WHERE stable_id=?`).run(projectedWriter, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, lastEventAt, heartbeat, progress, stableId);
 }
 
-function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>, notifySink: string): void {
+function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
   if (row.kind === "emitter_drained") { orphanDrainedEmitter(db, row, detail); return; }
   if (row.kind === "session_ended") {
     db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE stable_id=? AND writer_id=? AND state='pending'").run(row.at, row.stable_id, row.writer_id);
@@ -186,10 +191,8 @@ function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string,
   const kind = stringDetail(detail, "request_kind") ?? stringDetail(detail, "kind") ?? "decision";
   if (row.kind === "decision_requested") {
     if (!existing) {
-      db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, next_reminder_at, detail)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`).run(uid, row.stable_id, row.writer_id, row.emitter_id, id, kind, row.at, row.at, row.detail);
-      db.query(`INSERT OR IGNORE INTO notifications(request_uid, sink, kind, reminder_seq, state)
-        VALUES (?, ?, 'initial', 0, 'pending')`).run(uid, notifySink);
+      db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, detail)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(uid, row.stable_id, row.writer_id, row.emitter_id, id, kind, row.at, row.detail);
     }
     return;
   }

@@ -21,6 +21,7 @@ async function fixture() {
     CREATE TABLE session_incarnations(stable_id TEXT, writer_id TEXT, liveness_domain TEXT, pid INTEGER, proc_boot_id TEXT, started_at INTEGER, last_seen_at INTEGER);
     CREATE TABLE cursors(file_name TEXT PRIMARY KEY, bytes INTEGER);
     CREATE TABLE attachments(stable_id TEXT, platform TEXT, binding TEXT, observed_at INTEGER, valid INTEGER);
+    CREATE TABLE current(stable_id TEXT PRIMARY KEY, state TEXT, last_progress_at INTEGER, last_event_at INTEGER);
   `);
   db.close();
   const herdr = join(root, "herdr.sh");
@@ -33,6 +34,7 @@ async function fixture() {
     recon_interval_ms: 60_000,
     drain_grace_ms: 0,
     stall_profile_ms: 1_000,
+    turn_hang_ms: 1_000,
     command_timeout_ms: 10_000,
     host: "local",
     ledger,
@@ -51,6 +53,30 @@ async function events(spool: string) {
     .flatMap((text) => text.trim().split("\n").filter((line) => line.startsWith("{")));
   return lines.map((line) => JSON.parse(line));
 }
+
+/** A live pi incarnation (this process) with a controllable progress clock. */
+function seedLive(ledger: string, emitter: string, options: { at: number; state: string; progressAt: number }) {
+  const db = new Database(ledger);
+  db.query("INSERT INTO sessions VALUES (?, 'local', 'pi', 's1', '/repo')").run("local:pi:s1");
+  db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', ?, 'feedface00', 1, ?)")
+    .run("local:pi:s1", emitter, process.pid, options.at);
+  db.query("INSERT INTO journal VALUES (1, 'local', ?, 1, ?, ?, ?, 'heartbeat', '{}')")
+    .run(emitter, options.at, "local:pi:s1", emitter);
+  db.query("INSERT INTO current VALUES (?, ?, ?, ?)").run("local:pi:s1", options.state, options.progressAt, options.at);
+  db.close();
+}
+
+function ingestFinding(ledger: string, kind: string, emitter: string, at: number) {
+  const db = new Database(ledger);
+  db.query("INSERT INTO journal VALUES (99, 'local', 'overload-x', 1, ?, 'local:pi:s1', 'overload-x', ?, ?)")
+    .run(at, kind, JSON.stringify({ emitter_id: emitter, stable_id: "local:pi:s1" }));
+  db.close();
+}
+
+const probes = (addresses: string[], sockets: Array<{ local: string; peer: string }> = []) => ({
+  localAddresses: () => new Set(addresses),
+  establishedSockets: async () => sockets,
+});
 
 describe("ReconDaemon", () => {
   test("emits dead then drained only after every emitter spool cursor reaches EOF", async () => {
@@ -117,5 +143,70 @@ describe("ReconDaemon", () => {
     expect(recovered.byKind.source_recovered).toBe(1);
     const output = await events(f.spool);
     expect(output.filter((event) => event.detail?.source === "herdr").map((event) => event.kind)).toEqual(["source_outage", "source_recovered"]);
+  });
+
+  test("ignores idle silence and reports a working stall once per silence episode", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-idlecafe`;
+    const now = Date.now();
+    seedLive(f.ledger, emitter, { at: now - 5_000, state: "idle", progressAt: now - 5_000 });
+
+    const idle = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(idle.byKind.emitter_stalled ?? 0).toBe(0);
+
+    const db = new Database(f.ledger);
+    db.query("UPDATE current SET state='working'").run();
+    db.close();
+    const working = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(working.byKind.emitter_stalled).toBe(1);
+
+    ingestFinding(f.ledger, "emitter_stalled", emitter, now);
+    const repeat = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(repeat.byKind.emitter_stalled ?? 0).toBe(0);
+  });
+
+  test("reports a heartbeating turn with frozen progress as turn_hung", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-hungbeef`;
+    const now = Date.now();
+    seedLive(f.ledger, emitter, { at: now - 100, state: "working", progressAt: now - 60_000 });
+
+    const summary = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(summary.byKind.turn_hung).toBe(1);
+    expect(summary.byKind.emitter_stalled ?? 0).toBe(0);
+    const finding = (await events(f.spool)).find((event) => event.kind === "turn_hung");
+    expect(finding?.detail).toMatchObject({ emitter_id: emitter, stable_id: "local:pi:s1" });
+    expect(finding?.detail.hung_ms).toBeGreaterThanOrEqual(60_000);
+  });
+
+  test("outranks turn_hung with dead_connection when a socket is stranded on a lost address", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-deadconn`;
+    const now = Date.now();
+    // Only a lost address shortens the grace, so the hang is younger than turn_hang_ms.
+    const config = { ...f.config, turn_hang_ms: 3_600_000 };
+    seedLive(f.ledger, emitter, { at: now - 100, state: "working", progressAt: now - 120_000 });
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO journal VALUES (50, 'local', 'overload-x', 1, ?, 'admin', 'overload-x', 'network_changed', ?)")
+      .run(now - 200, JSON.stringify({ previous: [], current: ["10.0.0.1", "192.168.1.5"] }));
+    db.close();
+
+    const socket = { local: "192.168.1.5:55373", peer: "192.168.1.20:20128" };
+    const summary = await new ReconDaemon(config, probes(["10.0.0.1"], [socket])).runOnce(now);
+    expect(summary.byKind.dead_connection).toBe(1);
+    expect(summary.byKind.turn_hung ?? 0).toBe(0);
+    expect(summary.byKind.network_changed).toBe(1);
+    const finding = (await events(f.spool)).find((event) => event.kind === "dead_connection");
+    expect(finding?.detail).toMatchObject({ local: socket.local, peer: socket.peer });
+  });
+
+  test("holds back hang findings while the ingest clock is stale", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-stalepipe`;
+    const now = Date.now();
+    seedLive(f.ledger, emitter, { at: now - 600_000, state: "working", progressAt: now - 600_000 });
+
+    const summary = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(summary.byKind.turn_hung ?? 0).toBe(0);
   });
 });

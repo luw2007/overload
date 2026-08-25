@@ -67,7 +67,7 @@ describe("cmux workstream ingestion", () => {
     expect((await scanCmux(db, path)).inserted).toBe(1);
     expect((await scanCmux(db, path)).inserted).toBe(0);
     expect((db.query("SELECT count(*) AS n FROM journal").get() as { n: number }).n).toBe(1);
-    expect(await scanOnce(db, join(root, "missing-spool"), 500, "osascript", join(root, "missing.jsonl"))).toEqual({ files: 0, inserted: 0 });
+    expect(await scanOnce(db, join(root, "missing-spool"), 500, join(root, "missing.jsonl"))).toEqual({ files: 0, inserted: 0 });
     db.close();
   });
 });

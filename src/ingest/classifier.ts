@@ -2,6 +2,8 @@ import { appendFileSync, chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+/** Unchanged at 2: turn_hung/dead_connection are new event kinds, so every
+ *  input that could exist under v2 still classifies identically. */
 export const CLASSIFIER_VERSION = 2;
 
 export type ClassifiableCurrent = {
@@ -48,6 +50,8 @@ function desiredQueue(current: ClassifiableCurrent, event: ClassifierEvent): { q
     case "session_ended": state = "done"; reason = null; break;
     case "session_vanished": state = "vanished"; reason = null; break;
     case "emitter_stalled": reason = "stalled"; break;
+    case "turn_hung": reason = "turn_hung"; break;
+    case "dead_connection": reason = "dead_connection"; break;
     case "emitter_dead": reason = "dead_incarnation"; break;
     case "telemetry_gap": reason = "telemetry_gap"; break;
     case "emitter_drained": reason = "orphaned_request"; break;

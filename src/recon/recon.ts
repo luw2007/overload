@@ -2,7 +2,7 @@
 import { Database } from "bun:sqlite";
 import { chmod, lstat, mkdir, open, readFile, readdir, rename, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
@@ -11,6 +11,7 @@ import {
   SEGMENT_MAX_AGE_MS,
   SEGMENT_MAX_BYTES,
   STALL_PROFILE_MS,
+  TURN_HANG_MS,
   type EventEnvelope,
   type EventKind,
   type HostId,
@@ -19,17 +20,22 @@ import {
 const DEFAULT_RECON_INTERVAL_MS = 60_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const GAP_RATE_LIMIT_MS = 60 * 60_000;
+/** After the host loses an address, a working turn that has not progressed for
+ *  this long is checked for sockets stranded on the vanished address. */
+const NETWORK_HANG_GRACE_MS = 60_000;
 const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const SPOOL_FILE = /^(?:active|seg)-([A-Za-z0-9._-]+)-(\d+)(?:-recovered)?\.ndjson$/;
 
 type FindingKind = Extract<EventKind,
   "emitter_dead" | "emitter_drained" | "emitter_stalled" | "telemetry_gap" |
-  "session_vanished" | "source_outage" | "source_recovered" | "attachment_observed">;
+  "session_vanished" | "source_outage" | "source_recovered" | "attachment_observed" |
+  "turn_hung" | "dead_connection" | "network_changed">;
 
 export type ReconConfig = {
   recon_interval_ms: number;
   drain_grace_ms: number;
   stall_profile_ms: number;
+  turn_hang_ms: number;
   command_timeout_ms: number;
   host: HostId;
   ledger: string;
@@ -54,6 +60,15 @@ type Incarnation = {
   last_event_at: number | null;
 };
 
+type CurrentView = { state: string | null; last_progress_at: number | null; last_event_at: number | null };
+
+export type Socket = { local: string; peer: string };
+/** Host probes, injectable so hang detection is testable without real sockets. */
+export type ReconProbes = {
+  localAddresses: () => Set<string>;
+  establishedSockets: (pid: number, timeoutMs: number) => Promise<Socket[]>;
+};
+
 type NativeSession = { native_id: string; cwd?: string; visible: boolean; parent?: string };
 type SourceSnapshot = { sessions: NativeSession[] };
 type AttachmentRow = { stable_id: string; platform: string; binding: string };
@@ -74,9 +89,13 @@ export class ReconDaemon {
   private gaps = new Map<string, number>();
   private attachments = new Map<string, string>();
   private vanished = new Set<string>();
+  private networkSnapshot: string | null = null;
 
-  constructor(config: ReconConfig) {
+  private readonly probes: ReconProbes;
+
+  constructor(config: ReconConfig, probes: ReconProbes = defaultProbes) {
     this.config = config;
+    this.probes = probes;
     this.emitterId = `overload-${process.pid}-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
   }
 
@@ -84,6 +103,10 @@ export class ReconDaemon {
     const summary: ReconSummary = { total: 0, byKind: {} };
     const db = new Database(this.config.ledger, { readonly: true, create: false });
     try {
+      const addresses = this.probes.localAddresses();
+      const lostAddress = await this.syncNetwork(db, addresses, summary, now);
+      const hangGraceMs = lostAddress ? Math.min(NETWORK_HANG_GRACE_MS, this.config.turn_hang_ms) : this.config.turn_hang_ms;
+      const pipelineFresh = this.pipelineFresh(db, now);
       const incarnations = this.liveProcessIncarnations(db);
       const liveWriters = new Set<string>();
       for (const incarnation of incarnations) {
@@ -116,10 +139,19 @@ export class ReconDaemon {
         this.deadReported.delete(incarnation.writer_id);
         const lastSeen = incarnation.last_event_at ?? incarnation.last_seen_at ?? incarnation.started_at ?? now;
         const silentMs = Math.max(0, now - lastSeen);
-        if (silentMs > this.config.stall_profile_ms) {
+        // Read separately from the liveness query: a missing or older `current`
+        // must degrade hang detection only, never dead-emitter detection.
+        const view = this.currentView(db, incarnation.stable_id);
+        // Idle and awaiting_human sessions are silent by design: the extension
+        // heartbeats only while working. Only a working turn's silence is a fault.
+        if (view?.state === "working" && silentMs > this.config.stall_profile_ms &&
+            this.findingIsStale(db, "emitter_stalled", incarnation.writer_id, lastSeen)) {
           await this.emit(summary, "emitter_stalled", incarnation.session ?? "admin", now, {
             emitter_id: incarnation.writer_id, stable_id: incarnation.stable_id, silent_ms: silentMs,
           });
+        }
+        if (pipelineFresh && view?.state === "working") {
+          await this.inspectTurn(db, incarnation, view, addresses, hangGraceMs, summary, now);
         }
       }
 
@@ -158,6 +190,68 @@ export class ReconDaemon {
       WHERE i.liveness_domain='process'
         AND NOT EXISTS (SELECT 1 FROM journal e WHERE e.stable_id=i.stable_id
           AND e.writer_id=i.writer_id AND e.kind='session_ended')`);
+  }
+
+  /** A hung turn is invisible without `current`: heartbeat keeps the emitter
+   *  "alive" and even "recent", while the turn itself has not moved. */
+  private currentView(db: Database, stableId: string): CurrentView | null {
+    return safeGet(db, "SELECT state, last_progress_at, last_event_at FROM current WHERE stable_id=?",
+      stableId) as CurrentView | null;
+  }
+
+  /** One finding per silence episode: a finding newer than the last real event
+   *  means this episode is already reported. Survives recon restarts. */
+  private findingIsStale(db: Database, kind: FindingKind, emitterId: string, since: number): boolean {
+    const row = safeGet(db, `SELECT MAX(at) AS at FROM journal WHERE kind=?
+      AND json_extract(detail, '$.emitter_id')=?`, kind, emitterId);
+    return typeof row?.at === "number" ? row.at < since : true;
+  }
+
+  /** Ingest owns the journal clock: if it stopped, every session looks hung. */
+  private pipelineFresh(db: Database, now: number): boolean {
+    const row = safeGet(db, "SELECT MAX(at) AS at FROM journal");
+    return typeof row?.at === "number" ? now - row.at < this.config.turn_hang_ms / 2 : false;
+  }
+
+  /** Emits network_changed on any address-set change; returns true only when an
+   *  address was LOST, which is what strands in-flight sockets. */
+  private async syncNetwork(db: Database, addresses: Set<string>, summary: ReconSummary, now: number): Promise<boolean> {
+    const current = [...addresses].sort().join(",");
+    if (this.networkSnapshot === current) return false;
+    const previous = this.lastNetworkAddresses(db);
+    this.networkSnapshot = current;
+    if (previous && previous.join(",") === current) return false;
+    await this.emit(summary, "network_changed", "admin", now, { previous: previous ?? [], current: [...addresses].sort() });
+    return previous !== null && previous.some((address) => !addresses.has(address));
+  }
+
+  private lastNetworkAddresses(db: Database): string[] | null {
+    const row = safeGet(db, `SELECT json_extract(detail, '$.current') AS current FROM journal
+      WHERE kind='network_changed' ORDER BY ingest_seq DESC LIMIT 1`);
+    if (typeof row?.current !== "string") return null;
+    try {
+      const parsed = JSON.parse(row.current);
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : null;
+    } catch { return null; }
+  }
+
+  /** Progress silence is the symptom; a socket bound to an address this host no
+   *  longer owns is proof, so it outranks the heuristic finding. */
+  private async inspectTurn(db: Database, incarnation: Incarnation, view: CurrentView, addresses: Set<string>,
+    hangGraceMs: number, summary: ReconSummary, now: number): Promise<void> {
+    if (!incarnation.pid) return;
+    const progressAt = view.last_progress_at ?? view.last_event_at ?? incarnation.started_at ?? now;
+    const hungMs = Math.max(0, now - progressAt);
+    if (hungMs <= hangGraceMs) return;
+    const sockets = await this.probes.establishedSockets(incarnation.pid, this.config.command_timeout_ms);
+    const stranded = sockets.find((socket) => !addresses.has(socketHost(socket.local)));
+    if (hungMs <= this.config.turn_hang_ms && !stranded) return;
+    const kind: FindingKind = stranded ? "dead_connection" : "turn_hung";
+    if (!this.findingIsStale(db, kind, incarnation.writer_id, progressAt)) return;
+    await this.emit(summary, kind, incarnation.session ?? "admin", now, {
+      emitter_id: incarnation.writer_id, stable_id: incarnation.stable_id, hung_ms: hungMs,
+      ...(stranded ? { local: stranded.local, peer: stranded.peer } : {}),
+    });
   }
 
   private sourceOutageOpen(db: Database, source: string): boolean {
@@ -327,6 +421,44 @@ async function secureDirectory(path: string): Promise<void> {
   await chmod(path, 0o700);
 }
 
+/** Every address this host currently owns, loopback included. */
+function localAddresses(): Set<string> {
+  const addresses = new Set<string>();
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries ?? []) addresses.add(stripZone(entry.address));
+  }
+  return addresses;
+}
+
+/** lsof -F n prints one `n<local>-><peer>` line per matching socket. */
+async function establishedSockets(pid: number, timeoutMs: number): Promise<Socket[]> {
+  const proc = Bun.spawn(["lsof", "-nP", "-p", String(pid), "-a", "-i", "-sTCP:ESTABLISHED", "-F", "n"],
+    { stdout: "pipe", stderr: "ignore" });
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+  try {
+    const stdout = await new Response(proc.stdout).text();
+    await proc.exited;
+    return stdout.split("\n").filter((line) => line.startsWith("n") && line.includes("->"))
+      .map((line) => {
+        const [local, peer] = line.slice(1).split("->");
+        return { local: local!, peer: peer ?? "" };
+      });
+  } catch { return []; } finally { clearTimeout(timer); }
+}
+
+/** `192.168.1.5:55373` → `192.168.1.5`; `[fe80::1%en0]:443` → `fe80::1`. */
+function socketHost(endpoint: string): string {
+  if (endpoint.startsWith("[")) return stripZone(endpoint.slice(1, endpoint.indexOf("]")));
+  return stripZone(endpoint.slice(0, endpoint.lastIndexOf(":")));
+}
+
+function stripZone(address: string): string {
+  const zone = address.indexOf("%");
+  return zone === -1 ? address : address.slice(0, zone);
+}
+
+const defaultProbes: ReconProbes = { localAddresses, establishedSockets };
+
 async function inspectProcess(pid: number | null, runtime: string | null): Promise<ProcessState> {
   if (!pid || pid < 1) return { alive: false, verified: "kill0" };
   try { process.kill(pid, 0); } catch { return { alive: false, verified: "kill0" }; }
@@ -472,6 +604,7 @@ async function loadConfig(args: string[]): Promise<{ config: ReconConfig; once: 
     recon_interval_ms: numberValue("recon-interval-ms", "recon_interval_ms", DEFAULT_RECON_INTERVAL_MS),
     drain_grace_ms: numberValue("drain-grace-ms", "drain_grace_ms", DRAIN_GRACE_MS),
     stall_profile_ms: numberValue("stall-profile-ms", "stall_profile_ms", STALL_PROFILE_MS.narrow),
+    turn_hang_ms: numberValue("turn-hang-ms", "turn_hang_ms", TURN_HANG_MS),
     command_timeout_ms: numberValue("command-timeout-ms", "command_timeout_ms", DEFAULT_COMMAND_TIMEOUT_MS),
     host: host as HostId,
     ledger: values.get("ledger") ?? join(home, "ledger.db"),

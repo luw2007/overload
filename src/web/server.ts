@@ -4,10 +4,12 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ackRequest, configRefocusCostMin, queryAttention, queryHealth, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, type JumpTarget } from "../shared/queries";
+import { ackRequest, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "./jump";
 
 const DEFAULT_WEB_PORT = 4870;
+/** The list is a launchpad for drill-down, not an inventory: 1000 rows serve nobody. */
+const SESSION_LIST_LIMIT = 100;
 let warnedInvalidConfig = false;
 
 export type WebConfig = { web_port: number };
@@ -43,9 +45,9 @@ const dashboardHtml = `<!doctype html>
 </style></head><body>
 <header class="app-bar"><span class="brand">Overload</span><span class="health-pill" id="health-pill"><span class="dot"></span><span id="health-label">正在连接…</span></span></header>
 <main class="b-wrap"><div id="error" class="error hidden"></div><section class="b-tiles">
-<div class="b-tile alert"><div class="num" id="tile-q1">—</div><div class="label">Q1 待决策</div></div><div class="b-tile"><div class="num" id="tile-q2">—</div><div class="label">Q2 已完成</div></div><div class="b-tile"><div class="num" id="tile-zombie">—</div><div class="label">Zombie</div></div><div class="b-tile alert"><div class="num" id="tile-incidents">—</div><div class="label">Open incidents</div></div>
-</section><nav class="b-tabs" aria-label="数据集"><button class="b-tab active" data-tab="q1">Q1 决策</button><button class="b-tab" data-tab="q2">Q2 完成</button><button class="b-tab" data-tab="zombie">Zombie</button><button class="b-tab" data-tab="health">Health</button></nav>
-<div class="b-toolbar" id="toolbar"><span id="selected-count">0 项已选</span><button class="btn primary" id="bulk-ack">批量 Ack</button><button class="btn" id="clear-selection">取消</button></div><div class="b-table-wrap"><table class="b-table"><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div></main><script src="/static/app.js"></script></body></html>`;
+<div class="b-tile alert"><div class="num" id="tile-q1">—</div><div class="label">Q1 待决策</div></div><div class="b-tile alert"><div class="num" id="tile-hung">—</div><div class="label">卡死会话</div></div><div class="b-tile"><div class="num" id="tile-q2">—</div><div class="label">Q2 已完成</div></div><div class="b-tile"><div class="num" id="tile-zombie">—</div><div class="label">Zombie</div></div><div class="b-tile alert"><div class="num" id="tile-incidents">—</div><div class="label">Open incidents</div></div>
+</section><nav class="b-tabs" aria-label="数据集"><button class="b-tab active" data-tab="q1">Q1 决策</button><button class="b-tab" data-tab="hung">卡死</button><button class="b-tab" data-tab="sessions">会话</button><button class="b-tab" data-tab="q2">Q2 完成</button><button class="b-tab" data-tab="zombie">Zombie</button><button class="b-tab" data-tab="health">Health</button></nav>
+<div class="b-toolbar" id="toolbar"><span id="selected-count">0 项已选</span><button class="btn primary" id="bulk-ack">批量 Ack</button><button class="btn" id="clear-selection">取消</button></div><div id="detail" class="hidden"></div><div class="b-table-wrap" id="table-wrap"><table class="b-table"><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div></main><script src="/static/app.js"></script></body></html>`;
 
 const staticAppPath = fileURLToPath(new URL("./static/app.js", import.meta.url));
 
@@ -76,13 +78,14 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
         if (request.method === "GET" && url.pathname === "/static/app.js") return new Response(Bun.file(staticAppPath), { headers: { "content-type": "text/javascript; charset=utf-8" } });
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
-          return { q1: queryQ1(db).length, q2: queryQ2(db).length, open_incidents: health.open_incidents.length, coverage_gaps: health.coverage_gaps, telemetry_gaps: health.telemetry_gaps };
+          return { q1: queryQ1(db).length, q2: queryQ2(db).length, hung: queryHung(db).length, open_incidents: health.open_incidents.length, coverage_gaps: health.coverage_gaps, telemetry_gaps: health.telemetry_gaps };
         }));
-        if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, querySessions));
+        if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT)));
         if (request.method === "GET" && url.pathname === "/api/q1") return json(withReadonlyDb(ledgerPath, queryQ1).map(({ platform: _platform, ...row }) => row));
         if (request.method === "GET" && url.pathname === "/api/q2") return json(withReadonlyDb(ledgerPath, queryQ2));
         if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyDb(ledgerPath, queryZombie));
-        if (request.method === "GET" && url.pathname === "/api/health") return json(withReadonlyDb(ledgerPath, (db) => ({ ...queryHealth(db), attention: queryAttention(db, Date.now(), configRefocusCostMin()) })));
+        if (request.method === "GET" && url.pathname === "/api/hung") return json(withReadonlyDb(ledgerPath, (db) => queryHung(db)));
+        if (request.method === "GET" && url.pathname === "/api/health") return json(withReadonlyDb(ledgerPath, queryHealth));
         if (request.method === "GET" && url.pathname.startsWith("/api/sessions/")) {
           const stableId = routeParameter(url.pathname.slice("/api/sessions/".length));
           const result = withReadonlyDb(ledgerPath, (db) => querySession(db, stableId));
@@ -90,8 +93,16 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/jump/")) {
           const requestUid = routeParameter(url.pathname.slice("/api/jump/".length));
-          const target = withReadonlyDb(ledgerPath, (db) => queryJumpTarget(db, requestUid));
+          const target = withReadonlyDb(ledgerPath, (db) => {
+            const stableId = requestSession(db, requestUid);
+            return stableId ? queryJumpTarget(db, stableId) : null;
+          });
           return target ? json(await (options.jump ?? performJump)(target)) : json({ error: "request not found" }, { status: 404 });
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/api/jump-session/")) {
+          const stableId = routeParameter(url.pathname.slice("/api/jump-session/".length));
+          const target = withReadonlyDb(ledgerPath, (db) => queryJumpTarget(db, stableId));
+          return target ? json(await (options.jump ?? performJump)(target)) : json({ error: "session not found" }, { status: 404 });
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/ack/")) {
           const requestUid = routeParameter(url.pathname.slice("/api/ack/".length));

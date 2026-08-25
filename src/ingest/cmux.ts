@@ -34,7 +34,7 @@ const CANCELLED_STATUSES = new Set(["denied", "rejected", "cancelled", "canceled
 // all three actionable kinds; no terminal status was present in the local file.
 // The terminal sets above therefore conservatively accept the protocol's named
 // outcomes while unknown status keys are skipped rather than guessed.
-export async function scanCmux(db: Database, path: string, reducerBatchSize = 500, notifySink = "osascript"): Promise<CmuxScanResult> {
+export async function scanCmux(db: Database, path: string, reducerBatchSize = 500): Promise<CmuxScanResult> {
   let handle;
   try {
     handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -122,7 +122,7 @@ export async function scanCmux(db: Database, path: string, reducerBatchSize = 50
       }
     });
     commit.immediate();
-    while (reduceJournal(db, reducerBatchSize, notifySink) === reducerBatchSize) { /* drain */ }
+    while (reduceJournal(db, reducerBatchSize) === reducerBatchSize) { /* drain */ }
     return { inserted, generation: generation.generation_uuid };
   } finally {
     await handle.close();

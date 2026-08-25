@@ -40,21 +40,25 @@ export type EventKind =
   | "session_vanished"     // {stable_id, platform} — ONLY after a COMPLETE platform snapshot proves absence
   | "source_outage"        // {source} — platform CLI/host unreachable (aggregated: one event per outage start)
   | "source_recovered"     // {source}
-  | "attachment_observed"; // {stable_id, platform, binding, parent?} — jump-target binding refresh; parent = platform lineage (e.g. "orca:<parentWorktreeId>")
+  | "attachment_observed"  // {stable_id, platform, binding, parent?} — jump-target binding refresh; parent = platform lineage (e.g. "orca:<parentWorktreeId>")
+  | "turn_hung"            // {emitter_id, stable_id, hung_ms} — state=working ∧ progress silence ∧ heartbeat still fresh
+  | "dead_connection"      // {emitter_id, stable_id, hung_ms, local, peer} — an in-flight socket bound to an address the host no longer owns
+  | "network_changed";     // admin only: {previous, current} — host address set changed; every in-flight request on a dropped address is doomed
 
 // ── P2 state vocabulary (frozen) ──
 export type SessionState = "working" | "idle" | "awaiting_human" | "done" | "failed" | "vanished";
 export type QueueName = "q1" | "q2" | "q3" | "q5";           // Q4 closed until P4
-export type Q5Reason = "stalled" | "dead_incarnation" | "telemetry_gap" | "orphaned_request";
-export type NotificationState = "pending" | "attempting" | "sent" | "failed_permanent";
-export type NotificationKind = "initial" | "reminder";
-/** Retry backoff for sink failures (minutes), then failed_permanent. */
-export const SINK_BACKOFF_MIN = [1, 5, 15, 15, 15] as const;
-export const REMINDER_INTERVAL_MS = 15 * 60_000;
+export type Q5Reason = "stalled" | "dead_incarnation" | "telemetry_gap" | "orphaned_request" | "turn_hung" | "dead_connection";
 export const DRAIN_GRACE_MS = 5 * 60_000;
-export const ATTEMPTING_RETRY_GRACE_MS = 30_000;
 /** Heartbeat-silence profiles (§2.4): narrow default, wide for long tasks. */
 export const STALL_PROFILE_MS = { narrow: 30 * 60_000, wide: 120 * 60_000 } as const;
+/** A working turn with no progress event for this long is hung, not slow.
+ *  Heartbeat proves liveness only; progress is tool_activity/working/settled. */
+export const TURN_HANG_MS = 20 * 60_000;
+/** Event kinds that prove the turn advanced. `heartbeat` is deliberately absent. */
+export const PROGRESS_KINDS: Record<string, true> = {
+  session_started: true, working: true, settled: true, tool_activity: true, decision_requested: true,
+};
 
 export interface EventEnvelope {
   v: typeof ENVELOPE_VERSION;

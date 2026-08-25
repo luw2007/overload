@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { initializeLedger, readCompleteLines, scanOnce } from "./ingest";
@@ -50,6 +50,23 @@ describe("atomic spool ingestion", () => {
     db.close();
   });
 
+  test("does not reopen a file whose cursor already covers it", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const file = join(emitterDir, "seg-pi-42-bootabcd-0.ndjson");
+    await writeFile(file, `${JSON.stringify(event(1, "heartbeat"))}\n`);
+    await scanOnce(db, spool);
+
+    // Read permission is removed after the cursor reaches EOF: a scan that
+    // still opened consumed files would fail here instead of skipping them.
+    await chmod(file, 0o000);
+    try {
+      expect((await scanOnce(db, spool)).files).toBe(0);
+    } finally {
+      await chmod(file, 0o600);
+    }
+    db.close();
+  });
+
   test("deduplicates overlap from active and sealed files", async () => {
     const { spool, emitterDir, db } = await fixture();
     const line = `${JSON.stringify(event(1, "heartbeat"))}\n`;
@@ -84,19 +101,6 @@ describe("atomic spool ingestion", () => {
     await scanOnce(db, spool);
     expect(db.query("SELECT pid, proc_boot_id FROM session_incarnations").get())
       .toEqual({ pid: 4242, proc_boot_id: "bootfeedface" });
-    db.close();
-  });
-
-  test("stamps reducer-enqueued initial notifications with the configured sink (loop-1 E3)", async () => {
-    const { spool, emitterDir, db } = await fixture();
-    const lines = [
-      JSON.stringify(event(1, "session_started", { lease: { pid: 1 } })),
-      JSON.stringify(event(2, "decision_requested", { request_id: "ask-1" })),
-    ].join("\n");
-    await writeFile(join(emitterDir, "active-pi-42-bootabcd-0.ndjson"), `${lines}\n`);
-    await scanOnce(db, spool, 500, "file:/tmp/audit.ndjson");
-    expect(db.query("SELECT sink, state FROM notifications").get())
-      .toEqual({ sink: "file:/tmp/audit.ndjson", state: "pending" });
     db.close();
   });
 
@@ -147,6 +151,36 @@ describe("P2 reducer and classifier", () => {
     expect((db.query("SELECT count(*) n FROM queue_transitions").get() as { n: number }).n).toBe(count);
     db.close();
   });
+
+  test("separates the progress clock from the heartbeat clock and keeps recon findings off last_event_at", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const batch = [
+      event(1, "session_started", { pid: 42, parent: "agent" }),
+      event(2, "working"),
+      event(3, "tool_activity", { tool: "bash" }),
+      event(4, "heartbeat"),
+      event(5, "heartbeat"),
+    ].map(JSON.stringify).join("\n") + "\n";
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
+    await scanOnce(db, spool);
+
+    const beat = db.query("SELECT last_event_at, last_heartbeat_at, last_progress_at FROM current").get() as Record<string, number>;
+    // Heartbeats prove liveness only: the progress clock stays at tool_activity.
+    expect(beat.last_heartbeat_at).toBe(1_700_000_000_005);
+    expect(beat.last_progress_at).toBe(1_700_000_000_003);
+    expect(beat.last_event_at).toBe(1_700_000_000_005);
+
+    await writeFile(join(emitterDir, "seg-pi-42-bootabcd-1.ndjson"),
+      JSON.stringify(event(6, "turn_hung", { stable_id: "local:pi:session-1", emitter_id: "pi-42-bootabcd", hung_ms: 1_200_000 })) + "\n");
+    await scanOnce(db, spool);
+
+    const hung = db.query("SELECT queue, q5_reason, last_event_at, last_progress_at FROM current").get() as Record<string, unknown>;
+    expect(hung).toMatchObject({ queue: "q5", q5_reason: "turn_hung" });
+    // An observation about the session must not look like activity by it.
+    expect(hung.last_event_at).toBe(1_700_000_000_005);
+    expect(hung.last_progress_at).toBe(1_700_000_000_003);
+    db.close();
+  });
   test("projects session-start host context without creating an external attachment", async () => {
     const { spool, emitterDir, db } = await fixture();
     await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), `${JSON.stringify(event(1, "session_started", {
@@ -195,7 +229,7 @@ describe("P2 reducer and classifier", () => {
     db.close();
   });
 
-  test("enqueues initial notification atomically and orphans only when emitter is drained", async () => {
+  test("orphans a pending request only when its emitter is drained", async () => {
     const { spool, emitterDir, db } = await fixture();
     const batch = [
       event(1, "session_started"),
@@ -206,7 +240,6 @@ describe("P2 reducer and classifier", () => {
     await writeFile(join(emitterDir, "seg-pi-42-bootabcd-0.ndjson"), batch);
     await scanOnce(db, spool);
     expect(db.query("SELECT state FROM requests WHERE request_id='ask-1'").get()).toEqual({ state: "orphaned" });
-    expect(db.query("SELECT kind, state, reminder_seq FROM notifications").get()).toEqual({ kind: "initial", state: "pending", reminder_seq: 0 });
     expect(db.query("SELECT emitter_id, reason, to_at FROM coverage_gaps").get()).toEqual({ emitter_id: "pi-42-bootabcd", reason: "emitter_drained", to_at: event(4, "x").at });
     db.close();
   });

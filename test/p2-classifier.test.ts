@@ -455,13 +455,6 @@ describe.skipIf(!HAS_N5)("real: N5 classifier via ingest --once + CLI surface", 
         | undefined;
       expect(req?.state).toBe("pending");
 
-      // Protocol 4 enqueue side: initial notification row exists, atomically.
-      const initial = ldb.query(
-        "SELECT kind, reminder_seq, state FROM notifications WHERE request_uid=? AND kind='initial'",
-      ).all(reqUid) as Array<{ kind: string; reminder_seq: number; state: string }>;
-      expect(initial).toHaveLength(1);
-      expect(initial[0]!.reminder_seq).toBe(0);
-
       // Activation watermark: the current classifier version exactly once
       // (version-agnostic: v2 activated fresh ledgers after the P4 bump).
       const acts = ldb.query("SELECT version FROM classifier_activations").all() as Array<{ version: number }>;
@@ -493,7 +486,7 @@ describe.skipIf(!HAS_N5)("real: N5 classifier via ingest --once + CLI surface", 
       expect((ldb3.query("SELECT COUNT(*) AS n FROM queue_transitions").get() as { n: number }).n)
         .toBe(transitionsAfterFirst);
       expect((ldb3.query("SELECT COUNT(*) AS n FROM requests").get() as { n: number }).n).toBe(1);
-      expect((ldb3.query("SELECT COUNT(*) AS n FROM notifications WHERE kind='initial'").get() as { n: number }).n).toBe(1);
+      expect((ldb3.query("SELECT COUNT(*) AS n FROM requests WHERE state='pending'").get() as { n: number }).n).toBe(1);
       ldb3.close();
     } finally {
       try { ldb.close(); } catch { /* */ }

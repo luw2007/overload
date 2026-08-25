@@ -8,19 +8,27 @@ import { fileURLToPath } from "node:url";
 import { reduceJournal } from "./reducer";
 import { appendClassifierActivated, CLASSIFIER_VERSION } from "./classifier";
 import { scanCmux } from "./cmux";
+import { PROGRESS_KINDS } from "../shared/types";
+import { pruneSpool } from "./prune";
 
 const DEFAULT_SCAN_INTERVAL_MS = 2_000;
 const DEFAULT_REDUCER_BATCH_SIZE = 500;
+const DEFAULT_PRUNE_INTERVAL_MS = 3_600_000;
+const DEFAULT_SPOOL_RETENTION_MS = 86_400_000;
 const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const SEGMENT_FILE = /^(?:active|seg)-[A-Za-z0-9._-]+-\d+(?:-recovered)?\.ndjson$/;
 
 export type IngestConfig = {
   scan_interval_ms: number;
   reducer_batch_size: number;
-  /** Sink id stamped on reducer-enqueued initial notification rows (configurable, default osascript). */
-  notify_sink: string;
   cmux_workstream_path: string;
+  /** How often consumed spool bytes are swept. */
+  prune_interval_ms: number;
+  /** How long a consumed spool file is kept before it is swept. */
+  spool_retention_ms: number;
 };
+
+type SpoolFile = { path: string; size: number };
 
 type Envelope = {
   v: 1;
@@ -55,9 +63,10 @@ export async function loadConfig(path = join(homedir(), ".overload", "config.jso
   return {
     scan_interval_ms: positiveInteger(value.scan_interval_ms, DEFAULT_SCAN_INTERVAL_MS),
     reducer_batch_size: positiveInteger(value.reducer_batch_size, DEFAULT_REDUCER_BATCH_SIZE),
-    notify_sink: typeof value.notify_sink === "string" && value.notify_sink.length > 0 ? value.notify_sink : "osascript",
     cmux_workstream_path: typeof value.cmux_workstream_path === "string" && value.cmux_workstream_path.length > 0
       ? value.cmux_workstream_path : join(homedir(), ".cmuxterm", "workstream.jsonl"),
+    prune_interval_ms: positiveInteger(value.prune_interval_ms, DEFAULT_PRUNE_INTERVAL_MS),
+    spool_retention_ms: positiveInteger(value.spool_retention_ms, DEFAULT_SPOOL_RETENTION_MS),
   };
 }
 
@@ -85,7 +94,30 @@ export async function openLedger(path = join(homedir(), ".overload", "ledger.db"
 export function initializeLedger(db: Database): void {
   const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
   db.exec(requireText(schemaPath));
+  migrateProgressColumn(db);
+  dropNotificationOutbox(db);
   db.query("INSERT OR IGNORE INTO reducer_cursor(id, journal_seq) VALUES (1, 0)").run();
+}
+
+/** The outbox had no delivery daemon and no reader; its rows and the reminder
+ *  clock that fed it are unreachable state, so they leave with it. */
+function dropNotificationOutbox(db: Database): void {
+  db.exec("DROP TABLE IF EXISTS notifications");
+  const columns = db.query("PRAGMA table_info(requests)").all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === "next_reminder_at")) {
+    db.exec("ALTER TABLE requests DROP COLUMN next_reminder_at");
+  }
+}
+
+/** Ledgers created before the liveness/progress split carry no progress clock.
+ *  Backfill it from the journal so hang detection starts from a real event. */
+function migrateProgressColumn(db: Database): void {
+  const columns = db.query("PRAGMA table_info(current)").all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === "last_progress_at")) return;
+  db.exec("ALTER TABLE current ADD COLUMN last_progress_at INTEGER");
+  const kinds = Object.keys(PROGRESS_KINDS).map((kind) => `'${kind}'`).join(",");
+  db.exec(`UPDATE current SET last_progress_at=(SELECT MAX(j.at) FROM journal j
+    WHERE j.stable_id=current.stable_id AND j.kind IN (${kinds}))`);
 }
 
 function requireText(path: string): string {
@@ -102,13 +134,17 @@ export function activateClassifier(db: Database, home = homedir(), spoolRoot = j
   return true;
 }
 
-export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overload", "spool"), reducerBatchSize = DEFAULT_REDUCER_BATCH_SIZE, notifySink = "osascript", cmuxWorkstreamPath?: string): Promise<{ files: number; inserted: number }> {
+export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overload", "spool"), reducerBatchSize = DEFAULT_REDUCER_BATCH_SIZE, cmuxWorkstreamPath?: string): Promise<{ files: number; inserted: number }> {
   const files = await discoverSpoolFiles(spoolRoot);
   const pending: PendingFile[] = [];
-  for (const path of files) {
-    const key = relative(resolve(spoolRoot), path).split(sep).join("/");
-    const cursor = (db.query("SELECT bytes FROM cursors WHERE file_name=?").get(key) as { bytes: number } | null)?.bytes ?? 0;
-    const parsed = await readCompleteLines(path, key, cursor);
+  const cursorFor = db.query("SELECT bytes FROM cursors WHERE file_name=?");
+  for (const file of files) {
+    const key = relative(resolve(spoolRoot), file.path).split(sep).join("/");
+    const cursor = (cursorFor.get(key) as { bytes: number } | null)?.bytes ?? 0;
+    // A file already read to its last observed byte has nothing to offer; not
+    // opening it is what keeps the scan flat as the spool grows.
+    if (cursor === file.size) continue;
+    const parsed = await readCompleteLines(file.path, key, cursor);
     if (parsed) pending.push(parsed);
   }
 
@@ -124,13 +160,13 @@ export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overl
   });
   transaction.immediate();
 
-  while (reduceJournal(db, reducerBatchSize, notifySink) === reducerBatchSize) { /* drain */ }
-  if (cmuxWorkstreamPath) inserted += (await scanCmux(db, cmuxWorkstreamPath, reducerBatchSize, notifySink)).inserted;
+  while (reduceJournal(db, reducerBatchSize) === reducerBatchSize) { /* drain */ }
+  if (cmuxWorkstreamPath) inserted += (await scanCmux(db, cmuxWorkstreamPath, reducerBatchSize)).inserted;
   return { files: pending.length, inserted };
 }
 
-async function discoverSpoolFiles(root: string): Promise<string[]> {
-  const found: string[] = [];
+async function discoverSpoolFiles(root: string): Promise<SpoolFile[]> {
+  const found: SpoolFile[] = [];
   let hosts;
   try { hosts = await readdir(root, { withFileTypes: true }); }
   catch (error) {
@@ -148,7 +184,7 @@ async function discoverSpoolFiles(root: string): Promise<string[]> {
         const path = join(emitterPath, entry.name);
         const stat = await lstat(path);
         if (!stat.isFile() || stat.isSymbolicLink()) continue;
-        found.push(path);
+        found.push({ path, size: stat.size });
       }
     }
   }
@@ -256,11 +292,19 @@ async function main(): Promise<void> {
   const db = await openLedger(join(home, "ledger.db"));
   activateClassifier(db, homedir(), join(home, "spool"));
   const heartbeatPath = join(home, "ingest.heartbeat");
+  const spool = join(home, "spool");
+  let host = "local";
+  try { host = (await readFile(join(home, "host"), "utf8")).trim() || "local"; } catch { /* single-machine default */ }
+  let lastPruneAt = 0;
   const run = async () => {
-    const result = await scanOnce(db, join(home, "spool"), config.reducer_batch_size, config.notify_sink, config.cmux_workstream_path);
+    const result = await scanOnce(db, spool, config.reducer_batch_size, config.cmux_workstream_path);
     // Watchdog liveness contract (review P2 m4): the ingest loop owns this touch.
     try { await Bun.write(heartbeatPath, String(Date.now())); } catch { /* watchdog will alarm */ }
     if (once) console.log(`ingested ${result.inserted} new event(s) from ${result.files} file(s)`);
+    if (Date.now() - lastPruneAt < config.prune_interval_ms) return;
+    lastPruneAt = Date.now();
+    const swept = await pruneSpool(db, spool, { host, retentionMs: config.spool_retention_ms });
+    if (swept.files || once) console.log(`pruned ${swept.files} consumed spool file(s), ${swept.directories} directory(ies)`);
   };
   try {
     do {

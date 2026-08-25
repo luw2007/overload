@@ -31,7 +31,7 @@ describe("reducer Q4 projection", () => {
   test("projects read-only agent completion to q4 and a bash session to q2", () => {
     const db = new Database(":memory:");
     db.run("CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, origin TEXT)");
-    db.run("CREATE TABLE current(stable_id TEXT PRIMARY KEY, writer_id TEXT, state TEXT, queue TEXT, q5_reason TEXT, origin TEXT, last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER, frozen INTEGER DEFAULT 0)");
+    db.run("CREATE TABLE current(stable_id TEXT PRIMARY KEY, writer_id TEXT, state TEXT, queue TEXT, q5_reason TEXT, origin TEXT, last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER, last_progress_at INTEGER, frozen INTEGER DEFAULT 0)");
     db.run("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, at INTEGER, stable_id TEXT, writer_id TEXT, emitter_id TEXT, kind TEXT, detail TEXT)");
     db.run("CREATE TABLE reducer_cursor(id INTEGER PRIMARY KEY, journal_seq INTEGER)");
     db.run("CREATE TABLE requests(request_uid TEXT PRIMARY KEY, stable_id TEXT, writer_id TEXT, origin_emitter_id TEXT, request_id TEXT, kind TEXT, state TEXT, created_at INTEGER, resolved_at INTEGER, detail TEXT)");

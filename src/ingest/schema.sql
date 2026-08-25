@@ -28,7 +28,10 @@ CREATE INDEX IF NOT EXISTS incarnations_stable_id_started_at ON session_incarnat
 CREATE TABLE IF NOT EXISTS current(
   stable_id TEXT PRIMARY KEY, writer_id TEXT, state TEXT NOT NULL,
   queue TEXT, q5_reason TEXT, origin TEXT NOT NULL DEFAULT 'unknown',
-  last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER, frozen INTEGER DEFAULT 0);
+  last_ingest_seq INTEGER, last_event_at INTEGER, last_heartbeat_at INTEGER,
+  -- Liveness (heartbeat) and progress (tool_activity/working/settled) are
+  -- separate axes: a hung turn keeps heartbeating while progress stands still.
+  last_progress_at INTEGER, frozen INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS queue_transitions(
   id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL, queue TEXT NOT NULL,
   direction TEXT NOT NULL CHECK(direction IN('entered','left')), at INTEGER NOT NULL,
@@ -36,13 +39,6 @@ CREATE TABLE IF NOT EXISTS queue_transitions(
   UNIQUE(subject, queue, direction, source_seq, classifier_version));
 CREATE TABLE IF NOT EXISTS classifier_activations(
   version INTEGER PRIMARY KEY, activated_at_journal_seq INTEGER NOT NULL, activated_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS notifications(
-  notification_uid INTEGER PRIMARY KEY AUTOINCREMENT, request_uid TEXT NOT NULL,
-  sink TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN('initial','reminder')),
-  reminder_seq INTEGER NOT NULL DEFAULT 0,
-  state TEXT NOT NULL CHECK(state IN('pending','attempting','sent','failed_permanent')),
-  attempt_at INTEGER, sent_at INTEGER, retry_count INTEGER NOT NULL DEFAULT 0,
-  UNIQUE(request_uid, sink, kind, reminder_seq));
 CREATE TABLE IF NOT EXISTS attachments(
   stable_id TEXT NOT NULL, platform TEXT NOT NULL, binding TEXT NOT NULL,
   observed_at INTEGER NOT NULL, valid INTEGER NOT NULL DEFAULT 1,
@@ -57,8 +53,6 @@ CREATE TABLE IF NOT EXISTS incidents(
 CREATE TABLE IF NOT EXISTS coverage_gaps(
   id INTEGER PRIMARY KEY AUTOINCREMENT, stable_id TEXT, emitter_id TEXT NOT NULL,
   from_seq INTEGER, from_at INTEGER, to_at INTEGER NOT NULL, reason TEXT NOT NULL);
--- requests.next_reminder_at is part of the P1 base DDL above, so the frozen
--- `ALTER TABLE requests ADD COLUMN next_reminder_at INTEGER` migration is skipped.
 
 -- P4 (owner-frozen): cmux workstream source generations (tech-solution §2.9)
 CREATE TABLE IF NOT EXISTS source_generations(

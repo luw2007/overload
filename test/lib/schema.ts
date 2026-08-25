@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS session_incarnations(stable_id TEXT, writer_id TEXT,
   PRIMARY KEY(stable_id, writer_id));
 CREATE TABLE IF NOT EXISTS requests(request_uid TEXT PRIMARY KEY, stable_id TEXT, writer_id TEXT,
   origin_emitter_id TEXT, request_id TEXT, kind TEXT, state TEXT,
-  created_at INTEGER, resolved_at INTEGER, next_reminder_at INTEGER, detail TEXT);
+  created_at INTEGER, resolved_at INTEGER, detail TEXT);
 CREATE TABLE IF NOT EXISTS reducer_cursor(id INTEGER PRIMARY KEY CHECK(id=1), journal_seq INTEGER NOT NULL);
 
 -- Support indexes (frozen names come from the UNIQUE/PK; these are auxiliary).
