@@ -102,6 +102,26 @@ describe("ReconDaemon", () => {
     expect(output.every((event) => event.runtime === "overload" && event.dropped_total === 0 && event.write_error_total === 0)).toBe(true);
   });
 
+  test("does not judge process incarnations owned by another host", async () => {
+    const f = await fixture();
+    await writeFile(f.herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[{\"terminal_id\":\"devbox-term\",\"agent_status\":\"working\",\"cwd\":\"/devbox/repo\"}]}}'\n", { mode: 0o700 });
+    const emitter = "pi-999999-devbox00";
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO sessions VALUES (?, 'devbox', 'pi', 'remote', '/devbox/repo')").run("devbox:pi:remote");
+    db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', 999999, 'devbox0000', 1, ?)")
+      .run("devbox:pi:remote", emitter, Date.now() - 5_000);
+    db.query("INSERT INTO journal VALUES (1, 'devbox', ?, 1, ?, ?, ?, 'heartbeat', '{}')")
+      .run(emitter, Date.now() - 5_000, "devbox:pi:remote", emitter);
+    db.close();
+
+    const summary = await new ReconDaemon(f.config).runOnce();
+    expect(summary.byKind.emitter_dead ?? 0).toBe(0);
+    expect(summary.byKind.emitter_drained ?? 0).toBe(0);
+    expect(summary.byKind.telemetry_gap ?? 0).toBe(0);
+    const output = await events(f.spool);
+    expect(output.some((event) => ["emitter_dead", "emitter_drained", "telemetry_gap"].includes(event.kind))).toBe(false);
+  });
+
   test("joins visible native sessions by cwd and includes stable_id in a rate-limited telemetry gap", async () => {
     const f = await fixture();
     await writeFile(f.herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[{\"terminal_id\":\"term-1\",\"agent_status\":\"working\",\"cwd\":\"/repo\"},{\"terminal_id\":\"term-gap\",\"agent_status\":\"working\",\"cwd\":\"/missing\"}]}}'\n", { mode: 0o700 });

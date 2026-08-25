@@ -72,7 +72,7 @@ export type ReconProbes = {
 type NativeSession = { native_id: string; cwd?: string; visible: boolean; parent?: string };
 type SourceSnapshot = { sessions: NativeSession[] };
 type AttachmentRow = { stable_id: string; platform: string; binding: string };
-type SessionRow = { stable_id: string; cwd: string | null };
+type SessionRow = { stable_id: string; host: string; cwd: string | null };
 
 type ProcessState = { alive: boolean; verified?: "kill0" | "comm_mismatch"; comm?: string };
 
@@ -187,9 +187,9 @@ export class ReconDaemon {
       i.started_at, i.last_seen_at, s.cwd, s.runtime, s.session,
       (SELECT MAX(j.at) FROM journal j WHERE j.emitter_id=i.writer_id) AS last_event_at
       FROM session_incarnations i JOIN sessions s ON s.stable_id=i.stable_id
-      WHERE i.liveness_domain='process'
+      WHERE i.liveness_domain='process' AND s.host=?
         AND NOT EXISTS (SELECT 1 FROM journal e WHERE e.stable_id=i.stable_id
-          AND e.writer_id=i.writer_id AND e.kind='session_ended')`);
+          AND e.writer_id=i.writer_id AND e.kind='session_ended')`, this.config.host);
   }
 
   /** A hung turn is invisible without `current`: heartbeat keeps the emitter
@@ -294,7 +294,7 @@ export class ReconDaemon {
 
   private async reconcileSource(db: Database, platform: string, snapshot: SourceSnapshot,
     liveWriters: Set<string>, summary: ReconSummary, now: number): Promise<void> {
-    const sessions = safeAll<SessionRow>(db, "SELECT stable_id, cwd FROM sessions");
+    const sessions = safeAll<SessionRow>(db, "SELECT stable_id, host, cwd FROM sessions");
     const byCwd = new Map<string, SessionRow[]>();
     for (const session of sessions) {
       if (!session.cwd) continue;
@@ -320,15 +320,16 @@ export class ReconDaemon {
           this.attachments.set(attachmentKey, native.native_id);
         }
       }
-      if (native.visible && matches.length > 0 &&
-          !matches.some((match) => this.sessionHasLiveWriter(db, match.stable_id, liveWriters))) {
+      const localMatches = matches.filter((match) => match.host === this.config.host);
+      if (native.visible && localMatches.length > 0 &&
+          !localMatches.some((match) => this.sessionHasLiveWriter(db, match.stable_id, liveWriters))) {
         const key = `${platform}:${native.native_id}`;
         const journalAt = this.latestTelemetryGapAt(db, native.native_id);
         const latestAt = Math.max(this.gaps.get(key) ?? 0, journalAt ?? 0);
         if (now - latestAt >= GAP_RATE_LIMIT_MS) {
           await this.emit(summary, "telemetry_gap", "admin", now, {
             platform, native_id: native.native_id, cwd: native.cwd,
-            stable_id: matches[0]!.stable_id,
+            stable_id: localMatches[0]!.stable_id,
           });
           this.gaps.set(key, now);
         }

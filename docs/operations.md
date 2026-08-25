@@ -50,6 +50,13 @@ bun src/cli/overload.ts doctor
 
 The watchdog relies on `~/.overload/ingest.heartbeat`. Service stdout and stderr are in `/tmp/overload-*.{log,err}`. An unavailable remote source or integration becomes a visible incident; do not delete ledger rows to clear it.
 
+Recon only evaluates process liveness for sessions owned by its own host. A
+local recon must not test a devbox pid or infer that the devbox emitter spool
+is drained. Consequently, when recon is not deployed and running on the
+devbox, devbox sessions will not be declared dead or drained; those findings
+can only be produced on that host and returned through the existing pull
+channel.
+
 `doctor` is a read-only checklist (never installs or fixes anything): ledger
 reachability, pi/omp extension presence, the four LaunchAgent states,
 ingest/pull heartbeat freshness, whether recorded session activity is
