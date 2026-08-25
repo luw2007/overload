@@ -102,6 +102,40 @@ describe("ReconDaemon", () => {
     expect(output.every((event) => event.runtime === "overload" && event.dropped_total === 0 && event.write_error_total === 0)).toBe(true);
   });
 
+  test("treats a vanished spool file as consumed when prune wins the lstat race", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-pruned00";
+    const sourceDir = join(f.spool, "local", emitter);
+    await mkdir(sourceDir, { recursive: true });
+    const sourceFile = join(sourceDir, `active-${emitter}-0.ndjson`);
+    await writeFile(sourceFile, "source-event\n");
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO sessions VALUES (?, 'local', 'pi', 's1', '/repo')").run("local:pi:s1");
+    db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', 999999, 'pruned0000', 1, ?)")
+      .run("local:pi:s1", emitter, Date.now() - 5_000);
+    db.query("INSERT INTO journal VALUES (1, 'local', ?, 1, ?, ?, ?, 'heartbeat', '{}')")
+      .run(emitter, Date.now() - 5_000, "local:pi:s1", emitter);
+    db.close();
+
+    let raced = false;
+    const raceProbes = {
+      ...probes(["10.0.0.1"]),
+      spoolLstat: async (path: string) => {
+        if (path === sourceFile && !raced) {
+          raced = true;
+          await rm(path);
+          const error = new Error("pruned") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        return stat(path);
+      },
+    };
+    const summary = await new ReconDaemon(f.config, raceProbes).runOnce();
+    expect(raced).toBe(true);
+    expect(summary.byKind.emitter_drained).toBe(1);
+  });
+
   test("does not judge process incarnations owned by another host", async () => {
     const f = await fixture();
     await writeFile(f.herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[{\"terminal_id\":\"devbox-term\",\"agent_status\":\"working\",\"cwd\":\"/devbox/repo\"}]}}'\n", { mode: 0o700 });
@@ -218,6 +252,20 @@ describe("ReconDaemon", () => {
     expect(summary.byKind.network_changed).toBe(1);
     const finding = (await events(f.spool)).find((event) => event.kind === "dead_connection");
     expect(finding?.detail).toMatchObject({ local: socket.local, peer: socket.peer });
+  });
+
+  test("ignores a future remote clock when the local ingest pipeline is stale", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-remoteclock`;
+    const now = Date.now();
+    seedLive(f.ledger, emitter, { at: now - 600_000, state: "working", progressAt: now - 600_000 });
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO journal VALUES (2, 'devbox', 'pi-remote', 1, ?, 'devbox:pi:s2', 'pi-remote', 'heartbeat', '{}')")
+      .run(now + 60_000);
+    db.close();
+
+    const summary = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(summary.byKind.turn_hung ?? 0).toBe(0);
   });
 
   test("holds back hang findings while the ingest clock is stale", async () => {

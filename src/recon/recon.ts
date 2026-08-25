@@ -67,6 +67,7 @@ export type Socket = { local: string; peer: string };
 export type ReconProbes = {
   localAddresses: () => Set<string>;
   establishedSockets: (pid: number, timeoutMs: number) => Promise<Socket[]>;
+  spoolLstat?: typeof lstat;
 };
 
 type NativeSession = { native_id: string; cwd?: string; visible: boolean; parent?: string };
@@ -209,7 +210,7 @@ export class ReconDaemon {
 
   /** Ingest owns the journal clock: if it stopped, every session looks hung. */
   private pipelineFresh(db: Database, now: number): boolean {
-    const row = safeGet(db, "SELECT MAX(at) AS at FROM journal");
+    const row = safeGet(db, "SELECT MAX(at) AS at FROM journal WHERE host=?", this.config.host);
     return typeof row?.at === "number" ? now - row.at < this.config.turn_hang_ms / 2 : false;
   }
 
@@ -283,7 +284,12 @@ export class ReconDaemon {
     for (const entry of entries) {
       if (!entry.isFile() || !SPOOL_FILE.test(entry.name)) continue;
       const file = join(emitterDir, entry.name);
-      const info = await lstat(file);
+      let info;
+      try { info = await (this.probes.spoolLstat ?? lstat)(file); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
       if (!info.isFile() || info.isSymbolicLink()) return false;
       const key = relative(resolve(this.config.spool), file).split(sep).join("/");
       const cursor = safeGet(db, "SELECT bytes FROM cursors WHERE file_name=?", key) as { bytes: number } | null;
