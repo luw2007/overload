@@ -2,7 +2,6 @@
 import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { generateAttribReport } from "../attrib/report";
 import { ackRequest, queryHealth, queryHung, queryQ1, queryQ2, querySession, querySessions, queryZombie } from "../shared/queries";
 import { runDoctor, defaultDoctorDeps } from "./doctor";
 
@@ -11,7 +10,7 @@ type Output = (line: string) => void;
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q2 | q4 | hung | zombie | health | doctor | ack <request_uid> | attrib [--since <Nh|Nd>]"); process.exit(2); }
+function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q2 | q4 | hung | zombie | health | doctor | ack <request_uid>"); process.exit(2); }
 
 function listSessions(db: Database): void {
   const rows = querySessions(db);
@@ -69,24 +68,12 @@ function health(db: Database): void {
   console.log(`Health: open_incidents=${view.open_incidents.length} coverage_gaps=${view.coverage_gaps} telemetry_gaps=${view.telemetry_gaps}`);
   for (const row of view.open_incidents) console.log(`  incident ${row.source} since ${time(row.opened_at)}${detail(row.detail)}`);
 }
-function sinceMs(value: string): number | undefined {
-  const match = /^(\d+)(h|d)$/.exec(value); if (!match) return undefined;
-  return Number(match[1]) * (match[2] === "d" ? 86_400_000 : 3_600_000);
-}
-async function attrib(db: Database, value?: string): Promise<void> {
-  if (value && sinceMs(value) == null) usage();
-  const report = await generateAttribReport(db, { ...(value ? { sinceMs: sinceMs(value)! } : {}) });
-  console.log(`Attribution universe: ${report.universe.join(", ") || "(empty)"}`);
-  for (const row of report.rows) console.log(`${row.sha}\t${row.grade}\t${row.stable_id ?? "-"}\t${row.repo}\t${time(row.at)}`);
-}
-
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const [command, argument, ...extra] = argv;
   const simple = new Set(["sessions", "q1", "q2", "q4", "hung", "zombie", "health"]);
-  const validAttrib = command === "attrib" && ((argument == null && !extra.length) || (argument === "--since" && extra.length === 1));
   const validAck = command === "ack" && argument != null && !extra.length;
   const validDoctor = command === "doctor" && argument == null && !extra.length;
-  if (!command || (simple.has(command) && (argument || extra.length)) || (command === "show" && (!argument || extra.length)) || (!simple.has(command) && command !== "show" && !validAttrib && !validAck && !validDoctor)) usage();
+  if (!command || (simple.has(command) && (argument || extra.length)) || (command === "show" && (!argument || extra.length)) || (!simple.has(command) && command !== "show" && !validAck && !validDoctor)) usage();
   if (validAck) {
     // Human acknowledgement is a source terminal (the operator IS the decision
     // authority here): cancels the request and thereby stops reminders.
@@ -106,8 +93,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   let db: Database; try { db = new Database(path, { readonly: true }); } catch (error) { console.error(`Unable to open ledger ${path}: ${(error as Error).message}`); process.exit(1); }
   try {
     if (command === "sessions") listSessions(db); else if (command === "show") showSession(db, argument!); else if (command === "q1") q1(db); else if (command === "q2") q2(db);
-    else if (command === "q4") printQ4(db); else if (command === "hung") hung(db); else if (command === "zombie") zombie(db); else if (command === "health") health(db);
-    else await attrib(db, argument === "--since" ? extra[0] : undefined);
+    else if (command === "q4") printQ4(db); else if (command === "hung") hung(db); else if (command === "zombie") zombie(db); else health(db);
   } finally { db.close(); }
 }
 if (import.meta.main) await main();

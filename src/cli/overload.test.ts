@@ -51,34 +51,6 @@ describe("reducer Q4 projection", () => {
   });
 });
 
-describe("overload attrib", () => {
-  test("runs the CLI attrib branch against an isolated ledger", async () => {
-    const root = mkdtempSync(join(tmpdir(), "overload-cli-attrib-")); roots.push(root);
-    const ledger = join(root, "ledger.db");
-    const db = new Database(ledger);
-    db.exec(`
-      CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, cwd TEXT, origin TEXT);
-      CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, at INTEGER, stable_id TEXT, kind TEXT, detail TEXT);
-    `);
-    db.close();
-
-    const proc = Bun.spawn(["bun", "src/cli/overload.ts", "attrib"], {
-      env: { ...process.env, HOME: root, OVERLOAD_LEDGER_PATH: ledger },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-
-    expect(exitCode).toBe(0);
-    expect(stderr).toBe("");
-    expect(stdout.trim()).toBe("Attribution universe: (empty)");
-  });
-});
-
 describe("overload q4", () => {
   test("prints auto-verified read-only sessions", () => {
     const root = mkdtempSync(join(tmpdir(), "overload-cli-")); roots.push(root);
