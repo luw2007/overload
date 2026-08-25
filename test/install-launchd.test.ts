@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
 const roots: string[] = [];
@@ -49,7 +49,8 @@ describe("portable launchd installer", () => {
       const value = readFileSync(path, "utf8");
       expect(value).toContain(project);
       expect(value).not.toContain("$HOME/ai/overload");
-      expect(value).not.toContain("operator");
+      // Whoever runs this: the plist must name the checkout, never the operator.
+      expect(value).not.toContain(userInfo().username);
     }
     expect(existsSync(legacyNotifier)).toBe(false);
     expect(readFileSync(join(root, "launchctl.log"), "utf8")).toContain("bootstrap");
