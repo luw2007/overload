@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { queryHung, querySession } from "./queries";
+import { queryHealth, queryHung, querySession } from "./queries";
 
 const NOW = 1_755_000_000_000;
 const HOUR = 3_600_000;
@@ -40,6 +40,30 @@ describe("querySession", () => {
     expect(detail?.events[2]).toMatchObject({
       kind: "turn_hung",
       detail: { stable_id: target, reason: "no progress" },
+    });
+  });
+});
+
+describe("queryHealth", () => {
+  test("counts only recent gaps while keeping old open incidents", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE incidents(source TEXT, opened_at INTEGER, closed_at INTEGER, detail TEXT)");
+    db.run("CREATE TABLE coverage_gaps(stable_id TEXT, emitter_id TEXT, from_at INTEGER)");
+    db.run("CREATE TABLE journal(at INTEGER, kind TEXT, detail TEXT)");
+    const now = Date.now();
+    const recent = now - HOUR;
+    const stale = now - 25 * HOUR;
+
+    db.run("INSERT INTO incidents VALUES ('recon', ?, NULL, '{}')", [stale]);
+    db.run("INSERT INTO coverage_gaps VALUES ('recent-session', 'emitter', ?)", [recent]);
+    db.run("INSERT INTO coverage_gaps VALUES ('stale-session', 'emitter', ?)", [stale]);
+    db.run("INSERT INTO journal VALUES (?, 'telemetry_gap', ?)", [recent, JSON.stringify({ native_id: "recent-terminal" })]);
+    db.run("INSERT INTO journal VALUES (?, 'telemetry_gap', ?)", [stale, JSON.stringify({ native_id: "stale-terminal" })]);
+
+    expect(queryHealth(db)).toMatchObject({
+      open_incidents: [{ source: "recon", opened_at: stale }],
+      coverage_gaps: 1,
+      telemetry_gaps: 1,
     });
   });
 });

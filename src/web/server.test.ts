@@ -14,6 +14,7 @@ afterEach(() => {
 });
 
 function seedLedger(): string {
+  const now = Date.now();
   const root = mkdtempSync(join(tmpdir(), "overload-web-"));
   roots.push(root);
   const path = join(root, "ledger.db");
@@ -35,8 +36,8 @@ function seedLedger(): string {
   db.run("INSERT INTO session_hosts VALUES ('remote:pi:alpha', 'cmux', 'terminal-7', '/dev/ttys007', 1700000003000)");
   db.run("INSERT INTO current VALUES ('done:pi:beta', 'writer', 'done', 'q2', NULL, 'agent', 2, 1700000003000, NULL, NULL, 0)");
   db.run("INSERT INTO incidents VALUES (1, 'recon', 1700000004000, NULL, ?)", [JSON.stringify({ reason: "adapter unavailable" })]);
-  db.run("INSERT INTO coverage_gaps VALUES (1, 'remote:pi:alpha', 'emitter', 1, 1, 2, 'missing_seq')");
-  db.run("INSERT INTO journal VALUES (1, 1700000000000, 'remote:pi:alpha', 'writer', 'emitter', 'telemetry_gap', ?)", [JSON.stringify({ platform: "cmux", native_id: "term-9" })]);
+  db.run("INSERT INTO coverage_gaps VALUES (1, 'remote:pi:alpha', 'emitter', 1, ?, ?, 'missing_seq')", [now - 60_000, now]);
+  db.run("INSERT INTO journal VALUES (1, ?, 'remote:pi:alpha', 'writer', 'emitter', 'telemetry_gap', ?)", [now - 60_000, JSON.stringify({ platform: "cmux", native_id: "term-9" })]);
   db.run("INSERT INTO current VALUES ('remote:pi:alpha', 'writer', 'working', 'q5', 'turn_hung', 'agent', 9, 1700000009000, 1700000009000, 1700000005000, 0)");
   db.run("INSERT INTO journal VALUES (2, 1700000005000, 'remote:pi:alpha', 'writer', 'emitter', 'tool_activity', ?)", [JSON.stringify({ tool: "bash" })]);
   db.run("INSERT INTO journal VALUES (3, 1700000009000, 'remote:pi:alpha', 'writer', 'emitter', 'heartbeat', '{}')");

@@ -32,6 +32,9 @@ export type HealthView = {
 
 type JsonRow = { detail: string | null };
 
+// Health reflects currently active collection problems; stale gap history must age out.
+const HEALTH_GAP_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 function parseDetail(value: string | null): Record<string, unknown> | null {
   if (!value) return null;
   try {
@@ -146,10 +149,14 @@ export function queryHealth(db: Database): HealthView {
   const incidents = db.query("SELECT source, opened_at, detail FROM incidents WHERE closed_at IS NULL ORDER BY opened_at").all() as Array<HealthView["open_incidents"][number] & JsonRow>;
   // Distinct subjects, not event rows: recon re-reports the same gap hourly, so
   // a raw count says how long a problem has existed, never how many there are.
+  // Only recent gaps represent current collection health; open incidents remain
+  // unwindowed above because they are unresolved until explicitly closed.
+  const cutoff = Date.now() - HEALTH_GAP_WINDOW_MS;
   // bun:sqlite returns untyped rows; these aggregates are shaped by their SQL.
-  const coverage = db.query("SELECT count(DISTINCT COALESCE(stable_id, emitter_id)) n FROM coverage_gaps").get() as { n: number };
+  const coverage = db.query(`SELECT count(DISTINCT COALESCE(stable_id, emitter_id)) n
+    FROM coverage_gaps WHERE from_at>=?`).get(cutoff) as { n: number };
   const telemetry = db.query(`SELECT count(DISTINCT json_extract(detail, '$.native_id')) n
-    FROM journal WHERE kind='telemetry_gap'`).get() as { n: number };
+    FROM journal WHERE kind='telemetry_gap' AND at>=?`).get(cutoff) as { n: number };
   return { open_incidents: incidents.map(withParsedDetail), coverage_gaps: coverage.n, telemetry_gaps: telemetry.n };
 }
 
