@@ -80,6 +80,25 @@ request; that connection can never complete, so the turn must be cancelled
 and retried. A lost host address shortens the grace period to one minute, so
 such turns surface within about a minute instead of after `turn_hang_ms`.
 
+`turn_hang_ms` is tunable against evidence rather than taste, because a
+`turn_hung` finding can be falsified after the fact: if the flagged session
+emitted progress later, the turn was thinking, not hung. Re-measure before
+changing it:
+
+```sh
+sqlite3 ~/.overload/ledger.db "
+SELECT round(json_extract(h.detail,'\$.hung_ms')/60000.0,0) hung_min,
+  CASE WHEN EXISTS (SELECT 1 FROM journal j
+    WHERE j.stable_id=json_extract(h.detail,'\$.stable_id')
+      AND j.ingest_seq>h.ingest_seq
+      AND j.kind IN ('tool_activity','settled','working'))
+  THEN 'resumed (false positive)' ELSE 'never resumed' END verdict,
+  count(*) FROM journal h WHERE h.kind='turn_hung' GROUP BY 1,2 ORDER BY 1;"
+```
+
+`dead_connection` cannot be tuned this way and should not be: it reports
+socket evidence, not elapsed time. It stays at a one-minute grace.
+
 Every session id in the dashboard is a link into the 会话 tab's drill-down:
 state and queue, the three clocks, incarnation pids, pending asks, and the
 recent event timeline with heartbeats removed, so the top row is what the turn

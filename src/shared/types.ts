@@ -53,8 +53,16 @@ export const DRAIN_GRACE_MS = 5 * 60_000;
 /** Heartbeat-silence profiles (§2.4): narrow default, wide for long tasks. */
 export const STALL_PROFILE_MS = { narrow: 30 * 60_000, wide: 120 * 60_000 } as const;
 /** A working turn with no progress event for this long is hung, not slow.
- *  Heartbeat proves liveness only; progress is tool_activity/working/settled. */
-export const TURN_HANG_MS = 20 * 60_000;
+ *  Heartbeat proves liveness only; progress is tool_activity/working/settled.
+ *
+ *  60min, not 20: measured against the live journal by asking whether each
+ *  flagged session emitted progress afterwards (a resumption proves the turn
+ *  was thinking, not hung). At 20min 10 of 15 findings were false; at 60min
+ *  1 of 5. The real hangs clustered at 124-126min, the false ones at 20-22min
+ *  — the lower bound was measuring its own threshold. Network-caused hangs are
+ *  unaffected: dead_connection proves them from socket evidence within a
+ *  minute of the address change and never waits for this timer. */
+export const TURN_HANG_MS = 60 * 60_000;
 /** Event kinds that prove the turn advanced. `heartbeat` is deliberately absent. */
 export const PROGRESS_KINDS: Record<string, true> = {
   session_started: true, working: true, settled: true, tool_activity: true, decision_requested: true,

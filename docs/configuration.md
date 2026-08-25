@@ -13,7 +13,7 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 | `recon_interval_ms` | recon | Reconciliation interval. |
 | `drain_grace_ms` | recon | Delay before orphaning a dead emitter's pending requests. |
 | `stall_profile_ms` | recon | Silence threshold for a session that is still in `working` state; default `1800000`. Idle sessions are silent by design and are never stalled. |
-| `turn_hang_ms` | recon | A `working` turn with no progress event (heartbeat excluded) for this long is reported as `turn_hung`; default `1200000`. |
+| `turn_hang_ms` | recon | A `working` turn with no progress event (heartbeat excluded) for this long is reported as `turn_hung`; default `3600000`. Lower it and you start flagging long thinking: measured on this ledger, a 20-minute bound was false 10 times out of 15. |
 | `command_timeout_ms` | recon | External adapter command timeout. |
 
 Remote pull settings are command-line flags to `src/pull/pull.ts`: `--remote`, `--remote-spool`, `--dest`, `--ssh-cmd`, `--rsync-cmd`, `--fail-threshold`, and `--timeout-ms`. Run `bun src/pull/pull.ts --once` with invalid input to print the accepted contract.
