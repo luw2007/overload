@@ -42,6 +42,7 @@ export type ReconConfig = {
   spool: string;
   herdr_cmd: string;
   orca_cmd: string;
+  remote_probe_cmd: string;
   cmux_sessions_file: string;
 };
 
@@ -58,6 +59,7 @@ type Incarnation = {
   runtime: string | null;
   session: string | null;
   last_event_at: number | null;
+  host: string;
 };
 
 type CurrentView = { state: string | null; last_progress_at: number | null; last_event_at: number | null };
@@ -67,6 +69,7 @@ export type Socket = { local: string; peer: string };
 export type ReconProbes = {
   localAddresses: () => Set<string>;
   establishedSockets: (pid: number, timeoutMs: number) => Promise<Socket[]>;
+  remoteProcess?: (host: string, pid: number, command: string, timeoutMs: number) => Promise<"alive" | "dead">;
   spoolLstat?: typeof lstat;
 };
 
@@ -75,7 +78,7 @@ type SourceSnapshot = { sessions: NativeSession[] };
 type AttachmentRow = { stable_id: string; platform: string; binding: string };
 type SessionRow = { stable_id: string; host: string; cwd: string | null };
 
-type ProcessState = { alive: boolean; verified?: "kill0" | "comm_mismatch"; comm?: string };
+type ProcessState = { alive: boolean; verified?: "kill0" | "comm_mismatch" | "remote_probe"; comm?: string };
 
 export class ReconDaemon {
   private readonly config: ReconConfig;
@@ -110,8 +113,22 @@ export class ReconDaemon {
       const pipelineFresh = this.pipelineFresh(db, now);
       const incarnations = this.liveProcessIncarnations(db);
       const liveWriters = new Set<string>();
+      const remoteProbeStatus = new Map<string, boolean>();
       for (const incarnation of incarnations) {
-        const state = await inspectProcess(incarnation.pid, incarnation.runtime);
+        let state: ProcessState;
+        if (incarnation.host === this.config.host) {
+          state = await inspectProcess(incarnation.pid, incarnation.runtime);
+        } else {
+          try {
+            const result = await (this.probes.remoteProcess ?? remoteProcess)(incarnation.host, incarnation.pid!,
+              this.config.remote_probe_cmd, this.config.command_timeout_ms);
+            remoteProbeStatus.set(incarnation.host, remoteProbeStatus.get(incarnation.host) !== false);
+            state = { alive: result === "alive", verified: result === "dead" ? "remote_probe" : undefined };
+          } catch {
+            remoteProbeStatus.set(incarnation.host, false);
+            continue;
+          }
+        }
         if (!state.alive) {
           const firstDeadAt = this.deadAt.get(incarnation.writer_id) ?? now;
           this.deadAt.set(incarnation.writer_id, firstDeadAt);
@@ -125,7 +142,7 @@ export class ReconDaemon {
           const graceOrigin = incarnation.last_event_at ?? incarnation.last_seen_at ?? incarnation.started_at ?? firstDeadAt;
           if (!this.drained.has(incarnation.writer_id) &&
               now - graceOrigin >= this.config.drain_grace_ms &&
-              await this.spoolAtEof(db, incarnation.writer_id) &&
+              await this.spoolAtEof(db, incarnation.host, incarnation.writer_id) &&
               !this.wasDrained(db, incarnation.writer_id)) {
             await this.emit(summary, "emitter_drained", incarnation.session ?? "admin", now, {
               emitter_id: incarnation.writer_id, stable_id: incarnation.stable_id,
@@ -151,8 +168,20 @@ export class ReconDaemon {
             emitter_id: incarnation.writer_id, stable_id: incarnation.stable_id, silent_ms: silentMs,
           });
         }
-        if (pipelineFresh && view?.state === "working") {
+        if (incarnation.host === this.config.host && pipelineFresh && view?.state === "working") {
           await this.inspectTurn(db, incarnation, view, addresses, hangGraceMs, summary, now);
+        }
+      }
+
+      for (const [host, available] of remoteProbeStatus) {
+        const source = `host_probe:${host}`;
+        if (!available) {
+          if (!this.outages.has(source) && !this.sourceOutageOpen(db, source)) {
+            await this.emit(summary, "source_outage", "admin", now, { source });
+            this.outages.add(source);
+          }
+        } else if (this.outages.delete(source) || this.sourceOutageOpen(db, source)) {
+          await this.emit(summary, "source_recovered", "admin", now, { source });
         }
       }
 
@@ -185,12 +214,12 @@ export class ReconDaemon {
 
   private liveProcessIncarnations(db: Database): Incarnation[] {
     return safeAll<Incarnation>(db, `SELECT i.stable_id, i.writer_id, i.pid, i.proc_boot_id,
-      i.started_at, i.last_seen_at, s.cwd, s.runtime, s.session,
+      i.started_at, i.last_seen_at, s.cwd, s.runtime, s.session, s.host,
       (SELECT MAX(j.at) FROM journal j WHERE j.emitter_id=i.writer_id) AS last_event_at
       FROM session_incarnations i JOIN sessions s ON s.stable_id=i.stable_id
-      WHERE i.liveness_domain='process' AND s.host=?
+      WHERE i.liveness_domain='process' AND i.pid > 0
         AND NOT EXISTS (SELECT 1 FROM journal e WHERE e.stable_id=i.stable_id
-          AND e.writer_id=i.writer_id AND e.kind='session_ended')`, this.config.host);
+          AND e.writer_id=i.writer_id AND e.kind='session_ended')`);
   }
 
   /** A hung turn is invisible without `current`: heartbeat keeps the emitter
@@ -275,9 +304,9 @@ export class ReconDaemon {
     return safeGet(db, "SELECT 1 AS found FROM journal WHERE kind=? AND json_extract(detail, '$.emitter_id')=? LIMIT 1", kind, emitterId) !== null;
   }
 
-  private async spoolAtEof(db: Database, emitterId: string): Promise<boolean> {
-    if (!SAFE_COMPONENT.test(emitterId)) return false;
-    const emitterDir = join(this.config.spool, this.config.host, emitterId);
+  private async spoolAtEof(db: Database, host: string, emitterId: string): Promise<boolean> {
+    if (!SAFE_COMPONENT.test(host) || !SAFE_COMPONENT.test(emitterId)) return false;
+    const emitterDir = join(this.config.spool, host, emitterId);
     let entries;
     try { entries = await readdir(emitterDir, { withFileTypes: true }); }
     catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
@@ -466,6 +495,22 @@ function stripZone(address: string): string {
 
 const defaultProbes: ReconProbes = { localAddresses, establishedSockets };
 
+/** Probe command contract: 0 means alive, 3 means the remote host proved the
+ * process absent, and every other exit (including OpenSSH's 255) is unknown. */
+async function remoteProcess(host: string, pid: number, template: string, timeoutMs: number): Promise<"alive" | "dead"> {
+  if (!SAFE_COMPONENT.test(host) || !Number.isSafeInteger(pid) || pid < 1) throw new Error("unsafe remote probe target");
+  const command = template.replaceAll("{host}", host).replaceAll("{pid}", String(pid));
+  const proc = Bun.spawn(["sh", "-c", command], { stdout: "ignore", stderr: "ignore" });
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
+  try {
+    const rc = await proc.exited;
+    if (!timedOut && rc === 0) return "alive";
+    if (!timedOut && rc === 3) return "dead";
+    throw new Error(`remote probe inconclusive (${timedOut ? "timeout" : rc})`);
+  } finally { clearTimeout(timer); }
+}
+
 async function inspectProcess(pid: number | null, runtime: string | null): Promise<ProcessState> {
   if (!pid || pid < 1) return { alive: false, verified: "kill0" };
   try { process.kill(pid, 0); } catch { return { alive: false, verified: "kill0" }; }
@@ -619,6 +664,8 @@ async function loadConfig(args: string[]): Promise<{ config: ReconConfig; once: 
     // herdr prints JSON by default and rejects a --json flag (loop-1 E4).
     herdr_cmd: values.get("herdr-cmd") ?? "herdr agent list",
     orca_cmd: values.get("orca-cmd") ?? "orca worktree ps --json",
+    remote_probe_cmd: values.get("remote-probe-cmd") ??
+      "ssh -o BatchMode=yes -o ConnectTimeout=5 {host} 'kill -0 {pid} 2>/dev/null && exit 0; ps -p {pid} >/dev/null 2>&1 && exit 4; exit 3'",
     cmux_sessions_file: values.get("cmux-sessions-file") ?? join(homedir(), ".cmuxterm", "*-hook-sessions.json"),
   } };
 }

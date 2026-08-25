@@ -50,12 +50,15 @@ bun src/cli/overload.ts doctor
 
 The watchdog relies on `~/.overload/ingest.heartbeat`. Service stdout and stderr are in `/tmp/overload-*.{log,err}`. An unavailable remote source or integration becomes a visible incident; do not delete ledger rows to clear it.
 
-Recon only evaluates process liveness for sessions owned by its own host. A
-local recon must not test a devbox pid or infer that the devbox emitter spool
-is drained. Consequently, when recon is not deployed and running on the
-devbox, devbox sessions will not be declared dead or drained; those findings
-can only be produced on that host and returned through the existing pull
-channel.
+Recon checks process liveness directly for sessions owned by its own host and
+uses `remote_probe_cmd` for other ledger hosts. The default SSH command maps
+exit `0` to alive and emits exit `3` only after the remote shell successfully
+checks both `kill -0` and `ps` and proves the pid absent. OpenSSH connection or
+authentication failures (normally exit `255`), timeouts, and every other exit
+are unknown, never dead. Remote-probe failures are aggregated per host as
+`source_outage` (`host_probe:<host>`) and produce one `source_recovered` when
+the probe works again. A dead emitter is drained only after recon checks the
+pulled spool tree for that incarnation's host, `spool/<host>/<emitter>`.
 
 `doctor` is a read-only checklist (never installs or fixes anything): ledger
 reachability, pi/omp extension presence, the four LaunchAgent states,

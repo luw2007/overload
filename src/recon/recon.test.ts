@@ -41,6 +41,7 @@ async function fixture() {
     spool,
     herdr_cmd: herdr,
     orca_cmd: orca,
+    remote_probe_cmd: "unused {host} {pid}",
     cmux_sessions_file: cmux,
   };
   return { root, spool, ledger, herdr, orca, cmux, config };
@@ -77,6 +78,16 @@ const probes = (addresses: string[], sockets: Array<{ local: string; peer: strin
   localAddresses: () => new Set(addresses),
   establishedSockets: async () => sockets,
 });
+
+function seedRemote(ledger: string, emitter: string, pid = 999999) {
+  const db = new Database(ledger);
+  db.query("INSERT INTO sessions VALUES (?, 'devbox', 'pi', 'remote', '/devbox/repo')").run("devbox:pi:remote");
+  db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', ?, 'devbox0000', 1, ?)")
+    .run("devbox:pi:remote", emitter, pid, Date.now() - 5_000);
+  db.query("INSERT INTO journal VALUES (1, 'devbox', ?, 1, ?, ?, ?, 'heartbeat', '{}')")
+    .run(emitter, Date.now() - 5_000, "devbox:pi:remote", emitter);
+  db.close();
+}
 
 describe("ReconDaemon", () => {
   test("emits dead then drained only after every emitter spool cursor reaches EOF", async () => {
@@ -136,24 +147,74 @@ describe("ReconDaemon", () => {
     expect(summary.byKind.emitter_drained).toBe(1);
   });
 
-  test("does not judge process incarnations owned by another host", async () => {
+  test("keeps a remote incarnation live when its injected host probe finds the process", async () => {
     const f = await fixture();
-    await writeFile(f.herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[{\"terminal_id\":\"devbox-term\",\"agent_status\":\"working\",\"cwd\":\"/devbox/repo\"}]}}'\n", { mode: 0o700 });
     const emitter = "pi-999999-devbox00";
-    const db = new Database(f.ledger);
-    db.query("INSERT INTO sessions VALUES (?, 'devbox', 'pi', 'remote', '/devbox/repo')").run("devbox:pi:remote");
-    db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', 999999, 'devbox0000', 1, ?)")
-      .run("devbox:pi:remote", emitter, Date.now() - 5_000);
-    db.query("INSERT INTO journal VALUES (1, 'devbox', ?, 1, ?, ?, ?, 'heartbeat', '{}')")
-      .run(emitter, Date.now() - 5_000, "devbox:pi:remote", emitter);
-    db.close();
+    seedRemote(f.ledger, emitter);
+    let calledWith: [string, number] | undefined;
 
-    const summary = await new ReconDaemon(f.config).runOnce();
+    const summary = await new ReconDaemon(f.config, {
+      ...probes([]),
+      remoteProcess: async (host, pid) => { calledWith = [host, pid]; return "alive"; },
+    }).runOnce();
+
+    expect(calledWith).toEqual(["devbox", 999999]);
     expect(summary.byKind.emitter_dead ?? 0).toBe(0);
-    expect(summary.byKind.emitter_drained ?? 0).toBe(0);
-    expect(summary.byKind.telemetry_gap ?? 0).toBe(0);
+  });
+
+  test("declares a remote incarnation dead only when its injected host probe proves absence", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-devbox01";
+    seedRemote(f.ledger, emitter);
+
+    const summary = await new ReconDaemon(f.config, {
+      ...probes([]), remoteProcess: async () => "dead",
+    }).runOnce();
+
+    expect(summary.byKind.emitter_dead).toBe(1);
+  });
+
+  test("treats a failed remote host probe as unknown and aggregates outage and recovery", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-devbox02";
+    seedRemote(f.ledger, emitter);
+    let reachable = false;
+    const daemon = new ReconDaemon(f.config, {
+      ...probes([]),
+      remoteProcess: async () => {
+        if (!reachable) throw new Error("ssh timeout");
+        return "alive";
+      },
+    });
+
+    const failed = await daemon.runOnce();
+    const repeated = await daemon.runOnce();
+    reachable = true;
+    const recovered = await daemon.runOnce();
+
+    expect(failed.byKind.emitter_dead ?? 0).toBe(0);
+    expect(failed.byKind.source_outage).toBe(1);
+    expect(repeated.total).toBe(0);
+    expect(recovered.byKind.source_recovered).toBe(1);
     const output = await events(f.spool);
-    expect(output.some((event) => ["emitter_dead", "emitter_drained", "telemetry_gap"].includes(event.kind))).toBe(false);
+    expect(output.filter((event) => event.detail?.source === "host_probe:devbox").map((event) => event.kind))
+      .toEqual(["source_outage", "source_recovered"]);
+  });
+
+  test("checks a dead remote emitter against spool/<incarnation host>/<emitter>", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-devbox03";
+    seedRemote(f.ledger, emitter);
+    const sourceDir = join(f.spool, "devbox", emitter);
+    await mkdir(sourceDir, { recursive: true });
+    await writeFile(join(sourceDir, `active-${emitter}-0.ndjson`), "not-consumed\n");
+
+    const summary = await new ReconDaemon(f.config, {
+      ...probes([]), remoteProcess: async () => "dead",
+    }).runOnce();
+
+    expect(summary.byKind.emitter_dead).toBe(1);
+    expect(summary.byKind.emitter_drained ?? 0).toBe(0);
   });
 
   test("joins visible native sessions by cwd and includes stable_id in a rate-limited telemetry gap", async () => {

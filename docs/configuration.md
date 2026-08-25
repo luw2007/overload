@@ -14,7 +14,8 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 | `drain_grace_ms` | recon | Delay before orphaning a dead emitter's pending requests. |
 | `stall_profile_ms` | recon | Silence threshold for a session that is still in `working` state; default `1800000`. Idle sessions are silent by design and are never stalled. |
 | `turn_hang_ms` | recon | A `working` turn with no progress event (heartbeat excluded) for this long is reported as `turn_hung`; default `3600000`. Lower it and you start flagging long thinking: measured on this ledger, a 20-minute bound was false 10 times out of 15. |
-| `command_timeout_ms` | recon | External adapter command timeout. |
+| `command_timeout_ms` | recon | External adapter and remote process-probe command timeout. |
+| `remote_probe_cmd` | recon | Command template used to check process liveness on a non-local ledger host. The default uses batch-mode SSH with a five-second connection timeout. `{host}` and `{pid}` are substituted only after recon validates the host as a safe component and the pid as a positive integer. The command contract is exit `0` = alive, exit `3` = proven absent, and every other exit or timeout = unknown (never dead). |
 
 Remote pull settings are command-line flags to `src/pull/pull.ts`: `--remote`, `--remote-spool`, `--dest`, `--ssh-cmd`, `--rsync-cmd`, `--fail-threshold`, and `--timeout-ms`. Run `bun src/pull/pull.ts --once` with invalid input to print the accepted contract.
 
