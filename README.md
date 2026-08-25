@@ -63,7 +63,7 @@ The project redacts common token patterns before writing events. That is damage 
 ## Architecture
 
 ```text
-agent extensions / Claude hooks / cmux workstream / recon
+agent extensions / cmux workstream / recon
                          │
                          ▼
              ~/.overload/spool/*.ndjson

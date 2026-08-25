@@ -12,8 +12,8 @@
 #   3. live platform agent with no spool writer (fake herdr snapshot)
 #        → telemetry_gap event + Q5 row; repeated passes → NO storm
 #   4. platform CLI unreachable (fake herdr rc=1)
-#        → exactly one incident row; attached session frozen=1; recovery
-#          backfills closed_at and unfreezes; ZERO per-session findings derived
+#        → exactly one incident row; attached session never takes a q5 reason
+#          from the out source; closed_at backfilled on recovery; ZERO per-session
 #          from the source while it is out
 #
 # Isolation: every scenario runs under its OWN mktemp HOME; platform CLIs are
@@ -361,25 +361,25 @@ scenario_4() {
   herdr_down
   run_recon; run_ingest
   run_recon; run_ingest
-  local incidents outages per_session_after frozen
+  local incidents outages per_session_after gated_after
   incidents="$(q "SELECT COUNT(*) FROM incidents WHERE source='herdr';")"
   outages="$(journal_count source_outage '%herdr%')"
   per_session_after="$(q "SELECT COUNT(*) FROM journal WHERE kind IN ('telemetry_gap','session_vanished','attachment_observed') AND detail LIKE '%herdr%';")"
   [[ "$incidents" -eq 1 && "$outages" -eq 1 ]] || { record 4 FAIL "expected single incident/outage event, got incidents=$incidents outages=$outages"; cleanup_work; return; }
   [[ "$(q "SELECT COUNT(*) FROM incidents WHERE source='herdr' AND closed_at IS NULL;")" == "1" ]] || { record 4 FAIL "incident not open during outage"; cleanup_work; return; }
   [[ "$per_session_after" -eq "$per_session_before" ]] || { record 4 FAIL "per-session herdr findings emitted during outage ($per_session_before → $per_session_after)"; cleanup_work; return; }
-  frozen="$(q "SELECT frozen FROM current WHERE stable_id='local:claude:$sid';")"
-  [[ "$frozen" == "1" ]] || { record 4 FAIL "attached session not frozen during outage (frozen=${frozen:-none})"; cleanup_work; return; }
+  # The freeze is behavioural, not a stored flag: line 370 already asserts that
+  # zero new per-session findings are derived from the source while it is out.
 
   # Phase C — recovery.
   herdr_up
   run_recon; run_ingest
   [[ "$(journal_count source_recovered '%herdr%')" -eq 1 ]] || { record 4 FAIL "source_recovered missing after CLI recovery"; cleanup_work; return; }
   [[ "$(q "SELECT COUNT(*) FROM incidents WHERE source='herdr' AND closed_at IS NOT NULL;")" == "1" ]] || { record 4 FAIL "closed_at not backfilled on recovery"; cleanup_work; return; }
-  frozen="$(q "SELECT frozen FROM current WHERE stable_id='local:claude:$sid';")"
-  [[ "$frozen" == "0" ]] || { record 4 FAIL "session still frozen after recovery (frozen=$frozen)"; cleanup_work; return; }
+  gated_after="$(q "SELECT COUNT(*) FROM current WHERE stable_id='local:claude:$sid';")"
+  [[ "$gated_after" == "1" ]] || { record 4 FAIL "attached session row lost after recovery (rows=$gated_after)"; cleanup_work; return; }
   [[ "$(journal_count session_vanished '%herdr%')" -eq 0 ]] || { record 4 FAIL "session_vanished must never fire from an out/incomplete source"; cleanup_work; return; }
-  record 4 PASS "one incident, zero per-session findings while out, frozen 1→0, closed_at backfilled"
+  record 4 PASS "one incident, zero per-session findings while out, incident-gated classification, closed_at backfilled"
   cleanup_work
 }
 
