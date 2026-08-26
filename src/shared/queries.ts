@@ -19,6 +19,7 @@ export type SessionDetail = {
 export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null };
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null };
 export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
+export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number };
 export type HungRow = { stable_id: string; q5_reason: string; state: string; host: string | null; since: number | null; hung_ms: number; binding: string | null; detail: Record<string, unknown> | null };
 export type ZombieView = {
   groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number }> }>;
@@ -65,8 +66,8 @@ export function querySession(db: Database, stableId: string, eventLimit = 200): 
     LEFT JOIN session_hosts h ON h.stable_id=s.stable_id AND h.session_id IS NOT NULL
     WHERE s.stable_id=?`).get(stableId) as SessionDetail["session"] | null;
   if (!session) return null;
-  const incarnations = db.query(`SELECT writer_id, liveness_domain, pid, proc_boot_id, started_at, last_seen_at FROM session_incarnations WHERE stable_id=? ORDER BY started_at, writer_id`).all(stableId) as IncarnationRow[];
-  const pending = db.query(`SELECT request_uid, kind, created_at, detail FROM requests WHERE stable_id=? AND state='pending' ORDER BY created_at, request_uid`).all(stableId) as Array<PendingRequestRow & JsonRow>;
+  const incarnations = db.query(`SELECT writer_id, liveness_domain, pid, proc_boot_id, started_at, last_seen_at FROM session_incarnations WHERE stable_id=? ORDER BY started_at DESC, writer_id DESC`).all(stableId) as IncarnationRow[];
+  const pending = db.query(`SELECT request_uid, kind, created_at, detail FROM requests WHERE stable_id=? AND state='pending' ORDER BY created_at DESC, request_uid DESC`).all(stableId) as Array<PendingRequestRow & JsonRow>;
   // Heartbeats are liveness, not history: 900 of them would bury the one
   // tool_activity that says where the turn actually stopped.
   const events = db.query(`SELECT ingest_seq, at, emitter_id, writer_id, kind, detail FROM journal
@@ -88,7 +89,7 @@ export function queryQ1(db: Database): Q1Row[] {
     COALESCE((SELECT lower(app) FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL),
       (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) platform
     FROM requests r LEFT JOIN sessions s ON s.stable_id=r.stable_id
-    WHERE r.state='pending' ORDER BY r.created_at, r.request_uid`).all() as Array<Omit<Q1Row, "detail"> & JsonRow>;
+    WHERE r.state='pending' ORDER BY r.created_at DESC, r.request_uid DESC`).all() as Array<Omit<Q1Row, "detail"> & JsonRow>;
   return rows.map(withParsedDetail);
 }
 
@@ -121,16 +122,22 @@ export function queryHung(db: Database, now = Date.now()): HungRow[] {
       (SELECT binding FROM attachments a WHERE a.stable_id=c.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding
     FROM current c LEFT JOIN sessions s ON s.stable_id=c.stable_id
     WHERE c.q5_reason IN ('turn_hung','dead_connection')
-    ORDER BY since, c.stable_id`).all() as Array<Omit<HungRow, "detail" | "hung_ms"> & JsonRow>;
+    ORDER BY since DESC, c.stable_id DESC`).all() as Array<Omit<HungRow, "detail" | "hung_ms"> & JsonRow>;
   return rows.map((row) => ({ ...withParsedDetail(row), hung_ms: row.since ? Math.max(0, now - row.since) : 0 }));
 }
 
+/** Completed agent work with proven lineage; may require a human close-out. */
 export function queryQ2(db: Database): Q2Row[] {
-  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' ORDER BY last_event_at, stable_id").all() as Q2Row[];
+  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin<>'unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
+}
+
+/** Finished sessions lacking lineage; retained for audit, not human action. */
+export function queryArchive(db: Database): ArchiveRow[] {
+  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin='unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
 }
 
 export function queryZombie(db: Database): ZombieView {
-  const rows = db.query("SELECT stable_id, q5_reason, last_event_at FROM current WHERE queue='q5' ORDER BY q5_reason, last_event_at, stable_id").all() as Array<{ stable_id: string; q5_reason: string; last_event_at: number }>;
+  const rows = db.query("SELECT stable_id, q5_reason, last_event_at FROM current WHERE queue='q5' ORDER BY q5_reason, last_event_at DESC, stable_id DESC").all() as Array<{ stable_id: string; q5_reason: string; last_event_at: number }>;
   const groups: ZombieView["groups"] = [];
   for (const row of rows) {
     // Hung turns have their own surface; counting them twice inflates Zombie.
@@ -142,12 +149,12 @@ export function queryZombie(db: Database): ZombieView {
     }
     group.rows.push({ stable_id: row.stable_id, last_event_at: row.last_event_at });
   }
-  const orphaned_requests = db.query(`SELECT request_uid, stable_id, resolved_at FROM requests WHERE state='orphaned' ORDER BY resolved_at, request_uid`).all() as ZombieView["orphaned_requests"];
+  const orphaned_requests = db.query(`SELECT request_uid, stable_id, resolved_at FROM requests WHERE state='orphaned' ORDER BY resolved_at DESC, request_uid DESC`).all() as ZombieView["orphaned_requests"];
   return { groups, orphaned_requests };
 }
 
 export function queryHealth(db: Database): HealthView {
-  const incidents = db.query("SELECT source, opened_at, detail FROM incidents WHERE closed_at IS NULL ORDER BY opened_at").all() as Array<HealthView["open_incidents"][number] & JsonRow>;
+  const incidents = db.query("SELECT source, opened_at, detail FROM incidents WHERE closed_at IS NULL ORDER BY opened_at DESC, source DESC").all() as Array<HealthView["open_incidents"][number] & JsonRow>;
   // Distinct subjects, not event rows: recon re-reports the same gap hourly, so
   // a raw count says how long a problem has existed, never how many there are.
   // Only recent gaps represent current collection health; open incidents remain

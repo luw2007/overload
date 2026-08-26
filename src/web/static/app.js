@@ -1,5 +1,5 @@
 (() => {
-  const state = { tab: "q1", selected: new Set(), summary: null, q1: [], q2: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
+  const state = { tab: "q1", selected: new Set(), summary: null, q1: [], q2: [], archive: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? "-").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
   const formatTime = (value) => value == null ? "-" : new Date(value).toLocaleString();
@@ -60,6 +60,11 @@
     $("table-body").innerHTML = state.q2.length ? state.q2.map((row) => `<tr><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("") : "<tr><td class='empty' colspan='3'>没有已完成会话</td></tr>";
   }
 
+  function renderArchive() {
+    $("table-head").innerHTML = "<tr><th>会话</th><th>来源</th><th>最后事件</th></tr>";
+    $("table-body").innerHTML = state.archive.length ? state.archive.map((row) => `<tr><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("") : "<tr><td class='empty' colspan='3'>没有已归档会话</td></tr>";
+  }
+
   function renderHung() {
     $("table-head").innerHTML = "<tr><th>会话</th><th>判据</th><th>卡住时长</th><th>最后进展</th><th>证据</th><th>操作</th></tr>";
     $("table-body").innerHTML = state.hung.length ? state.hung.map((row) => `<tr class="failed"><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(hungLabel[row.q5_reason] ?? row.q5_reason)}</td><td>${escapeHtml(formatDuration(row.hung_ms))}</td><td>${escapeHtml(formatTime(row.since))}</td><td><code>${escapeHtml(row.detail?.local ? `${row.detail.local} -> ${row.detail.peer}` : bindingFor(row))}</code></td><td>${row.binding ? `<button class="btn primary jump" data-route="jump-session" data-id="${escapeHtml(row.stable_id)}" data-binding="${escapeHtml(row.binding)}">打开</button>` : "<span>暂无可跳转目标</span>"}<span class="jump-status" aria-live="polite"></span></td></tr>`).join("") : "<tr><td class='empty' colspan='6'>没有卡死会话</td></tr>";
@@ -107,13 +112,14 @@
     $("detail").innerHTML = `<p><button class="btn" id="detail-back">← 返回会话列表</button></p>${head}
       <h3>进程</h3>${incarnations}<h3>待决策</h3>${requests}
       <h3>最近事件（倒序，已隐去心跳）</h3>${events}`;
-    $("detail-back").addEventListener("click", () => { state.session = null; state.detail = null; renderTable(); });
+    $("detail-back").addEventListener("click", () => { state.session = null; state.detail = null; navigate("/sessions"); renderTable(); });
   }
 
-  async function openSession(stableId) {
+  async function openSession(stableId, push = true) {
     state.tab = "sessions";
     state.session = stableId;
     state.detail = null;
+    if (push) navigate(`/sessions/${encodeURIComponent(stableId)}`);
     document.querySelectorAll(".b-tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === "sessions"));
     renderTable();
     try {
@@ -124,11 +130,21 @@
     }
     renderTable();
   }
-
   function renderHealth() {
     const health = state.health;
     $("table-head").innerHTML = "<tr><th>来源</th><th>打开时间</th><th>详情</th></tr>";
     $("table-body").innerHTML = health?.open_incidents.length ? health.open_incidents.map((row) => `<tr><td>${escapeHtml(row.source)}</td><td>${escapeHtml(formatTime(row.opened_at))}</td><td><code>${escapeHtml(JSON.stringify(row.detail ?? {}))}</code></td></tr>`).join("") : `<tr><td class='empty' colspan='3'>无开放事件 · coverage gaps ${health?.coverage_gaps ?? 0} · telemetry gaps ${health?.telemetry_gaps ?? 0}</td></tr>`;
+  }
+
+  function navigate(path) {
+    if (location.pathname !== path) history.pushState(null, "", path);
+  }
+
+  function restoreRoute() {
+    const parts = location.pathname.split("/").filter(Boolean);
+    const tab = ["q1", "q2", "archive", "hung", "sessions", "zombie", "health"].includes(parts[0]) ? parts[0] : "q1";
+    if (tab === "sessions" && parts[1]) return openSession(decodeURIComponent(parts[1]), false);
+    state.tab = tab;
   }
 
   function renderToolbar() {
@@ -144,6 +160,7 @@
     if (detailMode) renderDetail();
     else if (state.tab === "q1") renderQ1();
     else if (state.tab === "q2") renderQ2();
+    else if (state.tab === "archive") renderArchive();
     else if (state.tab === "hung") renderHung();
     else if (state.tab === "sessions") renderSessions();
     else if (state.tab === "zombie") renderZombie();
@@ -204,9 +221,9 @@
 
   async function refresh() {
     try {
-      const names = ["summary", "q1", "q2", "hung", "sessions", "zombie", "health"];
-      const [summary, q1, q2, hung, sessions, zombie, health] = await Promise.all(names.map((name) => fetchJson(`/api/${name}`)));
-      Object.assign(state, { summary, q1, q2, hung, sessions, zombie, health });
+      const names = ["summary", "q1", "q2", "archive", "hung", "sessions", "zombie", "health"];
+      const [summary, q1, q2, archive, hung, sessions, zombie, health] = await Promise.all(names.map((name) => fetchJson(`/api/${name}`)));
+      Object.assign(state, { summary, q1, q2, archive, hung, sessions, zombie, health });
       const liveIds = new Set(q1.map((row) => row.request_uid));
       state.selected = new Set([...state.selected].filter((id) => liveIds.has(id)));
       // An open drill-down owns the pane; refreshing under it would scroll the
@@ -221,11 +238,13 @@
     state.tab = tab.dataset.tab;
     state.session = null;
     state.detail = null;
+    navigate(`/${state.tab}`);
     document.querySelectorAll(".b-tab").forEach((item) => item.classList.toggle("active", item === tab));
     renderTable();
   }));
   $("clear-selection").addEventListener("click", () => { state.selected.clear(); renderTable(); });
   $("bulk-ack").addEventListener("click", () => ack([...state.selected]));
+  restoreRoute();
   refresh();
-  setInterval(refresh, 3000);
+  addEventListener("popstate", () => { state.session = null; state.detail = null; restoreRoute(); refresh(); });
 })();

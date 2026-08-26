@@ -60,6 +60,29 @@ describe("web API", () => {
     expect(await response.json()).toEqual({ q1: 1, q2: 1, hung: 1, open_incidents: 1, coverage_gaps: 1, telemetry_gaps: 1 });
   });
 
+  test("separates unproven completed sessions into archive", async () => {
+    const path = seedLedger();
+    const db = new Database(path);
+    db.run("INSERT INTO current VALUES ('done:pi:unknown', 'writer', 'done', 'q2', NULL, 'unknown', 3, 1700000004000, NULL, NULL, 0)");
+    db.close();
+    const { base } = await runningServer(path);
+
+    expect(await (await fetch(`${base}/api/q2`)).json()).toEqual([{
+      stable_id: "done:pi:beta", origin: "agent", last_event_at: 1_700_000_003_000,
+    }]);
+    expect(await (await fetch(`${base}/api/archive`)).json()).toEqual([{
+      stable_id: "done:pi:unknown", origin: "unknown", last_event_at: 1_700_000_004_000,
+    }]);
+  });
+
+  test("serves archive as a dashboard route", async () => {
+    const { base } = await runningServer(seedLedger());
+    const response = await fetch(`${base}/archive`);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('data-tab="archive"');
+  });
+
   test("Q1 JSON preserves the CLI query semantics", async () => {
     const { base } = await runningServer(seedLedger());
     const response = await fetch(`${base}/api/q1`);
@@ -131,6 +154,24 @@ describe("web API", () => {
     expect(view.pending_requests).toHaveLength(1);
     expect((await fetch(`${base}/api/sessions/missing`)).status).toBe(404);
     expect((await fetch(`${base}/nope`)).status).toBe(404);
+  });
+
+  test("returns pending decisions newest-first", async () => {
+    const path = seedLedger();
+    const db = new Database(path);
+    db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["req-2", "remote:pi:alpha", "writer", "emitter", "request-2", "decision", "pending", 1_700_000_002_000, null, "{}"]);
+    db.close();
+    const { base } = await runningServer(path);
+    expect((await (await fetch(`${base}/api/q1`)).json()).map((row: { request_uid: string }) => row.request_uid)).toEqual(["req-2", "req-1"]);
+  });
+
+  test("serves dashboard routes for tabs and session deep links", async () => {
+    const { base } = await runningServer(seedLedger());
+    for (const path of ["/q1", "/sessions", `/sessions/${encodeURIComponent("remote:pi:alpha")}`]) {
+      const response = await fetch(`${base}${path}`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("Overload dashboard");
+    }
   });
 
   test("bounds the session list and carries queue state for drill-down", async () => {
