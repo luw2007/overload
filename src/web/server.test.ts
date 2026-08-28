@@ -79,12 +79,12 @@ describe("web API", () => {
     }]);
   });
 
-  test("serves archive as a dashboard route", async () => {
+  test("serves legacy archive route with the dashboard shell", async () => {
     const { base } = await runningServer(seedLedger());
     const response = await fetch(`${base}/archive`);
 
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain('data-tab="archive"');
+    expect(await response.text()).toContain('data-tab="done"');
   });
 
   test("Q1 JSON preserves the CLI query semantics", async () => {
@@ -99,6 +99,8 @@ describe("web API", () => {
       created_at: 1_700_000_001_000,
       detail: { question: "ship?" },
       binding: "terminal-7",
+      summary: null,
+      options: null,
     }]);
   });
 
@@ -195,9 +197,9 @@ describe("web API", () => {
     expect((await (await fetch(`${base}/api/q1`)).json()).map((row: { request_uid: string }) => row.request_uid)).toEqual(["req-2", "req-1"]);
   });
 
-  test("serves dashboard routes for tabs and session deep links", async () => {
+  test("serves dashboard routes for zones, legacy tabs, and session deep links", async () => {
     const { base } = await runningServer(seedLedger());
-    for (const path of ["/q1", "/sessions", `/sessions/${encodeURIComponent("remote:pi:alpha")}`]) {
+    for (const path of ["/now", "/inbox", "/done", "/sessions", "/health", "/q1", "/q2", "/archive", "/hung", "/zombie", `/sessions/${encodeURIComponent("remote:pi:alpha")}`]) {
       const response = await fetch(`${base}${path}`);
       expect(response.status).toBe(200);
       expect(await response.text()).toContain("Overload dashboard");

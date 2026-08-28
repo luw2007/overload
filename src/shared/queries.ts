@@ -16,7 +16,7 @@ export type SessionDetail = {
   /** Newest first and heartbeat-free: the question is what the turn last did. */
   events: EventRow[];
 };
-export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null };
+export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null; summary: string | null; options: string[] | null };
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null };
 export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
 export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number };
@@ -48,6 +48,18 @@ function parseDetail(value: string | null): Record<string, unknown> | null {
 
 function withParsedDetail<T extends JsonRow>(row: T): Omit<T, "detail"> & { detail: Record<string, unknown> | null } {
   return { ...row, detail: parseDetail(row.detail) };
+}
+
+function detailSummary(detail: Record<string, unknown> | null): string | null {
+  const value = detail?.summary;
+  return typeof value === "string" && value ? value : null;
+}
+
+function detailOptions(detail: Record<string, unknown> | null): string[] | null {
+  const value = detail?.options;
+  if (!Array.isArray(value)) return null;
+  const labels = value.filter((entry): entry is string => typeof entry === "string");
+  return labels.length ? labels : null;
 }
 
 export function querySessions(db: Database, limit = -1): SessionSummary[] {
@@ -89,8 +101,11 @@ export function queryQ1(db: Database): Q1Row[] {
     COALESCE((SELECT lower(app) FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL),
       (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) platform
     FROM requests r LEFT JOIN sessions s ON s.stable_id=r.stable_id
-    WHERE r.state='pending' ORDER BY r.created_at DESC, r.request_uid DESC`).all() as Array<Omit<Q1Row, "detail"> & JsonRow>;
-  return rows.map(withParsedDetail);
+    WHERE r.state='pending' ORDER BY r.created_at DESC, r.request_uid DESC`).all() as Array<Omit<Q1Row, "detail" | "summary" | "options"> & JsonRow>;
+  return rows.map((row) => {
+    const parsed = withParsedDetail(row);
+    return { ...parsed, summary: detailSummary(parsed.detail), options: detailOptions(parsed.detail) };
+  });
 }
 
 /** Keyed by session, not request: a hung turn has no pending request to jump from. */

@@ -52,7 +52,7 @@ function q2(db: Database): void {
   note("Q2 completed sessions:"); for (const row of rows) console.log(`${row.stable_id}\t${row.origin}\t${time(row.last_event_at)}`);
 }
 export function printQ4(db: Database, output: Output = console.log, heading: Output = note): void {
-  const rows = db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q4' ORDER BY last_event_at, stable_id").all() as Array<{ stable_id: string; origin: string; last_event_at: number }>;
+  const rows = db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q4' ORDER BY last_event_at DESC, stable_id DESC").all() as Array<{ stable_id: string; origin: string; last_event_at: number }>;
   if (!rows.length) { heading("Q4: no auto-verified read-only sessions."); return; }
   heading("Q4 auto-verified read-only sessions:"); for (const row of rows) output(`${row.stable_id}\t${row.origin}\t${time(row.last_event_at)}`);
 }

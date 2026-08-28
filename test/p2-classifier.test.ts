@@ -496,9 +496,15 @@ describe.skipIf(!HAS_N5)("real: N5 classifier via ingest --once + CLI surface", 
     const q1 = await runCli("q1");
     expect(q1.code).toBe(0);
     expect(q1.out).toContain(reqUid);
+    // done+unknown still classifies to queue q2, but the human-facing q2
+    // list excludes origin='unknown' (archive semantics, commit f5e67b7).
     const q2 = await runCli("q2");
     expect(q2.code).toBe(0);
-    expect(q2.out).toContain(SS_B);
+    expect(q2.out).not.toContain(SS_B);
+    const adb = new Database(ledgerPath);
+    const archived = adb.query("SELECT queue FROM current WHERE stable_id=?").get(`local:pi:${SS_B}`) as { queue: string } | null; // test-owned ledger row, shape fixed by schema.sql
+    expect(archived?.queue).toBe("q2");
+    adb.close();
     for (const sub of ["zombie", "health"]) {
       const r = await runCli(sub);
       expect(r.code).toBe(0);

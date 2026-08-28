@@ -1,8 +1,8 @@
 # Overload
 
-Overload is a local-first macOS control plane for agent work: it records agent lifecycle events in an append-only SQLite ledger, surfaces pending human decisions, detects stale sessions, and provides a loopback dashboard.
+Overload is a local-first macOS attention control plane for agent work. It turns agent lifecycle noise into a small set of timely, actionable human decisions, preserves the original context, and lets work resume after a decision. Append-only SQLite telemetry, classification, stale-session detection, and the loopback dashboard serve that goal.
 
-It is designed for a single operator managing local and SSH-reachable agent sessions. It is not a hosted service, a multi-user control plane, or an upstream-agent approval system.
+It is designed for a single operator managing local and SSH-reachable agent sessions. It is not a hosted service, a multi-user control plane, or an upstream-agent approval system. Product and engineering decisions follow [AGENTS.md](AGENTS.md).
 
 ## Status
 

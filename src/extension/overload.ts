@@ -117,6 +117,26 @@ function selectedOption(result: unknown, depth = 0): string | undefined {
   return visible ? truncateUtf8(visible) : undefined
 }
 
+// AskToolInput (@oh-my-pi/pi-coding-agent tools/ask.d.ts) is always
+// { questions: [{ question, options: [{ label }] }] }; unrecognized/legacy
+// shapes yield {}, never throw, and simply omit the fields (decision_requested
+// stays request_id-only).
+function questionPayload(input: unknown): { summary?: string; options?: string[] } {
+  if (!input || typeof input !== "object" || !("questions" in input) || !Array.isArray(input.questions)) return {}
+  const texts: string[] = []
+  const options: string[] = []
+  for (const entry of input.questions) {
+    if (!entry || typeof entry !== "object") continue
+    if ("question" in entry && typeof entry.question === "string" && entry.question) texts.push(entry.question)
+    if (!("options" in entry) || !Array.isArray(entry.options)) continue
+    for (const option of entry.options) {
+      if (!option || typeof option !== "object" || !("label" in option)) continue
+      if (typeof option.label === "string" && option.label) options.push(truncateUtf8(option.label, 120))
+    }
+  }
+  return { ...(texts.length ? { summary: truncateUtf8(texts.join("; "), 500) } : {}), ...(options.length ? { options } : {}) }
+}
+
 function hostContext(): Record<string, string> | undefined {
   let environment = { ...process.env } as Record<string, string | undefined>;
   const directHost = environment.CMUX_SURFACE_ID ? "cmux" : undefined;
@@ -528,7 +548,7 @@ export default function overload(pi: ExtensionApi): void {
     }
     if (event?.toolName === "ask" && typeof event.toolCallId === "string") {
       pendingAsk.add(event.toolCallId)
-      emit("decision_requested", { request_id: event.toolCallId })
+      emit("decision_requested", { request_id: event.toolCallId, ...questionPayload(event.input) })
     }
     const rule = gateRule(event)
     if (rule !== undefined && typeof event?.toolCallId === "string") {

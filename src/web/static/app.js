@@ -1,5 +1,9 @@
 (() => {
-  const state = { tab: "q1", selected: new Set(), summary: null, q1: [], q2: [], archive: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
+  // Legacy internal-queue paths still resolve; the client redirects them into
+  // the attention zone that now owns their data (AGENTS.md 产品界面原则).
+  const LEGACY_ZONE = { q1: "now", hung: "now", q2: "inbox", zombie: "inbox", archive: "done" };
+  const ZONES = ["now", "inbox", "done", "sessions", "health"];
+  const state = { tab: "now", selected: new Set(), summary: null, q1: [], q2: [], archive: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? "-").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
   const formatTime = (value) => value == null ? "-" : new Date(value).toLocaleString();
@@ -9,6 +13,7 @@
     return minutes < 60 ? `${minutes} 分钟` : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
   };
   const hungLabel = { turn_hung: "无进展", dead_connection: "连接已死" };
+  const zombieHint = { stalled: "事件流已停止，需人工确认会话是否还在运行。", dead_incarnation: "进程已消失，记录保留供核查，无需动作。", telemetry_gap: "遥测出现缺口，可能丢失部分事件。" };
 
   async function fetchJson(path, options) {
     const response = await fetch(path, options);
@@ -24,12 +29,9 @@
   function renderSummary() {
     const summary = state.summary;
     if (!summary) return;
-    $("tile-q1").textContent = summary.q1;
-    $("tile-q2").textContent = summary.q2;
-    $("tile-hung").textContent = summary.hung ?? 0;
-    $("tile-incidents").textContent = summary.open_incidents;
+    $("tile-now").textContent = (summary.q1 ?? 0) + (summary.hung ?? 0);
     const zombies = state.zombie.groups.reduce((total, group) => total + group.rows.length, 0) + state.zombie.orphaned_requests.length;
-    $("tile-zombie").textContent = zombies;
+    $("tile-inbox").textContent = (summary.q2 ?? 0) + zombies;
     const unhealthy = summary.open_incidents + summary.coverage_gaps + summary.telemetry_gaps > 0;
     $("health-pill").classList.toggle("warn", unhealthy);
     $("health-label").textContent = unhealthy ? `${summary.open_incidents} open incident · ${summary.coverage_gaps + summary.telemetry_gaps} gaps` : "health OK";
@@ -44,48 +46,83 @@
     return `<a href="#" class="drill" data-id="${escapeHtml(id)}">${escapeHtml(id)}</a>`;
   }
 
-  function renderQ1() {
-    $("table-head").innerHTML = "<tr><th style='width:42px'><input id='select-all' type='checkbox' aria-label='全选'></th><th>请求</th><th>会话</th><th>类型</th><th>时间</th><th>跳转标识</th><th>操作</th></tr>";
-    $("table-body").innerHTML = state.q1.length ? state.q1.map((row) => `<tr><td>${rowCheckbox(row.request_uid)}</td><td>${escapeHtml(row.request_uid)}</td><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.kind)}</td><td>${escapeHtml(formatTime(row.created_at))}</td><td><span class="chip">${escapeHtml(bindingFor(row))}</span>${row.binding ? ` <button class="btn copy-jump" data-binding="${escapeHtml(row.binding)}">复制</button>` : ""}<span class="jump-status" aria-live="polite"></span></td><td>${row.binding ? `<button class="btn primary jump" data-id="${escapeHtml(row.request_uid)}" data-binding="${escapeHtml(row.binding)}">打开</button>` : "<span>暂无可跳转目标</span>"} <button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></td></tr>`).join("") : "<tr><td class='empty' colspan='7'>没有待决策请求</td></tr>";
+  /** Binding chip + copy/open pair, shared by decision cards and hung cards. */
+  function jumpActions(row, idField, route) {
+    const chip = `<span class="chip">${escapeHtml(bindingFor(row))}</span>`;
+    if (!row.binding) return `${chip}<span>暂无可跳转目标</span>`;
+    const routeAttr = route ? ` data-route="${route}"` : "";
+    return `${chip} <button class="btn copy-jump" data-binding="${escapeHtml(row.binding)}">复制</button><button class="btn primary jump" data-id="${escapeHtml(row[idField])}"${routeAttr} data-binding="${escapeHtml(row.binding)}">打开</button><span class="jump-status" aria-live="polite"></span>`;
+  }
+
+  function decisionCard(row) {
+    const options = Array.isArray(row.options) && row.options.length
+      ? `<div class="option-chips">${row.options.map((option) => `<span class="chip">${escapeHtml(option)}</span>`).join("")}</div>`
+      : "";
+    return `<article class="decision-card">
+      <div class="decision-card-head">${rowCheckbox(row.request_uid)}<div class="decision-card-summary">${escapeHtml(row.summary ?? "(未采集问题内容)")}</div></div>
+      ${options}
+      <div class="decision-card-meta">${sessionLink(row.stable_id)} · <span class="chip">${escapeHtml(row.kind)}</span> · ${escapeHtml(formatTime(row.created_at))}</div>
+      <div class="decision-card-actions">${jumpActions(row, "request_uid")}<button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></div>
+    </article>`;
+  }
+
+  function hungCard(row) {
+    const evidence = row.detail?.local ? `${row.detail.local} -> ${row.detail.peer}` : bindingFor(row);
+    return `<article class="decision-card hung">
+      <div class="decision-card-head"><strong>${sessionLink(row.stable_id)}</strong><span class="chip">${escapeHtml(hungLabel[row.q5_reason] ?? row.q5_reason)}</span></div>
+      <div class="decision-card-meta">卡住 ${escapeHtml(formatDuration(row.hung_ms))} · 最后进展 ${escapeHtml(formatTime(row.since))}</div>
+      <div class="decision-card-meta">证据 <code>${escapeHtml(evidence)}</code></div>
+      <div class="decision-card-actions">${jumpActions(row, "stable_id", "jump-session")}</div>
+    </article>`;
+  }
+
+  function renderNow() {
+    const groups = [];
+    const byId = new Map();
+    for (const row of state.q1) {
+      let group = byId.get(row.stable_id);
+      if (!group) { group = { stable_id: row.stable_id, rows: [] }; byId.set(row.stable_id, group); groups.push(group); }
+      group.rows.push(row);
+    }
+    const groupsHtml = groups.length
+      ? `<div class="decision-groups">${groups.map((group) => `<div class="decision-group"><div class="group-head"><strong>${sessionLink(group.stable_id)}</strong><span class="chip">${group.rows.length} 项待决策</span></div><div class="decision-cards">${group.rows.map(decisionCard).join("")}</div></div>`).join("")}</div>`
+      : "<p class='empty'>没有待决策请求</p>";
+    const hungHtml = state.hung.length ? `<h3>卡死会话</h3><div class="decision-cards">${state.hung.map(hungCard).join("")}</div>` : "";
+    $("content").innerHTML = `${state.q1.length ? `<p><label><input id="select-all" type="checkbox"> 全选待决策</label></p>` : ""}${groupsHtml}${hungHtml}`;
     const selectAll = $("select-all");
-    selectAll.checked = state.q1.length > 0 && state.q1.every((row) => state.selected.has(row.request_uid));
-    selectAll.addEventListener("change", () => {
-      state.selected = selectAll.checked ? new Set(state.q1.map((row) => row.request_uid)) : new Set();
-      renderTable();
-    });
+    if (selectAll) {
+      selectAll.checked = state.q1.every((row) => state.selected.has(row.request_uid));
+      selectAll.addEventListener("change", () => {
+        state.selected = selectAll.checked ? new Set(state.q1.map((row) => row.request_uid)) : new Set();
+        renderZone();
+      });
+    }
   }
 
-  function renderQ2() {
-    $("table-head").innerHTML = "<tr><th>会话</th><th>来源</th><th>最后事件</th></tr>";
-    $("table-body").innerHTML = state.q2.length ? state.q2.map((row) => `<tr><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("") : "<tr><td class='empty' colspan='3'>没有已完成会话</td></tr>";
+  function renderInbox() {
+    const q2Html = state.q2.length
+      ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th>会话</th><th>来源</th><th>最后事件</th></tr></thead><tbody>${state.q2.map((row) => `<tr><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("")}</tbody></table></div>`
+      : "<p class='empty'>没有待收尾会话</p>";
+    const groupCards = state.zombie.groups.map((group) => `<article class="hint-card"><div class="decision-card-head"><strong>${escapeHtml(group.q5_reason)}</strong><span class="chip">${group.rows.length} 个会话</span></div><p class="hint-text">${escapeHtml(zombieHint[group.q5_reason] ?? "需人工核查。")}</p><div class="decision-cards">${group.rows.map((row) => `<span class="chip">${sessionLink(row.stable_id)} · ${escapeHtml(formatTime(row.last_event_at))}</span>`).join(" ")}</div></article>`).join("");
+    const orphanedCards = state.zombie.orphaned_requests.map((row) => `<article class="hint-card"><div class="decision-card-head"><strong>orphaned_request</strong><span class="chip">${sessionLink(row.stable_id)}</span></div><p class="hint-text">会话已结束，请求随之失效。</p><div class="decision-card-actions"><button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></div></article>`).join("");
+    const zombieHtml = groupCards || orphanedCards ? `<h3>Zombie</h3>${groupCards}${orphanedCards}` : "";
+    $("content").innerHTML = `<h3>待收尾</h3>${q2Html}${zombieHtml}`;
   }
 
-  function renderArchive() {
-    $("table-head").innerHTML = "<tr><th>会话</th><th>来源</th><th>最后事件</th></tr>";
-    $("table-body").innerHTML = state.archive.length ? state.archive.map((row) => `<tr><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("") : "<tr><td class='empty' colspan='3'>没有已归档会话</td></tr>";
-  }
-
-  function renderHung() {
-    $("table-head").innerHTML = "<tr><th>会话</th><th>判据</th><th>卡住时长</th><th>最后进展</th><th>证据</th><th>操作</th></tr>";
-    $("table-body").innerHTML = state.hung.length ? state.hung.map((row) => `<tr class="failed"><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(hungLabel[row.q5_reason] ?? row.q5_reason)}</td><td>${escapeHtml(formatDuration(row.hung_ms))}</td><td>${escapeHtml(formatTime(row.since))}</td><td><code>${escapeHtml(row.detail?.local ? `${row.detail.local} -> ${row.detail.peer}` : bindingFor(row))}</code></td><td>${row.binding ? `<button class="btn primary jump" data-route="jump-session" data-id="${escapeHtml(row.stable_id)}" data-binding="${escapeHtml(row.binding)}">打开</button>` : "<span>暂无可跳转目标</span>"}<span class="jump-status" aria-live="polite"></span></td></tr>`).join("") : "<tr><td class='empty' colspan='6'>没有卡死会话</td></tr>";
-  }
-
-  function renderZombie() {
-    const rows = state.zombie.groups.flatMap((group) => group.rows.map((row) => ({ reason: group.q5_reason, ...row })));
-    const orphaned = state.zombie.orphaned_requests.map((row) => ({ reason: "orphaned_request", stable_id: row.stable_id, request_uid: row.request_uid, last_event_at: row.resolved_at }));
-    $("table-head").innerHTML = "<tr><th>原因</th><th>会话 / 请求</th><th>时间</th></tr>";
-    $("table-body").innerHTML = [...rows, ...orphaned].map((row) => `<tr><td>${escapeHtml(row.reason)}</td><td>${row.request_uid ? escapeHtml(row.request_uid) : sessionLink(row.stable_id)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("") || "<tr><td class='empty' colspan='3'>没有 Zombie 会话</td></tr>";
+  function renderDone() {
+    $("content").innerHTML = state.archive.length
+      ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th>会话</th><th>来源</th><th>最后事件</th></tr></thead><tbody>${state.archive.map((row) => `<tr><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("")}</tbody></table></div>`
+      : "<p class='empty'>没有已归档会话</p>";
   }
 
   function renderSessions() {
-    $("table-head").innerHTML = "";
-    $("table-body").innerHTML = state.sessions.length ? `<tr><td><div class="session-grid">${state.sessions.map((row) => {
+    $("content").innerHTML = state.sessions.length ? `<div class="session-grid">${state.sessions.map((row) => {
       const capability = row.resume_capability;
       const action = capability?.resumable
         ? `<button class="btn primary resume-session" data-id="${escapeHtml(row.stable_id)}">Resume</button>`
         : `<span class="chip">${escapeHtml(capability?.reason === "process_alive" ? "进程运行中" : "仅查看")}</span>`;
       return `<article class="session-card"><div class="session-card-head"><strong>${sessionLink(row.stable_id)}</strong><span class="chip">${escapeHtml(row.runtime)}</span></div><div class="session-meta">${escapeHtml(row.origin)} · ${escapeHtml(row.state)}${row.queue ? ` · ${escapeHtml(row.q5_reason ? `${row.queue}/${row.q5_reason}` : row.queue)}` : ""}</div><div class="session-time">最后事件 ${escapeHtml(formatTime(row.last_event_at))}</div><div class="session-actions">${action}<span class="resume-status" aria-live="polite"></span></div></article>`;
-    }).join("")}</div></td></tr>` : "<tr><td class='empty'>没有会话</td></tr>";
+    }).join("")}</div>` : "<p class='empty'>没有会话</p>";
   }
 
   function keyValueTable(pairs) {
@@ -118,7 +155,7 @@
     $("detail").innerHTML = `<p><button class="btn" id="detail-back">← 返回会话列表</button></p>${head}
       <h3>进程</h3>${incarnations}<h3>待决策</h3>${requests}
       <h3>最近事件（倒序，已隐去心跳）</h3>${events}`;
-    $("detail-back").addEventListener("click", () => { state.session = null; state.detail = null; navigate("/sessions"); renderTable(); });
+    $("detail-back").addEventListener("click", () => { state.session = null; state.detail = null; navigate("/sessions"); renderZone(); });
   }
 
   async function openSession(stableId, push = true) {
@@ -126,55 +163,64 @@
     state.session = stableId;
     state.detail = null;
     if (push) navigate(`/sessions/${encodeURIComponent(stableId)}`);
-    document.querySelectorAll(".b-tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === "sessions"));
-    renderTable();
+    syncActiveTab();
+    renderZone();
     try {
       state.detail = await fetchJson(`/api/sessions/${encodeURIComponent(stableId)}`);
     } catch (error) {
       state.session = null;
       showError(error);
     }
-    renderTable();
+    renderZone();
   }
+
   function renderHealth() {
     const health = state.health;
-    $("table-head").innerHTML = "<tr><th>来源</th><th>打开时间</th><th>详情</th></tr>";
-    $("table-body").innerHTML = health?.open_incidents.length ? health.open_incidents.map((row) => `<tr><td>${escapeHtml(row.source)}</td><td>${escapeHtml(formatTime(row.opened_at))}</td><td><code>${escapeHtml(JSON.stringify(row.detail ?? {}))}</code></td></tr>`).join("") : `<tr><td class='empty' colspan='3'>无开放事件 · coverage gaps ${health?.coverage_gaps ?? 0} · telemetry gaps ${health?.telemetry_gaps ?? 0}</td></tr>`;
+    const rows = health?.open_incidents.length
+      ? health.open_incidents.map((row) => `<tr><td>${escapeHtml(row.source)}</td><td>${escapeHtml(formatTime(row.opened_at))}</td><td><code>${escapeHtml(JSON.stringify(row.detail ?? {}))}</code></td></tr>`).join("")
+      : `<tr><td class='empty' colspan='3'>无开放事件 · coverage gaps ${health?.coverage_gaps ?? 0} · telemetry gaps ${health?.telemetry_gaps ?? 0}</td></tr>`;
+    $("content").innerHTML = `<div class="b-table-wrap"><table class="b-table"><thead><tr><th>来源</th><th>打开时间</th><th>详情</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   }
 
   function navigate(path) {
     if (location.pathname !== path) history.pushState(null, "", path);
   }
 
+  function syncActiveTab() {
+    document.querySelectorAll(".b-tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.tab));
+  }
+
   function restoreRoute() {
     const parts = location.pathname.split("/").filter(Boolean);
-    const tab = ["q1", "q2", "archive", "hung", "sessions", "zombie", "health"].includes(parts[0]) ? parts[0] : "q1";
-    if (tab === "sessions" && parts[1]) return openSession(decodeURIComponent(parts[1]), false);
-    state.tab = tab;
+    let zone = LEGACY_ZONE[parts[0]] ?? parts[0];
+    if (!ZONES.includes(zone)) zone = "now";
+    if (zone === "sessions" && parts[1]) return openSession(decodeURIComponent(parts[1]), false);
+    state.tab = zone;
+    const canonical = `/${zone}`;
+    if (location.pathname !== canonical) history.replaceState(null, "", canonical);
+    syncActiveTab();
   }
 
   function renderToolbar() {
-    const show = state.tab === "q1" && state.selected.size > 0;
+    const show = state.tab === "now" && state.selected.size > 0;
     $("toolbar").classList.toggle("show", show);
     $("selected-count").textContent = `${state.selected.size} 项已选`;
   }
 
-  function renderTable() {
+  function renderZone() {
     const detailMode = state.tab === "sessions" && state.session;
     $("detail").classList.toggle("hidden", !detailMode);
-    $("table-wrap").classList.toggle("hidden", !!detailMode);
+    $("content").classList.toggle("hidden", !!detailMode);
     if (detailMode) renderDetail();
-    else if (state.tab === "q1") renderQ1();
-    else if (state.tab === "q2") renderQ2();
-    else if (state.tab === "archive") renderArchive();
-    else if (state.tab === "hung") renderHung();
+    else if (state.tab === "now") renderNow();
+    else if (state.tab === "inbox") renderInbox();
+    else if (state.tab === "done") renderDone();
     else if (state.tab === "sessions") renderSessions();
-    else if (state.tab === "zombie") renderZombie();
     else renderHealth();
     renderToolbar();
     document.querySelectorAll(".row-select").forEach((checkbox) => checkbox.addEventListener("change", () => {
       if (checkbox.checked) state.selected.add(checkbox.dataset.id); else state.selected.delete(checkbox.dataset.id);
-      renderTable();
+      renderZone();
     }));
     document.querySelectorAll(".ack").forEach((button) => button.addEventListener("click", () => ack([button.dataset.id])));
     document.querySelectorAll(".copy-jump").forEach((button) => button.addEventListener("click", () => copyBinding(button.dataset.binding, button.parentElement.querySelector(".jump-status"))));
@@ -200,7 +246,7 @@
   }
 
   async function jump(button) {
-    const status = button.closest("tr").querySelector(".jump-status");
+    const status = button.parentElement.querySelector(".jump-status");
     const fallback = async (reason) => {
       const copied = await copyBinding(button.dataset.binding, status);
       const suffix = reason ? `（${reason}）` : "";
@@ -251,7 +297,7 @@
       // reader back to the top every three seconds.
       if (state.session) { $("error").classList.add("hidden"); renderSummary(); return; }
       $("error").classList.add("hidden");
-      renderSummary(); renderTable();
+      renderSummary(); renderZone();
     } catch (error) { showError(error); }
   }
 
@@ -260,10 +306,10 @@
     state.session = null;
     state.detail = null;
     navigate(`/${state.tab}`);
-    document.querySelectorAll(".b-tab").forEach((item) => item.classList.toggle("active", item === tab));
-    renderTable();
+    syncActiveTab();
+    renderZone();
   }));
-  $("clear-selection").addEventListener("click", () => { state.selected.clear(); renderTable(); });
+  $("clear-selection").addEventListener("click", () => { state.selected.clear(); renderZone(); });
   $("bulk-ack").addEventListener("click", () => ack([...state.selected]));
   restoreRoute();
   refresh();
