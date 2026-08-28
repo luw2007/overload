@@ -78,8 +78,14 @@
   }
 
   function renderSessions() {
-    $("table-head").innerHTML = "<tr><th>会话</th><th>运行时</th><th>来源</th><th>状态</th><th>队列</th><th>最后事件</th></tr>";
-    $("table-body").innerHTML = state.sessions.length ? state.sessions.map((row) => `<tr><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.runtime)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(row.state)}</td><td>${escapeHtml(row.q5_reason ? `${row.queue}/${row.q5_reason}` : row.queue)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("") : "<tr><td class='empty' colspan='6'>没有会话</td></tr>";
+    $("table-head").innerHTML = "";
+    $("table-body").innerHTML = state.sessions.length ? `<tr><td><div class="session-grid">${state.sessions.map((row) => {
+      const capability = row.resume_capability;
+      const action = capability?.resumable
+        ? `<button class="btn primary resume-session" data-id="${escapeHtml(row.stable_id)}">Resume</button>`
+        : `<span class="chip">${escapeHtml(capability?.reason === "process_alive" ? "进程运行中" : "仅查看")}</span>`;
+      return `<article class="session-card"><div class="session-card-head"><strong>${sessionLink(row.stable_id)}</strong><span class="chip">${escapeHtml(row.runtime)}</span></div><div class="session-meta">${escapeHtml(row.origin)} · ${escapeHtml(row.state)}${row.queue ? ` · ${escapeHtml(row.q5_reason ? `${row.queue}/${row.q5_reason}` : row.queue)}` : ""}</div><div class="session-time">最后事件 ${escapeHtml(formatTime(row.last_event_at))}</div><div class="session-actions">${action}<span class="resume-status" aria-live="polite"></span></div></article>`;
+    }).join("")}</div></td></tr>` : "<tr><td class='empty'>没有会话</td></tr>";
   }
 
   function keyValueTable(pairs) {
@@ -173,6 +179,7 @@
     document.querySelectorAll(".ack").forEach((button) => button.addEventListener("click", () => ack([button.dataset.id])));
     document.querySelectorAll(".copy-jump").forEach((button) => button.addEventListener("click", () => copyBinding(button.dataset.binding, button.parentElement.querySelector(".jump-status"))));
     document.querySelectorAll(".jump").forEach((button) => button.addEventListener("click", () => jump(button)));
+    document.querySelectorAll(".resume-session").forEach((button) => button.addEventListener("click", () => resume(button)));
     document.querySelectorAll(".drill").forEach((link) => link.addEventListener("click", (event) => {
       event.preventDefault();
       openSession(link.dataset.id);
@@ -208,6 +215,20 @@
       }
     } catch {
       await fallback();
+    }
+  }
+
+  async function resume(button) {
+    const status = button.parentElement.querySelector(".resume-status");
+    button.disabled = true;
+    status.textContent = "正在恢复…";
+    try {
+      await fetchJson(`/api/resume-session/${encodeURIComponent(button.dataset.id)}`, { method: "POST" });
+      status.textContent = "已拉起";
+      await refresh();
+    } catch (error) {
+      status.textContent = `恢复失败：${error.message}`;
+      button.disabled = false;
     }
   }
 

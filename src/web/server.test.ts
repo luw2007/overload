@@ -31,6 +31,10 @@ function seedLedger(): string {
     CREATE TABLE coverage_gaps(id INTEGER PRIMARY KEY, stable_id TEXT, emitter_id TEXT, from_seq INTEGER, from_at INTEGER, to_at INTEGER, reason TEXT);
   `);
   db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["remote:pi:alpha", "buildbox", "pi", "alpha", "agent", "/repo", "main", 1_700_000_000_000, 1_700_000_000_000]);
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:pi:dead", "local", "pi", "pi-session", "agent", "/repo/pi", "main", 1_700_000_000_100, 1_700_000_000_100]);
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:omp:dead", "local", "omp", "omp-session", "agent", "/repo/omp", "main", 1_700_000_000_200, 1_700_000_000_200]);
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:pi:live", "local", "pi", "live-session", "agent", "/repo/live", "main", 1_700_000_000_300, 1_700_000_000_300]);
+  db.run("INSERT INTO session_incarnations VALUES (?, ?, ?, ?, ?, ?, ?)", ["local:pi:live", "writer-live", "process", 4242, "boot", 1_700_000_000_300, 1_700_000_000_300]);
   db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)", ["req-1", "remote:pi:alpha", "writer", "emitter", "one", "decision", 1_700_000_001_000, JSON.stringify({ question: "ship?" })]);
   db.run("INSERT INTO attachments VALUES ('remote:pi:alpha', 'cmux', 'workspace-42', 1700000002000, 1)");
   db.run("INSERT INTO session_hosts VALUES ('remote:pi:alpha', 'cmux', 'terminal-7', '/dev/ttys007', 1700000003000)");
@@ -140,6 +144,32 @@ describe("web API", () => {
     expect(await second.json()).toEqual({ acked: false });
   });
 
+  test("reports resume capability and launches pi and omp sessions through cmux", async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const server = startWebServer({ ledgerPath: seedLedger(), port: 0, processAlive: (pid) => pid === 4242, resume: async (command, args) => {
+      calls.push({ command, args });
+      return { ok: true };
+    } });
+    servers.push(server);
+
+    const sessions = await (await fetch(`${server.url}api/sessions`)).json() as Array<{ stable_id: string; resume_capability: { resumable: boolean; runtime?: string; reason?: string } }>;
+    expect(sessions.find((row) => row.stable_id === "local:pi:dead")?.resume_capability).toEqual({ resumable: true, runtime: "pi" });
+    expect(sessions.find((row) => row.stable_id === "local:omp:dead")?.resume_capability).toEqual({ resumable: true, runtime: "omp" });
+    expect(sessions.find((row) => row.stable_id === "local:pi:live")?.resume_capability).toEqual({ resumable: false, reason: "process_alive" });
+    expect(sessions.find((row) => row.stable_id === "remote:pi:alpha")?.resume_capability).toEqual({ resumable: false, reason: "remote_host_unsupported" });
+
+    expect(await (await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:pi:dead")}`, { method: "POST" })).json()).toEqual({ resumed: true });
+    expect(await (await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:omp:dead")}`, { method: "POST" })).json()).toEqual({ resumed: true });
+    expect(calls).toEqual([
+      { command: "cmux", args: ["new-workspace", "--cwd", "/repo/pi", "--command", "pi --resume='pi-session'", "--focus", "true"] },
+      { command: "cmux", args: ["new-workspace", "--cwd", "/repo/omp", "--command", "omp --resume='omp-session'", "--focus", "true"] },
+    ]);
+
+    const conflict = await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:pi:live")}`, { method: "POST" });
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toEqual({ resumed: false, reason: "process_alive" });
+  });
+
   test("serves session detail and returns 404 for missing resources", async () => {
     const { base } = await runningServer(seedLedger());
     const detail = await fetch(`${base}/api/sessions/${encodeURIComponent("remote:pi:alpha")}`);
@@ -177,7 +207,7 @@ describe("web API", () => {
   test("bounds the session list and carries queue state for drill-down", async () => {
     const { base } = await runningServer(seedLedger());
     const rows = await (await fetch(`${base}/api/sessions`)).json();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung" });
+    expect(rows).toHaveLength(4);
+    expect(rows.find((row: { stable_id: string }) => row.stable_id === "remote:pi:alpha")).toMatchObject({ stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung" });
   });
 });
