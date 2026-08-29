@@ -6,7 +6,7 @@ It is designed for a single operator managing local and SSH-reachable agent sess
 
 ## Status
 
-The supported v0 surface is the Bun/SQLite ingest pipeline, CLI, recon, pull, and loopback dashboard. Pending decisions are read from the dashboard; Overload does not emit macOS notifications.
+The supported v0 surface is the Bun/SQLite ingest pipeline, CLI, recon, pull, and loopback dashboard. Pending decisions are read from the dashboard; when the Now zone goes from empty to non-empty, the maintenance job emits one aggregated macOS notification (`osascript`), never per-event.
 ## Requirements
 
 - macOS 13+ for the supported launchd workflow
