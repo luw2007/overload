@@ -7,3 +7,4 @@ node_modules/
 # and a done marker names a candidate SHA. Neither is repository history.
 .dispatch/
 .done/
+.dispatch-ledger/
