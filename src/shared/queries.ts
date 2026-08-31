@@ -19,7 +19,7 @@ export type SessionDetail = {
 export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null; summary: string | null; options: string[] | null };
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null };
 export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
-export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number };
+export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number; closed_out?: true };
 export type HungRow = { stable_id: string; q5_reason: string; state: string; host: string | null; since: number | null; hung_ms: number; binding: string | null; detail: Record<string, unknown> | null };
 export type ZombieView = {
   groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number }> }>;
@@ -141,14 +141,21 @@ export function queryHung(db: Database, now = Date.now()): HungRow[] {
   return rows.map((row) => ({ ...withParsedDetail(row), hung_ms: row.since ? Math.max(0, now - row.since) : 0 }));
 }
 
-/** Completed agent work with proven lineage; may require a human close-out. */
-export function queryQ2(db: Database): Q2Row[] {
-  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin<>'unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
+function hasCloseouts(db: Database): boolean {
+  return Boolean(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='closeouts'").get());
 }
 
-/** Finished sessions lacking lineage; retained for audit, not human action. */
+/** Completed agent work with proven lineage; may require a human close-out. */
+export function queryQ2(db: Database): Q2Row[] {
+  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin<>'unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
+  return db.query("SELECT stable_id, origin, last_event_at FROM current c WHERE queue='q2' AND origin<>'unknown' AND NOT EXISTS (SELECT 1 FROM closeouts x WHERE x.stable_id=c.stable_id) ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
+}
+
+/** Finished sessions lacking lineage, plus operator-closed work; retained for audit. */
 export function queryArchive(db: Database): ArchiveRow[] {
-  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin='unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
+  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin='unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
+  const rows = db.query("SELECT stable_id, origin, last_event_at, EXISTS(SELECT 1 FROM closeouts x WHERE x.stable_id=c.stable_id) closed_out FROM current c WHERE (queue='q2' AND origin='unknown') OR closed_out ORDER BY last_event_at DESC, stable_id DESC").all() as Array<Omit<ArchiveRow, "closed_out"> & { closed_out: number }>;
+  return rows.map(({ closed_out, ...row }) => closed_out ? { ...row, closed_out: true } : row);
 }
 
 export function queryZombie(db: Database): ZombieView {
