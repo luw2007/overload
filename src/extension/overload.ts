@@ -5,7 +5,7 @@
 // Intentionally has no package imports: pi, omp, and prime-agent expose compatible
 // extension APIs under different package names.
 import { constants } from "node:fs"
-import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
+import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { randomUUID } from "node:crypto"
@@ -41,7 +41,85 @@ type Envelope = {
 
 type ExtensionApi = {
   on: (event: string, handler: (event: any, ctx: any) => unknown) => void
+  registerTool?: (tool: Record<string, unknown>) => void
   exec?: (command: string, args: string[], options?: Record<string, unknown>) => Promise<{ stdout?: string; code?: number }>
+}
+
+type WebAnswer = { request_uid: string; option: string | null; text: string | null }
+type AskQuestion = {
+  id?: string
+  question?: string
+  header?: string
+  options?: Array<string | { label?: string; description?: string }>
+  multi?: boolean
+}
+
+const ASK_SCHEMA = {
+  type: "object",
+  properties: {
+    questions: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" }, question: { type: "string" }, header: { type: "string" },
+          options: { type: "array", items: { type: "object", properties: { label: { type: "string" }, description: { type: "string" } }, required: ["label"] } },
+          multi: { type: "boolean" }, recommended: { type: "number" },
+        },
+        required: ["question", "options"],
+      },
+    },
+  },
+  required: ["questions"],
+}
+
+function answerPath(requestUid: string): string {
+  return join(process.env.OVERLOAD_ANSWERS_DIR || join(homedir(), ".overload", "answers"), `${requestUid}.json`)
+}
+
+async function takeWebAnswer(requestUid: string): Promise<WebAnswer | undefined> {
+  const path = answerPath(requestUid)
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<WebAnswer>
+    await unlink(path)
+    if (parsed.request_uid !== requestUid) return undefined
+    const option = typeof parsed.option === "string" ? parsed.option : null
+    const text = typeof parsed.text === "string" ? parsed.text : null
+    return option !== null || text !== null ? { request_uid: requestUid, option, text } : undefined
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      try { await unlink(path) } catch {}
+    }
+    return undefined
+  }
+}
+
+async function pollWebAnswer(requestUid: string, signal: AbortSignal): Promise<WebAnswer | undefined> {
+  while (!signal.aborted) {
+    const answer = await takeWebAnswer(requestUid)
+    if (answer) return answer
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 2_000)
+      signal.addEventListener("abort", () => { clearTimeout(timer); resolve() }, { once: true })
+    })
+  }
+  return undefined
+}
+
+function optionLabels(question: AskQuestion): string[] {
+  return (question.options || []).map((option) => typeof option === "string" ? option : String(option.label || "")).filter(Boolean)
+}
+
+function askResult(question: AskQuestion, answer: WebAnswer): Record<string, unknown> {
+  const options = optionLabels(question)
+  const selected = answer.option && options.includes(answer.option) ? [answer.option] : []
+  const customInput = answer.text || undefined
+  const text = [selected.length ? `Selected: ${selected.join(", ")}` : "", customInput ? `User input: ${customInput}` : ""].filter(Boolean).join("\n")
+  return {
+    content: [{ type: "text", text: text || "No answer supplied" }],
+    details: { question: question.question, options, multi: question.multi === true, selectedOptions: selected, customInput },
+  }
 }
 
 type ApprovalGate = {
@@ -360,6 +438,52 @@ export default function overload(pi: ExtensionApi): void {
     spool.enqueue({ session, kind, ...(detail ? { detail } : {}) })
   }
 
+  if (pi.registerTool) {
+    pi.registerTool({
+      name: "ask",
+      label: "Ask",
+      description: "Ask the user one or more questions and wait for an answer from the TUI or Overload.",
+      parameters: ASK_SCHEMA,
+      async execute(toolCallId: string, params: { questions?: AskQuestion[] }, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: any) {
+        const question = params.questions?.[0] || {}
+        const requestUid = `${stableId}#${spool.writerId}#${toolCallId}`
+        const pollController = new AbortController()
+        const dialogController = new AbortController()
+        const abort = () => { pollController.abort(); dialogController.abort() }
+        signal?.addEventListener("abort", abort, { once: true })
+
+        const tui = (async () => {
+          const labels = optionLabels(question)
+          const selected = labels.length
+            ? await ctx.ui.select(question.question || "Decision required", labels, { signal: dialogController.signal })
+            : undefined
+          const text = selected === undefined
+            ? await ctx.ui.input(question.question || "Decision required", undefined, { signal: dialogController.signal })
+            : undefined
+          if (selected === undefined && text === undefined) throw new Error("Ask tool was cancelled by the user")
+          return askResult(question, { request_uid: requestUid, option: selected || null, text: text || null })
+        })()
+        // Avoid an aborting loser becoming an unhandled rejection after Promise.race.
+        tui.catch(() => undefined)
+
+        try {
+          const aborted = new Promise<never>((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("Ask tool was cancelled by the user")), { once: true }))
+          const winner = await Promise.race([
+            tui.then((result) => ({ source: "tui" as const, result })),
+            pollWebAnswer(requestUid, pollController.signal).then((answer) => answer ? ({ source: "web" as const, result: askResult(question, answer) }) : new Promise<never>(() => {})),
+            aborted,
+          ])
+          if (winner.source === "web") dialogController.abort()
+          else pollController.abort()
+          return winner.result
+        } finally {
+          abort()
+          signal?.removeEventListener("abort", abort)
+        }
+      },
+    })
+  }
+
   function warnAndDisableGate(error: unknown): void {
     approvalGate = null
     if (gateWarned) return
@@ -576,6 +700,8 @@ export default function overload(pi: ExtensionApi): void {
 
   on("tool_execution_end", (event) => {
     if (event?.toolName !== "ask" || !pendingAsk.delete(event.toolCallId)) return
+    // A TUI winner may race a web write. Remove that losing answer lazily.
+    void unlink(answerPath(`${stableId}#${spool.writerId}#${event.toolCallId}`)).catch(() => undefined)
     const selected = selectedOption(event.result)
     emit("decision_resolved", {
       request_id: event.toolCallId,
