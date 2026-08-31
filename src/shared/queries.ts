@@ -141,13 +141,19 @@ export function queryHung(db: Database, now = Date.now()): HungRow[] {
   return rows.map((row) => ({ ...withParsedDetail(row), hung_ms: row.since ? Math.max(0, now - row.since) : 0 }));
 }
 
+function hasCloseouts(db: Database): boolean {
+  return Boolean(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='closeouts'").get());
+}
+
 /** Completed agent work with proven lineage; may require a human close-out. */
 export function queryQ2(db: Database): Q2Row[] {
+  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin<>'unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
   return db.query("SELECT stable_id, origin, last_event_at FROM current c WHERE queue='q2' AND origin<>'unknown' AND NOT EXISTS (SELECT 1 FROM closeouts x WHERE x.stable_id=c.stable_id) ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
 }
 
 /** Finished sessions lacking lineage, plus operator-closed work; retained for audit. */
 export function queryArchive(db: Database): ArchiveRow[] {
+  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin='unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
   const rows = db.query("SELECT stable_id, origin, last_event_at, EXISTS(SELECT 1 FROM closeouts x WHERE x.stable_id=c.stable_id) closed_out FROM current c WHERE (queue='q2' AND origin='unknown') OR closed_out ORDER BY last_event_at DESC, stable_id DESC").all() as Array<Omit<ArchiveRow, "closed_out"> & { closed_out: number }>;
   return rows.map(({ closed_out, ...row }) => closed_out ? { ...row, closed_out: true } : row);
 }

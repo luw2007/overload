@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { queryArchive, queryQ2 } from "../shared/queries";
 import { startWebServer } from "./server";
 
 const roots: string[] = [];
@@ -57,6 +58,21 @@ async function runningServer(path: string, jump?: (target: { source: "host" | "a
 }
 
 describe("web API", () => {
+  test("queries fresh readonly ledgers without the optional closeouts table", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-web-fresh-"));
+    roots.push(root);
+    const path = join(root, "ledger.db");
+    const writable = new Database(path);
+    writable.exec(await Bun.file(new URL("../ingest/schema.sql", import.meta.url)).text());
+    writable.run("INSERT INTO current(stable_id, writer_id, state, queue, origin, last_event_at) VALUES ('known', 'w', 'done', 'q2', 'agent', 2), ('unknown', 'w', 'done', 'q2', 'unknown', 1)");
+    writable.close();
+
+    const readonly = new Database(path, { readonly: true });
+    expect(queryQ2(readonly)).toEqual([{ stable_id: "known", origin: "agent", last_event_at: 2 }]);
+    expect(queryArchive(readonly)).toEqual([{ stable_id: "unknown", origin: "unknown", last_event_at: 1 }]);
+    readonly.close();
+  });
+
   test("binds loopback and exposes summary counts", async () => {
     const { server, base } = await runningServer(seedLedger());
     expect(server.hostname).toBe("127.0.0.1");

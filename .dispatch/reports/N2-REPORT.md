@@ -1,4 +1,4 @@
-# N2 Report — ATTEMPT_ID n2-a1-3281B9D5
+# N2 Report — ATTEMPT_ID n2-a2-EDB602BC
 
 ## Delivered
 
@@ -6,7 +6,8 @@
 - Added `POST /api/closeout/:stable_id`, including 404 handling, Q2 exclusion, and Archive inclusion with `closed_out: true` only for explicitly closed rows (the field is absent otherwise).
 - Added `POST /api/answer/:request_uid` validation and atomic private answer-file writes.
 - Added the bounded dashboard CSS hooks requested by N2.
-- Added server tests covering resume capability, close-out behavior, and answer endpoint status/file semantics.
+- Added server tests covering resume capability, close-out behavior, answer endpoint status/file semantics, and optional-table compatibility on a fresh readonly ledger.
+- Audit fix: `queryQ2` and `queryArchive` probe `sqlite_master` once per call. When `closeouts` is absent, both preserve pre-N2 behavior without attempting DDL, including on readonly CLI connections.
 
 ## Persistence and resolution decisions
 
@@ -16,6 +17,5 @@
 
 ## Verification
 
-- `bun test src/web/server.test.ts` — 17 pass, 0 fail.
-- `bun test test/queries-q1.test.ts` — 6 pass, 0 fail.
+- `bun test src/web/server.test.ts test/queries-q1.test.ts` — 24 pass, 0 fail.
 - `git diff --check` — clean.
