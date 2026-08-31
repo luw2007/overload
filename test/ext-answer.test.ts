@@ -28,7 +28,7 @@ beforeAll(async () => {
   const { default: overload } = await import("../src/extension/overload");
   overload({
     on(name: string, handler: Handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
-    registerTool(tool: any) { if (tool.name === "ask") askTool = tool; },
+    registerTool(tool: { name: string }) { if (tool.name === "ask" || tool.name === "ask_user") askTool = tool; },
   } as never);
   await Promise.all(dispatch("session_start", {}, { cwd: home, sessionManager: { getSessionId: () => sessionId } }));
 });
