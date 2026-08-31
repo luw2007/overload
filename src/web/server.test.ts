@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startWebServer } from "./server";
@@ -11,6 +11,7 @@ const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
 afterEach(() => {
   for (const server of servers.splice(0)) server.stop(true);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  delete process.env.OVERLOAD_ANSWERS_DIR;
 });
 
 function seedLedger(): string {
@@ -77,6 +78,50 @@ describe("web API", () => {
     expect(await (await fetch(`${base}/api/archive`)).json()).toEqual([{
       stable_id: "done:pi:unknown", origin: "unknown", last_event_at: 1_700_000_004_000,
     }]);
+  });
+
+  test("closes out q2 work into archive and rejects unknown sessions", async () => {
+    const path = seedLedger();
+    const db = new Database(path);
+    db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["done:pi:beta", "local", "pi", "beta", "agent", "/repo", "main", 1, 1]);
+    db.close();
+    const { base } = await runningServer(path);
+
+    expect(await (await fetch(`${base}/api/closeout/done:pi:beta`, { method: "POST" })).json()).toEqual({ closed: true });
+    expect(await (await fetch(`${base}/api/q2`)).json()).toEqual([]);
+    expect(await (await fetch(`${base}/api/archive`)).json()).toContainEqual({ stable_id: "done:pi:beta", origin: "agent", last_event_at: 1_700_000_003_000, closed_out: true });
+    expect((await fetch(`${base}/api/closeout/missing`, { method: "POST" })).status).toBe(404);
+  });
+
+  test("writes pending answers atomically with private permissions", async () => {
+    const path = seedLedger();
+    const answers = join(roots[roots.length - 1]!, "answers");
+    process.env.OVERLOAD_ANSWERS_DIR = answers;
+    const db = new Database(path);
+    db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["ask-answer", "remote:pi:alpha", "writer", "emitter", "req", "permission", "pending", 1, null, "{}"]) ;
+    db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["ask-done", "remote:pi:alpha", "writer", "emitter", "req2", "permission", "acked", 1, 2, "{}"]) ;
+    db.close();
+    const { base } = await runningServer(path);
+
+    expect(await (await fetch(`${base}/api/answer/ask-answer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ option: "Allow", text: "once" }) })).json()).toEqual({ written: true });
+    const answerPath = join(answers, "ask-answer.json");
+    expect(statSync(answerPath).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(answerPath, "utf8"))).toMatchObject({ request_uid: "ask-answer", option: "Allow", text: "once" });
+    expect((await fetch(`${base}/api/answer/missing`, { method: "POST", body: JSON.stringify({ text: "x" }) })).status).toBe(404);
+    expect((await fetch(`${base}/api/answer/ask-done`, { method: "POST", body: JSON.stringify({ text: "x" }) })).status).toBe(409);
+    expect((await fetch(`${base}/api/answer/ask-answer`, { method: "POST", body: "{}" })).status).toBe(400);
+  });
+
+  test("adds resume capability to hung and zombie rows", async () => {
+    const path = seedLedger();
+    const db = new Database(path);
+    db.run("UPDATE current SET queue='q5', q5_reason='turn_hung', state='running' WHERE stable_id='remote:pi:alpha'");
+    db.run("UPDATE current SET queue='q5', q5_reason='process_lost' WHERE stable_id='done:pi:beta'");
+    db.close();
+    const { base } = await runningServer(path);
+
+    expect((await (await fetch(`${base}/api/hung`)).json())[0]).toHaveProperty("resume_capability");
+    expect((await (await fetch(`${base}/api/zombie`)).json()).groups[0].rows[0]).toHaveProperty("resume_capability");
   });
 
   test("serves legacy archive route with the dashboard shell", async () => {
