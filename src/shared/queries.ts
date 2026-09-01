@@ -11,6 +11,7 @@ export type SessionDetail = {
     last_event_at: number | null; last_heartbeat_at: number | null; last_progress_at: number | null;
     binding: string | null;
   };
+  latest_surface_session: SessionSummary | null;
   incarnations: IncarnationRow[];
   pending_requests: PendingRequestRow[];
   /** Newest first and heartbeat-free: the question is what the turn last did. */
@@ -85,8 +86,16 @@ export function querySession(db: Database, stableId: string, eventLimit = 200): 
     WHERE kind<>'heartbeat' AND (stable_id=? OR
       (kind IN ('turn_hung','dead_connection') AND json_extract(detail, '$.stable_id')=?))
     ORDER BY ingest_seq DESC LIMIT ?`).all(stableId, stableId, eventLimit) as Array<EventRow & JsonRow>;
+  const latestSurfaceSession = session.binding == null || session.app == null ? null : db.query(`SELECT s.stable_id, s.runtime, s.origin, s.created_at,
+    c.state, c.queue, c.q5_reason, COALESCE(c.last_event_at, s.first_seen_at) last_event_at
+    FROM session_hosts h JOIN sessions s ON s.stable_id=h.stable_id
+    LEFT JOIN current c ON c.stable_id=s.stable_id
+    WHERE h.app=? AND h.session_id=? AND h.stable_id<>?
+      AND COALESCE(c.last_event_at, s.first_seen_at)>COALESCE(?, 0)
+    ORDER BY last_event_at DESC, s.stable_id DESC LIMIT 1`).get(session.app, session.binding, stableId, session.last_event_at) as SessionSummary | null;
   return {
     session,
+    latest_surface_session: latestSurfaceSession?.stable_id === stableId ? null : latestSurfaceSession,
     incarnations,
     pending_requests: pending.map(withParsedDetail),
     events: events.map(withParsedDetail),
