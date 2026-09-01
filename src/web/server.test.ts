@@ -42,6 +42,9 @@ function seedLedger(): string {
   db.run("INSERT INTO session_hosts VALUES ('remote:pi:alpha', 'cmux', 'terminal-7', '/dev/ttys007', 1700000003000)");
   db.run("INSERT INTO current VALUES ('done:pi:beta', 'writer', 'done', 'q2', NULL, 'agent', 2, 1700000003000, NULL, NULL, 0)");
   db.run("INSERT INTO incidents VALUES (1, 'recon', 1700000004000, NULL, ?)", [JSON.stringify({ reason: "adapter unavailable" })]);
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["remote:pi:new", "remote", "pi", "new", "agent", "/repo", "main", 1_700_000_000_500, 1_700_000_000_500]);
+  db.run("INSERT INTO current VALUES ('remote:pi:new', 'writer-new', 'working', 'q3', NULL, 'agent', 5, 1700000010000, 1700000010000, 1700000010000, 0)");
+  db.run("INSERT INTO session_hosts VALUES ('remote:pi:new', 'cmux', 'terminal-7', '/dev/ttys007', 1700000006000)");
   db.run("INSERT INTO coverage_gaps VALUES (1, 'remote:pi:alpha', 'emitter', 1, ?, ?, 'missing_seq')", [now - 60_000, now]);
   db.run("INSERT INTO journal VALUES (1, ?, 'remote:pi:alpha', 'writer', 'emitter', 'telemetry_gap', ?)", [now - 60_000, JSON.stringify({ platform: "cmux", native_id: "term-9" })]);
   db.run("INSERT INTO current VALUES ('remote:pi:alpha', 'writer', 'working', 'q5', 'turn_hung', 'agent', 9, 1700000009000, 1700000009000, 1700000005000, 0)");
@@ -245,6 +248,9 @@ describe("web API", () => {
     // Newest first, heartbeat-free: the top row must be what the turn last did.
     expect(view.events.map((row: { kind: string }) => row.kind)).toEqual(["tool_activity", "telemetry_gap"]);
     expect(view.pending_requests).toHaveLength(1);
+    expect(view.latest_surface_session).toMatchObject({ stable_id: "remote:pi:new", state: "working", last_event_at: 1_700_000_010_000 });
+    const latest = await (await fetch(`${base}/api/sessions/${encodeURIComponent("remote:pi:new")}`)).json();
+    expect(latest.latest_surface_session).toBeNull();
     expect((await fetch(`${base}/api/sessions/missing`)).status).toBe(404);
     expect((await fetch(`${base}/nope`)).status).toBe(404);
   });
@@ -270,7 +276,7 @@ describe("web API", () => {
   test("bounds the session list and carries queue state for drill-down", async () => {
     const { base } = await runningServer(seedLedger());
     const rows = await (await fetch(`${base}/api/sessions`)).json();
-    expect(rows).toHaveLength(4);
+    expect(rows).toHaveLength(5);
     expect(rows.find((row: { stable_id: string }) => row.stable_id === "remote:pi:alpha")).toMatchObject({ stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung" });
   });
 });

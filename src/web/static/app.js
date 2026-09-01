@@ -174,6 +174,9 @@
       ["时钟", escapeHtml(clocks)],
       ["跳转", s.binding ? `<span class="chip">${escapeHtml(s.binding)}</span> <button class="btn primary jump" data-route="jump-session" data-id="${escapeHtml(s.stable_id)}" data-binding="${escapeHtml(s.binding)}">打开</button><span class="jump-status" aria-live="polite"></span>` : "暂无可跳转目标"],
     ]);
+    const replacement = view.latest_surface_session
+      ? `<article class="decision-card"><strong>此 surface 已有较新会话</strong><div class="session-meta">${escapeHtml(view.latest_surface_session.state ?? "unknown")} · 最后事件 ${escapeHtml(formatTime(view.latest_surface_session.last_event_at))}</div><div class="session-actions">${sessionLink(view.latest_surface_session.stable_id)}</div></article>`
+      : "";
     const incarnations = view.incarnations.length
       ? `<table class="b-table"><thead><tr><th>写入者</th><th>域</th><th>pid</th><th>启动</th><th>最后可见</th></tr></thead><tbody>${view.incarnations.map((row) => `<tr><td>${escapeHtml(row.writer_id)}</td><td>${escapeHtml(row.liveness_domain)}</td><td>${escapeHtml(row.pid)}</td><td>${escapeHtml(formatTime(row.started_at))}</td><td>${escapeHtml(formatTime(row.last_seen_at))}</td></tr>`).join("")}</tbody></table>`
       : "<p class='empty'>没有进程记录</p>";
@@ -183,9 +186,9 @@
     const events = view.events.length
       ? `<table class="b-table"><thead><tr><th>#</th><th>时间</th><th>事件</th><th>详情</th></tr></thead><tbody>${view.events.map((row) => `<tr><td>${escapeHtml(row.ingest_seq)}</td><td>${escapeHtml(formatTime(row.at))}</td><td>${escapeHtml(row.kind)}</td><td><code>${escapeHtml(JSON.stringify(row.detail ?? {}))}</code></td></tr>`).join("")}</tbody></table>`
       : "<p class='empty'>没有事件</p>";
-    $("detail").innerHTML = `<p><button class="btn" id="detail-back">← 返回会话列表</button></p>${head}
+    $("detail").innerHTML = `<p><button class="btn" id="detail-back">← 返回会话列表</button></p>${replacement}${head}
       <h3>进程</h3>${incarnations}<h3>待决策</h3>${requests}
-      <h3>最近事件（倒序，已隐去心跳）</h3>${events}`;
+      <h3>事件（最新在前，已隐藏 heartbeat）</h3>${events}`;
     $("detail-back").addEventListener("click", () => { state.session = null; state.detail = null; navigate("/sessions"); renderZone(); });
   }
 
