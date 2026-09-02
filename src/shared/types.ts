@@ -47,7 +47,7 @@ export type EventKind =
 
 // ── P2 state vocabulary (frozen) ──
 export type SessionState = "working" | "idle" | "awaiting_human" | "done" | "failed" | "vanished";
-export type QueueName = "q1" | "q2" | "q3" | "q5";           // Q4 closed until P4
+export type QueueName = "q1" | "q2" | "q3" | "q4" | "q5";
 export type Q5Reason = "stalled" | "dead_incarnation" | "telemetry_gap" | "orphaned_request" | "turn_hung" | "dead_connection";
 export const DRAIN_GRACE_MS = 5 * 60_000;
 /** Heartbeat-silence profiles (§2.4): narrow default, wide for long tasks. */

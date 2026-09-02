@@ -15,6 +15,8 @@ const DEFAULT_SCAN_INTERVAL_MS = 2_000;
 const DEFAULT_REDUCER_BATCH_SIZE = 500;
 const DEFAULT_PRUNE_INTERVAL_MS = 3_600_000;
 const DEFAULT_SPOOL_RETENTION_MS = 86_400_000;
+const MAX_SPOOL_READ_BYTES = 4 * 1024 * 1024;
+const MAX_SPOOL_LINE_BYTES = 64 * 1024;
 const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const SEGMENT_FILE = /^(?:active|seg)-[A-Za-z0-9._-]+-\d+(?:-recovered)?\.ndjson$/;
 
@@ -48,6 +50,7 @@ export type PendingFile = {
   path: string;
   end: number;
   events: Array<{ envelope: Envelope; lineStart: number }>;
+  gaps: Array<{ emitterId: string; at: number }>;
 };
 
 export async function loadConfig(path = join(homedir(), ".overload", "config.json")): Promise<IngestConfig> {
@@ -84,6 +87,7 @@ export async function openLedger(path = join(homedir(), ".overload", "ledger.db"
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const db = new Database(path, { create: true });
+  db.exec("PRAGMA busy_timeout = 5000");
   initializeLedger(db);
   for (const file of [path, `${path}-wal`, `${path}-shm`]) {
     try { await chmod(file, 0o600); } catch { /* Sidecars are created lazily. */ }
@@ -158,6 +162,10 @@ export async function scanOnce(db: Database, spoolRoot = join(homedir(), ".overl
       for (const event of file.events) {
         if (insertEnvelope(db, event.envelope, `${file.key}:${event.lineStart}`)) inserted++;
       }
+      for (const gap of file.gaps) {
+        db.query(`INSERT INTO coverage_gaps(stable_id, emitter_id, from_seq, from_at, to_at, reason)
+          VALUES (NULL, ?, NULL, NULL, ?, 'spool_line_too_long')`).run(gap.emitterId, gap.at);
+      }
       db.query(`INSERT INTO cursors(file_name, bytes) VALUES (?, ?)
         ON CONFLICT(file_name) DO UPDATE SET bytes=excluded.bytes`).run(file.key, file.end);
     }
@@ -212,21 +220,40 @@ export async function readCompleteLines(path: string, key: string, cursor: numbe
     const stat = await handle.stat();
     const start = stat.size < cursor ? 0 : cursor;
     if (stat.size === start) return null;
-    const buffer = Buffer.alloc(stat.size - start);
+    const buffer = Buffer.alloc(Math.min(stat.size - start, MAX_SPOOL_READ_BYTES));
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    let continuesOversizedLine = false;
+    if (start > 0) {
+      const previous = Buffer.alloc(1);
+      const result = await handle.read(previous, 0, 1, start - 1);
+      continuesOversizedLine = result.bytesRead === 1 && previous[0] !== 0x0a;
+    }
     const chunk = buffer.subarray(0, bytesRead);
     const newline = chunk.lastIndexOf(0x0a);
-    if (newline < 0) return null;
+    if (newline < 0) {
+      if (bytesRead < MAX_SPOOL_READ_BYTES) return null;
+      return {
+        key, path, end: start + bytesRead, events: [],
+        gaps: continuesOversizedLine ? [] : [{ emitterId: key.split("/")[1]!, at: Date.now() }],
+      };
+    }
     const complete = chunk.subarray(0, newline + 1);
     const events: PendingFile["events"] = [];
+    const gaps: PendingFile["gaps"] = [];
     let offset = 0;
-    for (const bytes of complete.toString("utf8").split("\n").slice(0, -1)) {
+    for (const [index, bytes] of complete.toString("utf8").split("\n").slice(0, -1).entries()) {
       const lineBytes = Buffer.byteLength(bytes) + 1;
-      const envelope = parseEnvelope(bytes, key);
-      if (envelope) events.push({ envelope, lineStart: start + offset });
+      if (continuesOversizedLine && index === 0) {
+        // A prior read window already recorded and began discarding this line.
+      } else if (lineBytes - 1 > MAX_SPOOL_LINE_BYTES) {
+        gaps.push({ emitterId: key.split("/")[1]!, at: Date.now() });
+      } else {
+        const envelope = parseEnvelope(bytes, key);
+        if (envelope) events.push({ envelope, lineStart: start + offset });
+      }
       offset += lineBytes;
     }
-    return { key, path, end: start + complete.length, events };
+    return { key, path, end: start + complete.length, events, gaps };
   } finally {
     await handle.close();
   }

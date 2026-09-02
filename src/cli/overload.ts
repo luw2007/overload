@@ -2,9 +2,10 @@
 import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { ackRequest, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession } from "../shared/queries";
+import { ackRequest, queryHealth, queryHung, queryJumpTarget, queryQ1, querySession, querySessions, queryZombie, requestSession } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { runDoctor, defaultDoctorDeps } from "./doctor";
+import { runCli as runOrchestratorCli } from "../orchestrator/cli";
 
 const path = process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
 type Output = (line: string) => void;
@@ -15,7 +16,7 @@ const note: Output = (line) => console.error(line);
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q2 | q4 | hung | zombie | health | doctor | ack <request_uid>... | jump <stable_id|request_uid>"); process.exit(2); }
+function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q4 | hung | zombie | health | doctor | ack <request_uid>... | jump <stable_id|request_uid> | orch ..."); process.exit(2); }
 
 function listSessions(db: Database): void {
   const rows = querySessions(db);
@@ -45,11 +46,6 @@ function q1(db: Database): void {
     const jump = row.binding ?? (row.host && row.host !== "local" ? `ssh ${row.host}` : "-");
     console.log(`${row.request_uid}\t${row.kind}\t${time(row.created_at)}\tjump=${jump}${detail(row.detail)}`);
   }
-}
-function q2(db: Database): void {
-  const rows = queryQ2(db);
-  if (!rows.length) { note("Q2: no completed agent sessions."); return; }
-  note("Q2 completed sessions:"); for (const row of rows) console.log(`${row.stable_id}\t${row.origin}\t${time(row.last_event_at)}`);
 }
 export function printQ4(db: Database, output: Output = console.log, heading: Output = note): void {
   const rows = db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q4' ORDER BY last_event_at DESC, stable_id DESC").all() as Array<{ stable_id: string; origin: string; last_event_at: number }>;
@@ -100,11 +96,12 @@ export function ackAll(db: Database, uids: string[]): void {
 }
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const [command, ...rest] = argv;
-  const simple = new Set(["sessions", "q1", "q2", "q4", "hung", "zombie", "health"]);
+  const simple = new Set(["sessions", "q1", "q4", "hung", "zombie", "health"]);
   const arity: Record<string, (count: number) => boolean> = {
     show: (count) => count === 1, jump: (count) => count === 1, ack: (count) => count >= 1, doctor: (count) => count === 0,
   };
   if (!command) usage();
+  if (command === "orch") { await runOrchestratorCli(rest); return; }
   if (simple.has(command)) { if (rest.length) usage(); } else if (!arity[command]?.(rest.length)) usage();
   if (command === "ack") {
     const rw = new Database(path);
@@ -120,7 +117,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   let db: Database; try { db = new Database(path, { readonly: true }); } catch (error) { console.error(`Unable to open ledger ${path}: ${(error as Error).message}`); process.exit(1); }
   try {
     if (command === "jump") await jumpTo(db, rest[0]!);
-    else if (command === "sessions") listSessions(db); else if (command === "show") showSession(db, rest[0]!); else if (command === "q1") q1(db); else if (command === "q2") q2(db);
+    else if (command === "sessions") listSessions(db); else if (command === "show") showSession(db, rest[0]!); else if (command === "q1") q1(db);
     else if (command === "q4") printQ4(db); else if (command === "hung") hung(db); else if (command === "zombie") zombie(db); else health(db);
   } finally { db.close(); }
 }

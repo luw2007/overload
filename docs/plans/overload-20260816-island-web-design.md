@@ -1,3 +1,5 @@
+> **历史文档**：本文件描述的部分能力（如 outbox/digest/attrib/Island 原生面板）已从代码中移除，不代表当前实现。
+
 # Overload: Island + Web 界面设计
 
 新增两个只读优先的界面消费方，共享同一个只读查询层，唯一写路径是 `ack`（既有 CLI 语义的复用，不新增写回能力）。取代 `overload-20260813-ledger-design.md` §9 "不做 web UI" 非目标（用户已批准架构性扩展；ledger/reducer/queue 契约不变）。

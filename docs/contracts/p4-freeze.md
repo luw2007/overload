@@ -1,3 +1,5 @@
+> **历史文档**：本文件描述的部分能力（如 outbox/digest/attrib/Island 原生面板）已从代码中移除，不代表当前实现。
+
 # P4 冻结契约（owner 独占；worker 只读）
 
 依据：tech-solution §2.9（已 sol 对齐的 cmux 契约）/§2.6/§2.4c(Q4)/§2.1(审批门 v2 预留)/§4-P4；REVIEW-P3.md m2。P1-P3 契约有效。

@@ -24,8 +24,14 @@ function terminalState(detail: Record<string, unknown>): string {
   if (typeof candidate === "string" && SOURCE_TERMINALS.has(candidate)) return candidate;
   return detail.error === true ? "cancelled" : "resolved";
 }
-function targetStableId(row: JournalRow, detail: Record<string, unknown>): string {
-  return stringDetail(detail, "stable_id") ?? row.stable_id;
+function targetStableId(db: Database, row: JournalRow, detail: Record<string, unknown>): string {
+  const stableId = stringDetail(detail, "stable_id");
+  if (stableId && stableId.split(":")[0] !== row.stable_id.split(":")[0]) {
+    db.query(`INSERT INTO coverage_gaps(stable_id, emitter_id, from_seq, from_at, to_at, reason)
+      VALUES (?, ?, ?, ?, ?, 'cross_host_stable_id')`).run(row.stable_id, row.emitter_id, row.ingest_seq, row.at, row.at);
+    return row.stable_id;
+  }
+  return stableId ?? row.stable_id;
 }
 function platformFor(stableId: string): string { return stableId.split(":")[1] ?? "unknown"; }
 function isIncidentOpen(db: Database, source: string): boolean {
@@ -108,7 +114,7 @@ function applyHost(db: Database, row: JournalRow, detail: Record<string, unknown
 }
 
 function applyAttachment(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
-  const stableId = targetStableId(row, detail), platform = stringDetail(detail, "platform"), binding = stringDetail(detail, "binding");
+  const stableId = targetStableId(db, row, detail), platform = stringDetail(detail, "platform"), binding = stringDetail(detail, "binding");
   if (!platform || !binding) return;
   db.query(`INSERT INTO attachments(stable_id, platform, binding, observed_at, valid) VALUES (?, ?, ?, ?, 1)
     ON CONFLICT(stable_id, platform) DO UPDATE SET binding=excluded.binding, observed_at=excluded.observed_at, valid=1`)
@@ -129,7 +135,7 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   // A platform process without an attributable session is health evidence only;
   // never create a synthetic overload-admin current row for it.
   if (row.kind === "telemetry_gap" && !stringDetail(detail, "stable_id")) return;
-  const stableId = targetStableId(row, detail);
+  const stableId = targetStableId(db, row, detail);
   if (RECON_EVENTS.has(row.kind) && isIncidentOpen(db, stringDetail(detail, "platform") ?? platformFor(stableId))) return;
   const current = ensureCurrent(db, stableId, row.writer_id, row);
   // Re-reduction retains derived tables. A row already reflected by this

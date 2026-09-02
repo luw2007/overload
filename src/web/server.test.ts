@@ -61,22 +61,27 @@ describe("web API", () => {
     expect(server.hostname).toBe("127.0.0.1");
     const response = await fetch(`${base}/api/summary`);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ q1: 1, q2: 1, hung: 1, open_incidents: 1, coverage_gaps: 1, telemetry_gaps: 1 });
+    expect(await response.json()).toEqual({ q1: 1, hung: 1, open_incidents: 1, coverage_gaps: 1, telemetry_gaps: 1 });
   });
 
-  test("separates unproven completed sessions into archive", async () => {
+  test("/api/q2 route is gone (D1)", async () => {
+    const { base } = await runningServer(seedLedger());
+    expect((await fetch(`${base}/api/q2`)).status).toBe(404);
+  });
+
+  test("archive includes both q2 and q4 rows", async () => {
     const path = seedLedger();
     const db = new Database(path);
     db.run("INSERT INTO current VALUES ('done:pi:unknown', 'writer', 'done', 'q2', NULL, 'unknown', 3, 1700000004000, NULL, NULL, 0)");
+    db.run("INSERT INTO current VALUES ('done:pi:autoverified', 'writer', 'done', 'q4', NULL, 'agent', 4, 1700000005000, NULL, NULL, 0)");
     db.close();
     const { base } = await runningServer(path);
 
-    expect(await (await fetch(`${base}/api/q2`)).json()).toEqual([{
-      stable_id: "done:pi:beta", origin: "agent", last_event_at: 1_700_000_003_000,
-    }]);
-    expect(await (await fetch(`${base}/api/archive`)).json()).toEqual([{
-      stable_id: "done:pi:unknown", origin: "unknown", last_event_at: 1_700_000_004_000,
-    }]);
+    expect(await (await fetch(`${base}/api/archive`)).json()).toEqual([
+      { stable_id: "done:pi:autoverified", origin: "agent", last_event_at: 1_700_000_005_000 },
+      { stable_id: "done:pi:unknown", origin: "unknown", last_event_at: 1_700_000_004_000 },
+      { stable_id: "done:pi:beta", origin: "agent", last_event_at: 1_700_000_003_000 },
+    ]);
   });
 
   test("serves legacy archive route with the dashboard shell", async () => {
@@ -116,7 +121,7 @@ describe("web API", () => {
       target = input;
       return { opened: true };
     });
-    const response = await fetch(`${base}/api/jump/req-1`, { method: "POST" });
+    const response = await fetch(`${base}/api/jump/req-1`, { method: "POST", headers: { origin: base } });
     expect(await response.json()).toEqual({ opened: true });
     expect(target).toEqual({ source: "host", platform: "cmux", binding: "terminal-7", tty: "/dev/ttys007", host: "buildbox" });
   });
@@ -137,13 +142,56 @@ describe("web API", () => {
   test("ack moves a pending request to the acked terminal and is idempotent", async () => {
     const path = seedLedger();
     const { base } = await runningServer(path);
-    const first = await fetch(`${base}/api/ack/req-1`, { method: "POST" });
+    const first = await fetch(`${base}/api/ack/req-1`, { method: "POST", headers: { origin: base } });
     expect(await first.json()).toEqual({ acked: true });
     const db = new Database(path, { readonly: true });
     expect(db.query("SELECT state FROM requests WHERE request_uid='req-1'").get()).toEqual({ state: "acked" });
     db.close();
-    const second = await fetch(`${base}/api/ack/req-1`, { method: "POST" });
+    const second = await fetch(`${base}/api/ack/req-1`, { method: "POST", headers: { origin: base } });
     expect(await second.json()).toEqual({ acked: false });
+  });
+
+  describe("SEC-1: Origin/Host guard", () => {
+    test("correct headers: POST /api/ack/<uid> succeeds and mutates state", async () => {
+      const path = seedLedger();
+      const { base } = await runningServer(path);
+      const response = await fetch(`${base}/api/ack/req-1`, { method: "POST", headers: { origin: base, host: new URL(base).host } });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ acked: true });
+      const db = new Database(path, { readonly: true });
+      expect(db.query("SELECT state FROM requests WHERE request_uid='req-1'").get()).toEqual({ state: "acked" });
+      db.close();
+    });
+
+    test("wrong Origin: 403 and no state change", async () => {
+      const path = seedLedger();
+      const { base } = await runningServer(path);
+      const response = await fetch(`${base}/api/ack/req-1`, { method: "POST", headers: { origin: "https://evil.example" } });
+      expect(response.status).toBe(403);
+      const db = new Database(path, { readonly: true });
+      expect(db.query("SELECT state FROM requests WHERE request_uid='req-1'").get()).toEqual({ state: "pending" });
+      db.close();
+    });
+
+    test("wrong Host: 403", async () => {
+      const { server } = await runningServer(seedLedger());
+      const response = await fetch(`http://127.0.0.1:${server.port}/api/ack/req-1`, { method: "POST", headers: { origin: `http://127.0.0.1:${server.port}`, host: "evil.example" } });
+      expect(response.status).toBe(403);
+    });
+
+    test("missing Origin: 403", async () => {
+      const { base } = await runningServer(seedLedger());
+      const response = await fetch(`${base}/api/ack/req-1`, { method: "POST" });
+      expect(response.status).toBe(403);
+    });
+
+    test("GET /api/q1: correct Host succeeds, wrong Host 403", async () => {
+      const { server } = await runningServer(seedLedger());
+      const ok = await fetch(`http://127.0.0.1:${server.port}/api/q1`, { headers: { host: `127.0.0.1:${server.port}` } });
+      expect(ok.status).toBe(200);
+      const bad = await fetch(`http://127.0.0.1:${server.port}/api/q1`, { headers: { host: "evil.example" } });
+      expect(bad.status).toBe(403);
+    });
   });
 
   test("reports resume capability and launches pi and omp sessions through cmux", async () => {
@@ -160,14 +208,15 @@ describe("web API", () => {
     expect(sessions.find((row) => row.stable_id === "local:pi:live")?.resume_capability).toEqual({ resumable: false, reason: "process_alive" });
     expect(sessions.find((row) => row.stable_id === "remote:pi:alpha")?.resume_capability).toEqual({ resumable: false, reason: "remote_host_unsupported" });
 
-    expect(await (await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:pi:dead")}`, { method: "POST" })).json()).toEqual({ resumed: true });
-    expect(await (await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:omp:dead")}`, { method: "POST" })).json()).toEqual({ resumed: true });
+    const origin = `http://127.0.0.1:${server.port}`;
+    expect(await (await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:pi:dead")}`, { method: "POST", headers: { origin } })).json()).toEqual({ resumed: true });
+    expect(await (await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:omp:dead")}`, { method: "POST", headers: { origin } })).json()).toEqual({ resumed: true });
     expect(calls).toEqual([
       { command: "cmux", args: ["new-workspace", "--cwd", "/repo/pi", "--command", "pi --resume='pi-session'", "--focus", "true"] },
       { command: "cmux", args: ["new-workspace", "--cwd", "/repo/omp", "--command", "omp --resume='omp-session'", "--focus", "true"] },
     ]);
 
-    const conflict = await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:pi:live")}`, { method: "POST" });
+    const conflict = await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:pi:live")}`, { method: "POST", headers: { origin } });
     expect(conflict.status).toBe(409);
     expect(await conflict.json()).toEqual({ resumed: false, reason: "process_alive" });
   });
@@ -211,5 +260,113 @@ describe("web API", () => {
     const rows = await (await fetch(`${base}/api/sessions`)).json();
     expect(rows).toHaveLength(4);
     expect(rows.find((row: { stable_id: string }) => row.stable_id === "remote:pi:alpha")).toMatchObject({ stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung" });
+  });
+
+  describe("POST /api/orchestrator/answer/:approval_id", () => {
+    function answersDb(root: string): string {
+      const path = join(root, "answers.db");
+      const db = new Database(path);
+      db.exec("CREATE TABLE IF NOT EXISTS answers(approval_id TEXT PRIMARY KEY, answer TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL)");
+      db.close();
+      return path;
+    }
+
+    test("valid request inserts row and returns 200", async () => {
+      const root = mkdtempSync(join(tmpdir(), "overload-answer-"));
+      roots.push(root);
+      const aPath = answersDb(root);
+      process.env.OVERLOAD_ANSWERS_PATH = aPath;
+      const { server } = await runningServer(seedLedger());
+      const base = `http://127.0.0.1:${server.port}`;
+      const response = await fetch(`${base}/api/orchestrator/answer/test-approval-1`, {
+        method: "POST",
+        headers: { origin: base, host: `127.0.0.1:${server.port}`, "content-type": "application/json", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
+        body: JSON.stringify({ answer: "approve" }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ok: true });
+      const db = new Database(aPath, { readonly: true });
+      const row = db.query("SELECT approval_id, answer, actor FROM answers WHERE approval_id='test-approval-1'").get() as { approval_id: string; answer: string; actor: string } | null;
+      db.close();
+      expect(row).toEqual({ approval_id: "test-approval-1", answer: "approve", actor: "ui" });
+      delete process.env.OVERLOAD_ANSWERS_PATH;
+    });
+
+    test("missing Sec-Fetch-* headers returns 403", async () => {
+      const root = mkdtempSync(join(tmpdir(), "overload-answer-"));
+      roots.push(root);
+      const aPath = answersDb(root);
+      process.env.OVERLOAD_ANSWERS_PATH = aPath;
+      const { server } = await runningServer(seedLedger());
+      const base = `http://127.0.0.1:${server.port}`;
+      const response = await fetch(`${base}/api/orchestrator/answer/test-approval-2`, {
+        method: "POST",
+        headers: { origin: base, host: `127.0.0.1:${server.port}`, "content-type": "application/json" },
+        body: JSON.stringify({ answer: "approve" }),
+      });
+      expect(response.status).toBe(403);
+      delete process.env.OVERLOAD_ANSWERS_PATH;
+    });
+
+    test("wrong Origin returns 403 (reuses checkOrigin)", async () => {
+      const root = mkdtempSync(join(tmpdir(), "overload-answer-"));
+      roots.push(root);
+      answersDb(root);
+      process.env.OVERLOAD_ANSWERS_PATH = join(root, "answers.db");
+      const { server } = await runningServer(seedLedger());
+      const response = await fetch(`http://127.0.0.1:${server.port}/api/orchestrator/answer/test-approval-3`, {
+        method: "POST",
+        headers: { origin: "https://evil.example", "content-type": "application/json", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
+        body: JSON.stringify({ answer: "approve" }),
+      });
+      expect(response.status).toBe(403);
+      delete process.env.OVERLOAD_ANSWERS_PATH;
+    });
+
+    test("missing answers.db returns 503", async () => {
+      process.env.OVERLOAD_ANSWERS_PATH = join(tmpdir(), "nonexistent-" + Date.now(), "answers.db");
+      const { server } = await runningServer(seedLedger());
+      const base = `http://127.0.0.1:${server.port}`;
+      const response = await fetch(`${base}/api/orchestrator/answer/test-approval-4`, {
+        method: "POST",
+        headers: { origin: base, host: `127.0.0.1:${server.port}`, "content-type": "application/json", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
+        body: JSON.stringify({ answer: "approve" }),
+      });
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ error: "orchestrator_not_running" });
+      delete process.env.OVERLOAD_ANSWERS_PATH;
+    });
+
+    test("malformed JSON body returns 400", async () => {
+      const root = mkdtempSync(join(tmpdir(), "overload-answer-"));
+      roots.push(root);
+      const aPath = answersDb(root);
+      process.env.OVERLOAD_ANSWERS_PATH = aPath;
+      const { server } = await runningServer(seedLedger());
+      const base = `http://127.0.0.1:${server.port}`;
+      const response = await fetch(`${base}/api/orchestrator/answer/test-approval-5`, {
+        method: "POST",
+        headers: { origin: base, host: `127.0.0.1:${server.port}`, "content-type": "application/json", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
+        body: "not json",
+      });
+      expect(response.status).toBe(400);
+      delete process.env.OVERLOAD_ANSWERS_PATH;
+    });
+
+    test("missing answer field returns 400", async () => {
+      const root = mkdtempSync(join(tmpdir(), "overload-answer-"));
+      roots.push(root);
+      const aPath = answersDb(root);
+      process.env.OVERLOAD_ANSWERS_PATH = aPath;
+      const { server } = await runningServer(seedLedger());
+      const base = `http://127.0.0.1:${server.port}`;
+      const response = await fetch(`${base}/api/orchestrator/answer/test-approval-6`, {
+        method: "POST",
+        headers: { origin: base, host: `127.0.0.1:${server.port}`, "content-type": "application/json", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
+        body: JSON.stringify({ wrong: "field" }),
+      });
+      expect(response.status).toBe(400);
+      delete process.env.OVERLOAD_ANSWERS_PATH;
+    });
   });
 });

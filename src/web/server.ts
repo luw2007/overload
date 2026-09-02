@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
+import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
 
@@ -66,25 +67,35 @@ function routeParameter(value: string): string {
   try { return decodeURIComponent(value); } catch { return value; }
 }
 
+/** CSRF hygiene, not caller binding (plan §5.1): Host blocks DNS rebinding, Origin
+ *  blocks cross-site POST. Any same-UID local process can still supply both headers. */
+function checkOrigin(request: Request, port: number): Response | null {
+  if (request.headers.get("host") !== `127.0.0.1:${port}`) return json({ error: "forbidden" }, { status: 403 });
+  if (request.method === "POST" && request.headers.get("origin") !== `http://127.0.0.1:${port}`) return json({ error: "forbidden" }, { status: 403 });
+  return null;
+}
+
 export function startWebServer(options: { ledgerPath?: string; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe } = {}) {
   const ledgerPath = options.ledgerPath ?? process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
+  const port = options.port ?? DEFAULT_WEB_PORT;
   return Bun.serve({
     // Loopback is the v1 trust boundary. Add authentication before supporting
     // shared machines or any non-loopback bind address.
     hostname: "127.0.0.1",
-    port: options.port ?? DEFAULT_WEB_PORT,
-    async fetch(request) {
+    port,
+    async fetch(request, server) {
       const url = new URL(request.url);
       try {
         if (request.method === "GET" && (url.pathname === "/" || dashboardRoute(url.pathname))) return new Response(dashboardHtml, { headers: { "content-type": "text/html; charset=utf-8" } });
         if (request.method === "GET" && url.pathname === "/static/app.js") return new Response(Bun.file(staticAppPath), { headers: { "content-type": "text/javascript; charset=utf-8" } });
+        const originError = checkOrigin(request, port === 0 ? server.port : port);
+        if (originError) return originError;
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
-          return { q1: queryQ1(db).length, q2: queryQ2(db).length, hung: queryHung(db).length, open_incidents: health.open_incidents.length, coverage_gaps: health.coverage_gaps, telemetry_gaps: health.telemetry_gaps };
+          return { q1: queryQ1(db).length, hung: queryHung(db).length, open_incidents: health.open_incidents.length, coverage_gaps: health.coverage_gaps, telemetry_gaps: health.telemetry_gaps };
         }));
         if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive) }))));
         if (request.method === "GET" && url.pathname === "/api/q1") return json(withReadonlyDb(ledgerPath, queryQ1).map(({ platform: _platform, ...row }) => row));
-        if (request.method === "GET" && url.pathname === "/api/q2") return json(withReadonlyDb(ledgerPath, queryQ2));
         if (request.method === "GET" && url.pathname === "/api/archive") return json(withReadonlyDb(ledgerPath, queryArchive));
         if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyDb(ledgerPath, queryZombie));
         if (request.method === "GET" && url.pathname === "/api/hung") return json(withReadonlyDb(ledgerPath, (db) => queryHung(db)));
@@ -118,7 +129,29 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
         if (request.method === "POST" && url.pathname.startsWith("/api/ack/")) {
           const requestUid = routeParameter(url.pathname.slice("/api/ack/".length));
           const db = new Database(ledgerPath);
+          db.exec("PRAGMA busy_timeout=5000");
           try { return json({ acked: ackRequest(db, requestUid).changes === 1 }); } finally { db.close(); }
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/api/orchestrator/answer/")) {
+          // Sec-Fetch-* hygiene (plan §3.9): browsers always send these;
+          // curl does not. Cheap, non-guaranteed check — not authentication.
+          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) {
+            return json({ error: "forbidden" }, { status: 403 });
+          }
+          let body: unknown;
+          try { body = await request.json(); } catch { return json({ error: "invalid JSON" }, { status: 400 }); }
+          if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).answer !== "string") {
+            return json({ error: "missing answer" }, { status: 400 });
+          }
+          const approvalId = routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));
+          const answersPath = process.env.OVERLOAD_ANSWERS_PATH ?? join(homedir(), ".overload", "orchestrator-answers.db");
+          if (!existsSync(answersPath)) return json({ error: "orchestrator_not_running" }, { status: 503 });
+          const db = new Database(answersPath);
+          db.exec("PRAGMA busy_timeout=5000");
+          try {
+            db.run("INSERT OR IGNORE INTO answers(approval_id, answer, actor, at) VALUES (?, ?, 'ui', ?)", [approvalId, (body as Record<string, unknown>).answer, Date.now()]);
+          } finally { db.close(); }
+          return json({ ok: true });
         }
         return json({ error: "not found" }, { status: 404 });
       } catch (error) {

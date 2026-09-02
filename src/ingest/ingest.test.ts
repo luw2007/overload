@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { initializeLedger, readCompleteLines, scanOnce } from "./ingest";
+import { initializeLedger, openLedger, readCompleteLines, scanOnce } from "./ingest";
 import { reduceJournal } from "./reducer";
 import { CLASSIFIER_VERSION, classify, queueAfter } from "./classifier";
 import { ackRequest } from "../shared/queries";
@@ -33,6 +33,14 @@ function event(seq: number, kind: string, detail: Record<string, unknown> = {}) 
 }
 
 describe("ledger schema migrations", () => {
+  test("sets a five-second busy timeout on opened writable ledgers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "overload-ledger-"));
+    roots.push(root);
+    const db = await openLedger(join(root, "ledger.db"));
+    expect((db.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(5_000);
+    db.close();
+  });
+
   test("fresh schema does not recreate the retired request reminder column", async () => {
     const schema = await readFile(new URL("./schema.sql", import.meta.url), "utf8");
     expect(schema).not.toContain("next_reminder_at");
@@ -61,6 +69,39 @@ describe("ledger schema migrations", () => {
 });
 
 describe("atomic spool ingestion", () => {
+  test("reads a spool file larger than 4 MiB across scan passes without loss or duplication", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const file = join(emitterDir, "seg-pi-42-bootabcd-0.ndjson");
+    const lines = Array.from({ length: 80 }, (_, index) => JSON.stringify(event(index + 1, "heartbeat", {
+      padding: "x".repeat(60 * 1024),
+    })));
+    await writeFile(file, `${lines.join("\n")}\n`);
+
+    expect((await scanOnce(db, spool)).inserted).toBeGreaterThan(0);
+    const firstCursor = (db.query("SELECT bytes FROM cursors").get() as { bytes: number }).bytes;
+    const firstCount = (db.query("SELECT count(*) AS n FROM journal").get() as { n: number }).n;
+    expect(firstCursor).toBeLessThan(Buffer.byteLength(`${lines.join("\n")}\n`));
+    expect((await scanOnce(db, spool)).inserted).toBe(80 - firstCount);
+    expect((db.query("SELECT count(*) AS n FROM journal").get() as { n: number }).n).toBe(80);
+    expect((await scanOnce(db, spool)).inserted).toBe(0);
+    db.close();
+  });
+
+  test("drops lines longer than 64 KiB and records a coverage gap", async () => {
+    const { spool, emitterDir, db } = await fixture();
+    const file = join(emitterDir, "seg-pi-42-bootabcd-0.ndjson");
+    const oversized = JSON.stringify(event(1, "heartbeat", { padding: "x".repeat(65 * 1024) }));
+    await writeFile(file, `${oversized}\n${JSON.stringify(event(2, "heartbeat"))}\n`);
+
+    expect((await scanOnce(db, spool)).inserted).toBe(1);
+    expect((db.query("SELECT seq FROM journal").get() as { seq: number }).seq).toBe(2);
+    expect(db.query("SELECT emitter_id, reason FROM coverage_gaps").get()).toEqual({
+      emitter_id: "pi-42-bootabcd",
+      reason: "spool_line_too_long",
+    });
+    db.close();
+  });
+
   test("consumes only newline-terminated valid envelopes and resumes by byte cursor", async () => {
     const { spool, emitterDir, db } = await fixture();
     const file = join(emitterDir, "active-pi-42-bootabcd-0.ndjson");

@@ -1,3 +1,5 @@
+> **历史文档**：本文件描述的部分能力（如 outbox/digest/attrib/Island 原生面板）已从代码中移除，不代表当前实现。
+
 # Overload 技术方案（最终版，sol 对齐 ALIGN @ R7）
 
 管理两台机器（本机 + devbox）上 100+ agent session 的注意力路由系统。

@@ -2,18 +2,18 @@ import type { Database } from "bun:sqlite";
 
 export type ResumeCapability =
   | { resumable: true; runtime: "pi" | "omp" }
-  | { resumable: false; reason: "process_alive" | "runtime_unsupported" | "missing_session_id" | "missing_cwd" | "remote_host_unsupported" };
+  | { resumable: false; reason: "process_alive" | "runtime_unsupported" | "missing_session_id" | "missing_cwd" | "remote_host_unsupported" | "orchestrator_owned" };
 
 export type ResumeResult = { resumed: true } | { resumed: false; reason: string };
 export type ResumeExecutor = (command: string, args: string[]) => Promise<{ ok: boolean; error?: string }>;
 export type ProcessProbe = (pid: number) => boolean;
 
-type ResumeRow = { host: string | null; runtime: string | null; session: string | null; cwd: string | null; pid: number | null };
+type ResumeRow = { host: string | null; runtime: string | null; session: string | null; cwd: string | null; pid: number | null; origin: string | null };
 
 const supportedRuntime = (runtime: string | null): runtime is "pi" | "omp" => runtime === "pi" || runtime === "omp";
 
 function resumeRow(db: Database, stableId: string): ResumeRow | null {
-  return db.query(`SELECT s.host, s.runtime, s.session, s.cwd,
+  return db.query(`SELECT s.host, s.runtime, s.session, s.cwd, s.origin,
     (SELECT i.pid FROM session_incarnations i WHERE i.stable_id=s.stable_id AND i.liveness_domain='process'
       AND NOT EXISTS (SELECT 1 FROM journal j WHERE j.stable_id=i.stable_id AND j.writer_id=i.writer_id AND j.kind='session_ended')
       ORDER BY i.last_seen_at DESC LIMIT 1) pid
@@ -24,6 +24,9 @@ export function inspectResume(db: Database, stableId: string, processAlive: Proc
   const row = resumeRow(db, stableId);
   if (!row) return null;
   if (row.pid && processAlive(row.pid)) return { resumable: false, reason: "process_alive" };
+  // Plan §3.10: orchestrator-launched runners must never be resumed through the generic
+  // path — a human clicking Resume would start a parallel process against the same worktree.
+  if (row.origin?.startsWith("orch:")) return { resumable: false, reason: "orchestrator_owned" };
   if (row.host !== "local") return { resumable: false, reason: "remote_host_unsupported" };
   if (!supportedRuntime(row.runtime)) return { resumable: false, reason: "runtime_unsupported" };
   if (!row.session) return { resumable: false, reason: "missing_session_id" };

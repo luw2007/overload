@@ -6,7 +6,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/install-launchd.sh [--install|--uninstall] [--project-dir PATH] [--dry-run]
 
-Installs or removes the four supported Overload LaunchAgents for the current user.
+Installs or removes the five supported Overload LaunchAgents for the current user.
 Pending decisions are surfaced in the loopback web dashboard; Overload does not emit macOS notifications.
 EOF
 }
@@ -42,7 +42,8 @@ bun_path=$(command -v bun) || { printf 'bun is required; install it before runni
 bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- "$bun_path")
 
 agents_dir=$HOME/Library/LaunchAgents
-labels='ingest maintenance pull web'
+logs_dir=$HOME/.overload/logs
+labels='ingest maintenance pull web orchestrator'
 retired_labels='notifier'
 uid=$(id -u)
 xml_escape() {
@@ -57,6 +58,7 @@ write_plist() {
     maintenance) arguments="<string>$(xml_escape "$project_dir/scripts/maintenance.sh")</string>"; schedule='<key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>' ;;
     pull) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/pull/pull.ts")</string><string>--once</string>"; schedule='<key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>' ;;
     web) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/web/server.ts")</string>"; schedule='<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>' ;;
+    orchestrator) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/orchestrator/orchestrator.ts")</string>"; schedule='<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>' ;;
   esac
   cat >"$target" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -67,8 +69,8 @@ write_plist() {
   <key>EnvironmentVariables</key><dict><key>OVERLOAD_ROOT</key><string>$(xml_escape "$project_dir")</string><key>OVERLOAD_BUN</key><string>$(xml_escape "$bun_path")</string></dict>
   $schedule
   <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>/tmp/overload-$name.log</string>
-  <key>StandardErrorPath</key><string>/tmp/overload-$name.err</string>
+  <key>StandardOutPath</key><string>$(if [ "$name" = orchestrator ]; then xml_escape "$logs_dir/orchestrator.log"; else printf '/tmp/overload-%s.log' "$name"; fi)</string>
+  <key>StandardErrorPath</key><string>$(if [ "$name" = orchestrator ]; then xml_escape "$logs_dir/orchestrator.err"; else printf '/tmp/overload-%s.err' "$name"; fi)</string>
 </dict></plist>
 EOF
   plutil -lint "$target" >/dev/null
@@ -80,7 +82,7 @@ if [ "$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-mkdir -p "$agents_dir"
+mkdir -p "$agents_dir" "$logs_dir"
 for name in $retired_labels; do
   target=$agents_dir/works.earendil.overload.$name.plist
   launchctl bootout "gui/$uid" "$target" >/dev/null 2>&1 || true

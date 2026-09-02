@@ -2,7 +2,7 @@
 
 Overload is a local-first macOS attention control plane for agent work. It turns agent lifecycle noise into a small set of timely, actionable human decisions, preserves the original context, and lets work resume after a decision. Append-only SQLite telemetry, classification, stale-session detection, and the loopback dashboard serve that goal.
 
-It is designed for a single operator managing local and SSH-reachable agent sessions. It is not a hosted service, a multi-user control plane, or an upstream-agent approval system. Product and engineering decisions follow [AGENTS.md](AGENTS.md).
+It is designed for a single operator managing local and SSH-reachable agent sessions. It is not a hosted service or a multi-user control plane. Overload never approves, answers, or resumes an agent it did not launch: the ingest path stays one-way. The optional `src/orchestrator/` module launches and steers its own `pi` children, and human gates for those children surface as ordinary Now decisions. That authority is scoped to processes the orchestrator started. These gates are a **workflow** boundary, not a security boundary: on a single-UID machine any same-UID process can bypass them. Product and engineering decisions follow [AGENTS.md](AGENTS.md).
 
 ## Status
 
@@ -82,6 +82,7 @@ agent extensions / cmux workstream / recon
                ┌─────────┴───────────┐
                ▼                     ▼
               CLI            loopback dashboard
+```
 
 The ledger is append-only at the source-event layer; current queues are derived projections.
 

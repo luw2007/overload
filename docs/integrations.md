@@ -4,7 +4,7 @@
 
 `src/extension/overload.ts` uses the compatible pi-family extension API. Install it in the relevant runtime extension directory. It writes lifecycle, ask, heartbeat, tool-activity, and commit-observation events to the local spool.
 
-The extension is observational. Its optional local pre-tool denylist is disabled by default; Overload never remotely approves or resumes an agent.
+The extension is primarily observational. Its optional local pre-tool denylist (`approval_gate` in the session config) can block or modify bash commands matching configured patterns, but it is disabled by default, deterministic, and never waits for a remote decision. Overload never remotely approves or resumes an agent it did not launch; the optional `src/orchestrator/` module's human gates are scoped to processes it started and are a workflow boundary, not a security boundary.
 
 When a session's bash tool spawns another agent CLI (`pi`, `omp`,
 `prime-agent`, `claude`) as a simple command, the extension prefixes
@@ -19,10 +19,7 @@ dedicated Claude Code hook was removed: it could record a permission request
 but had no durable response channel, so a local Q1 acknowledgement never
 decided the prompt.
 
-On session start the hook records parent lineage when available: a subagent
-transcript path (`…/<parent-session>/subagents/agent-*.jsonl`) yields the
-parent Claude session's stable id, else a non-empty `OVERLOAD_PARENT`
-environment value is recorded verbatim.
+
 
 ## Terminal hosts and Recon platforms
 

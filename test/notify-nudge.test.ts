@@ -39,10 +39,20 @@ async function run() {
 function addPendingRequest(uid: string): void {
   const db = new Database(ledgerPath);
   const now = Date.now();
-  db.query(`INSERT INTO sessions(stable_id, host, runtime, session, origin, created_at, first_seen_at)
+  db.query(`INSERT OR REPLACE INTO sessions(stable_id, host, runtime, session, origin, created_at, first_seen_at)
     VALUES (?, 'local', 'pi', ?, 'unknown', ?, ?)`).run(uid, uid, now, now);
-  db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, detail)
+  db.query(`INSERT OR REPLACE INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, detail)
     VALUES (?, ?, 'w1', 'e1', ?, 'ask', 'pending', ?, NULL)`).run(uid, uid, uid, now);
+  db.close();
+}
+
+function addHungItem(stableId: string): void {
+  const db = new Database(ledgerPath);
+  const now = Date.now();
+  db.query(`INSERT INTO sessions(stable_id, host, runtime, session, origin, created_at, first_seen_at)
+    VALUES (?, 'local', 'pi', ?, 'unknown', ?, ?)`).run(stableId, stableId, now, now);
+  db.query(`INSERT INTO current(stable_id, writer_id, state, queue, q5_reason, origin, last_event_at, last_heartbeat_at, last_progress_at)
+    VALUES (?, 'w1', 'active', 'q5', 'turn_hung', 'unknown', ?, ?, ?)`).run(stableId, now - 600_000, now, now - 600_000);
   db.close();
 }
 
@@ -64,16 +74,45 @@ describe("nudgeOnce", () => {
     expect(sent[0]).toContain("http://127.0.0.1:4870/now");
   });
 
-  test("non-empty→still non-empty stays silent even when the count grows", async () => {
+  test("non-empty→still non-empty notifies for new subjects", async () => {
     addPendingRequest("r1");
-    await run(); // notifies, persists 1
+    await run(); // notifies for r1
     addPendingRequest("r2");
     const result = await run();
-    expect(result).toEqual({ count: 2, notified: false });
+    expect(result).toEqual({ count: 2, notified: true });
+    expect(sent).toHaveLength(2);
+  });
+
+  test("same subjects repeated: no re-notification", async () => {
+    addPendingRequest("r1");
+    await run(); // notifies for r1
+    const result = await run();
+    expect(result).toEqual({ count: 1, notified: false });
     expect(sent).toHaveLength(1);
   });
 
-  test("draining to empty re-arms the nudge", async () => {
+  test("lingering item + new item still fires notification", async () => {
+    addPendingRequest("r1");
+    await run(); // notifies for r1
+    // r1 lingers, then a new item r2 appears
+    addPendingRequest("r2");
+    const result = await run();
+    expect(result).toEqual({ count: 2, notified: true });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toContain("2 项待处理");
+  });
+
+  test("lingering hung item + new pending request still fires", async () => {
+    addHungItem("s1");
+    await run(); // notifies for hung s1
+    // hung s1 lingers, then a new pending request appears
+    addPendingRequest("r1");
+    const result = await run();
+    expect(result).toEqual({ count: 2, notified: true });
+    expect(sent).toHaveLength(2);
+  });
+
+  test("draining to empty and re-entering same subject re-notifies", async () => {
     addPendingRequest("r1");
     await run();
     const db = new Database(ledgerPath);
@@ -81,7 +120,7 @@ describe("nudgeOnce", () => {
     db.close();
     const drained = await run();
     expect(drained).toEqual({ count: 0, notified: false });
-    addPendingRequest("r2");
+    addPendingRequest("r1");
     const rearmed = await run();
     expect(rearmed.notified).toBe(true);
     expect(sent).toHaveLength(2);

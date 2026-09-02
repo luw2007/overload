@@ -14,30 +14,36 @@ export type NudgeDeps = {
   notify: (message: string) => Promise<void>;
 };
 
-/** Previous Now count persisted across runs; missing/corrupt file reads as 0. */
-function readPrevious(statePath: string): number {
+/** Previous notified subject IDs persisted across runs; missing/corrupt file reads as empty set. */
+function readPrevious(statePath: string): Set<string> {
   try {
-    const parsed = Number.parseInt(readFileSync(statePath, "utf8").trim(), 10);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    const content = readFileSync(statePath, "utf8").trim();
+    if (!content) return new Set<string>();
+    return new Set(content.split("\n").filter(Boolean));
   } catch {
-    return 0;
+    return new Set<string>();
   }
 }
 
 
 export async function nudgeOnce(deps: NudgeDeps): Promise<{ count: number; notified: boolean }> {
   const db = new Database(deps.ledgerPath, { readonly: true, create: false });
-  let count: number;
+  let currentIds: Set<string>;
   try {
-    count = queryQ1(db).length + queryHung(db).length;
+    const q1Ids = queryQ1(db).map(r => `q1:${r.request_uid}`);
+    const hungIds = queryHung(db).map(r => `hung:${r.stable_id}`);
+    currentIds = new Set([...q1Ids, ...hungIds]);
   } finally {
     db.close();
   }
   const previous = readPrevious(deps.statePath);
-  const notified = previous === 0 && count > 0;
-  if (notified) await deps.notify(`${count} 项待处理 — 打开 http://127.0.0.1:4870/now`);
-  if (count !== previous) writeFileSync(deps.statePath, `${count}\n`, { mode: 0o600 });
-  return { count, notified };
+  let hasNew = false;
+  for (const id of currentIds) {
+    if (!previous.has(id)) { hasNew = true; break; }
+  }
+  if (hasNew) await deps.notify(`${currentIds.size} 项待处理 — 打开 http://127.0.0.1:4870/now`);
+  writeFileSync(deps.statePath, [...currentIds].join("\n") + "\n", { mode: 0o600 });
+  return { count: currentIds.size, notified: hasNew };
 }
 
 /** Message is derived from a count only; still passed as argv, never interpolated into script source. */

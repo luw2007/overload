@@ -46,7 +46,7 @@ export class Puller {
         ? `${this.config.remote_spool.replace(/\/$/, "")}/`
         : `${this.config.remote}:${this.config.remote_spool.replace(/\/$/, "")}/`;
       const output = await runCommand(commandWords(this.config.rsync_cmd), [
-        "-a", "--out-format=%n|%l", "--include=*/", "--include=seg-*.ndjson",
+        "-a", "--out-format=%n|%l", "--max-size=8m", "--include=*/", "--include=seg-*.ndjson",
         // Review P3 M1: "--" terminates option parsing so leading-dash
         // remote/dest config values cannot inject rsync options.
         "--include=active-*.ndjson", "--exclude=*", "--", source, `${this.config.dest.replace(/\/$/, "")}/`,

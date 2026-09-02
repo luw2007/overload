@@ -45,6 +45,17 @@ function addJournalFinding(ledger: string, kind: string): void {
 }
 
 describe("Puller", () => {
+  test("limits rsync transfers to 8 MiB files", async () => {
+    const f = await fixture();
+    const argsPath = join(f.root, "rsync-args.txt");
+    const rsync = join(f.root, "rsync.sh");
+    await writeFile(rsync, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsPath)}\n`, { mode: 0o700 });
+
+    await new Puller({ ...f.config, rsync_cmd: rsync }).runOnce();
+
+    expect((await readFile(argsPath, "utf8")).split("\n")).toContain("--max-size=8m");
+  });
+
   test("emits one outage at the consecutive failure threshold and journal-deduplicates later attempts", async () => {
     const f = await fixture(true);
     const puller = new Puller(f.config);

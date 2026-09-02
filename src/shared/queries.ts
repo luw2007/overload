@@ -18,7 +18,6 @@ export type SessionDetail = {
 };
 export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null; summary: string | null; options: string[] | null };
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null };
-export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
 export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number };
 export type HungRow = { stable_id: string; q5_reason: string; state: string; host: string | null; since: number | null; hung_ms: number; binding: string | null; detail: Record<string, unknown> | null };
 export type ZombieView = {
@@ -141,14 +140,9 @@ export function queryHung(db: Database, now = Date.now()): HungRow[] {
   return rows.map((row) => ({ ...withParsedDetail(row), hung_ms: row.since ? Math.max(0, now - row.since) : 0 }));
 }
 
-/** Completed agent work with proven lineage; may require a human close-out. */
-export function queryQ2(db: Database): Q2Row[] {
-  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin<>'unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
-}
-
-/** Finished sessions lacking lineage; retained for audit, not human action. */
+/** Done: session terminated, no longer needs attention. Audit view, not a todo. */
 export function queryArchive(db: Database): ArchiveRow[] {
-  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin='unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
+  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue IN ('q2','q4') ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
 }
 
 export function queryZombie(db: Database): ZombieView {

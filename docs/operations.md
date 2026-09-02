@@ -83,7 +83,7 @@ is `OK`, `WARN`, or `FAIL`; the command exits 1 if anything is `FAIL`.
 
 `health` reports open incidents plus coverage and telemetry gaps as counts of
 distinct affected subjects, not of repeated finding events. Inspect pending
-decisions in the loopback dashboard; Overload emits no macOS notifications.
+decisions in the loopback dashboard; when the Now zone transitions from empty to non-empty, the maintenance job emits one aggregated macOS notification via `osascript` (see `src/notify/nudge.ts`). No per-event notifications are sent while Now remains non-empty.
 
 `hung` (and the dashboard's 卡死 tab) lists sessions whose turn stopped
 advancing while the process kept heartbeating. Liveness and progress are

@@ -11,7 +11,7 @@ The four active jobs are:
 - `works.earendil.overload.pull`: 60-second devbox spool pull (`src/pull/pull.ts --once`).
 - `works.earendil.overload.web`: keepalive web dashboard server (`src/web/server.ts`, binds `127.0.0.1`).
 
-Overload intentionally emits no macOS notifications; inspect Q1 in the loopback dashboard instead.
+When the Now zone (pending decisions + hung turns) transitions from empty to non-empty, the maintenance job emits one aggregated macOS notification via `osascript`. No per-event notifications are sent while Now remains non-empty. Inspect Q1 in the loopback dashboard for details.
 
 The watchdog depends on the ingest loop touching
 `~/.overload/ingest.heartbeat`; it does not create that heartbeat itself.

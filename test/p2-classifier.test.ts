@@ -496,11 +496,10 @@ describe.skipIf(!HAS_N5)("real: N5 classifier via ingest --once + CLI surface", 
     const q1 = await runCli("q1");
     expect(q1.code).toBe(0);
     expect(q1.out).toContain(reqUid);
-    // done+unknown still classifies to queue q2, but the human-facing q2
-    // list excludes origin='unknown' (archive semantics, commit f5e67b7).
-    const q2 = await runCli("q2");
-    expect(q2.code).toBe(0);
-    expect(q2.out).not.toContain(SS_B);
+    // done+unknown still classifies to queue q2 internally (archive semantics,
+    // commit f5e67b7); the q2 CLI/API surface was removed (D1, orchestrator
+    // plan) since it was a never-cleared Inbox zone nobody acted on. Verify
+    // the classification directly against the ledger instead of via CLI.
     const adb = new Database(ledgerPath);
     const archived = adb.query("SELECT queue FROM current WHERE stable_id=?").get(`local:pi:${SS_B}`) as { queue: string } | null; // test-owned ledger row, shape fixed by schema.sql
     expect(archived?.queue).toBe("q2");
