@@ -7,7 +7,7 @@ import type { SpoolWriter } from "./spool";
 import { getTask, transition } from "./store";
 
 export const defaultAnswersPath=join(homedir(),".overload","orchestrator-answers.db");
-export function openAnswersDb(path=defaultAnswersPath):Database{mkdirSync(dirname(path),{recursive:true,mode:0o700});const db=new Database(path,{create:true});db.exec("CREATE TABLE IF NOT EXISTS answers(approval_id TEXT PRIMARY KEY, answer TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL)");chmodSync(path,0o600);return db;}
+export function openAnswersDb(path=defaultAnswersPath):Database{mkdirSync(dirname(path),{recursive:true,mode:0o700});const db=new Database(path,{create:true});db.exec("PRAGMA busy_timeout=5000");db.exec("CREATE TABLE IF NOT EXISTS answers(approval_id TEXT PRIMARY KEY, answer TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL)");chmodSync(path,0o600);return db;}
 
 export function requestApproval(db:Database,spool:SpoolWriter,taskId:string,gate:"ready"|"ci_anomaly",question:string,options:string[],expiresInMs=24*3600*1000):string{
   const task=getTask(db,taskId);if(!task)throw new Error(`Task not found: ${taskId}`);
@@ -24,8 +24,9 @@ export function consumeAnswers(db:Database,answers:Database,spool:SpoolWriter,no
   answers.run("DELETE FROM answers WHERE at < ?",now-7*24*3600*1000);
   const rows=answers.query("SELECT approval_id,answer,actor,at FROM answers").all() as Array<{approval_id:string;answer:string;actor:string;at:number}>;
   for(const row of rows){const approval=db.query("SELECT * FROM approvals WHERE approval_id=?").get(row.approval_id) as any;
-    let why:string|undefined;if(!approval)why="unknown_approval";else if(approval.consumed_at!==null)why="already_consumed";else if(now>=approval.expires_at)why="expired";else {let opts:string[]=[];try{opts=JSON.parse(approval.options);}catch{}if(!opts.includes(row.answer))why="invalid_option";else if(getTask(db,approval.task_id)?.state!=="awaiting_human")why="task_not_awaiting";}
-    if(why){audit(db,approval?.task_id??`approval:${row.approval_id}`,"answer_discarded",{approval_id:row.approval_id,reason:why,actor:row.actor},now);answers.run("DELETE FROM answers WHERE approval_id=?",row.approval_id);continue;}
+    if(!approval)continue;
+    let why:string|undefined;if(approval.consumed_at!==null)why="already_consumed";else if(now>=approval.expires_at)why="expired";else {let opts:string[]=[];try{opts=JSON.parse(approval.options);}catch{}if(!opts.includes(row.answer))why="invalid_option";else if(getTask(db,approval.task_id)?.state!=="awaiting_human")why="task_not_awaiting";}
+    if(why){audit(db,approval.task_id,"answer_discarded",{approval_id:row.approval_id,reason:why,actor:row.actor},now);answers.run("DELETE FROM answers WHERE approval_id=?",row.approval_id);continue;}
     const event=`answer=${row.answer}`;db.transaction(()=>{transition(db,approval.task_id,event,{actor:row.actor,approval_id:row.approval_id},now);db.run("UPDATE approvals SET consumed_at=?,actor=? WHERE approval_id=?",[now,row.actor,row.approval_id]);})();spool.emit(getTask(db,approval.task_id)?.stable_id??approval.task_id,"decision_resolved",{request_id:row.approval_id,state:"resolved",selected:row.answer,answer:row.answer,actor:row.actor});answers.run("DELETE FROM answers WHERE approval_id=?",row.approval_id);
   }
 }

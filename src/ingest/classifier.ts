@@ -48,10 +48,23 @@ function desiredQueue(current: ClassifiableCurrent, event: ClassifierEvent): { q
   let reason = current.q5_reason;
   switch (event.kind) {
     case "working": state = "working"; reason = null; break;
-    case "settled": state = "idle"; reason = null; break;
+    case "settled": {
+      state = "idle";
+      reason = null;
+      // Handoff exists only in new settled detail, so replay of old journals is unchanged.
+      const handoff = event.detail.handoff;
+      if (handoff && typeof handoff === "object" && !Array.isArray(handoff)) {
+        const status = (handoff as Record<string, unknown>).status;
+        const uncertainties = (handoff as Record<string, unknown>).uncertainties;
+        if (status === "partial" || status === "blocked" || (typeof uncertainties === "number" && uncertainties > 0)) reason = "handoff_blocked";
+      }
+      break;
+    }
     case "decision_requested": state = "awaiting_human"; break;
     case "decision_resolved": state = "idle"; reason = null; break;
-    case "session_ended": state = "done"; reason = null; break;
+    // Liveness reasons die with the session, but a blocked handoff is a human
+    // decision the exit does not make; clearing it would archive the interrupt.
+    case "session_ended": state = "done"; if (reason !== "handoff_blocked") reason = null; break;
     case "session_vanished": state = "vanished"; reason = null; break;
     case "emitter_stalled": reason = "stalled"; break;
     case "turn_hung": reason = "turn_hung"; break;

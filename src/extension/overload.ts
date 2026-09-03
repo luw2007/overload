@@ -1,10 +1,9 @@
 // @overload-event-source
-// Approval gate v0 is a local, deterministic pre-tool denylist. It is disabled by
-// default, never waits for a remote decision, and fails open (with one warning) if
-// its session-start configuration cannot be parsed or compiled.
+// Approval gate is disabled by default. Enabled invalid configuration fails closed
+// for bash/write/edit calls while still warning once during session startup.
 // Intentionally has no package imports: pi, omp, and prime-agent expose compatible
 // extension APIs under different package names.
-import { constants } from "node:fs"
+import { constants, readFileSync, statSync } from "node:fs"
 import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -16,6 +15,9 @@ const SEGMENT_MAX_BYTES = 1_048_576
 const HEARTBEAT_INTERVAL_MS = 60_000
 const TOOL_ACTIVITY_INTERVAL_MS = 5_000
 const WRITE_QUEUE_LIMIT = 1000
+const DEFAULT_APPROVAL_TIMEOUT_MS = 30 * 60_000
+const DEFAULT_WEB_PORT = 4870
+const APPROVAL_POLL_INTERVAL_MS = 2_000
 const procBootId = randomUUID()
 
 type Runtime = "pi" | "omp" | "prime"
@@ -44,9 +46,16 @@ type ExtensionApi = {
   exec?: (command: string, args: string[], options?: Record<string, unknown>) => Promise<{ stdout?: string; code?: number }>
 }
 
+type GateRule = { kind: "block" | "require"; rule: string }
+
 type ApprovalGate = {
   bash: Array<{ source: string; pattern: RegExp }>
+  requireBash: Array<{ source: string; pattern: RegExp }>
   writePaths: string[]
+  requireWritePaths: string[]
+  timeoutMs: number
+  webPort: number
+  misconfigured?: string
 }
 
 function processName(value: unknown): string {
@@ -347,6 +356,8 @@ export default function overload(pi: ExtensionApi): void {
   const headByCwd = new Map<string, string>()
   let session = safeComponent(randomUUID(), "session")
   let stableId = ""
+  let sessionCwd = process.cwd()
+  let runStartedAt = 0
   let working = false
   let settledForRun = false
   let lastToolActivity = 0
@@ -361,10 +372,11 @@ export default function overload(pi: ExtensionApi): void {
   }
 
   function warnAndDisableGate(error: unknown): void {
-    approvalGate = null
+    const message = (error as Error)?.message || String(error)
+    approvalGate = { bash: [], requireBash: [], writePaths: [], requireWritePaths: [], timeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS, webPort: DEFAULT_WEB_PORT, misconfigured: message }
     if (gateWarned) return
     gateWarned = true
-    console.warn("[overload] invalid approval_gate configuration; gate disabled:", (error as Error)?.message || error)
+    console.warn("[overload] invalid approval_gate configuration; gate disabled:", message)
   }
 
   async function loadApprovalGate(): Promise<void> {
@@ -383,45 +395,144 @@ export default function overload(pi: ExtensionApi): void {
       if (!gate || typeof gate !== "object" || typeof gate.enabled !== "boolean") {
         throw new Error("approval_gate must contain a boolean enabled field")
       }
-      // Review P4 m3: a disabled gate is inert by definition — never validate
-      // (and thus never warn about) rule shapes the gate will not use.
       if (!gate.enabled) return
-      if (!Array.isArray(gate.block_bash_patterns) || !gate.block_bash_patterns.every((value: unknown) => typeof value === "string")) {
-        throw new Error("block_bash_patterns must be an array of strings")
+      const stringArray = (key: string): string[] => {
+        const value = gate[key]
+        if (value === undefined) return []
+        if (!Array.isArray(value) || !value.every((item: unknown) => typeof item === "string")) {
+          throw new Error(`${key} must be an array of strings`)
+        }
+        return [...value]
       }
-      if (!Array.isArray(gate.block_write_paths) || !gate.block_write_paths.every((value: unknown) => typeof value === "string")) {
-        throw new Error("block_write_paths must be an array of strings")
-      }
+      const timeoutMs = gate.timeout_ms === undefined ? DEFAULT_APPROVAL_TIMEOUT_MS : gate.timeout_ms
+      if (typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("timeout_ms must be a positive integer")
+      const webPort = config.web_port === undefined ? DEFAULT_WEB_PORT : config.web_port
+      if (typeof webPort !== "number" || !Number.isSafeInteger(webPort) || webPort <= 0 || webPort > 65535) throw new Error("web_port must be a positive integer")
+      const blockBash = stringArray("block_bash_patterns")
+      const requireBash = stringArray("require_approval_bash_patterns")
+      const writePaths = stringArray("block_write_paths")
+      const requireWritePaths = stringArray("require_approval_write_paths")
       approvalGate = {
-        bash: gate.block_bash_patterns.map((source: string) => ({ source, pattern: new RegExp(source) })),
-        writePaths: [...gate.block_write_paths],
+        bash: blockBash.map((source) => ({ source, pattern: new RegExp(source) })),
+        requireBash: requireBash.map((source) => ({ source, pattern: new RegExp(source) })),
+        writePaths,
+        requireWritePaths,
+        timeoutMs,
+        webPort,
       }
     } catch (error) {
       warnAndDisableGate(error)
     }
   }
-
-  function gateRule(event: any): string | undefined {
+  function gateRule(event: any): GateRule | undefined {
     const gate = approvalGate
-    if (!gate) return undefined
+    if (!gate || !/^(bash|write|edit)$/i.test(String(event?.toolName || ""))) return undefined
+    if (gate.misconfigured) return { kind: "block", rule: "misconfigured" }
     if (event?.toolName === "bash" && typeof event?.input?.command === "string") {
       for (const rule of gate.bash) {
         rule.pattern.lastIndex = 0
-        if (rule.pattern.test(event.input.command)) return rule.source
+        if (rule.pattern.test(event.input.command)) return { kind: "block", rule: rule.source }
+      }
+      for (const rule of gate.requireBash) {
+        rule.pattern.lastIndex = 0
+        if (rule.pattern.test(event.input.command)) return { kind: "require", rule: rule.source }
       }
       return undefined
     }
     if ((event?.toolName === "write" || event?.toolName === "edit") && typeof event?.input?.path === "string") {
       for (const path of gate.writePaths) {
-        if (event.input.path.startsWith(path)) return path
+        if (event.input.path.startsWith(path)) return { kind: "block", rule: path }
+      }
+      for (const path of gate.requireWritePaths) {
+        if (event.input.path.startsWith(path)) return { kind: "require", rule: path }
       }
     }
+    return undefined
+  }
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      timer.unref?.()
+    })
+  }
+  function approvalDetail(event: any, rule: string, expiresAt: number): Record<string, unknown> {
+    const tool = String(event?.toolName || "unknown")
+    const command = typeof event?.input?.command === "string" ? truncateUtf8(event.input.command, 120) : ""
+    const path = typeof event?.input?.path === "string" ? truncateUtf8(event.input.path, 120) : ""
+    const target = command || path
+    const approvalId = `${stableId}#${spool.writerId}#${String(event?.toolCallId || "")}`
+    return {
+      request_id: String(event?.toolCallId || ""),
+      gated: true,
+      gate: "action",
+      approval_id: approvalId,
+      rule,
+      tool,
+      ...(command ? { command } : {}),
+      ...(path ? { path } : {}),
+      summary: truncateUtf8(`放行 ${tool}: ${target}?`, 500),
+      options: ["approve", "deny"],
+      expires_at: expiresAt,
+    }
+  }
+
+  async function waitForApproval(event: any, rule: GateRule): Promise<{ block: true; reason: string } | undefined> {
+    const gate = approvalGate
+    if (!gate || typeof event?.toolCallId !== "string") return { block: true, reason: `overload approval gate: ${rule.rule}` }
+    if (rule.kind === "block") {
+      // A denial is already terminal: it carries no options and no expiry, so the
+      // dashboard never renders approve buttons for a request nobody can answer.
+      const detail = { request_id: String(event.toolCallId), gated: true, rule: gate.misconfigured ? "misconfigured" : rule.rule, tool: String(event?.toolName || "unknown") }
+      emit("decision_requested", detail)
+      emit("decision_resolved", { ...detail, state: "cancelled" })
+      return { block: true, reason: gate.misconfigured ? `overload approval gate misconfigured: ${gate.misconfigured}` : `overload approval gate: ${rule.rule}` }
+    }
+    const expiresAt = Date.now() + gate.timeoutMs
+    const detail = approvalDetail(event, rule.rule, expiresAt)
+    emit("decision_requested", detail)
+    const approvalId = String(detail.approval_id)
+    const base = `http://127.0.0.1:${gate.webPort}`
+    while (Date.now() < expiresAt) {
+      try {
+        const response = await globalThis.fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(approvalId)}`)
+        if (response.status === 200) {
+          const payload = await response.json() as { answer?: unknown; actor?: unknown }
+          const answer = typeof payload.answer === "string" ? payload.answer : ""
+          const actor = typeof payload.actor === "string" ? payload.actor : "unknown"
+          await globalThis.fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(approvalId)}`, { method: "DELETE", headers: { Origin: base } })
+          emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "resolved", selected: answer, actor })
+          return answer === "approve" ? undefined : { block: true, reason: `overload approval gate: denied by ${actor}` }
+        }
+      } catch {
+        // Poll errors are fail-closed at expiry, not an early allow.
+      }
+      await sleep(Math.min(APPROVAL_POLL_INTERVAL_MS, Math.max(1, expiresAt - Date.now())))
+    }
+    emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "timed_out" })
+    return { block: true, reason: "overload approval gate: timed out" }
+  }
+
+  function shellCommand(command: string): string {
+    const tokens = command.trim().split(/\s+/)
+    while (/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(tokens[0] || "")) tokens.shift()
+    return tokens.join(" ")
+  }
+
+  function consequentialClass(command: string): string | undefined {
+    const normalized = shellCommand(command)
+    if (/^git push\b/.test(normalized)) return "push"
+    if (/^(npm|bun|pnpm|yarn) publish\b|^gh (pr merge|release create)\b/.test(normalized)) return "publish"
+    if (/^rm -rf?\b|^git branch -D\b|^gh.* delete\b/.test(normalized)) return "delete"
+    if (/^(kubectl|helm) (apply|delete|rollout)\b|^terraform apply\b/.test(normalized)) return "prod"
+    if (/^(curl|http|wget)\b.*(-X\s*(POST|PUT|DELETE|PATCH)\b|--data\b)/i.test(normalized)) return "send"
     return undefined
   }
 
   function setWorking(): void {
     settledForRun = false
     if (!working) {
+      runStartedAt = Date.now()
       working = true
       emit("working")
     }
@@ -433,23 +544,67 @@ export default function overload(pi: ExtensionApi): void {
     }
   }
 
+  function handoff(): Record<string, unknown> | undefined {
+    const path = join(sessionCwd, "HANDOFF.md")
+    try {
+      if (statSync(path).mtimeMs < runStartedAt) return undefined
+      const lines = readFileSync(path, "utf8").split(/\r?\n/)
+      let task = ""
+      let status = "unknown"
+      let nextOwner = ""
+      let uncertainties = 0
+      let inUncertainties = false
+      for (const line of lines) {
+        const match = line.match(/^(TASK|STATUS|NEXT OWNER|NEXT_OWNER)\s*[—:-]\s*(.*)$/)
+        if (match) {
+          inUncertainties = false
+          if (match[1] === "TASK") task = match[2]
+          else if (match[1] === "STATUS") status = match[2].trim().toLowerCase()
+          else nextOwner = match[2].trim()
+          continue
+        }
+        if (/^UNCERTAINTIES(?:\s*[—:-].*)?$/.test(line.trim())) {
+          inUncertainties = true
+          continue
+        }
+        if (inUncertainties && /^[A-Z][A-Z0-9_ ]*(?:\s*[—:-]|$)/.test(line.trim())) {
+          inUncertainties = false
+          continue
+        }
+        if (inUncertainties && line.trim()) uncertainties++
+      }
+      const normalizedStatus = status === "complete" || status === "partial" || status === "blocked" ? status : "unknown"
+      return {
+        path,
+        status: normalizedStatus,
+        ...(nextOwner ? { next_owner: truncateUtf8(nextOwner, 200) } : {}),
+        uncertainties,
+        ...(task ? { task: truncateUtf8(task, 200) } : {}),
+      }
+    } catch {
+      return undefined
+    }
+  }
+
   function settle(): void {
     if (!working || settledForRun) return
     working = false
     settledForRun = true
+    const handoffDetail = handoff()
     emit("settled", {
       ...(lastAssistantText ? { text: truncateUtf8(lastAssistantText) } : {}),
       // Review P4 B1: resident change flag flushed with every settle so the
       // classifier never depends on a throttled tool_activity row alone.
       change_evidence: changeEvidenceSeen,
+      ...(handoffDetail ? { handoff: handoffDetail } : {}),
     })
   }
 
   function settleAgentLifecycle(): void {
-    if (settledForRun) return
     // Some hosts dispatch the terminal agent event even when an earlier lifecycle
     // callback was skipped during print-mode setup. Reconstruct the required
     // transition here rather than silently losing both working and settled.
+    if (settledForRun) return
     if (!working) setWorking()
     settle()
   }
@@ -488,6 +643,7 @@ export default function overload(pi: ExtensionApi): void {
     const rawSession = ctx?.sessionManager?.getSessionId?.()
     session = safeComponent(rawSession, randomUUID())
     const cwd = String(ctx?.cwd || process.cwd())
+    sessionCwd = cwd
     try {
       // Hosts await session_start handlers, preserving lifecycle order while all
       // subsequent handlers themselves remain non-blocking.
@@ -531,14 +687,21 @@ export default function overload(pi: ExtensionApi): void {
     if (event?.message?.role === "assistant") lastAssistantText = textFrom(event.message)
   })
 
-  on("tool_call", (event) => {
+  on("tool_call", async (event) => {
     const now = Date.now()
     const tool = String(event?.toolName || "unknown")
-    // Review P4 B1: the 5s throttle must never suppress CHANGE evidence —
-    // the first change-capable call always emits (unthrottled) and latches a
-    // resident flag that is also flushed with settled/session_ended details.
+    const command = typeof event?.input?.command === "string" ? event.input.command : ""
+    const actionClass = tool.toLowerCase() === "bash" ? consequentialClass(command) : undefined
     const changeCapable = /^(bash|write|edit)$/i.test(tool)
-    if (changeCapable && !changeEvidenceSeen) {
+    // Review P4 B1: the 5s throttle must never suppress CHANGE evidence — the
+    // first change-capable call always emits (unthrottled) and latches a resident
+    // flag that is also flushed with settled/session_ended details. Consequential
+    // classes bypass the throttle for the same reason: audit must never miss one.
+    if (actionClass) {
+      changeEvidenceSeen = true
+      lastToolActivity = now
+      emit("tool_activity", { tool: truncateUtf8(tool, 80), change: true, consequential: true, class: actionClass })
+    } else if (changeCapable && !changeEvidenceSeen) {
       changeEvidenceSeen = true
       lastToolActivity = now
       emit("tool_activity", { tool: truncateUtf8(tool, 80), change: true })
@@ -551,14 +714,11 @@ export default function overload(pi: ExtensionApi): void {
       emit("decision_requested", { request_id: event.toolCallId, ...questionPayload(event.input) })
     }
     const rule = gateRule(event)
-    if (rule !== undefined && typeof event?.toolCallId === "string") {
-      const detail = { request_id: event.toolCallId, gated: true }
-      emit("decision_requested", detail)
-      emit("decision_resolved", { ...detail, state: "cancelled" })
-      return { block: true, reason: `overload approval gate: ${rule}` }
+    if (rule) {
+      const decision = await waitForApproval(event, rule)
+      if (decision) return decision
     }
-    if (event?.toolName !== "bash" || !event.input || typeof event.input.command !== "string") return
-    const command = event.input.command
+    if (event?.toolName !== "bash" || !command) return
     // Shared guard: never rewrite compound commands (quoting hazards); the
     // dispatch templates own env injection for those (EXT-19 non-goal #2).
     if (/[|;&`$()\n\r]/.test(command)) return
@@ -573,7 +733,6 @@ export default function overload(pi: ExtensionApi): void {
       event.input.command = `OVERLOAD_PARENT=${stableId} ${command}`
     }
   })
-
   on("tool_execution_end", (event) => {
     if (event?.toolName !== "ask" || !pendingAsk.delete(event.toolCallId)) return
     const selected = selectedOption(event.result)

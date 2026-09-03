@@ -56,7 +56,28 @@ bun src/cli/overload.ts hung
 bun src/cli/overload.ts jump <stable_id|request_uid>
 bun src/cli/overload.ts ack <request_uid>...
 bun src/cli/overload.ts doctor
+bun src/cli/overload.ts audit
+bun src/cli/overload.ts audit --sample 20 --since 24h
 ```
+
+`audit` is a read-only, deterministic report over recent journal evidence. It
+shows gated decisions, consequential tool classes, captured `HANDOFF.md`
+status, human-wait dwell, pass rate, repeated failure patterns, and suggested
+approval rules. `--sample N` limits the most recently active sessions (`0`
+means all); `--since` accepts a duration such as `7d`, `24h`, or milliseconds.
+Settled handoffs with `partial` or `blocked` status, or non-zero
+`uncertainties`, remain in the Inbox for human follow-up; complete,
+zero-uncertainty handoffs are archived normally.
+
+The CLI covers the same decision path as the dashboard: list what needs a human,
+reach that terminal, and acknowledge. Rows go to stdout and headings to stderr,
+so `q1 2>/dev/null | cut -f1 | xargs ... ack` is the shell equivalent of the
+dashboard's multi-select 批量 Ack.
+
+Q1 **Ack** changes only Overload's local request state to `acked`. Pending
+decisions are shown in the loopback dashboard; it does not emit macOS
+notifications or approve, deny, answer, resume, or otherwise unblock the
+originating agent.
 
 The CLI covers the same decision path as the dashboard: list what needs a human,
 reach that terminal, and acknowledge. Rows go to stdout and headings to stderr,

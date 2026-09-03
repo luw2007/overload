@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startWebServer } from "./server";
@@ -11,6 +11,7 @@ const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
 afterEach(() => {
   for (const server of servers.splice(0)) server.stop(true);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  delete process.env.OVERLOAD_ANSWERS_PATH;
 });
 
 function seedLedger(): string {
@@ -72,6 +73,30 @@ describe("web API", () => {
     expect((await fetch(`${base}/api/q2`)).status).toBe(404);
   });
 
+  test("reads, creates, and deletes an orchestrator answer mailbox row", async () => {
+    const path = seedLedger();
+    const answerPath = join(roots[roots.length - 1], "answers.db");
+    process.env.OVERLOAD_ANSWERS_PATH = answerPath;
+    const { base } = await runningServer(path);
+    const id = "stable#writer#tool";
+    expect((await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`)).status).toBe(404);
+    const post = await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`, { method: "POST", headers: { origin: base, "sec-fetch-site": "same-origin" }, body: JSON.stringify({ answer: "approve" }) });
+    expect(post.status).toBe(200);
+    expect(await (await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`)).json()).toMatchObject({ answer: "approve", actor: "ui" });
+    const noOrigin = await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`, { method: "DELETE" });
+    expect(noOrigin.status).toBe(403);
+    const remove = await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`, { method: "DELETE", headers: { origin: base } });
+    expect(remove.status).toBe(200);
+    expect((await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`)).status).toBe(404);
+  });
+  test("missing Origin blocks answer DELETE", async () => {
+    const path = seedLedger();
+    const answerPath = join(roots[roots.length - 1], "answers.db");
+    process.env.OVERLOAD_ANSWERS_PATH = answerPath;
+    const { base } = await runningServer(path);
+    const response = await fetch(`${base}/api/orchestrator/answer/id`, { method: "DELETE" });
+    expect(response.status).toBe(403);
+  });
   test("archive includes both q2 and q4 rows", async () => {
     const path = seedLedger();
     const db = new Database(path);
@@ -329,7 +354,7 @@ describe("web API", () => {
       delete process.env.OVERLOAD_ANSWERS_PATH;
     });
 
-    test("missing answers.db returns 503", async () => {
+    test("missing answers.db is created", async () => {
       process.env.OVERLOAD_ANSWERS_PATH = join(tmpdir(), "nonexistent-" + Date.now(), "answers.db");
       const { server } = await runningServer(seedLedger());
       const base = `http://127.0.0.1:${server.port}`;
@@ -338,8 +363,9 @@ describe("web API", () => {
         headers: { origin: base, host: `127.0.0.1:${server.port}`, "content-type": "application/json", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
         body: JSON.stringify({ answer: "approve" }),
       });
-      expect(response.status).toBe(503);
-      expect(await response.json()).toMatchObject({ error: "orchestrator_not_running" });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ok: true });
+      expect(existsSync(process.env.OVERLOAD_ANSWERS_PATH)).toBe(true);
       delete process.env.OVERLOAD_ANSWERS_PATH;
     });
 

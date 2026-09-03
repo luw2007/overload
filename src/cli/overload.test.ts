@@ -26,6 +26,19 @@ describe("classifier v2 Q4", () => {
     expect(queueAfter({ ...base, state: "idle", has_change_evidence: false }, { ...done, kind: "settled" }).queue).toBe("q3");
   });
 });
+describe("classifier handoff routing", () => {
+  test("settled blocked handoff enters Inbox q5", () => {
+    const event = { ...done, kind: "settled", detail: { handoff: { path: "/tmp/HANDOFF.md", status: "blocked", uncertainties: 0 } } };
+    expect(queueAfter({ ...base, queue: "q3", q5_reason: null }, event)).toEqual({ queue: "q5", q5_reason: "handoff_blocked" });
+  });
+
+  test("settled complete or missing handoff stays q3 and clears prior handoff reason", () => {
+    const complete = { ...done, kind: "settled", detail: { handoff: { path: "/tmp/HANDOFF.md", status: "complete", uncertainties: 0 } } };
+    const missing = { ...done, kind: "settled", detail: {} };
+    expect(queueAfter({ ...base, queue: "q5", q5_reason: "handoff_blocked" }, complete)).toEqual({ queue: "q3", q5_reason: null });
+    expect(queueAfter({ ...base, queue: "q5", q5_reason: "handoff_blocked" }, missing)).toEqual({ queue: "q3", q5_reason: null });
+  });
+});
 
 describe("reducer Q4 projection", () => {
   test("projects read-only agent completion to q4 and a bash session to q2", () => {

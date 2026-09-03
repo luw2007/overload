@@ -46,9 +46,9 @@
 
 ## 协议 15：审批门 v0（N17）
 
-- 扩展 config（`~/.overload/config.json` 读一次 + warn-once）：`approval_gate: {enabled: false, block_bash_patterns: string[], block_write_paths: string[]}`。默认 enabled=false（**部署安全：默认零行为变化**）。
-- enabled 时 `tool_call` 检查：bash 命令匹配任一 pattern（RegExp）或 write/edit 目标路径前缀匹配 → 返回 `{block: true, reason}` 并 emit `decision_requested` + 立即 `decision_resolved{state:"cancelled", gated: true}`（本地确定性拒绝，无远程等待——v0 无 UDS 通道，诚实记账）。不匹配零开销放行。
-- 门自身故障（正则非法等）→ warn-once + 门整体禁用（无干扰优先）。
+- 扩展 config（`~/.overload/config.json` 读一次 + warn-once）：`approval_gate: {enabled: false, block_bash_patterns?: string[], block_write_paths?: string[], require_approval_bash_patterns?: string[], require_approval_write_paths?: string[], timeout_ms?: number}`；`web_port` 沿用顶层 web 配置，默认 `4870`。
+- enabled 时 block 规则优先，命中即 `{block:true}`，并 emit `decision_requested` + `decision_resolved{state:"cancelled", gated:true}`。require_approval 命中 emit C3 请求，轮询本机 answers mailbox；approve 放行并继续后续 rewrite，deny/超时阻断。
+- enabled 配置非法时 fail-closed：bash/write/edit 全部拒绝，reason 为 `overload approval gate misconfigured: <error>`，仍记录 `rule:"misconfigured"` 的 requested/cancelled 对；缺失配置或 disabled 保持 inert。
 
 ## 验收（N18）
 

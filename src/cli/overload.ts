@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ackRequest, queryHealth, queryHung, queryJumpTarget, queryQ1, querySession, querySessions, queryZombie, requestSession } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { runDoctor, defaultDoctorDeps } from "./doctor";
+import { audit, parseSince, printAudit } from "./audit";
 import { runCli as runOrchestratorCli } from "../orchestrator/cli";
 
 const path = process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
@@ -16,7 +17,7 @@ const note: Output = (line) => console.error(line);
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q4 | hung | zombie | health | doctor | ack <request_uid>... | jump <stable_id|request_uid> | orch ..."); process.exit(2); }
+function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q4 | hung | zombie | health | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | orch ..."); process.exit(2); }
 
 function listSessions(db: Database): void {
   const rows = querySessions(db);
@@ -57,7 +58,7 @@ function zombie(db: Database): void {
   if (!groups.length && !orphaned.length) { note("Q5: no zombie sessions."); return; }
   // The reason belongs on the row, not in a heading: a grouped row loses its
   // classification the moment it is filtered or piped.
-  for (const group of groups) for (const row of group.rows) console.log(`${row.stable_id}\t${group.q5_reason}\t${time(row.last_event_at)}`);
+  for (const group of groups) for (const row of group.rows) console.log(`${row.stable_id}\t${group.q5_reason}\t${time(row.last_event_at)}${row.handoff ? `\thandoff=${JSON.stringify(row.handoff)}` : ""}`);
   for (const row of orphaned) console.log(`${row.request_uid}\torphaned_request\t${row.stable_id}\t${time(row.resolved_at)}`);
 }
 function hung(db: Database): void {
@@ -94,11 +95,28 @@ export function ackAll(db: Database, uids: string[]): void {
   }
   if (missed) process.exitCode = 1;
 }
+function runAudit(db: Database, args: string[]): void {
+  let sample = 5;
+  let sinceMs = 7 * 24 * 60 * 60_000;
+  for (let i = 0; i < args.length; i += 2) {
+    const option = args[i];
+    const value = args[i + 1];
+    if (!value || (option !== "--sample" && option !== "--since")) usage();
+    if (option === "--sample") {
+      sample = Number(value);
+      if (!Number.isSafeInteger(sample) || sample < 0) usage();
+    } else {
+      try { sinceMs = parseSince(value); } catch { usage(); }
+    }
+  }
+  printAudit(audit(db, { sample, sinceMs, now: Date.now() }));
+}
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const [command, ...rest] = argv;
   const simple = new Set(["sessions", "q1", "q4", "hung", "zombie", "health"]);
   const arity: Record<string, (count: number) => boolean> = {
-    show: (count) => count === 1, jump: (count) => count === 1, ack: (count) => count >= 1, doctor: (count) => count === 0,
+    show: (count) => count === 1, jump: (count) => count === 1, ack: (count) => count >= 1,
+    doctor: (count) => count === 0, audit: (count) => count <= 4 && count % 2 === 0,
   };
   if (!command) usage();
   if (command === "orch") { await runOrchestratorCli(rest); return; }
@@ -118,7 +136,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   try {
     if (command === "jump") await jumpTo(db, rest[0]!);
     else if (command === "sessions") listSessions(db); else if (command === "show") showSession(db, rest[0]!); else if (command === "q1") q1(db);
-    else if (command === "q4") printQ4(db); else if (command === "hung") hung(db); else if (command === "zombie") zombie(db); else health(db);
+    else if (command === "q4") printQ4(db); else if (command === "hung") hung(db); else if (command === "zombie") zombie(db); else if (command === "health") health(db); else runAudit(db, rest);
   } finally { db.close(); }
 }
 if (import.meta.main) await main();

@@ -56,7 +56,7 @@
 
   function decisionCard(row) {
     const isOrchestratorGate = row.detail && typeof row.detail.gate === "string";
-    const approvalId = row.detail?.request_id;
+    const approvalId = row.detail?.approval_id ?? row.detail?.request_id;
     const options = Array.isArray(row.options) && row.options.length
       ? isOrchestratorGate && approvalId
         ? `<div class="option-chips">${row.options.map((option) => `<button class="btn primary approve" data-approval-id="${escapeHtml(approvalId)}" data-answer="${escapeHtml(option)}">${escapeHtml(option)}</button>`).join("")}</div>`
@@ -67,6 +67,7 @@
       : `<button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button>`;
     return `<article class="decision-card">
       <div class="decision-card-head">${rowCheckbox(row.request_uid)}<div class="decision-card-summary">${escapeHtml(row.summary ?? "(未采集问题内容)")}</div></div>
+      ${row.detail?.rule || row.detail?.command ? `<div class="impact-line">${row.detail?.rule ? `规则：${escapeHtml(row.detail.rule)}` : ""}${row.detail?.rule && row.detail?.command ? " · " : ""}${row.detail?.command ? `命令：${escapeHtml(row.detail.command)}` : ""}</div>` : ""}
       ${options}
       <div class="decision-card-meta">${sessionLink(row.stable_id)} · <span class="chip">${escapeHtml(row.kind)}</span> · ${escapeHtml(formatTime(row.created_at))}</div>
       <div class="decision-card-actions">${jumpActions(row, "request_uid")}${ackOrApprove}</div>

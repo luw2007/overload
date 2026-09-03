@@ -4,7 +4,7 @@
 
 `src/extension/overload.ts` uses the compatible pi-family extension API. Install it in the relevant runtime extension directory. It writes lifecycle, ask, heartbeat, tool-activity, and commit-observation events to the local spool.
 
-The extension is primarily observational. Its optional local pre-tool denylist (`approval_gate` in the session config) can block or modify bash commands matching configured patterns, but it is disabled by default, deterministic, and never waits for a remote decision. Overload never remotely approves or resumes an agent it did not launch; the optional `src/orchestrator/` module's human gates are scoped to processes it started and are a workflow boundary, not a security boundary.
+The extension is primarily observational. Its optional `approval_gate` is disabled by default; block rules deny locally, while require-approval rules pause bash/write/edit until a human answers through the loopback answers mailbox. Approve falls through to normal execution and command rewrites; deny or timeout blocks. Overload does not resume agents it did not launch; the mailbox is the only human-to-agent answer channel.
 
 When a session's bash tool spawns another agent CLI (`pi`, `omp`,
 `prime-agent`, `claude`) as a simple command, the extension prefixes

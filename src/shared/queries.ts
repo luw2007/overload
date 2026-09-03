@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 
-export type SessionSummary = { stable_id: string; runtime: string | null; origin: string | null; created_at: number | null; state: string | null; queue: string | null; q5_reason: string | null; last_event_at: number | null };
+export type Handoff = { path: string; status: "complete" | "partial" | "blocked" | "unknown"; uncertainties: number; next_owner?: string; task?: string };
+export type SessionSummary = { stable_id: string; runtime: string | null; origin: string | null; created_at: number | null; state: string | null; queue: string | null; q5_reason: string | null; last_event_at: number | null; handoff: Handoff | null };
 export type IncarnationRow = { writer_id: string; liveness_domain: string; pid: number | null; proc_boot_id: string | null; started_at: number | null; last_seen_at: number | null };
 export type PendingRequestRow = { request_uid: string; kind: string; created_at: number; detail: Record<string, unknown> | null };
 export type EventRow = { ingest_seq: number; at: number; emitter_id: string; writer_id: string; kind: string; detail: Record<string, unknown> | null };
@@ -9,7 +10,7 @@ export type SessionDetail = {
     stable_id: string; origin: string | null; runtime: string | null; app: string | null; created_at: number | null;
     cwd: string | null; branch: string | null; state: string | null; queue: string | null; q5_reason: string | null;
     last_event_at: number | null; last_heartbeat_at: number | null; last_progress_at: number | null;
-    binding: string | null;
+    binding: string | null; handoff: Handoff | null;
   };
   latest_surface_session: SessionSummary | null;
   incarnations: IncarnationRow[];
@@ -19,10 +20,8 @@ export type SessionDetail = {
 };
 export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null; summary: string | null; options: string[] | null };
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null };
-export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number };
-export type HungRow = { stable_id: string; q5_reason: string; state: string; host: string | null; since: number | null; hung_ms: number; binding: string | null; detail: Record<string, unknown> | null };
 export type ZombieView = {
-  groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number }> }>;
+  groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number; handoff: Handoff | null }> }>;
   orphaned_requests: Array<{ request_uid: string; stable_id: string; resolved_at: number | null }>;
 };
 export type HealthView = {
@@ -62,11 +61,32 @@ function detailOptions(detail: Record<string, unknown> | null): string[] | null 
   return labels.length ? labels : null;
 }
 
+function detailHandoff(detail: Record<string, unknown> | null): Handoff | null {
+  const value = detail?.handoff;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const handoff = value as Record<string, unknown>;
+  if (typeof handoff.path !== "string" || typeof handoff.status !== "string" || typeof handoff.uncertainties !== "number") return null;
+  if (!["complete", "partial", "blocked", "unknown"].includes(handoff.status)) return null;
+  return {
+    path: handoff.path,
+    status: handoff.status as Handoff["status"],
+    uncertainties: handoff.uncertainties,
+    ...(typeof handoff.next_owner === "string" ? { next_owner: handoff.next_owner } : {}),
+    ...(typeof handoff.task === "string" ? { task: handoff.task } : {}),
+  };
+}
+
+function latestSettledHandoff(db: Database, stableId: string): Handoff | null {
+  const row = db.query("SELECT detail FROM journal WHERE stable_id=? AND kind='settled' ORDER BY ingest_seq DESC LIMIT 1").get(stableId) as JsonRow | null;
+  return row ? detailHandoff(parseDetail(row.detail)) : null;
+}
+
 export function querySessions(db: Database, limit = -1): SessionSummary[] {
-  return db.query(`SELECT s.stable_id, s.runtime, s.origin, s.created_at,
+  const rows = db.query(`SELECT s.stable_id, s.runtime, s.origin, s.created_at,
     c.state, c.queue, c.q5_reason, COALESCE(c.last_event_at, s.first_seen_at) last_event_at
     FROM sessions s LEFT JOIN current c ON c.stable_id=s.stable_id
     ORDER BY last_event_at DESC, s.stable_id LIMIT ?`).all(limit) as SessionSummary[];
+  return rows.map((row) => ({ ...row, handoff: latestSettledHandoff(db, row.stable_id) }));
 }
 
 export function querySession(db: Database, stableId: string, eventLimit = 200): SessionDetail | null {
@@ -78,6 +98,7 @@ export function querySession(db: Database, stableId: string, eventLimit = 200): 
     LEFT JOIN session_hosts h ON h.stable_id=s.stable_id AND h.session_id IS NOT NULL
     WHERE s.stable_id=?`).get(stableId) as SessionDetail["session"] | null;
   if (!session) return null;
+  session.handoff = latestSettledHandoff(db, stableId);
   const incarnations = db.query(`SELECT writer_id, liveness_domain, pid, proc_boot_id, started_at, last_seen_at FROM session_incarnations WHERE stable_id=? ORDER BY started_at DESC, writer_id DESC`).all(stableId) as IncarnationRow[];
   const pending = db.query(`SELECT request_uid, kind, created_at, detail FROM requests WHERE stable_id=? AND state='pending' ORDER BY created_at DESC, request_uid DESC`).all(stableId) as Array<PendingRequestRow & JsonRow>;
   // Heartbeats are liveness, not history: 900 of them would bury the one
@@ -93,6 +114,7 @@ export function querySession(db: Database, stableId: string, eventLimit = 200): 
     WHERE h.app=? AND h.session_id=? AND h.stable_id<>?
       AND COALESCE(c.last_event_at, s.first_seen_at)>COALESCE(?, 0)
     ORDER BY last_event_at DESC, s.stable_id DESC LIMIT 1`).get(session.app, session.binding, stableId, session.last_event_at) as SessionSummary | null;
+  if (latestSurfaceSession) latestSurfaceSession.handoff = latestSettledHandoff(db, latestSurfaceSession.stable_id);
   return {
     session,
     latest_surface_session: latestSurfaceSession?.stable_id === stableId ? null : latestSurfaceSession,
@@ -165,7 +187,7 @@ export function queryZombie(db: Database): ZombieView {
       group = { q5_reason: row.q5_reason, rows: [] };
       groups.push(group);
     }
-    group.rows.push({ stable_id: row.stable_id, last_event_at: row.last_event_at });
+    group.rows.push({ stable_id: row.stable_id, last_event_at: row.last_event_at, handoff: latestSettledHandoff(db, row.stable_id) });
   }
   const orphaned_requests = db.query(`SELECT request_uid, stable_id, resolved_at FROM requests WHERE state='orphaned' ORDER BY resolved_at DESC, request_uid DESC`).all() as ZombieView["orphaned_requests"];
   return { groups, orphaned_requests };
@@ -192,4 +214,3 @@ export function ackRequest(db: Database, requestUid: string): { changes: number 
   const result = db.query("UPDATE requests SET state='acked', resolved_at=? WHERE request_uid=? AND state='pending'").run(Date.now(), requestUid);
   return { changes: Number(result.changes) };
 }
-

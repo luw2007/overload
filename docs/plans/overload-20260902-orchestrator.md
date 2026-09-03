@@ -14,7 +14,7 @@
 | 1 | claim SQL 自锁 | **已修**。改为「partial unique index 强制 + BEGIN IMMEDIATE 内取最老 queued」，`queued` 不持锁。见 §3.4。 |
 | 2 | 「写锁释放」夸大、无 owner/lease | **已修**。引入 `owner_instance` / `lease_expires_at` / `heartbeat_at`，启动前强制 reconciliation。见 §3.5。 |
 | 3 | Origin/Host 不构成 caller binding | **已修（改为承认）**。§5.1 明写：gate 是**工作流边界，不是安全边界**；同 UID runner 可 curl loopback、可直写 answers 文件，Overload 无机制可阻止。Origin/Host 降级为 CSRF 卫生。 |
-| 4 | devbox 伪造 Now 卡 | **部分修 + 部分反驳**。反驳：伪造卡**不可操作**——答复端在 orchestrator 侧要求 `approval_id` 在自有 `approvals` 有行（§3.9），无行即丢弃。provenance 已由现有字段呈现：`Q1Row.host`（`src/shared/queries.ts:19,98`）与 `stable_id` 首段（`src/ingest/ingest.ts:249` 构造 `host:runtime:session`），`app.js:64` 的 `sessionLink(row.stable_id)` 已渲染该串。v1 不加字段、不加列。 |
+| 4 | devbox 伪造 Now 卡 | **部分修 + 部分反驳**。反驳：伪造卡**不可操作**——答复端在 orchestrator 侧要求 `approval_id` 在自有 `approvals` 有行；无行即跳过且不消费。provenance 已由现有字段呈现：`Q1Row.host`（`src/shared/queries.ts:19,98`）与 `stable_id` 首段（`src/ingest/ingest.ts:249` 构造 `host:runtime:session`），`app.js:64` 的 `sessionLink(row.stable_id)` 已渲染该串。v1 不加字段、不加列。 |
 | 5 | 里程碑不独立 | **已修**。§6 重排：M1 用 `repo` 路径作 `cwd`（不依赖 M2 worktree）；`awaiting_human` 在 M3 引入且同期就有 CLI 消费方；web 答复（M4）是 M3 的叠加面而非前提。 |
 | 6 | submitted 路径缺失 | **已修**。§3.8 定义 push / PR create / `pr_url` 写入 / CI 轮询 / `gh` 缺失 → `blocked(tool_missing)`。 |
 | 7 | failed 发 gate 与终态规则矛盾 | **已修**。新增非终态 `blocked`；`failed` 永不发 gate（§3.3）。 |
@@ -276,7 +276,7 @@ CREATE TABLE IF NOT EXISTS answers(
 
 **写入方**：web 的 `POST /api/orchestrator/answer/<approval_id>`（`actor='ui'`）与 `overload orch answer <approval_id> <option>`（`actor='cli'`）写**同一张表**，因此 CLI 路径在 M3 就是完整可用的降级面，web 只是叠加。
 
-**消费（orchestrator 侧，每 tick）**：`approval_id` 必须在自有 `approvals` 有行、`consumed_at IS NULL`、`now < expires_at`、`answer` 命中 `options` JSON 白名单——四条全过才产生一次状态转移并写 `task_events`（含 `actor`），随后删除 answers 行；任一不过则丢弃并记 `task_events`。**不把 answer 回写 `approvals`**（决定：删双写，审计留在 `task_events`）。保留策略：每 tick 删除 `at < now-7d` 的残留行。
+**消费（orchestrator 侧，每 tick）**：`approval_id` 必须在自有 `approvals` 有行、`consumed_at IS NULL`、`now < expires_at`、`answer` 命中 `options` JSON 白名单——四条全过才产生一次状态转移并写 `task_events`（含 `actor`），随后删除 answers 行；未知 `approval_id` **跳过且不消费**，因为这些 foreign rows 属于其他 mailbox consumer（例如按包含 `#` 的 `request_uid` 识别的 extension action gate），由其自身消费者处理，并在 7 天后过期清理。其余任一校验不过仍丢弃并记 `task_events`。**不把 answer 回写 `approvals`**（决定：删双写，审计留在 `task_events`）。保留策略：每 tick 删除 `at < now-7d` 的残留行。明确：伪造一个不存在 approval 的 answer 永远不会被 orchestrator 消费，forgery defense 不变。approval_id 命名空间隐式 distinct（UUID vs 含 `#` 的 request_uid）；若新增第三个 consumer，应增加 owner 列，而不是继续增加 skip 规则。
 
 **web 侧附加检查（廉价，非保证）**：拒绝没有 `Sec-Fetch-Site`/`Sec-Fetch-Mode` 头的答复请求。浏览器必带，`curl` 默认不带；一行 `if` 就能提高本地脚本误触/顺手滥用的门槛，但攻击者补上头即可绕过——**这是卫生措施，不是认证**。
 

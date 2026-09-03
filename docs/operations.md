@@ -45,6 +45,7 @@ over SSH rather than a local copy).
 ```sh
 bun src/cli/overload.ts q1
 bun src/cli/overload.ts hung
+bun src/cli/overload.ts audit --sample 20 --since 24h
 bun src/cli/overload.ts doctor
 ```
 
@@ -55,6 +56,23 @@ request uids and exits non-zero if one of them matched nothing:
 ```sh
 bun src/cli/overload.ts q1 2>/dev/null | cut -f1 | xargs bun src/cli/overload.ts ack
 ```
+`audit` never changes the ledger or adapter configuration. It reads journal
+evidence in the requested time window and prints the most recently active
+sessions first. Each session includes decision counts, approval rules,
+consequential action classes, the latest captured `HANDOFF.md` status,
+uncertainty count, and maximum time awaiting a human. Use `--sample 0` for all
+qualifying sessions; `--since` accepts `7d`, `24h`, or a millisecond value.
+
+The classifier sends a settled handoff to Inbox when its status is `partial` or
+`blocked`, or when it reports one or more uncertainties. A complete handoff
+with zero uncertainties follows the normal idle/archive path. `unknown` is
+shown by audit but does not itself interrupt the session. The Inbox entry
+survives session exit: a blocked handoff is a decision the exit does not make,
+so it is not cleared into Done the way liveness reasons are.
+
+Repeated blocked handoffs in one workspace and consequential actions without a
+matching gate appear as patterns or rule recommendations; these are evidence
+for an operator to review, not automatic policy changes.
 
 `jump <stable_id|request_uid>` focuses the recorded terminal from the shell, the
 same action the dashboard's 打开 button performs. It accepts either id because a

@@ -10,6 +10,12 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 | `prune_interval_ms` | ingest | How often consumed spool bytes are swept; default `3600000`. |
 | `spool_retention_ms` | ingest | How long a fully consumed spool file is kept before the sweep removes it; default `86400000`. Only this host's tree is swept — a pulled tree is a mirror and rsync would refetch it. |
 | `web_port` | web | Loopback dashboard port; default `4870`. |
+| `approval_gate.enabled` | extension | Enables action gate; default `false`. Missing or disabled gate is inert. |
+| `approval_gate.block_bash_patterns` | extension | Regex patterns that always deny bash; optional, and win over approval rules. |
+| `approval_gate.block_write_paths` | extension | Path prefixes that always deny write/edit; optional, and win over approval rules. |
+| `approval_gate.require_approval_bash_patterns` | extension | Regex patterns requiring human approve/deny via loopback mailbox; optional. |
+| `approval_gate.require_approval_write_paths` | extension | Path prefixes requiring human approve/deny; optional. |
+| `approval_gate.timeout_ms` | extension | Human approval timeout; default `1800000`. Timeout denies. |
 | `recon_interval_ms` | recon | Reconciliation interval. |
 | `drain_grace_ms` | recon | Delay before orphaning a dead emitter's pending requests. |
 | `stall_profile_ms` | recon | Silence threshold for a session that is still in `working` state; default `1800000`. Idle sessions are silent by design and are never stalled. |

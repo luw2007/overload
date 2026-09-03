@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
 import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
@@ -71,7 +71,7 @@ function routeParameter(value: string): string {
  *  blocks cross-site POST. Any same-UID local process can still supply both headers. */
 function checkOrigin(request: Request, port: number): Response | null {
   if (request.headers.get("host") !== `127.0.0.1:${port}`) return json({ error: "forbidden" }, { status: 403 });
-  if (request.method === "POST" && request.headers.get("origin") !== `http://127.0.0.1:${port}`) return json({ error: "forbidden" }, { status: 403 });
+  if (request.method !== "GET" && request.headers.get("origin") !== `http://127.0.0.1:${port}`) return json({ error: "forbidden" }, { status: 403 });
   return null;
 }
 
@@ -133,24 +133,31 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
           try { return json({ acked: ackRequest(db, requestUid).changes === 1 }); } finally { db.close(); }
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/orchestrator/answer/")) {
-          // Sec-Fetch-* hygiene (plan §3.9): browsers always send these;
-          // curl does not. Cheap, non-guaranteed check — not authentication.
-          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) {
-            return json({ error: "forbidden" }, { status: 403 });
-          }
+          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });
           let body: unknown;
           try { body = await request.json(); } catch { return json({ error: "invalid JSON" }, { status: 400 }); }
-          if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).answer !== "string") {
-            return json({ error: "missing answer" }, { status: 400 });
-          }
+          if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).answer !== "string") return json({ error: "missing answer" }, { status: 400 });
           const approvalId = routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));
-          const answersPath = process.env.OVERLOAD_ANSWERS_PATH ?? join(homedir(), ".overload", "orchestrator-answers.db");
-          if (!existsSync(answersPath)) return json({ error: "orchestrator_not_running" }, { status: 503 });
-          const db = new Database(answersPath);
+          const answersPath = process.env.OVERLOAD_ANSWERS_PATH ?? defaultAnswersPath;
+          const db = openAnswersDb(answersPath);
           db.exec("PRAGMA busy_timeout=5000");
+          try { db.run("INSERT OR IGNORE INTO answers(approval_id, answer, actor, at) VALUES (?, ?, 'ui', ?)", [approvalId, (body as Record<string, unknown>).answer, Date.now()]); } finally { db.close(); }
+          return json({ ok: true });
+        }
+        if (request.method === "GET" && url.pathname.startsWith("/api/orchestrator/answer/")) {
+          const approvalId = routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));
+          const answersPath = process.env.OVERLOAD_ANSWERS_PATH ?? defaultAnswersPath;
+          const db = openAnswersDb(answersPath);
           try {
-            db.run("INSERT OR IGNORE INTO answers(approval_id, answer, actor, at) VALUES (?, ?, 'ui', ?)", [approvalId, (body as Record<string, unknown>).answer, Date.now()]);
+            const row = db.query("SELECT answer, actor, at FROM answers WHERE approval_id=?").get(approvalId) as { answer: string; actor: string; at: number } | null;
+            return row ? json(row) : json({ error: "not found" }, { status: 404 });
           } finally { db.close(); }
+        }
+        if (request.method === "DELETE" && url.pathname.startsWith("/api/orchestrator/answer/")) {
+          const approvalId = routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));
+          const answersPath = process.env.OVERLOAD_ANSWERS_PATH ?? defaultAnswersPath;
+          const db = openAnswersDb(answersPath);
+          try { db.run("DELETE FROM answers WHERE approval_id=?", [approvalId]); } finally { db.close(); }
           return json({ ok: true });
         }
         return json({ error: "not found" }, { status: 404 });

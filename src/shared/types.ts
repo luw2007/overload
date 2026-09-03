@@ -48,7 +48,7 @@ export type EventKind =
 // ── P2 state vocabulary (frozen) ──
 export type SessionState = "working" | "idle" | "awaiting_human" | "done" | "failed" | "vanished";
 export type QueueName = "q1" | "q2" | "q3" | "q4" | "q5";
-export type Q5Reason = "stalled" | "dead_incarnation" | "telemetry_gap" | "orphaned_request" | "turn_hung" | "dead_connection";
+export type Q5Reason = "stalled" | "dead_incarnation" | "telemetry_gap" | "orphaned_request" | "turn_hung" | "dead_connection" | "handoff_blocked"; // settled with HANDOFF.md status partial/blocked or uncertainties>0
 export const DRAIN_GRACE_MS = 5 * 60_000;
 /** Heartbeat-silence profiles (§2.4): narrow default, wide for long tasks. */
 export const STALL_PROFILE_MS = { narrow: 30 * 60_000, wide: 120 * 60_000 } as const;

@@ -56,6 +56,14 @@ describe("querySession", () => {
       detail: { stable_id: target, reason: "no progress" },
     });
   });
+  test("exposes latest settled handoff fields", () => {
+    const db = sessionFixture();
+    const target = "local:pi:handoff";
+    db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", [target, NOW, NOW]);
+    db.run("INSERT INTO current VALUES (?, 'idle', 'q5', 'handoff_blocked', ?, ?, ?)", [target, NOW + 2, NOW + 2, NOW + 2]);
+    db.run("INSERT INTO journal VALUES (1, ?, ?, 'pi', 'writer', 'settled', ?)", [target, NOW + 1, JSON.stringify({ handoff: { path: "/repo/HANDOFF.md", status: "blocked", uncertainties: 2, next_owner: "ops", task: "finish" } })]);
+    expect(querySession(db, target)?.session.handoff).toEqual({ path: "/repo/HANDOFF.md", status: "blocked", uncertainties: 2, next_owner: "ops", task: "finish" });
+  });
 });
 
 describe("queryHealth", () => {
