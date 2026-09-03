@@ -4,15 +4,16 @@ set -eu
 
 usage() {
   cat <<'EOF'
-Usage: scripts/install-launchd.sh [--install|--uninstall] [--project-dir PATH] [--dry-run]
+Usage: scripts/install-launchd.sh [--install|--uninstall] [--project-dir PATH] [--dry-run] [--with-orchestrator]
 
-Installs or removes the five supported Overload LaunchAgents for the current user.
-Pending decisions are surfaced in the loopback web dashboard; Overload does not emit macOS notifications.
+Installs or removes four supported Overload LaunchAgents for current user. Pass --with-orchestrator to include optional orchestrator job.
+Pending decisions surface in loopback web dashboard; maintenance job emits one aggregated macOS notification.
 EOF
 }
 
 mode=install
 project_dir=
+with_orchestrator=0
 dry_run=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -24,6 +25,7 @@ while [ "$#" -gt 0 ]; do
       project_dir=$1
       ;;
     --dry-run) dry_run=1 ;;
+    --with-orchestrator) with_orchestrator=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -43,7 +45,9 @@ bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- 
 
 agents_dir=$HOME/Library/LaunchAgents
 logs_dir=$HOME/.overload/logs
-labels='ingest maintenance pull web orchestrator'
+labels='ingest maintenance pull web'
+all_labels='ingest maintenance pull web orchestrator'
+if [ "$with_orchestrator" -eq 1 ]; then labels="$labels orchestrator"; fi
 retired_labels='notifier'
 uid=$(id -u)
 xml_escape() {
@@ -73,11 +77,13 @@ write_plist() {
   <key>StandardErrorPath</key><string>$(if [ "$name" = orchestrator ]; then xml_escape "$logs_dir/orchestrator.err"; else printf '/tmp/overload-%s.err' "$name"; fi)</string>
 </dict></plist>
 EOF
-  plutil -lint "$target" >/dev/null
+  if command -v plutil >/dev/null 2>&1; then plutil -lint "$target" >/dev/null; fi
 }
 
 if [ "$dry_run" -eq 1 ]; then
-  for name in $labels; do printf '%s %s %s\n' "$mode" "works.earendil.overload.$name" "$agents_dir/works.earendil.overload.$name.plist"; done
+  dry_labels=$labels
+  if [ "$mode" = uninstall ]; then dry_labels=$all_labels; fi
+  for name in $dry_labels; do printf '%s %s %s\n' "$mode" "works.earendil.overload.$name" "$agents_dir/works.earendil.overload.$name.plist"; done
   for name in $retired_labels; do printf 'remove %s %s\n' "works.earendil.overload.$name" "$agents_dir/works.earendil.overload.$name.plist"; done
   exit 0
 fi
@@ -97,9 +103,9 @@ if [ "$mode" = install ]; then
   done
   printf 'Installed Overload LaunchAgents from %s\n' "$project_dir"
 else
-  for name in $labels; do
+  for name in $all_labels; do
     target=$agents_dir/works.earendil.overload.$name.plist
-    launchctl bootout "gui/$uid" "$target" >/dev/null 2>&1 || true
+    if [ -f "$target" ]; then launchctl bootout "gui/$uid" "$target" >/dev/null 2>&1 || true; fi
     rm -f "$target"
   done
   printf 'Removed Overload LaunchAgents\n'

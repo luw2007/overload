@@ -23,7 +23,7 @@ export function openStore(path = process.env.OVERLOAD_ORCHESTRATOR_PATH ?? join(
   const db = new Database(path, { create:true }); db.exec(schema); chmodSync(path, 0o600);
   db.run("INSERT OR IGNORE INTO spool_seq(id,seq,segment) VALUES(1,0,0)"); return db;
 }
-export function addTask(db:Database,title:string,repo:string,baseRef="HEAD",now=Date.now()): Task {
+export function addTask(db:Database,title:string,repo:string,baseRef:string,now=Date.now()): Task {
   const id=randomUUID(); db.run("INSERT INTO tasks(task_id,title,repo,base_ref,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",[id,title,repo,baseRef,"queued",now,now]);
   db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event) VALUES(?,?,?,?,?)",[id,now,null,"queued","add"]); return getTask(db,id)!;
 }

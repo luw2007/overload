@@ -20,7 +20,7 @@ describe("spawnRunner", () => {
     const artifactsRoot = mkdtempSync(join(tmpdir(), "artifacts-"));
     dirs.push(artifactsRoot);
     const db = store();
-    const task = addTask(db, "task-title", "/repo");
+    const task = addTask(db, "task-title", "/repo", "0000000000000000000000000000000000000000");
     claim(db, "o", 4);
     const bound = getTask(db, task.task_id)!;
     const calls: Array<{ command: string; args: string[] }> = [];
@@ -45,7 +45,7 @@ describe("spawnRunner", () => {
     const artifactsRoot = mkdtempSync(join(tmpdir(), "artifacts2-"));
     dirs.push(artifactsRoot);
     const db = store();
-    const task = addTask(db, "t", "/repo");
+    const task = addTask(db, "t", "/repo", "0000000000000000000000000000000000000000");
     claim(db, "o", 4);
     const bound = getTask(db, task.task_id)!;
     const exec: RunnerExecutor = async () => ({ ok: false, error: "cmux_unavailable" });
@@ -79,7 +79,7 @@ describe("bindRunnerSession", () => {
       { stable_id: "local:pi:new", origin, created_at: 2, pid: 4242, boot_id: "boot-xyz" },
     ]);
     const db = store();
-    const task = addTask(db, "t", "/repo");
+    const task = addTask(db, "t", "/repo", "0000000000000000000000000000000000000000");
     db.close();
     const bound = bindRunnerSession(ledgerPath, { ...({} as never), task_id: "task-1" } as never, "attempt-1");
     expect(bound).toEqual({ stable_id: "local:pi:new", pid: 4242, boot_id: "boot-xyz" });

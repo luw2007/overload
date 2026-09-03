@@ -8,7 +8,7 @@ Install supported services from any checkout location:
 scripts/install-launchd.sh --install
 ```
 
-The installer writes four user LaunchAgents: ingest, maintenance, pull, and web. It derives absolute paths for the current checkout and `bun`, so moving or upgrading the checkout requires a reinstall:
+The installer writes four user LaunchAgents: ingest, maintenance, pull, and web. The optional fifth, orchestrator, is written only with `--with-orchestrator`; `--uninstall` removes all five. It derives absolute paths for the current checkout and `bun`, so moving or upgrading the checkout requires a reinstall:
 
 ```sh
 scripts/install-launchd.sh --uninstall

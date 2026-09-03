@@ -24,9 +24,11 @@ function terminalState(detail: Record<string, unknown>): string {
   if (typeof candidate === "string" && SOURCE_TERMINALS.has(candidate)) return candidate;
   return detail.error === true ? "cancelled" : "resolved";
 }
+/** The local admin emitter (recon; envelope check binds host to spool/local) probes every host and
+ *  is authoritative for all of them; any other emitter may only target its own host. */
 function targetStableId(db: Database, row: JournalRow, detail: Record<string, unknown>): string {
   const stableId = stringDetail(detail, "stable_id");
-  if (stableId && stableId.split(":")[0] !== row.stable_id.split(":")[0]) {
+  if (stableId && !row.stable_id.startsWith("local:overload:") && stableId.split(":")[0] !== row.stable_id.split(":")[0]) {
     db.query(`INSERT INTO coverage_gaps(stable_id, emitter_id, from_seq, from_at, to_at, reason)
       VALUES (?, ?, ?, ?, ?, 'cross_host_stable_id')`).run(row.stable_id, row.emitter_id, row.ingest_seq, row.at, row.at);
     return row.stable_id;

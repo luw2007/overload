@@ -73,7 +73,7 @@ describe("gcWorktree (mocked executor)", () => {
 
   test("only reports (never deletes) a dirty worktree", async () => {
     const db = store();
-    const task = addTask(db, "t", "/repo");
+    const task = addTask(db, "t", "/repo", "0000000000000000000000000000000000000000");
     db.run("UPDATE tasks SET state='done',worktree=? WHERE task_id=?", ["/wt/dirty", task.task_id]);
     const exec: CommandExecutor = async (cmd, args) => args[2] === "status" ? { ok: true, stdout: " M file\n", stderr: "" } : { ok: true, stdout: "", stderr: "" };
     const result = await gcWorktree(db, task.task_id, false, "/root", exec);
@@ -83,7 +83,7 @@ describe("gcWorktree (mocked executor)", () => {
 
   test("dryRun never deletes even when clean and terminal", async () => {
     const db = store();
-    const task = addTask(db, "t", "/repo");
+    const task = addTask(db, "t", "/repo", "0000000000000000000000000000000000000000");
     db.run("UPDATE tasks SET state='done',worktree=? WHERE task_id=?", ["/wt/clean", task.task_id]);
     let removeCalled = false;
     const exec: CommandExecutor = async (cmd, args) => {
@@ -99,7 +99,7 @@ describe("gcWorktree (mocked executor)", () => {
 
   test("refuses to delete a non-terminal task's worktree", async () => {
     const db = store();
-    const task = addTask(db, "t", "/repo"); // state=queued
+    const task = addTask(db, "t", "/repo", "0000000000000000000000000000000000000000"); // state=queued
     const exec: CommandExecutor = async () => ({ ok: true, stdout: "", stderr: "" });
     const result = await gcWorktree(db, task.task_id, false, "/root", exec);
     expect(result).toEqual({ deleted: false, reason: "not_terminal" });
@@ -108,7 +108,7 @@ describe("gcWorktree (mocked executor)", () => {
 
   test("refuses to delete while a live pid holds the worktree", async () => {
     const db = store();
-    const task = addTask(db, "t", "/repo");
+    const task = addTask(db, "t", "/repo", "0000000000000000000000000000000000000000");
     db.run("UPDATE tasks SET state='failed',worktree=?,runner_pid=? WHERE task_id=?", ["/wt/live", 999, task.task_id]);
     const exec: CommandExecutor = async () => ({ ok: true, stdout: "", stderr: "" });
     const result = await gcWorktree(db, task.task_id, false, "/root", exec, (pid) => pid === 999);
@@ -118,7 +118,7 @@ describe("gcWorktree (mocked executor)", () => {
 
   test("deletes a clean, terminal, no-live-pid worktree with --apply (dryRun=false)", async () => {
     const db = store();
-    const task = addTask(db, "t", "/repo");
+    const task = addTask(db, "t", "/repo", "0000000000000000000000000000000000000000");
     db.run("UPDATE tasks SET state='abandoned',worktree=? WHERE task_id=?", ["/wt/clean2", task.task_id]);
     const calls: string[][] = [];
     const exec: CommandExecutor = async (cmd, args) => {
@@ -135,9 +135,9 @@ describe("gcWorktree (mocked executor)", () => {
 
   test("gcCandidates only considers terminal tasks", async () => {
     const db = store();
-    const running = addTask(db, "running-task", "/repo");
+    const running = addTask(db, "running-task", "/repo", "0000000000000000000000000000000000000000");
     transition(db, running.task_id, "human_abandon"); // -> abandoned, terminal
-    const queued = addTask(db, "queued-task", "/repo2"); // stays queued, not terminal
+    const queued = addTask(db, "queued-task", "/repo2", "0000000000000000000000000000000000000000"); // stays queued, not terminal
     const exec: CommandExecutor = async (cmd, args) => args[2] === "status" ? { ok: true, stdout: "", stderr: "" } : { ok: true, stdout: "", stderr: "" };
     const results = await gcCandidates(db, true, "/root", exec, () => false);
     expect(results.map((r) => r.task_id)).toEqual([running.task_id]);
@@ -208,8 +208,9 @@ describe("ensureWorktree (real git, scratch repo)", () => {
     const d = mkdtempSync(join(tmpdir(), "gc-store-"));
     dirs.push(d);
     const db = openStore(join(d, "db"));
-    const cleanTask = addTask(db, "clean", repo);
-    const dirtyTask = addTask(db, "dirty", repo);
+    const head = run(["rev-parse", "HEAD"]).stdout.toString().trim();
+    const cleanTask = addTask(db, "clean", repo, head);
+    const dirtyTask = addTask(db, "dirty", repo, head);
     await ensureWorktree(repo, cleanTask.task_id, "clean-branch", "HEAD", root);
     const dirtyWt = (await ensureWorktree(repo, dirtyTask.task_id, "dirty-branch", "HEAD", root)).dir;
     Bun.spawnSync(["bash", "-c", `echo y > ${join(dirtyWt, "untracked")}`]);

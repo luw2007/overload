@@ -15,7 +15,7 @@ import type { Database } from "bun:sqlite";
 const BIND_TIMEOUT_TICKS = 12; // ~60s at the 5s tick interval, plan §3.3 bind_timeout.
 
 export class Orchestrator {
-  readonly owner=randomUUID(); private started=new Set<string>(); private bindAttempts=new Map<string,number>(); private lastCiCheck=new Map<string,number>();
+  readonly owner=randomUUID(); private started=new Set<string>(); private bindAttempts=new Map<string,number>(); private lastCiCheck=new Map<string,number>(); private inFlight=false;
   private static readonly CI_CHECK_INTERVAL=5*60*1000; // 5 minutes
   constructor(readonly db:Database,readonly spool:SpoolWriter,readonly concurrency=2,
     readonly ledgerPath=process.env.OVERLOAD_LEDGER_PATH??join(homedir(),".overload","ledger.db"),
@@ -31,15 +31,28 @@ export class Orchestrator {
     renewLeases(this.db,this.owner,now);
   }
   async tick(now=Date.now()):Promise<Task[]> {
-    this.reconcile(now); const claimed=claim(this.db,this.owner,this.concurrency,now);
-    for(const task of claimed){this.spool.emit(task.task_id,"session_started",{parent:"orchestrator",cwd:task.repo,branch:task.branch,lease:{pid:process.pid,proc_boot_id:this.owner}});this.started.add(task.task_id);}
-    for(const task of listTasks(this.db)) {
-      if(task.state==="starting") await this.startRunner(task);
-      else if(task.state==="running") await this.pollRunning(task,now);
-      else if(task.state==="submitted") await this.pollSubmitted(task,now);
-    }
-    const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{consumeAnswers(this.db,answers,this.spool,now);}finally{answers.close();}expireApprovals(this.db,now);
-    renewLeases(this.db,this.owner,now); return claimed.map(t=>getTask(this.db,t.task_id)!);
+    if(this.inFlight)return [];
+    this.inFlight=true;
+    try {
+      this.reconcile(now); const claimed=claim(this.db,this.owner,this.concurrency,now);
+      for(const task of claimed){this.spool.emit(task.task_id,"session_started",{parent:"orchestrator",cwd:task.repo,branch:task.branch,lease:{pid:process.pid,proc_boot_id:this.owner}});this.started.add(task.task_id);}
+      for(const task of listTasks(this.db)) {
+        try {
+          if(task.state==="starting") await this.startRunner(task);
+          else if(task.state==="running") await this.pollRunning(task,now);
+          else if(task.state==="submitted") await this.pollSubmitted(task,now);
+        } catch(error) {
+          const state=getTask(this.db,task.task_id)?.state??task.state;
+          this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,now,state,state,"tick_error",JSON.stringify({error:error instanceof Error?error.message:String(error)})]);
+        }
+      }
+      try {
+        const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{consumeAnswers(this.db,answers,this.spool,now);}finally{answers.close();}
+        expireApprovals(this.db,now);
+        renewLeases(this.db,this.owner,now);
+      } catch(error) { console.error(error); }
+      return claimed.map(t=>getTask(this.db,t.task_id)!);
+    } finally { this.inFlight=false; }
   }
   // §3.6/§3.7: ensureWorktree -> spawnRunner -> transition. worktree_ok/spawn_ok both land on "running"
   // (store.ts's rules), matching the plan's combined "worktree_ok ∧ spawn_ok -> running" row.

@@ -32,6 +32,9 @@ scripts/install-launchd.sh --install     # ingest, maintenance, pull, web Launch
 scripts/install-extension.sh --install   # pi/omp lifecycle telemetry; restart the runtime after
 ```
 
+The optional orchestrator LaunchAgent (`src/orchestrator/`) is installed only
+with `scripts/install-launchd.sh --install --with-orchestrator`.
+
 No installer sets up a prime-agent extension (its extension-directory
 convention is unverified; see docs/integrations.md).
 

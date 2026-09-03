@@ -4,10 +4,10 @@
   <key>Label</key><string>works.earendil.overload.orchestrator</string>
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>-lc</string>
-    <string>mkdir -p "$HOME/.overload/logs"; exec "$HOME/.bun/bin/bun" "$HOME/ai/overload/src/orchestrator/orchestrator.ts"</string>
+    <string>exec "$HOME/.bun/bin/bun" "$HOME/ai/overload/src/orchestrator/orchestrator.ts"</string>
   </array>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>/Users/luwei.will/.overload/logs/orchestrator.log</string>
-  <key>StandardErrorPath</key><string>/Users/luwei.will/.overload/logs/orchestrator.err</string>
+  <key>StandardOutPath</key><string>$HOME/.overload/logs/orchestrator.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.overload/logs/orchestrator.err</string>
 </dict></plist>
