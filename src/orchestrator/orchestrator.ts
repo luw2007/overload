@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getTask, claim, listTasks, openStore, renewLeases, transition, getRecovery, setRecovery, bumpUnknown, resetUnknown, type Task, type TransitionDetail } from "./store";
 import { SpoolWriter } from "./spool";
-import { ensureWorktree, worktreesRoot, defaultCommandExecutor, defaultPidAlive, type CommandExecutor } from "./worktree";
+import { ensureWorktree, worktreesRoot, gcCandidates, defaultCommandExecutor, defaultPidAlive, type CommandExecutor } from "./worktree";
 import { spawnRunner, bindRunnerSession, probeRunnerLiveness, defaultRunnerExecutor, type RunnerExecutor } from "./runner";
 import { collectEvidence, evidenceReady } from "./evidence";
 import { submitTask } from "./submit";
@@ -15,8 +15,10 @@ import type { Database } from "bun:sqlite";
 const BIND_TIMEOUT_TICKS = 12; // ~60s at the 5s tick interval, plan §3.3 bind_timeout.
 
 export class Orchestrator {
-  readonly owner=randomUUID(); private started=new Set<string>(); private bindAttempts=new Map<string,number>(); private lastCiCheck=new Map<string,number>(); private reconciled=new Set<string>(); private inFlight=false;
+  readonly owner=randomUUID(); private started=new Set<string>(); private bindAttempts=new Map<string,number>(); private lastCiCheck=new Map<string,number>(); private reconciled=new Set<string>(); private inFlight=false; private lastGc=0;
   private static readonly CI_CHECK_INTERVAL=5*60*1000; // 5 minutes
+  private static readonly GC_INTERVAL=5*60*1000; // §3.6: sweep worktrees at most this often, not on every 5s tick.
+  private static readonly GC_MIN_AGE=60*60*1000; // Leave a finished worktree alone for an hour so a human can still look.
   constructor(readonly db:Database,readonly spool:SpoolWriter,readonly concurrency=2,
     readonly ledgerPath=process.env.OVERLOAD_LEDGER_PATH??join(homedir(),".overload","ledger.db"),
     readonly worktreeExec:CommandExecutor=defaultCommandExecutor,readonly runnerExec:RunnerExecutor=defaultRunnerExecutor,
@@ -110,9 +112,25 @@ export class Orchestrator {
         const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{consumeAnswers(this.db,answers,this.spool,now);}finally{answers.close();}
         expireApprovals(this.db,now);
         renewLeases(this.db,this.owner,now);
+        await this.collectWorktrees(now);
       } catch(error) { console.error(error); }
       return claimed.map(t=>getTask(this.db,t.task_id)!);
     } finally { this.inFlight=false; }
+  }
+  /**
+   * §3.6: the module that creates worktrees is the one that cleans them, so GC lives and dies with
+   * the orchestrator rather than in the default-installed maintenance job. gcCandidates only ever
+   * removes clean, terminal, unheld worktrees; dirty ones stay on disk and are left for a human.
+   */
+  private async collectWorktrees(now:number):Promise<void> {
+    if(now-this.lastGc<Orchestrator.GC_INTERVAL)return;
+    this.lastGc=now;
+    const results=await gcCandidates(this.db,false,this.worktreesDir,this.worktreeExec,defaultPidAlive,{minAgeMs:Orchestrator.GC_MIN_AGE,now});
+    for(const result of results){
+      if(!result.deleted)continue; // A blocked sweep repeats every interval; recording it would be recurring noise, not news.
+      const state=getTask(this.db,result.task_id)?.state??"done";
+      this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[result.task_id,now,state,state,"worktree_gc",JSON.stringify({worktree:"removed"})]);
+    }
   }
   // §3.6/§3.7: ensureWorktree -> spawnRunner -> transition. worktree_ok/spawn_ok both land on "running"
   // (store.ts's rules), matching the plan's combined "worktree_ok ∧ spawn_ok -> running" row.

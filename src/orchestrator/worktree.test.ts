@@ -144,6 +144,20 @@ describe("gcWorktree (mocked executor)", () => {
     expect(results.map((r) => r.task_id)).not.toContain(queued.task_id);
     db.close();
   });
+
+  test("a grace window spares a worktree whose task only just went terminal", async () => {
+    const db = store();
+    const fresh = addTask(db, "fresh", "/repo", "0".repeat(40));
+    const stale = addTask(db, "stale", "/repo", "0".repeat(40));
+    const now = 10 * 60 * 60 * 1000;
+    db.run("UPDATE tasks SET state='done',worktree=?,updated_at=? WHERE task_id=?", ["/wt/fresh", now - 60_000, fresh.task_id]);
+    db.run("UPDATE tasks SET state='done',worktree=?,updated_at=? WHERE task_id=?", ["/wt/stale", now - 2 * 60 * 60 * 1000, stale.task_id]);
+    const exec: CommandExecutor = async () => ({ ok: true, stdout: "", stderr: "" });
+    const results = await gcCandidates(db, false, "/root", exec, () => false, { minAgeMs: 60 * 60 * 1000, now });
+    // The unattended collector must not race an operator who just walked over to look.
+    expect(results).toEqual([{ task_id: stale.task_id, deleted: true }]);
+    db.close();
+  });
 });
 
 describe("ensureWorktree (real git, scratch repo)", () => {

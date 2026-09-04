@@ -75,9 +75,10 @@ function inWindow(at: number, cutoff: number, now: number): boolean {
   return at >= cutoff && at <= now;
 }
 
-export function parseSince(value: string): number {
+/** `flag` names the caller's own option so a typo is reported against the flag the operator typed. */
+export function parseSince(value: string, flag = "--since"): number {
   const match = /^(\d+)(ms|s|m|h|d)?$/.exec(value);
-  if (!match) throw new Error(`invalid --since: ${value}`);
+  if (!match) throw new Error(`invalid ${flag}: ${value}`);
   const amount = Number(match[1]);
   const multiplier = { ms: 1, s: 1_000, m: 60_000, h: 60 * 60_000, d: 24 * 60 * 60_000 }[match[2] ?? "ms"];
   return amount * multiplier;

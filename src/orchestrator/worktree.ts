@@ -58,10 +58,16 @@ export function defaultPidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-export async function gcCandidates(db: Database, dryRun: boolean, root = worktreesRoot(), exec: CommandExecutor = defaultCommandExecutor, pidAlive: PidAlive = defaultPidAlive): Promise<Array<{ task_id: string; deleted: boolean; reason?: string }>> {
+export type GcOptions = { minAgeMs?: number; now?: number };
+
+/** Unattended callers pass minAgeMs so a just-finished worktree survives long enough to be inspected. */
+export async function gcCandidates(db: Database, dryRun: boolean, root = worktreesRoot(), exec: CommandExecutor = defaultCommandExecutor, pidAlive: PidAlive = defaultPidAlive, opts: GcOptions = {}): Promise<Array<{ task_id: string; deleted: boolean; reason?: string }>> {
   const results: Array<{ task_id: string; deleted: boolean; reason?: string }> = [];
+  const minAgeMs = opts.minAgeMs ?? 0;
+  const now = opts.now ?? Date.now();
   for (const task of listTasks(db)) {
     if (!isTerminal(task.state)) continue;
+    if (minAgeMs > 0 && now - task.updated_at < minAgeMs) continue;
     results.push({ task_id: task.task_id, ...(await gcWorktree(db, task.task_id, dryRun, root, exec, pidAlive)) });
   }
   return results;

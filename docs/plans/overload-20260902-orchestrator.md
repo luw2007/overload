@@ -21,7 +21,7 @@
 | 8 | 预算与 follow-up 无限繁殖 | **已修**。ready 拒绝 → `blocked`（不扣预算，由人决定重跑并重置或放弃）；CI 异常 → 一条 `decision_requested`，人选 rerun/new-task/abandon，**不自动建单**、无 ancestry 机制。 |
 | 9 | 并发上限计入非活跃态 | **已修**。上限只计 `starting|running`（§3.4）。 |
 | 10 | jump 降级不可接受 | **已修**。runner 经 `cmux new-workspace` 启动（与 `src/shared/resume.ts:40` 同一命令形态），会话取得真实 cmux surface，走既有 jump 链路。见 §3.7。 |
-| 11 | worktree 永不清理 | **已修**。`creating` 折进 `starting`（幂等探测）；新增 `overload orch gc --older-than`，只删 clean + 终态 + 无活进程者，dirty 只列不删。无后台 GC 服务。 |
+| 11 | worktree 永不清理 | **已修**。`creating` 折进 `starting`（幂等探测）；`overload orch gc --older-than` 供人手动清理，orchestrator 自身每 5 分钟扫一次（见 §3.6）。只删 clean + 终态 + 无活进程者，dirty 只列不删。 |
 | 12 | 删 migration 不安全 | **接受**。v1 计划中「删 `dropRetiredColumns`」条目撤销，见 §7。 |
 
 ### 对 §3「设计缺陷」表
@@ -220,7 +220,8 @@ COMMIT;   -- 该 repo 已有活跃任务时，UNIQUE 约束在此失败 → 回�
 ### 3.6 Worktree 生命周期
 
 - **`creating` 折进 `starting`**：`~/.overload/worktrees/<task_id>/` 存在且是该 repo 的 worktree → 复用；分支已存在 → 复用；均无 → `git -C <repo> worktree add <dir> -b <branch> <base_ref>`。全部幂等。
-- **GC = CLI，不是服务**：`overload orch gc --older-than <dur>`。只删同时满足「任务终态」「`git -C <wt> status --porcelain` 为空」「无活进程」三条的 worktree；dirty 的**只列出、永不删**（`AGENTS.md` 原则 6）。无后台 GC 作业。
+- **GC 双入口**：`overload orch gc [--older-than <dur>] [--apply]` 供人按需清理（默认只列，`--apply` 才删）；orchestrator 的 tick 另以 **5 分钟节流**自扫一次，且只收 `updated_at` 早于 **1 小时**者——无人值守的删除不该跟刚走过去查看的人抢现场。两者共用同一判据：只删同时满足「任务终态」「`git -C <wt> status --porcelain` 为空」「无活进程」三条的 worktree；dirty 的**只列出、永不删**（`AGENTS.md` 原则 6）。清理成功写一条 `task_events(event='worktree_gc')`；未删成功的原因**不记**——它每轮都会复现，记下来只是重复噪声。
+- **归属**：GC 与 worktree 同生共死于 orchestrator 进程，不进默认安装的 maintenance 作业——造垃圾的模块负责收垃圾，未启用 orchestrator 的装机不会凭空多出一个扫 `orchestrator.db` 的后台任务。
 
 ### 3.7 Runner adapter（仅 Pi，经 cmux）
 

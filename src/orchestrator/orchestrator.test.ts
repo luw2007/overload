@@ -259,3 +259,24 @@ test("§7-11 a legacy pre-upgrade row with a pid but no recovery row never gets 
   expect(db.query("SELECT state FROM tasks WHERE task_id=?").get(task.task_id)).toEqual({state:"starting"});
   spool.close();db.close();
 });
+
+test("§3.6 tick collects abandoned worktrees on its own, throttled, and records each deletion",async()=>{
+  const root=mkdtempSync(join(tmpdir(),"orch-gc-"));dirs.push(root);writeFileSync(join(root,"host"),"local\n");
+  const db=openStore(join(root,"orchestrator.db"));const spool=new SpoolWriter(db,root);
+  const removed:string[][]=[];
+  const worktreeExec=async(_cmd:string,args:string[])=>{
+    if(args[2]==="worktree"&&args[3]==="remove"){removed.push(args);return{ok:true,stdout:"",stderr:""};}
+    return{ok:true,stdout:"",stderr:""}; // `status --porcelain` clean
+  };
+  const orch=new Orchestrator(db,spool,1,join(root,"ledger.db"),worktreeExec,async()=>({ok:true}),join(root,"worktrees"),join(root,"artifacts"));
+  const task=addTask(db,"finished","/repo",BASE_REF,1);
+  const now=10*60*60*1000;
+  db.run("UPDATE tasks SET state='done',worktree=?,updated_at=? WHERE task_id=?",["/wt/done",now-3*60*60*1000,task.task_id]);
+  await orch.tick(now);
+  expect(removed).toHaveLength(1);
+  expect(db.query("SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND event='worktree_gc'").get(task.task_id)).toEqual({n:1});
+  // Throttled: the next tick a second later must not re-scan every terminal task.
+  await orch.tick(now+1000);
+  expect(removed).toHaveLength(1);
+  spool.close();db.close();
+});
