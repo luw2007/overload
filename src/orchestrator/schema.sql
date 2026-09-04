@@ -28,3 +28,10 @@ CREATE TABLE IF NOT EXISTS approvals(
 
 CREATE TABLE IF NOT EXISTS spool_seq(id INTEGER PRIMARY KEY CHECK(id=1),
   seq INTEGER NOT NULL, segment INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS task_recovery(
+  task_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL,
+  spawn_state TEXT NOT NULL CHECK(spawn_state IN ('intent','spawned','failed')),
+  spawn_at INTEGER NOT NULL,
+  unknown_ticks INTEGER NOT NULL DEFAULT 0);

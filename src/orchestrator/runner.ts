@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Task } from "./store";
 
 export type RunnerExecutor = (command: string, args: string[]) => Promise<{ ok: boolean; error?: string }>;
+export type RunnerProbe={kind:"absent"}|{kind:"unreadable"}|{kind:"found";stable_id:string;pid:number|null;boot_id:string|null;has_incarnation:boolean;ended:boolean};
 
 /** Same shape/behavior as src/shared/resume.ts's defaultResumeExecutor. */
 export const defaultRunnerExecutor: RunnerExecutor = async (command, args) => {
@@ -49,6 +50,9 @@ type IncarnationRow = { pid: number | null; proc_boot_id: string | null };
  * §3.7 会话绑定 / §4.2 boundary: opens ledger.db `{readonly:true}` exactly like
  * src/web/server.ts:61, reads only sessions/session_incarnations, never writes.
  */
+type ProbeRow={stable_id:string;pid:number|null;proc_boot_id:string|null;has_incarnation:number;ended:number};
+export function probeRunnerLiveness(ledgerPath:string,taskId:string,attemptId:string):RunnerProbe{let db:Database|null=null;try{db=new Database(ledgerPath,{readonly:true});const r=db.query(`SELECT s.stable_id,i.pid,i.proc_boot_id,(i.stable_id IS NOT NULL) AS has_incarnation,EXISTS(SELECT 1 FROM journal j WHERE j.stable_id=i.stable_id AND j.writer_id=i.writer_id AND j.kind='session_ended') AS ended FROM sessions s LEFT JOIN session_incarnations i ON i.stable_id=s.stable_id AND i.liveness_domain='process' WHERE s.origin=? ORDER BY s.created_at DESC,i.last_seen_at DESC LIMIT 1`).get(taskOrigin(taskId,attemptId)) as ProbeRow|null;return r?{kind:"found",stable_id:r.stable_id,pid:r.pid,boot_id:r.proc_boot_id,has_incarnation:!!r.has_incarnation,ended:!!r.ended}:{kind:"absent"}}catch{return{kind:"unreadable"}}finally{db?.close()}}
+
 export function bindRunnerSession(ledgerPath: string, task: Task, attemptId: string): { stable_id: string; pid: number | null; boot_id: string | null } | null {
   let db: Database;
   try { db = new Database(ledgerPath, { readonly: true }); } catch { return null; }
