@@ -14,6 +14,59 @@ function insertEvent(db: Database, seq: number, kind: string, stableId: string, 
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(host, emitter, seq, 1_700_000_000_000 + seq, stableId, emitter, kind, JSON.stringify(detail));
 }
 
+describe("decision resolution outcomes", () => {
+  test.each([
+    ["absent", {}],
+    ["unrecognized", { state: "blocked_by_policy" }],
+  ])("%s outcome stays pending and records an anomaly", (_label, outcome) => {
+    const db = fixture();
+    insertEvent(db, 1, "decision_requested", "devbox:pi:x", { request_id: "req-1" }, "devbox", "pi-1");
+    insertEvent(db, 2, "decision_resolved", "devbox:pi:x", { request_id: "req-1", ...outcome }, "devbox", "pi-1");
+
+    reduceJournal(db);
+
+    expect(db.query("SELECT state, resolved_at FROM requests WHERE request_id='req-1'").get()).toEqual({ state: "pending", resolved_at: null });
+    expect(db.query("SELECT state FROM current WHERE stable_id='devbox:pi:x'").get()).toEqual({ state: "awaiting_human" });
+    expect(db.query("SELECT stable_id, emitter_id, from_seq, reason FROM coverage_gaps").all()).toEqual([
+      { stable_id: "devbox:pi:x", emitter_id: "pi-1", from_seq: 2, reason: "unrecognized_decision_outcome" },
+    ]);
+    db.close();
+  });
+
+  test.each([
+    ["resolved", { state: "resolved" }, "resolved"],
+    ["cancelled", { state: "cancelled" }, "cancelled"],
+    ["timed_out", { state: "timed_out" }, "timed_out"],
+    ["error", { error: true }, "cancelled"],
+  ])("preserves %s mapping", (_label, outcome, expected) => {
+    const db = fixture();
+    insertEvent(db, 1, "decision_requested", "devbox:pi:x", { request_id: "req-1" }, "devbox", "pi-1");
+    insertEvent(db, 2, "decision_resolved", "devbox:pi:x", { request_id: "req-1", ...outcome }, "devbox", "pi-1");
+
+    reduceJournal(db);
+
+    expect(db.query("SELECT state FROM requests WHERE request_id='req-1'").get()).toEqual({ state: expected });
+    expect(db.query("SELECT COUNT(*) AS count FROM coverage_gaps").get()).toEqual({ count: 0 });
+    db.close();
+  });
+
+  test("re-reduction does not duplicate an unrecognized-outcome anomaly", () => {
+    const db = fixture();
+    insertEvent(db, 1, "decision_requested", "devbox:pi:x", { request_id: "req-1" }, "devbox", "pi-1");
+    insertEvent(db, 2, "decision_resolved", "devbox:pi:x", { request_id: "req-1", outcome: "newer_state" }, "devbox", "pi-1");
+
+    reduceJournal(db);
+    db.query("UPDATE reducer_cursor SET journal_seq=0 WHERE id=1").run();
+    reduceJournal(db);
+
+    expect(db.query("SELECT state, resolved_at FROM requests WHERE request_id='req-1'").get()).toEqual({ state: "pending", resolved_at: null });
+    expect(db.query("SELECT reason, COUNT(*) AS count FROM coverage_gaps GROUP BY reason").all()).toEqual([
+      { reason: "unrecognized_decision_outcome", count: 1 },
+    ]);
+    db.close();
+  });
+});
+
 describe("detail stable_id host authority", () => {
   test("session_vanished cannot target another host", () => {
     const db = fixture();

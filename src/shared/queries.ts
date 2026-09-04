@@ -10,7 +10,7 @@ export type SessionDetail = {
     stable_id: string; origin: string | null; runtime: string | null; app: string | null; created_at: number | null;
     cwd: string | null; branch: string | null; state: string | null; queue: string | null; q5_reason: string | null;
     last_event_at: number | null; last_heartbeat_at: number | null; last_progress_at: number | null;
-    binding: string | null; handoff: Handoff | null;
+    binding: string | null; host_probe_error: string | null; handoff: Handoff | null;
   };
   latest_surface_session: SessionSummary | null;
   incarnations: IncarnationRow[];
@@ -18,8 +18,8 @@ export type SessionDetail = {
   /** Newest first and heartbeat-free: the question is what the turn last did. */
   events: EventRow[];
 };
-export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null; summary: string | null; options: string[] | null };
-export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null };
+export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null; host_probe_error: string | null; summary: string | null; options: string[] | null };
+export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null; host_probe_error: string | null };
 export type ZombieView = {
   groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number; handoff: Handoff | null }> }>;
   orphaned_requests: Array<{ request_uid: string; stable_id: string; resolved_at: number | null }>;
@@ -93,7 +93,11 @@ export function querySession(db: Database, stableId: string, eventLimit = 200): 
   const session = db.query(`SELECT s.stable_id, s.origin, s.runtime, h.app, s.created_at, s.cwd, s.branch,
     c.state, c.queue, c.q5_reason, c.last_event_at, c.last_heartbeat_at, c.last_progress_at,
     COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=s.stable_id AND h.session_id IS NOT NULL),
-      (SELECT binding FROM attachments a WHERE a.stable_id=s.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding
+      (SELECT binding FROM attachments a WHERE a.stable_id=s.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding,
+    CASE WHEN COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=s.stable_id AND h.session_id IS NOT NULL),
+      (SELECT binding FROM attachments a WHERE a.stable_id=s.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) IS NULL
+      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal j
+        WHERE j.stable_id=s.stable_id AND j.kind='session_started' ORDER BY j.ingest_seq DESC LIMIT 1) END host_probe_error
     FROM sessions s LEFT JOIN current c ON c.stable_id=s.stable_id
     LEFT JOIN session_hosts h ON h.stable_id=s.stable_id AND h.session_id IS NOT NULL
     WHERE s.stable_id=?`).get(stableId) as SessionDetail["session"] | null;
@@ -129,7 +133,11 @@ export function queryQ1(db: Database): Q1Row[] {
     COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL),
       (SELECT binding FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding,
     COALESCE((SELECT lower(app) FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL),
-      (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) platform
+      (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) platform,
+    CASE WHEN NOT EXISTS (SELECT 1 FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL)
+      AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1)
+      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal j
+        WHERE j.stable_id=r.stable_id AND j.kind='session_started' ORDER BY j.ingest_seq DESC LIMIT 1) END host_probe_error
     FROM requests r LEFT JOIN sessions s ON s.stable_id=r.stable_id
     WHERE r.state='pending' ORDER BY r.created_at DESC, r.request_uid DESC`).all() as Array<Omit<Q1Row, "detail" | "summary" | "options"> & JsonRow>;
   return rows.map((row) => {
@@ -144,7 +152,11 @@ export function queryJumpTarget(db: Database, stableId: string): JumpTarget | nu
     CASE WHEN h.stable_id IS NOT NULL THEN 'host' ELSE 'attachment' END source,
     COALESCE(lower(h.app), a.platform) platform,
     COALESCE(h.session_id, h.tty, a.binding) binding,
-    h.tty
+    h.tty,
+    CASE WHEN COALESCE(h.session_id, h.tty, a.binding) IS NULL THEN
+      (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal j
+       WHERE j.stable_id=s.stable_id AND j.kind='session_started' ORDER BY j.ingest_seq DESC LIMIT 1)
+    END host_probe_error
     FROM sessions s
     LEFT JOIN session_hosts h ON h.stable_id=s.stable_id AND h.session_id IS NOT NULL
     LEFT JOIN attachments a ON a.stable_id=s.stable_id AND a.valid=1
@@ -164,7 +176,11 @@ export function queryHung(db: Database, now = Date.now()): HungRow[] {
     (SELECT j.detail FROM journal j WHERE j.kind=c.q5_reason
        AND json_extract(j.detail, '$.stable_id')=c.stable_id ORDER BY j.ingest_seq DESC LIMIT 1) detail,
     COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=c.stable_id AND h.session_id IS NOT NULL),
-      (SELECT binding FROM attachments a WHERE a.stable_id=c.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding
+      (SELECT binding FROM attachments a WHERE a.stable_id=c.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding,
+    CASE WHEN NOT EXISTS (SELECT 1 FROM session_hosts h WHERE h.stable_id=c.stable_id AND h.session_id IS NOT NULL)
+      AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.stable_id=c.stable_id AND a.valid=1)
+      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal j
+        WHERE j.stable_id=c.stable_id AND j.kind='session_started' ORDER BY j.ingest_seq DESC LIMIT 1) END host_probe_error
     FROM current c LEFT JOIN sessions s ON s.stable_id=c.stable_id
     WHERE c.q5_reason IN ('turn_hung','dead_connection')
     ORDER BY since DESC, c.stable_id DESC`).all() as Array<Omit<HungRow, "detail" | "hung_ms"> & JsonRow>;

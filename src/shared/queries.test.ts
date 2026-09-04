@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { ackRequest, queryHealth, queryHung, querySession } from "./queries";
+import { ackRequest, queryHealth, queryHung, queryJumpTarget, querySession } from "./queries";
 
 const NOW = 1_755_000_000_000;
 const HOUR = 3_600_000;
@@ -27,6 +27,43 @@ describe("ackRequest", () => {
       { request_uid: "local-ack", state: "acked" },
       { request_uid: "source-cancel", state: "cancelled" },
     ]);
+  });
+});
+
+describe("queryJumpTarget", () => {
+  test("surfaces only the latest session-start probe failure when no binding exists", () => {
+    const db = sessionFixture();
+    db.run("ALTER TABLE sessions ADD COLUMN host TEXT");
+    db.run("ALTER TABLE attachments ADD COLUMN platform TEXT");
+    db.run("ALTER TABLE session_hosts ADD COLUMN tty TEXT");
+    db.run("INSERT INTO sessions(stable_id) VALUES ('failed'), ('no-host')");
+    db.run(`INSERT INTO journal(ingest_seq, stable_id, kind, detail) VALUES
+      (1, 'failed', 'session_started', '{"host_probe_error":"ps_failed"}'),
+      (2, 'failed', 'session_started', '{"host_probe_error":"ps_timeout"}'),
+      (3, 'no-host', 'session_started', '{}')`);
+
+    expect(queryJumpTarget(db, "failed")?.host_probe_error).toBe("ps_timeout");
+    expect(queryJumpTarget(db, "no-host")?.host_probe_error).toBeNull();
+  });
+
+  test("leaves an existing binding unaffected", () => {
+    const db = sessionFixture();
+    db.run("ALTER TABLE sessions ADD COLUMN host TEXT");
+    db.run("ALTER TABLE attachments ADD COLUMN platform TEXT");
+    db.run("ALTER TABLE session_hosts ADD COLUMN tty TEXT");
+    db.run("INSERT INTO sessions(stable_id, origin) VALUES ('bound', 'pi')");
+    db.run("INSERT INTO session_hosts(stable_id, app, session_id) VALUES ('bound', 'cmux', 'surface-1')");
+    db.run(`INSERT INTO journal(ingest_seq, stable_id, kind, detail) VALUES
+      (1, 'bound', 'session_started', '{"host_probe_error":"ps_failed"}')`);
+
+    expect(queryJumpTarget(db, "bound")).toEqual({
+      host: null,
+      source: "host",
+      platform: "cmux",
+      binding: "surface-1",
+      tty: null,
+      host_probe_error: null,
+    });
   });
 });
 
@@ -95,7 +132,7 @@ describe("queryHung", () => {
     const db = new Database(":memory:");
     db.run("CREATE TABLE current(stable_id TEXT PRIMARY KEY, state TEXT, queue TEXT, q5_reason TEXT, last_event_at INTEGER, last_progress_at INTEGER)");
     db.run("CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, host TEXT)");
-    db.run("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, kind TEXT, detail TEXT)");
+    db.run("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, stable_id TEXT, kind TEXT, detail TEXT)");
     db.run("CREATE TABLE session_hosts(stable_id TEXT, app TEXT, session_id TEXT)");
     db.run("CREATE TABLE attachments(stable_id TEXT, platform TEXT, binding TEXT, observed_at INTEGER, valid INTEGER)");
     return db;
@@ -107,7 +144,7 @@ describe("queryHung", () => {
     db.run("INSERT INTO current VALUES ('local:omp:a','working','q5','dead_connection',?,?)", [NOW, NOW - 2 * HOUR]);
     db.run("INSERT INTO current VALUES ('local:pi:b','idle','q5','stalled',?,?)", [NOW, NOW]);
     db.run("INSERT INTO session_hosts VALUES ('local:omp:a','cmux','surface-9')");
-    db.run("INSERT INTO journal VALUES (1,'dead_connection',?)",
+    db.run("INSERT INTO journal VALUES (1,'local:omp:a','dead_connection',?)",
       [JSON.stringify({ stable_id: "local:omp:a", local: "192.168.1.5:55373", peer: "192.168.1.20:20128" })]);
 
     const rows = queryHung(db, NOW);

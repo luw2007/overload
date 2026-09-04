@@ -48,21 +48,27 @@ export async function scanCmux(db: Database, path: string, reducerBatchSize = 50
     const devInode = `${stat.dev}:${stat.ino}`;
     let generation = db.query(`SELECT generation_uuid, dev_inode, head_fp, fp_len, cursor_bytes, cursor_tail_fp
       FROM source_generations WHERE path=? AND retired=0 ORDER BY first_seen DESC, rowid DESC LIMIT 1`).get(path) as Generation | null;
-    const file = Buffer.alloc(stat.size);
-    if (file.length) {
-      const { bytesRead } = await handle.read(file, 0, file.length, 0);
-      if (bytesRead !== file.length) throw new Error(`short read from cmux workstream: ${path}`);
-    }
-    const firstNewline = file.indexOf(0x0a);
-    const headLine = firstNewline >= 0 ? file.subarray(0, firstNewline + 1) : null;
-
-    const changed = generation != null && (
-      generation.dev_inode !== devInode || stat.size < generation.cursor_bytes ||
-      (generation.head_fp != null && (headLine == null || headLine.length !== generation.fp_len || fingerprint(headLine) !== generation.head_fp)) ||
-      (generation.cursor_tail_fp != null && fingerprint(lastLineBefore(file, generation.cursor_bytes)) !== generation.cursor_tail_fp)
+    const hadGeneration = generation != null;
+    let headLine: Buffer | null = null;
+    let changed = generation != null && (
+      generation.dev_inode !== devInode || stat.size < generation.cursor_bytes
     );
 
+    if (generation && !changed) {
+      headLine = generation.head_fp != null && generation.fp_len != null
+        ? await readExact(handle, generation.fp_len, 0, path)
+        : await readHeadLine(handle, stat.size, path);
+      changed = (
+        (generation.head_fp != null && (headLine == null || headLine.length !== generation.fp_len || fingerprint(headLine) !== generation.head_fp)) ||
+        (generation.cursor_tail_fp != null && fingerprint(await readLastLineBefore(handle, generation.cursor_bytes, path)) !== generation.cursor_tail_fp)
+      );
+    }
+
+    let file: Buffer | null = null;
     if (!generation || changed) {
+      file = await readExact(handle, stat.size, 0, path);
+      const firstNewline = file.indexOf(0x0a);
+      headLine = firstNewline >= 0 ? file.subarray(0, firstNewline + 1) : null;
       generation = {
         generation_uuid: randomUUID(), dev_inode: devInode,
         head_fp: headLine ? fingerprint(headLine) : null, fp_len: headLine?.length ?? null,
@@ -74,14 +80,18 @@ export async function scanCmux(db: Database, path: string, reducerBatchSize = 50
       generation.fp_len = headLine.length;
     }
 
+    if (hadGeneration && !changed && stat.size === generation.cursor_bytes) {
+      return { inserted: 0, generation: generation.generation_uuid };
+    }
+
     const start = generation.cursor_bytes;
-    const remaining = file.subarray(start);
+    const remaining = file?.subarray(start) ?? await readExact(handle, stat.size - start, start, path);
     const lastNewline = remaining.lastIndexOf(0x0a);
     const end = lastNewline < 0 ? start : start + lastNewline + 1;
     const events: JournalEvent[] = [];
     let offset = 0;
     if (end > start) {
-      for (const line of file.subarray(start, end).toString("utf8").split("\n").slice(0, -1)) {
+      for (const line of remaining.subarray(0, end - start).toString("utf8").split("\n").slice(0, -1)) {
         const bytes = Buffer.byteLength(line) + 1;
         const event = translate(line, start + offset);
         if (event) events.push(event);
@@ -97,7 +107,7 @@ export async function scanCmux(db: Database, path: string, reducerBatchSize = 50
         ON CONFLICT(generation_uuid) DO UPDATE SET dev_inode=excluded.dev_inode, head_fp=excluded.head_fp,
           fp_len=excluded.fp_len, cursor_bytes=excluded.cursor_bytes, cursor_tail_fp=excluded.cursor_tail_fp`)
         .run(path, generation!.generation_uuid, devInode, generation!.head_fp, generation!.fp_len, end,
-          end > 0 ? fingerprint(lastLineBefore(file, end)) : null, Date.now());
+          end > start ? fingerprint(lastLineBefore(remaining, end - start)) : generation!.cursor_tail_fp, Date.now());
       const emitterId = `cmux-${generation!.generation_uuid}`;
       for (const event of events) {
         const stableId = `local:cmux:${event.session}`;
@@ -187,6 +197,46 @@ function lastLineBefore(file: Buffer, cursor: number): Buffer {
   if (cursor <= 0 || cursor > file.length || file[cursor - 1] !== 0x0a) return Buffer.alloc(0);
   const previous = file.lastIndexOf(0x0a, cursor - 2);
   return file.subarray(previous + 1, cursor);
+}
+
+async function readExact(handle: Awaited<ReturnType<typeof open>>, length: number, position: number, path: string): Promise<Buffer> {
+  const buffer = Buffer.alloc(length);
+  if (length) {
+    const { bytesRead } = await handle.read(buffer, 0, length, position);
+    if (bytesRead !== length) throw new Error(`short read from cmux workstream: ${path}`);
+  }
+  return buffer;
+}
+
+async function readHeadLine(handle: Awaited<ReturnType<typeof open>>, size: number, path: string): Promise<Buffer | null> {
+  const chunks: Buffer[] = [];
+  let position = 0;
+  while (position < size) {
+    const chunk = await readExact(handle, Math.min(4096, size - position), position, path);
+    const newline = chunk.indexOf(0x0a);
+    if (newline >= 0) {
+      chunks.push(chunk.subarray(0, newline + 1));
+      return Buffer.concat(chunks);
+    }
+    chunks.push(chunk);
+    position += chunk.length;
+  }
+  return null;
+}
+
+async function readLastLineBefore(handle: Awaited<ReturnType<typeof open>>, cursor: number, path: string): Promise<Buffer> {
+  if (cursor <= 0) return Buffer.alloc(0);
+  const chunks: Buffer[] = [Buffer.from("\n")];
+  let end = cursor - 1;
+  while (end > 0) {
+    const start = Math.max(0, end - 4096);
+    const chunk = await readExact(handle, end - start, start, path);
+    const newline = chunk.lastIndexOf(0x0a);
+    chunks.unshift(newline >= 0 ? chunk.subarray(newline + 1) : chunk);
+    if (newline >= 0) break;
+    end = start;
+  }
+  return Buffer.concat(chunks);
 }
 
 function fingerprint(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }

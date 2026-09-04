@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, open, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { initializeLedger, scanOnce } from "./ingest";
@@ -30,6 +30,39 @@ function row(kind: string, status: string, id: string, extra: Record<string, unk
 }
 
 describe("cmux workstream ingestion", () => {
+  test("reads only bounded verification bytes plus the appended tail in steady state", async () => {
+    const { path, db } = await fixture();
+    const initial = Array.from({ length: 512 }, (_, index) =>
+      `${row("sessionStart", "telemetry", `start-${index}`, { padding: "x".repeat(1024) })}\n`
+    ).join("");
+    await writeFile(path, initial);
+    await scanCmux(db, path);
+
+    const appended = `${row("question", "pending", "ask-tail")}\n`;
+    await appendFile(path, appended);
+
+    const probe = await open(path, "r");
+    const prototype = Object.getPrototypeOf(probe) as { read: (...args: any[]) => Promise<{ bytesRead: number }> };
+    await probe.close();
+    const originalRead = prototype.read;
+    const reads: Array<{ bytesRead: number; position: number | null }> = [];
+    prototype.read = async function (...args: any[]) {
+      const result = await originalRead.apply(this, args);
+      reads.push({ bytesRead: result.bytesRead, position: args[3] });
+      return result;
+    };
+
+    try {
+      expect((await scanCmux(db, path)).inserted).toBe(1);
+    } finally {
+      prototype.read = originalRead;
+    }
+
+    const bytesRead = reads.reduce((total, read) => total + read.bytesRead, 0);
+    expect(bytesRead).toBeLessThan(appended.length + 8192);
+    expect(reads.some((read) => read.position === initial.length)).toBeTrue();
+  });
+
   test("turns a real-shape pending question into a Q1 request and terminal status resolves it", async () => {
     const { path, db } = await fixture();
     const started = row("sessionStart", "telemetry", "start-1");
@@ -43,6 +76,21 @@ describe("cmux workstream ingestion", () => {
     expect((await scanCmux(db, path)).inserted).toBe(1);
     expect(db.query("SELECT state FROM requests WHERE request_id='ask-1'").get()).toEqual({ state: "resolved" });
     db.close();
+  });
+
+  test("detects rotation even when the replacement has the same head line", async () => {
+    const { root, path, db } = await fixture();
+    const head = row("sessionStart", "telemetry", "same-head");
+    await writeFile(path, `${head}\n${row("question", "pending", "old-question")}\n`);
+    const first = await scanCmux(db, path);
+
+    await rename(path, join(root, "workstream.old.jsonl"));
+    await writeFile(path, `${head}\n${row("question", "pending", "new-question")}\n`);
+    const second = await scanCmux(db, path);
+
+    expect(second.generation).not.toBe(first.generation);
+    expect(second.inserted).toBe(2);
+    expect((db.query("SELECT COUNT(*) AS count FROM source_generations WHERE path=?").get(path) as { count: number }).count).toBe(2);
   });
 
   test("detects truncate-and-regrow ABA with the same first line using cursor tail fingerprint", async () => {

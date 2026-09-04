@@ -19,10 +19,10 @@ function stringDetail(detail: Record<string, unknown>, key: string): string | un
   return typeof detail[key] === "string" && (detail[key] as string).length > 0 ? detail[key] as string : undefined;
 }
 function requestId(detail: Record<string, unknown>): string | undefined { return stringDetail(detail, "request_id"); }
-function terminalState(detail: Record<string, unknown>): string {
+function terminalState(detail: Record<string, unknown>): string | undefined {
   const candidate = detail.state ?? detail.outcome;
   if (typeof candidate === "string" && SOURCE_TERMINALS.has(candidate)) return candidate;
-  return detail.error === true ? "cancelled" : "resolved";
+  return detail.error === true ? "cancelled" : undefined;
 }
 /** The local admin emitter (recon; envelope check binds host to spool/local) probes every host and
  *  is authoritative for all of them; any other emitter may only target its own host. */
@@ -88,8 +88,8 @@ function applyEvent(db: Database, row: JournalRow): void {
   if (row.kind === "source_outage" || row.kind === "source_recovered") { applyIncident(db, row, detail); return; }
   if (row.kind === "session_started") applyHost(db, row, detail);
   if (row.kind === "attachment_observed") applyAttachment(db, row, detail);
-  const orphanedRequest = applyRequestEvent(db, row, detail);
-  applySessionEvent(db, row, detail, orphanedRequest);
+  const requestEffect = applyRequestEvent(db, row, detail);
+  applySessionEvent(db, row, detail, requestEffect);
 }
 
 function applyIncident(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
@@ -131,7 +131,7 @@ function applyAttachment(db: Database, row: JournalRow, detail: Record<string, u
   }
 }
 
-function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>, orphanedRequest: boolean): void {
+function applySessionEvent(db: Database, row: JournalRow, detail: Record<string, unknown>, requestEffect: false | "orphaned" | "unrecognized_resolution"): void {
   const relevant = new Set(["session_started", "working", "settled", "decision_requested", "decision_resolved", "session_ended", "session_vanished", "emitter_dead", "emitter_drained", "emitter_stalled", "turn_hung", "dead_connection", "telemetry_gap", "heartbeat", "tool_activity"]);
   if (!relevant.has(row.kind)) return;
   // A platform process without an attributable session is health evidence only;
@@ -156,13 +156,13 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
   if (row.kind === "session_started") origin = stringDetail(detail, "parent") ?? stringDetail(detail, "origin") ?? origin;
   if (row.kind === "working") state = "working";
   else if (row.kind === "settled") state = "idle";
-  else if (row.kind === "decision_requested") state = "awaiting_human";
+  else if (row.kind === "decision_requested" || requestEffect === "unrecognized_resolution") state = "awaiting_human";
   else if (row.kind === "decision_resolved") state = "idle";
   else if (row.kind === "session_ended") state = "done";
   else if (row.kind === "session_vanished") state = "vanished";
 
   const changeEvidence = hasChangeEvidence(db, stableId, row.ingest_seq);
-  const classificationFacts = { has_change_evidence: changeEvidence, orphaned_request: orphanedRequest };
+  const classificationFacts = { has_change_evidence: changeEvidence, orphaned_request: requestEffect === "orphaned" };
   const view = { ...current, stable_id: stableId, state, origin, ...classificationFacts };
   const classifierEvent: ClassifierEvent = { ingest_seq: row.ingest_seq, at: row.at, kind: row.kind, detail };
   for (const transition of classify({ ...current, ...classificationFacts }, classifierEvent)) {
@@ -179,8 +179,8 @@ function applySessionEvent(db: Database, row: JournalRow, detail: Record<string,
     last_event_at=?, last_heartbeat_at=?, last_progress_at=? WHERE stable_id=?`).run(projectedWriter, state, queue.queue, queue.q5_reason, origin, row.ingest_seq, lastEventAt, heartbeat, progress, stableId);
 }
 
-function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): boolean {
-  if (row.kind === "emitter_drained") return orphanDrainedEmitter(db, row, detail);
+function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): false | "orphaned" | "unrecognized_resolution" {
+  if (row.kind === "emitter_drained") return orphanDrainedEmitter(db, row, detail) ? "orphaned" : false;
   if (row.kind === "session_ended" || (row.kind === "settled" && platformFor(row.stable_id) === "cmux")) {
     db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE stable_id=? AND writer_id=? AND state='pending'").run(row.at, row.stable_id, row.writer_id);
     return false;
@@ -198,6 +198,18 @@ function applyRequestEvent(db: Database, row: JournalRow, detail: Record<string,
     return false;
   }
   const state = terminalState(detail);
+  if (!state) {
+    if (!existing) {
+      db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, detail)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(uid, row.stable_id, row.writer_id, row.emitter_id, id, kind, row.at, row.detail);
+    }
+    db.query(`INSERT INTO coverage_gaps(stable_id, emitter_id, from_seq, from_at, to_at, reason)
+      SELECT ?, ?, ?, ?, ?, 'unrecognized_decision_outcome'
+      WHERE NOT EXISTS (SELECT 1 FROM coverage_gaps
+        WHERE stable_id=? AND emitter_id=? AND from_seq=? AND reason='unrecognized_decision_outcome')`)
+      .run(row.stable_id, row.emitter_id, row.ingest_seq, row.at, row.at, row.stable_id, row.emitter_id, row.ingest_seq);
+    return "unrecognized_resolution";
+  }
   if (!existing) {
     db.query(`INSERT INTO requests(request_uid, stable_id, writer_id, origin_emitter_id, request_id, kind, state, created_at, resolved_at, detail)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(uid, row.stable_id, row.writer_id, row.emitter_id, id, kind, state, row.at, row.at, row.detail);

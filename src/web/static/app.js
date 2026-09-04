@@ -46,10 +46,14 @@
     return `<a href="#" class="drill" data-id="${escapeHtml(id)}">${escapeHtml(id)}</a>`;
   }
 
+  function missingJumpTarget(row) {
+    return row.host_probe_error ? `跳转目标探测失败：${escapeHtml(row.host_probe_error)}` : "暂无可跳转目标";
+  }
+
   /** Binding chip + copy/open pair, shared by decision cards and hung cards. */
   function jumpActions(row, idField, route) {
     const chip = `<span class="chip">${escapeHtml(bindingFor(row))}</span>`;
-    if (!row.binding) return `${chip}<span>暂无可跳转目标</span>`;
+    if (!row.binding) return `${chip}<span>${missingJumpTarget(row)}</span>`;
     const routeAttr = route ? ` data-route="${route}"` : "";
     return `${chip} <button class="btn copy-jump" data-binding="${escapeHtml(row.binding)}">复制</button><button class="btn primary jump" data-id="${escapeHtml(row[idField])}"${routeAttr} data-binding="${escapeHtml(row.binding)}">打开</button><span class="jump-status" aria-live="polite"></span>`;
   }
@@ -146,7 +150,7 @@
       ["宿主 App", escapeHtml(s.app ?? "-")],
       ["工作区", `${escapeHtml(s.cwd)}${s.branch ? ` (${escapeHtml(s.branch)})` : ""}`],
       ["时钟", escapeHtml(clocks)],
-      ["跳转", s.binding ? `<span class="chip">${escapeHtml(s.binding)}</span> <button class="btn primary jump" data-route="jump-session" data-id="${escapeHtml(s.stable_id)}" data-binding="${escapeHtml(s.binding)}">打开</button><span class="jump-status" aria-live="polite"></span>` : "暂无可跳转目标"],
+      ["跳转", s.binding ? `<span class="chip">${escapeHtml(s.binding)}</span> <button class="btn primary jump" data-route="jump-session" data-id="${escapeHtml(s.stable_id)}" data-binding="${escapeHtml(s.binding)}">打开</button><span class="jump-status" aria-live="polite"></span>` : missingJumpTarget(s)],
     ]);
     const replacement = view.latest_surface_session
       ? `<article class="decision-card"><strong>此 surface 已有较新会话</strong><div class="session-meta">${escapeHtml(view.latest_surface_session.state ?? "unknown")} · 最后事件 ${escapeHtml(formatTime(view.latest_surface_session.last_event_at))}</div><div class="session-actions">${sessionLink(view.latest_surface_session.stable_id)}</div></article>`
