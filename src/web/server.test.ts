@@ -413,3 +413,19 @@ describe("web API", () => {
     });
   });
 });
+
+test("hung and zombie API rows expose resume capability", async () => {
+  const path = seedLedger();
+  const db = new Database(path);
+  db.run("INSERT INTO current VALUES ('local:pi:dead', 'writer-dead', 'idle', 'q5', 'stalled', 'agent', 10, 1700000011000, 1700000011000, 1700000011000)");
+  db.close();
+  const { base } = await runningServer(path);
+
+  const hung = await (await fetch(`${base}/api/hung`)).json();
+  expect(hung[0]).toHaveProperty("resume_capability");
+  const zombie = await (await fetch(`${base}/api/zombie`)).json();
+  expect(zombie.groups[0].rows[0]).toMatchObject({
+    stable_id: "local:pi:dead",
+    resume_capability: { resumable: true, runtime: "pi" },
+  });
+});

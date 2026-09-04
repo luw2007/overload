@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ackRequest, queryHealth, queryHung, queryJumpTarget, querySession } from "./queries";
 
 const NOW = 1_755_000_000_000;
@@ -153,4 +155,10 @@ describe("queryHung", () => {
     expect(rows[0]!.hung_ms).toBe(2 * HOUR);
     expect(rows[0]!.detail).toMatchObject({ local: "192.168.1.5:55373" });
   });
+});
+
+test("HungRow declares the complete hung payload including resume capability", () => {
+  const source = readFileSync(join(import.meta.dir, "queries.ts"), "utf8");
+  const declaration = source.match(/export type HungRow = \{[^}]+\}/s)?.[0];
+  expect(declaration).toContain("resume_capability?: ResumeCapability | null");
 });

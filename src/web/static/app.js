@@ -123,7 +123,7 @@
 
   function renderDone() {
     $("content").innerHTML = state.archive.length
-      ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th>会话</th><th>来源</th><th>最后事件</th></tr></thead><tbody>${state.archive.map((row) => `<tr><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("")}</tbody></table></div>`
+      ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th>会话</th><th>来源</th><th>最后事件</th></tr></thead><tbody>${state.archive.map((row) => `<tr><td>${sessionLink(row.stable_id)} ${row.closed_out ? `<span class="chip">${escapeHtml("已收尾")}</span>` : ""}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("")}</tbody></table></div>`
       : "<p class='empty'>没有已归档会话</p>";
   }
 
@@ -217,9 +217,11 @@
   }
 
   function renderToolbar() {
-    const show = state.tab === "now" && state.selected.size > 0;
+    const show = (state.tab === "now" || state.tab === "inbox") && state.selected.size > 0;
     $("toolbar").classList.toggle("show", show);
     $("selected-count").textContent = `${state.selected.size} 项已选`;
+    $("bulk-ack").classList.toggle("hidden", state.tab !== "now");
+    $("bulk-closeout").classList.toggle("hidden", state.tab !== "inbox");
   }
 
   function renderZone() {
@@ -331,7 +333,9 @@
       const names = ["summary", "q1", "q2", "archive", "hung", "sessions", "zombie", "health"];
       const [summary, q1, q2, archive, hung, sessions, zombie, health] = await Promise.all(names.map((name) => fetchJson(`/api/${name}`)));
       Object.assign(state, { summary, q1, q2, archive, hung, sessions, zombie, health });
-      const liveIds = new Set(q1.map((row) => row.request_uid));
+      const q1Ids = q1.map((row) => row.request_uid);
+      const q2Ids = q2.map((row) => row.stable_id);
+      const liveIds = new Set([...q1Ids, ...q2Ids]);
       state.selected = new Set([...state.selected].filter((id) => liveIds.has(id)));
       // An open drill-down owns the pane; refreshing under it would scroll the
       // reader back to the top every three seconds.
@@ -351,6 +355,7 @@
   }));
   $("clear-selection").addEventListener("click", () => { state.selected.clear(); renderZone(); });
   $("bulk-ack").addEventListener("click", () => ack([...state.selected]));
+  $("bulk-closeout").addEventListener("click", () => closeout([...state.selected]));
   restoreRoute();
   refresh();
   addEventListener("popstate", () => { state.session = null; state.detail = null; restoreRoute(); refresh(); });

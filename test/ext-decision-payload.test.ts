@@ -70,6 +70,25 @@ beforeAll(async () => {
   });
   dispatch("tool_call", { toolName: "ask", toolCallId: "call-unknown-shape", input: { legacyField: "whatever" } });
   dispatch("tool_call", { toolName: "ask", toolCallId: "call-no-input" });
+  dispatch("tool_call", {
+    toolName: "ask_user",
+    toolCallId: "call-ask-user",
+    input: {
+      questions: [{
+        question: "Choose rollout strategy",
+        options: [
+          { label: "Canary", description: "Start with ten percent" },
+          { label: "All at once" },
+        ],
+      }],
+    },
+  });
+  dispatch("tool_execution_end", {
+    toolName: "ask_user",
+    toolCallId: "call-ask-user",
+    result: { content: [{ type: "text", text: "Canary" }] },
+    isError: false,
+  });
   dispatch("tool_call", { toolName: "bash", toolCallId: "call-gated", input: { command: "echo hi" } });
 
   // session_shutdown flushes and seals the segment (EXT-13), making the read
@@ -115,6 +134,19 @@ describe("ask tool_call decision_requested payload capture", () => {
 
   test("missing input omits summary/options", () => {
     expect(eventFor("call-no-input")?.detail).toEqual({ request_id: "call-no-input" });
+  });
+
+  test("bundled ask_user emits paired requested and resolved events", () => {
+    expect(eventFor("call-ask-user")?.detail).toEqual({
+      request_id: "call-ask-user",
+      summary: "Choose rollout strategy",
+      options: ["Canary", "All at once"],
+    });
+    expect(events.find((event) => event.kind === "decision_resolved" && event.detail?.request_id === "call-ask-user")?.detail).toEqual({
+      request_id: "call-ask-user",
+      state: "resolved",
+      selected: "Canary",
+    });
   });
 
   test("non-ask tool_call never produces a decision_requested with summary/options", () => {

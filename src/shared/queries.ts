@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { ResumeCapability } from "./resume";
 
 export type Handoff = { path: string; status: "complete" | "partial" | "blocked" | "unknown"; uncertainties: number; next_owner?: string; task?: string };
 export type SessionSummary = { stable_id: string; runtime: string | null; origin: string | null; created_at: number | null; state: string | null; queue: string | null; q5_reason: string | null; last_event_at: number | null; handoff: Handoff | null };
@@ -22,8 +23,9 @@ export type Q1Row = { request_uid: string; stable_id: string; host: string | nul
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null; host_probe_error: string | null };
 export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
 export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number; closed_out?: true };
+export type HungRow = { stable_id: string; q5_reason: string; state: string; host: string | null; since: number | null; hung_ms: number; binding: string | null; detail: Record<string, unknown> | null; resume_capability?: ResumeCapability | null };
 export type ZombieView = {
-  groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number; handoff: Handoff | null }> }>;
+  groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number; handoff: Handoff | null; resume_capability?: ResumeCapability | null }> }>;
   orphaned_requests: Array<{ request_uid: string; stable_id: string; resolved_at: number | null }>;
 };
 export type HealthView = {

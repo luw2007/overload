@@ -363,6 +363,7 @@ export default function overload(pi: ExtensionApi): void {
   const runtime = detectRuntime()
   const spool = new SpoolWriter(runtime)
   const pendingAsk = new Set<string>()
+  const isAskTool = (name: unknown) => name === "ask" || name === "ask_user"
   const headByCwd = new Map<string, string>()
   let session = safeComponent(randomUUID(), "session")
   let stableId = ""
@@ -720,7 +721,7 @@ export default function overload(pi: ExtensionApi): void {
       lastToolActivity = now
       emit("tool_activity", { tool: truncateUtf8(tool, 80), ...(changeCapable ? { change: true } : {}) })
     }
-    if (event?.toolName === "ask" && typeof event.toolCallId === "string") {
+    if (isAskTool(event?.toolName) && typeof event.toolCallId === "string") {
       pendingAsk.add(event.toolCallId)
       emit("decision_requested", { request_id: event.toolCallId, ...questionPayload(event.input) })
     }
@@ -745,7 +746,7 @@ export default function overload(pi: ExtensionApi): void {
     }
   })
   on("tool_execution_end", (event) => {
-    if (event?.toolName !== "ask" || !pendingAsk.delete(event.toolCallId)) return
+    if (!isAskTool(event?.toolName) || !pendingAsk.delete(event.toolCallId)) return
     const selected = selectedOption(event.result)
     emit("decision_resolved", {
       request_id: event.toolCallId,

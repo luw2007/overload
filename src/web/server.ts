@@ -50,7 +50,7 @@ const dashboardHtml = `<!doctype html>
 <main class="b-wrap"><div id="error" class="error hidden"></div><section class="b-tiles">
 <div class="b-tile alert"><div class="num" id="tile-now">—</div><div class="label">Now 待处理</div></div><div class="b-tile"><div class="num" id="tile-inbox">—</div><div class="label">Inbox 待批量</div></div>
 </section><nav class="b-tabs" aria-label="数据集"><button class="b-tab active" data-tab="now">Now</button><button class="b-tab" data-tab="inbox">Inbox</button><button class="b-tab" data-tab="done">Done</button><span class="b-tabs-secondary"><button class="b-tab secondary" data-tab="sessions">会话</button><button class="b-tab secondary" data-tab="health">Health</button></span></nav>
-<div class="b-toolbar" id="toolbar"><span id="selected-count">0 项已选</span><button class="btn primary" id="bulk-ack">批量 Ack</button><button class="btn" id="clear-selection">取消</button></div><div id="detail" class="hidden"></div><div class="b-content" id="content"></div></main><script src="/static/app.js"></script></body></html>`;
+<div class="b-toolbar" id="toolbar"><span id="selected-count">0 项已选</span><button class="btn primary" id="bulk-ack">批量 Ack</button><button class="btn primary hidden" id="bulk-closeout">批量收尾</button><button class="btn" id="clear-selection">取消</button></div><div id="detail" class="hidden"></div><div class="b-content" id="content"></div></main><script src="/static/app.js"></script></body></html>`;
 
 const staticAppPath = fileURLToPath(new URL("./static/app.js", import.meta.url));
 
@@ -104,8 +104,11 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
         if (request.method === "GET" && url.pathname === "/api/q1") return json(withReadonlyDb(ledgerPath, queryQ1).map(({ platform: _platform, ...row }) => row));
         if (request.method === "GET" && url.pathname === "/api/q2") return json(withReadonlyDb(ledgerPath, queryQ2));
         if (request.method === "GET" && url.pathname === "/api/archive") return json(withReadonlyDb(ledgerPath, queryArchive));
-        if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyDb(ledgerPath, queryZombie));
-        if (request.method === "GET" && url.pathname === "/api/hung") return json(withReadonlyDb(ledgerPath, (db) => queryHung(db)));
+        if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyDb(ledgerPath, (db) => {
+          const view = queryZombie(db);
+          return { ...view, groups: view.groups.map((group) => ({ ...group, rows: group.rows.map((row) => ({ ...row, resume_capability: inspectResume(db, row.stable_id, options.processAlive) })) })) };
+        }));
+        if (request.method === "GET" && url.pathname === "/api/hung") return json(withReadonlyDb(ledgerPath, (db) => queryHung(db).map((row) => ({ ...row, resume_capability: inspectResume(db, row.stable_id, options.processAlive) }))));
         if (request.method === "GET" && url.pathname === "/api/health") return json(withReadonlyDb(ledgerPath, queryHealth));
         if (request.method === "GET" && url.pathname.startsWith("/api/sessions/")) {
           const stableId = routeParameter(url.pathname.slice("/api/sessions/".length));
