@@ -382,12 +382,12 @@ export default function overload(pi: ExtensionApi): void {
     spool.enqueue({ session, kind, ...(detail ? { detail } : {}) })
   }
 
-  function warnAndDisableGate(error: unknown): void {
+  function warnAndSealGate(error: unknown): void {
     const message = (error as Error)?.message || String(error)
     approvalGate = { bash: [], requireBash: [], writePaths: [], requireWritePaths: [], timeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS, webPort: DEFAULT_WEB_PORT, misconfigured: message }
     if (gateWarned) return
     gateWarned = true
-    console.warn("[overload] invalid approval_gate configuration; gate disabled:", message)
+    console.warn("[overload] invalid approval_gate configuration; blocking all bash/write/edit until it is fixed:", message)
   }
 
   async function loadApprovalGate(): Promise<void> {
@@ -432,7 +432,7 @@ export default function overload(pi: ExtensionApi): void {
         webPort,
       }
     } catch (error) {
-      warnAndDisableGate(error)
+      warnAndSealGate(error)
     }
   }
   function gateRule(event: any): GateRule | undefined {
