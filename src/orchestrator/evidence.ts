@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { CommandExecutor } from "./worktree";
@@ -12,9 +12,9 @@ export async function collectEvidence(worktreeDir:string,taskId:string,baseRef:s
     executor("git",["status","--porcelain"],{cwd:worktreeDir}),
   ]);
   const check=join(worktreeDir,"orchestrator.check");
-  // Deliberately require a regular file with an executable bit; a merely tracked file is not executable.
-  const executable=existsSync(check)&&statSync(check).isFile()&&(statSync(check).mode&0o111)!==0;
-  const checked=executable?await executor(check,[],{cwd:worktreeDir}):null;
+  // Only a missing path means no check. A present but non-executable/broken check is
+  // still attempted so the executor's spawn error is preserved as failed evidence.
+  const checked=existsSync(check)?await executor(check,[],{cwd:worktreeDir}):null;
   const dir=join(artifactsRoot,taskId);mkdirSync(dir,{recursive:true,mode:0o700});chmodSync(dir,0o700);
   const runnerPath=join(dir,"runner.log");const prior=existsSync(runnerPath)?readFileSync(runnerPath,"utf8"):"";
   const runnerLogTail=prior.slice(-64*1024);

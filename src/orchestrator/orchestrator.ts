@@ -72,6 +72,7 @@ export class Orchestrator {
     if(defaultPidAlive(task.runner_pid)||!task.worktree)return;
     try { const evidence=await collectEvidence(task.worktree,task.task_id,task.base_ref,this.worktreeExec,this.artifactsDir),ready=evidenceReady(evidence);
       if(ready.ready){transition(this.db,task.task_id,"runner_exit",{evidence_complete:true},now);requestApproval(this.db,this.spool,task.task_id,"ready","Approve these verified changes?",["approve","reject","abandon"]);}
+      else if(ready.reason==="no_check")transition(this.db,task.task_id,"check_absent",{reason:ready.reason},now);
       else transition(this.db,task.task_id,"runner_exit",{evidence_complete:false,reason:ready.reason},now);
     } catch(error) { transition(this.db,task.task_id,"runner_exit",{evidence_complete:false,reason:"evidence_collection_failed",error:String((error as Error).message??error)},now); }
   }
