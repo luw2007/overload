@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { queryArchive, queryQ2 } from "../shared/queries";
 import { startWebServer } from "./server";
 
 const roots: string[] = [];
@@ -56,12 +57,31 @@ describe("web API", () => {
     expect(server.hostname).toBe("127.0.0.1");
     const response = await fetch(`${base}/api/summary`);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ q1: 1, hung: 1, open_incidents: 1, coverage_gaps: 1, telemetry_gaps: 1 });
+    expect(await response.json()).toEqual({ q1: 1, q2: 1, hung: 1, open_incidents: 1, coverage_gaps: 1, telemetry_gaps: 1 });
   });
 
-  test("/api/q2 route is gone (D1)", async () => {
-    const { base } = await runningServer(seedLedger());
-    expect((await fetch(`${base}/api/q2`)).status).toBe(404);
+  test("queries fresh readonly ledgers without the optional closeouts table", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-web-fresh-"));
+    roots.push(root);
+    const path = join(root, "ledger.db");
+    const writable = new Database(path);
+    writable.exec(await Bun.file(new URL("../ingest/schema.sql", import.meta.url)).text());
+    writable.run("INSERT INTO current(stable_id, writer_id, state, queue, origin, last_event_at) VALUES ('known', 'w', 'done', 'q2', 'agent', 2), ('unknown', 'w', 'done', 'q2', 'unknown', 1)");
+    writable.close();
+    const readonly = new Database(path, { readonly: true });
+    expect(queryQ2(readonly)).toEqual([{ stable_id: "known", origin: "agent", last_event_at: 2 }]);
+    expect(queryArchive(readonly)).toEqual([{ stable_id: "unknown", origin: "unknown", last_event_at: 1 }]);
+    readonly.close();
+  });
+
+  test("closeout moves q2 work to archive", async () => {
+    const path = seedLedger();
+    const { base } = await runningServer(path);
+    const headers = { origin: base };
+    expect(await (await fetch(`${base}/api/closeout/done:pi:beta`, { method: "POST", headers })).json()).toEqual({ closed: true });
+    expect(await (await fetch(`${base}/api/q2`)).json()).toEqual([]);
+    expect(await (await fetch(`${base}/api/archive`)).json()).toContainEqual({ stable_id: "done:pi:beta", origin: "agent", last_event_at: 1_700_000_003_000, closed_out: true });
+    expect((await fetch(`${base}/api/closeout/missing`, { method: "POST", headers })).status).toBe(404);
   });
 
   test("reads, creates, and deletes an orchestrator answer mailbox row", async () => {
@@ -88,7 +108,7 @@ describe("web API", () => {
     const response = await fetch(`${base}/api/orchestrator/answer/id`, { method: "DELETE" });
     expect(response.status).toBe(403);
   });
-  test("archive includes both q2 and q4 rows", async () => {
+  test("archive includes q4 and unproven q2 rows", async () => {
     const path = seedLedger();
     const db = new Database(path);
     db.run("INSERT INTO current VALUES ('done:pi:unknown', 'writer', 'done', 'q2', NULL, 'unknown', 3, 1700000004000, NULL, NULL)");
@@ -99,7 +119,6 @@ describe("web API", () => {
     expect(await (await fetch(`${base}/api/archive`)).json()).toEqual([
       { stable_id: "done:pi:autoverified", origin: "agent", last_event_at: 1_700_000_005_000 },
       { stable_id: "done:pi:unknown", origin: "unknown", last_event_at: 1_700_000_004_000 },
-      { stable_id: "done:pi:beta", origin: "agent", last_event_at: 1_700_000_003_000 },
     ]);
   });
 

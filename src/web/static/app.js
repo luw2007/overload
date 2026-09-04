@@ -3,7 +3,7 @@
   // the attention zone that now owns their data (AGENTS.md 产品界面原则).
   const LEGACY_ZONE = { q1: "now", hung: "now", q2: "inbox", zombie: "inbox", archive: "done" };
   const ZONES = ["now", "inbox", "done", "sessions", "health"];
-  const state = { tab: "now", selected: new Set(), summary: null, q1: [], archive: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
+  const state = { tab: "now", selected: new Set(), summary: null, q1: [], q2: [], archive: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? "-").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
   const formatTime = (value) => value == null ? "-" : new Date(value).toLocaleString();
@@ -13,6 +13,10 @@
     return minutes < 60 ? `${minutes} 分钟` : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
   };
   const hungLabel = { turn_hung: "无进展", dead_connection: "连接已死" };
+  const hungImpact = { turn_hung: "回合已停滞，上下文持续占用", dead_connection: "连接已断，会话无法继续" };
+  const ASK_IMPACT = "会话挂起等待回答，此期间无进展";
+  const ageText = (ms) => { const seconds = Math.floor(ms / 1000); if (seconds < 60) return `${seconds} 秒`; const minutes = Math.floor(ms / 60000); return minutes < 60 ? `${minutes} 分钟` : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`; };
+  const AGE_WARN_MS = 30 * 60 * 1000;
   const zombieHint = { stalled: "事件流已停止，需人工确认会话是否还在运行。", dead_incarnation: "进程已消失，记录保留供核查，无需动作。", telemetry_gap: "遥测出现缺口，可能丢失部分事件。" };
 
   async function fetchJson(path, options) {
@@ -61,30 +65,22 @@
   function decisionCard(row) {
     const isOrchestratorGate = row.detail && typeof row.detail.gate === "string";
     const approvalId = row.detail?.approval_id ?? row.detail?.request_id;
-    const options = Array.isArray(row.options) && row.options.length
-      ? isOrchestratorGate && approvalId
-        ? `<div class="option-chips">${row.options.map((option) => `<button class="btn primary approve" data-approval-id="${escapeHtml(approvalId)}" data-answer="${escapeHtml(option)}">${escapeHtml(option)}</button>`).join("")}</div>`
-        : `<div class="option-chips">${row.options.map((option) => `<span class="chip">${escapeHtml(option)}</span>`).join("")}</div>`
-      : "";
-    const ackOrApprove = isOrchestratorGate && approvalId && !(Array.isArray(row.options) && row.options.length)
-      ? `<button class="btn primary approve" data-approval-id="${escapeHtml(approvalId)}" data-answer="approve">批准并继续</button>`
-      : `<button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button>`;
-    return `<article class="decision-card">
-      <div class="decision-card-head">${rowCheckbox(row.request_uid)}<div class="decision-card-summary">${escapeHtml(row.summary ?? "(未采集问题内容)")}</div></div>
-      ${row.detail?.rule || row.detail?.command ? `<div class="impact-line">${row.detail?.rule ? `规则：${escapeHtml(row.detail.rule)}` : ""}${row.detail?.rule && row.detail?.command ? " · " : ""}${row.detail?.command ? `命令：${escapeHtml(row.detail.command)}` : ""}</div>` : ""}
-      ${options}
-      <div class="decision-card-meta">${sessionLink(row.stable_id)} · <span class="chip">${escapeHtml(row.kind)}</span> · ${escapeHtml(formatTime(row.created_at))}</div>
-      <div class="decision-card-actions">${jumpActions(row, "request_uid")}${ackOrApprove}</div>
-    </article>`;
+    const age = Date.now() - row.created_at;
+    const options = Array.isArray(row.options) && row.options.length ? `<div class="option-chips">${row.options.map((option) => isOrchestratorGate && approvalId ? `<button class="btn primary approve" data-approval-id="${escapeHtml(approvalId)}" data-answer="${escapeHtml(option)}">${escapeHtml(option)}</button>` : `<span class="option-chip">${escapeHtml(option)}</span>`).join("")}</div>` : "";
+    const gate = isOrchestratorGate ? `<div class="meta">门禁：${escapeHtml(row.detail.gate)}${row.detail.rule ? ` · 规则：${escapeHtml(row.detail.rule)}` : ""}${row.detail.command ? ` · 命令：${escapeHtml(row.detail.command)}` : ""}</div>` : "";
+    return `<article class="card decision-card">${rowCheckbox(row.request_uid)}<div class="card-main"><div class="headline"><span class="dot red"></span>${escapeHtml(row.summary || row.detail?.question || row.detail?.prompt || `${row.kind} 需要决策`)}</div><div class="meta">${sessionLink(row.stable_id)} · ${escapeHtml(row.host || "未知主机")} · <span class="age-chip${age >= AGE_WARN_MS ? " age-warn" : ""}">等待 ${ageText(age)}</span></div>${gate}<div class="impact-line">${ASK_IMPACT}</div>${options}</div><div class="actions"><button class="btn danger ack" data-id="${escapeHtml(row.request_uid)}">确认并归档</button>${jumpActions(row, "request_uid", "q1")}</div></article>`;
   }
 
   function hungCard(row) {
     const evidence = row.detail?.local ? `${row.detail.local} -> ${row.detail.peer}` : bindingFor(row);
+    const capability = row.resume_capability;
+    const resumeBtn = capability?.resumable ? `<button class="btn primary resume-session" data-id="${escapeHtml(row.stable_id)}">Resume</button><span class="resume-status" aria-live="polite"></span>` : "";
     return `<article class="decision-card hung">
       <div class="decision-card-head"><strong>${sessionLink(row.stable_id)}</strong><span class="chip">${escapeHtml(hungLabel[row.q5_reason] ?? row.q5_reason)}</span></div>
-      <div class="decision-card-meta">卡住 ${escapeHtml(formatDuration(row.hung_ms))} · 最后进展 ${escapeHtml(formatTime(row.since))}</div>
+      <div class="impact-line">${escapeHtml(hungImpact[row.q5_reason] ?? "会话异常，需人工确认")}</div>
+      <div class="decision-card-meta">卡住 ${escapeHtml(formatDuration(row.hung_ms))} · 最后进展 ${ageChip(row.since)}</div>
       <div class="decision-card-meta">证据 <code>${escapeHtml(evidence)}</code></div>
-      <div class="decision-card-actions">${jumpActions(row, "stable_id", "jump-session")}</div>
+      <div class="decision-card-actions">${jumpActions(row, "stable_id", "jump-session")}${resumeBtn}</div>
     </article>`;
   }
 
@@ -112,10 +108,17 @@
   }
 
   function renderInbox() {
-    const groupCards = state.zombie.groups.map((group) => `<article class="hint-card"><div class="decision-card-head"><strong>${escapeHtml(group.q5_reason)}</strong><span class="chip">${group.rows.length} 个会话</span></div><p class="hint-text">${escapeHtml(zombieHint[group.q5_reason] ?? "需人工核查。")}</p><div class="decision-cards">${group.rows.map((row) => `<span class="chip">${sessionLink(row.stable_id)} · ${escapeHtml(formatTime(row.last_event_at))}</span>`).join(" ")}</div></article>`).join("");
+    const q2Html = state.q2.length
+      ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th></th><th>会话</th><th>来源</th><th>最后事件</th><th></th></tr></thead><tbody>${state.q2.map((row) => `<tr><td>${rowCheckbox(row.stable_id)}</td><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td><td><button class="btn closeout" data-id="${escapeHtml(row.stable_id)}">收尾</button></td></tr>`).join("")}</tbody></table></div>`
+      : "<p class='empty'>没有待收尾会话</p>";
+    const groupCards = state.zombie.groups.map((group) => `<article class="hint-card"><div class="decision-card-head"><strong>${escapeHtml(group.q5_reason)}</strong><span class="chip">${group.rows.length} 个会话</span></div><p class="hint-text">${escapeHtml(zombieHint[group.q5_reason] ?? "需人工核查。")}</p><div class="decision-cards">${group.rows.map((row) => {
+      const capability = row.resume_capability;
+      const resumeBtn = capability?.resumable ? `<button class="btn primary resume-session" data-id="${escapeHtml(row.stable_id)}">Resume</button><span class="resume-status" aria-live="polite"></span>` : "";
+      return `<span class="chip">${sessionLink(row.stable_id)} · ${escapeHtml(formatTime(row.last_event_at))}</span>${resumeBtn}`;
+    }).join(" ")}</div></article>`).join("");
     const orphanedCards = state.zombie.orphaned_requests.map((row) => `<article class="hint-card"><div class="decision-card-head"><strong>orphaned_request</strong><span class="chip">${sessionLink(row.stable_id)}</span></div><p class="hint-text">会话已结束，请求随之失效。</p><div class="decision-card-actions"><button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></div></article>`).join("");
     const zombieHtml = groupCards || orphanedCards ? `<h3>Zombie</h3>${groupCards}${orphanedCards}` : "";
-    $("content").innerHTML = zombieHtml || "<p class='empty'>Inbox 为空</p>";
+    $("content").innerHTML = `<h3>待收尾</h3>${q2Html}${zombieHtml}`;
   }
 
   function renderDone() {
@@ -235,6 +238,7 @@
       renderZone();
     }));
     document.querySelectorAll(".ack").forEach((button) => button.addEventListener("click", () => ack([button.dataset.id])));
+    document.querySelectorAll(".closeout").forEach((button) => button.addEventListener("click", () => closeout([button.dataset.id])));
     document.querySelectorAll(".approve").forEach((button) => button.addEventListener("click", () => approve(button)));
     document.querySelectorAll(".copy-jump").forEach((button) => button.addEventListener("click", () => copyBinding(button.dataset.binding, button.parentElement.querySelector(".jump-status"))));
     document.querySelectorAll(".jump").forEach((button) => button.addEventListener("click", () => jump(button)));
@@ -299,6 +303,14 @@
     } catch (error) { showError(error); }
   }
 
+  async function closeout(ids) {
+    try {
+      await Promise.all(ids.map((id) => fetchJson(`/api/closeout/${encodeURIComponent(id)}`, { method: "POST" })));
+      ids.forEach((id) => state.selected.delete(id));
+      await refresh();
+    } catch (error) { showError(error); }
+  }
+
   async function approve(button) {
     button.disabled = true;
     try {
@@ -316,9 +328,9 @@
 
   async function refresh() {
     try {
-      const names = ["summary", "q1", "archive", "hung", "sessions", "zombie", "health"];
-      const [summary, q1, archive, hung, sessions, zombie, health] = await Promise.all(names.map((name) => fetchJson(`/api/${name}`)));
-      Object.assign(state, { summary, q1, archive, hung, sessions, zombie, health });
+      const names = ["summary", "q1", "q2", "archive", "hung", "sessions", "zombie", "health"];
+      const [summary, q1, q2, archive, hung, sessions, zombie, health] = await Promise.all(names.map((name) => fetchJson(`/api/${name}`)));
+      Object.assign(state, { summary, q1, q2, archive, hung, sessions, zombie, health });
       const liveIds = new Set(q1.map((row) => row.request_uid));
       state.selected = new Set([...state.selected].filter((id) => liveIds.has(id)));
       // An open drill-down owns the pane; refreshing under it would scroll the

@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
-import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
+import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
 
@@ -67,6 +67,11 @@ function routeParameter(value: string): string {
   try { return decodeURIComponent(value); } catch { return value; }
 }
 
+function ensureCloseouts(path: string): void {
+  const db = new Database(path);
+  try { db.exec("CREATE TABLE IF NOT EXISTS closeouts(stable_id TEXT PRIMARY KEY, closed_at INTEGER NOT NULL)"); } finally { db.close(); }
+}
+
 /** CSRF hygiene, not caller binding (plan §5.1): Host blocks DNS rebinding, Origin
  *  blocks cross-site POST. Any same-UID local process can still supply both headers. */
 function checkOrigin(request: Request, port: number): Response | null {
@@ -78,6 +83,7 @@ function checkOrigin(request: Request, port: number): Response | null {
 export function startWebServer(options: { ledgerPath?: string; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe } = {}) {
   const ledgerPath = options.ledgerPath ?? process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
   const port = options.port ?? DEFAULT_WEB_PORT;
+  ensureCloseouts(ledgerPath);
   return Bun.serve({
     // Loopback is the v1 trust boundary. Add authentication before supporting
     // shared machines or any non-loopback bind address.
@@ -92,10 +98,11 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
         if (originError) return originError;
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
-          return { q1: queryQ1(db).length, hung: queryHung(db).length, open_incidents: health.open_incidents.length, coverage_gaps: health.coverage_gaps, telemetry_gaps: health.telemetry_gaps };
+          return { q1: queryQ1(db).length, q2: queryQ2(db).length, hung: queryHung(db).length, open_incidents: health.open_incidents.length, coverage_gaps: health.coverage_gaps, telemetry_gaps: health.telemetry_gaps };
         }));
         if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive) }))));
         if (request.method === "GET" && url.pathname === "/api/q1") return json(withReadonlyDb(ledgerPath, queryQ1).map(({ platform: _platform, ...row }) => row));
+        if (request.method === "GET" && url.pathname === "/api/q2") return json(withReadonlyDb(ledgerPath, queryQ2));
         if (request.method === "GET" && url.pathname === "/api/archive") return json(withReadonlyDb(ledgerPath, queryArchive));
         if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyDb(ledgerPath, queryZombie));
         if (request.method === "GET" && url.pathname === "/api/hung") return json(withReadonlyDb(ledgerPath, (db) => queryHung(db)));
@@ -124,6 +131,18 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
           try {
             const result = await resumeSession(db, stableId, options.resume, options.processAlive);
             return result ? json(result, { status: result.resumed ? 200 : 409 }) : json({ error: "session not found" }, { status: 404 });
+          } finally { db.close(); }
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/api/closeout/")) {
+          const stableId = routeParameter(url.pathname.slice("/api/closeout/".length));
+          const db = new Database(ledgerPath);
+          db.exec("PRAGMA busy_timeout=5000");
+          try {
+            const current = db.query("SELECT queue FROM current WHERE stable_id=?").get(stableId) as { queue: string | null } | null;
+            if (!current) return json({ error: "session not found" }, { status: 404 });
+            if (current.queue !== "q2") return json({ error: "session is not eligible for closeout" }, { status: 409 });
+            db.run("INSERT OR IGNORE INTO closeouts(stable_id, closed_at) VALUES (?, ?)", [stableId, Date.now()]);
+            return json({ closed: true });
           } finally { db.close(); }
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/ack/")) {

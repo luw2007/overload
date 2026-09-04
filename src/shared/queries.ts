@@ -20,6 +20,8 @@ export type SessionDetail = {
 };
 export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null; host_probe_error: string | null; summary: string | null; options: string[] | null };
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null; host_probe_error: string | null };
+export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
+export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number; closed_out?: true };
 export type ZombieView = {
   groups: Array<{ q5_reason: string; rows: Array<{ stable_id: string; last_event_at: number; handoff: Handoff | null }> }>;
   orphaned_requests: Array<{ request_uid: string; stable_id: string; resolved_at: number | null }>;
@@ -47,6 +49,10 @@ function parseDetail(value: string | null): Record<string, unknown> | null {
 
 function withParsedDetail<T extends JsonRow>(row: T): Omit<T, "detail"> & { detail: Record<string, unknown> | null } {
   return { ...row, detail: parseDetail(row.detail) };
+}
+
+function hasCloseouts(db: Database): boolean {
+  return Boolean(db.query("SELECT 1 present FROM sqlite_master WHERE type='table' AND name='closeouts'").get());
 }
 
 function detailSummary(detail: Record<string, unknown> | null): string | null {
@@ -187,9 +193,19 @@ export function queryHung(db: Database, now = Date.now()): HungRow[] {
   return rows.map((row) => ({ ...withParsedDetail(row), hung_ms: row.since ? Math.max(0, now - row.since) : 0 }));
 }
 
-/** Done: session terminated, no longer needs attention. Audit view, not a todo. */
+/** Inbox: ended sessions that have not been explicitly closed out by an operator. */
+export function queryQ2(db: Database): Q2Row[] {
+  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin!='unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
+  return db.query("SELECT c.stable_id, c.origin, c.last_event_at FROM current c LEFT JOIN closeouts x ON x.stable_id=c.stable_id WHERE c.queue='q2' AND c.origin!='unknown' AND x.stable_id IS NULL ORDER BY c.last_event_at DESC, c.stable_id DESC").all() as Q2Row[];
+}
+
+/** Done: terminal sessions plus operator-closed Q2 work. Audit view, not a todo. */
 export function queryArchive(db: Database): ArchiveRow[] {
-  return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue IN ('q2','q4') ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
+  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q4' OR (queue='q2' AND origin='unknown') ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
+  return db.query(`SELECT c.stable_id, c.origin, c.last_event_at, CASE WHEN x.stable_id IS NOT NULL THEN 1 END closed_out
+    FROM current c LEFT JOIN closeouts x ON x.stable_id=c.stable_id
+    WHERE c.queue='q4' OR (c.queue='q2' AND (c.origin='unknown' OR x.stable_id IS NOT NULL))
+    ORDER BY c.last_event_at DESC, c.stable_id DESC`).all().map((row: any) => ({ ...row, ...(row.closed_out ? { closed_out: true as const } : { closed_out: undefined }) }));
 }
 
 export function queryZombie(db: Database): ZombieView {
