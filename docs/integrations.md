@@ -12,6 +12,37 @@ When a session's bash tool spawns another agent CLI (`pi`, `omp`,
 parent. Compound commands (pipes, substitution, quoting wrappers) are
 never rewritten; dispatch templates own env injection there.
 
+### Handoff packet
+
+When an agent finishes a run it may leave a `HANDOFF.md` in the session's
+working directory. The extension reads it on `agent_end` and attaches a
+summary to the `settled` event; Overload never writes or edits the file.
+Only a file modified during the current run counts, so a stale packet from
+an earlier session in the same directory is ignored.
+
+The parser looks for these lines, in any order, each as `KEY: value` (a
+dash or em-dash also works as the separator):
+
+```
+TASK: one line describing the work
+STATUS: complete | partial | blocked
+NEXT_OWNER: who should pick this up
+UNCERTAINTIES:
+- one open question per line
+- the block ends at the next KEY line or the end of the file
+```
+
+`STATUS` values other than the three above are recorded as `unknown`.
+`UNCERTAINTIES` is counted, not quoted; the card shows the number and the
+file path so the reader opens the packet only when the count is non-zero.
+Other sections (`OUTPUT`, `SOURCES`, `DECISIONS`, prose) are left for the
+human and not parsed.
+
+A `partial` or `blocked` status, or any uncertainty, routes the session to
+Inbox with reason `handoff_blocked`; that reason survives session exit
+because the exit does not make the decision. A `complete` packet with no
+uncertainties is archived silently.
+
 ## Claude Code
 
 Claude Code sessions are observed only through cmux's workstream file. The

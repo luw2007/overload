@@ -69,11 +69,12 @@ describe("approval gate", () => {
       return new Response(init?.method === "DELETE" ? "" : JSON.stringify({ answer: "approve", actor: "ui" }), { status: 200, headers: { "content-type": "application/json" } });
     }) as typeof fetch;
     try {
-      const h = await harness({ web_port: 4901, approval_gate: { enabled: true, require_approval_bash_patterns: ["^echo"] } });
-      const result = await Promise.all(h.dispatch("tool_call", { toolName: "bash", toolCallId: "approve-call", input: { command: "echo hi" } }));
+      const h = await harness({ web_port: 4901, approval_gate: { enabled: true, require_approval_bash_patterns: ["^git push"] } });
+      const result = await Promise.all(h.dispatch("tool_call", { toolName: "bash", toolCallId: "approve-call", input: { command: "git push origin main" } }));
       expect(result[0]).toBeUndefined();
       const events = await h.close();
-      expect(events.find((item) => item.kind === "decision_requested")?.detail).toMatchObject({ request_id: "approve-call", gated: true, gate: "action", rule: "^echo", tool: "bash", command: "echo hi", summary: "放行 bash: echo hi?", options: ["approve", "deny"] });
+      // The card must say what kind of action is being released, not only which regex matched.
+      expect(events.find((item) => item.kind === "decision_requested")?.detail).toMatchObject({ request_id: "approve-call", gated: true, gate: "action", rule: "^git push", tool: "bash", command: "git push origin main", class: "push", summary: "放行 bash: git push origin main?", options: ["approve", "deny"] });
       expect(events.find((item) => item.kind === "decision_resolved")?.detail).toMatchObject({ request_id: "approve-call", gated: true, state: "resolved", selected: "approve", actor: "ui" });
       expect(calls.some((call) => call.init?.method === "DELETE" && call.init.headers && new Headers(call.init.headers).get("Origin") === "http://127.0.0.1:4901")).toBe(true);
     } finally {

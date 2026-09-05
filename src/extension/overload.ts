@@ -472,6 +472,7 @@ export default function overload(pi: ExtensionApi): void {
     const command = typeof event?.input?.command === "string" ? truncateUtf8(event.input.command, 120) : ""
     const path = typeof event?.input?.path === "string" ? truncateUtf8(event.input.path, 120) : ""
     const target = command || path
+    const actionClass = command ? consequentialClass(event.input.command) : undefined
     const approvalId = `${stableId}#${spool.writerId}#${String(event?.toolCallId || "")}`
     return {
       request_id: String(event?.toolCallId || ""),
@@ -481,6 +482,7 @@ export default function overload(pi: ExtensionApi): void {
       rule,
       tool,
       ...(command ? { command } : {}),
+      ...(actionClass ? { class: actionClass } : {}),
       ...(path ? { path } : {}),
       summary: truncateUtf8(`放行 ${tool}: ${target}?`, 500),
       options: ["approve", "deny"],
