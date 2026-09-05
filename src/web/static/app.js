@@ -17,7 +17,12 @@
   const ASK_IMPACT = "会话挂起等待回答，此期间无进展";
   const ageText = (ms) => { const seconds = Math.floor(ms / 1000); if (seconds < 60) return `${seconds} 秒`; const minutes = Math.floor(ms / 60000); return minutes < 60 ? `${minutes} 分钟` : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`; };
   const AGE_WARN_MS = 30 * 60 * 1000;
-  const zombieHint = { stalled: "事件流已停止，需人工确认会话是否还在运行。", dead_incarnation: "进程已消失，记录保留供核查，无需动作。", telemetry_gap: "遥测出现缺口，可能丢失部分事件。" };
+  const zombieHint = { stalled: "事件流已停止，需人工确认会话是否还在运行。", dead_incarnation: "进程已消失，记录保留供核查，无需动作。", telemetry_gap: "遥测出现缺口，可能丢失部分事件。", handoff_blocked: "Agent 已交接但未完成：决定是续跑、改派还是关闭。" };
+  const handoffStatus = { partial: "部分完成", blocked: "受阻", complete: "已完成", unknown: "状态不明" };
+  // AGENTS.md 决策卡最小载荷：结论、证据、要决定什么。HANDOFF.md 的字段就是那三样，卡上直接摆出来，不让人再去开文件。
+  const handoffLine = (handoff) => handoff
+    ? `<div class="impact-line">${escapeHtml(handoffStatus[handoff.status] ?? handoff.status)} · 未决 ${escapeHtml(handoff.uncertainties)} 项${handoff.task ? ` · ${escapeHtml(handoff.task)}` : ""}${handoff.next_owner ? ` · 下一责任人 ${escapeHtml(handoff.next_owner)}` : ""} · <code>${escapeHtml(handoff.path)}</code></div>`
+    : "";
 
   async function fetchJson(path, options) {
     const response = await fetch(path, options);
@@ -114,7 +119,7 @@
     const groupCards = state.zombie.groups.map((group) => `<article class="hint-card"><div class="decision-card-head"><strong>${escapeHtml(group.q5_reason)}</strong><span class="chip">${group.rows.length} 个会话</span></div><p class="hint-text">${escapeHtml(zombieHint[group.q5_reason] ?? "需人工核查。")}</p><div class="decision-cards">${group.rows.map((row) => {
       const capability = row.resume_capability;
       const resumeBtn = capability?.resumable ? `<button class="btn primary resume-session" data-id="${escapeHtml(row.stable_id)}">Resume</button><span class="resume-status" aria-live="polite"></span>` : "";
-      return `<span class="chip">${sessionLink(row.stable_id)} · ${escapeHtml(formatTime(row.last_event_at))}</span>${resumeBtn}`;
+      return `<span class="chip">${sessionLink(row.stable_id)} · ${escapeHtml(formatTime(row.last_event_at))}</span>${resumeBtn}${handoffLine(row.handoff)}`;
     }).join(" ")}</div></article>`).join("");
     const orphanedCards = state.zombie.orphaned_requests.map((row) => `<article class="hint-card"><div class="decision-card-head"><strong>orphaned_request</strong><span class="chip">${sessionLink(row.stable_id)}</span></div><p class="hint-text">会话已结束，请求随之失效。</p><div class="decision-card-actions"><button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></div></article>`).join("");
     const zombieHtml = groupCards || orphanedCards ? `<h3>Zombie</h3>${groupCards}${orphanedCards}` : "";
