@@ -7,7 +7,7 @@ import { constants, readFileSync, statSync } from "node:fs"
 import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { execFile, execFileSync } from "node:child_process"
 
 const SEGMENT_MAX_AGE_MS = 30_000
@@ -23,7 +23,7 @@ const procBootId = randomUUID()
 type Runtime = "pi" | "omp" | "prime"
 type Kind =
   | "session_started" | "working" | "settled" | "decision_requested"
-  | "decision_resolved" | "tool_activity" | "heartbeat"
+  | "decision_resolved" | "control_event" | "tool_activity" | "heartbeat"
   | "commit_observed" | "session_ended"
 
 type Envelope = {
@@ -490,6 +490,10 @@ export default function overload(pi: ExtensionApi): void {
     }
   }
 
+  const receiptByToolCall = new Map<string,{receiptId:string;attemptId?:string;effect:string}>()
+  function canonicalValue(value:unknown):string{if(value===null||typeof value!=="object")return JSON.stringify(value);if(Array.isArray(value))return `[${value.map(canonicalValue).join(",")}]`;const row=value as Record<string,unknown>;return `{${Object.keys(row).sort().map(key=>`${JSON.stringify(key)}:${canonicalValue(row[key])}`).join(",")}}`}
+  function emitEffect(payload:Record<string,unknown>):void{const receiptId=String(payload.receipt_id),toolCallId=String(payload.toolCallId),eventId=`extension:${receiptId}:${toolCallId}:effect_observed`;emit("control_event",{event_id:eventId,producer_id:`extension:${spool.emitterId}`,entity_id:receiptId,entity_version:1,event_kind:"effect_observed",payload,payload_hash:createHash("sha256").update(canonicalValue(payload)).digest("hex")})}
+
   async function waitForApproval(event: any, rule: GateRule): Promise<{ block: true; reason: string } | undefined> {
     const gate = approvalGate
     if (!gate || typeof event?.toolCallId !== "string") return { block: true, reason: `overload approval gate: ${rule.rule}` }
@@ -508,7 +512,7 @@ export default function overload(pi: ExtensionApi): void {
     const evidence = { tool: detail.tool, command: typeof event?.input?.command === "string" ? event.input.command : undefined, path: typeof event?.input?.path === "string" ? event.input.path : undefined, input: event?.input, cwd: sessionCwd, rule: rule.rule, class: detail.class, toolCallId: event.toolCallId }
     let targetVersion = ""
     try {
-      const registered = await globalThis.fetch(`${base}/api/decision/target`, { method: "POST", headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumerOwner: "extension", approvalId, stableId, requestUid: `${stableId}#${spool.writerId}#${event.toolCallId}`, question: detail.summary, options: ["approve", "deny"], effect: String(detail.class || "gated_tool"), scope: { gate: "action", rule: rule.rule, cwd: sessionCwd }, evidence, expiresAt }) })
+      const registered = await globalThis.fetch(`${base}/api/decision/target`, { method: "POST", headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumerOwner: "extension", approvalId, stableId, requestUid: `${stableId}#${spool.writerId}#${event.toolCallId}`, question: detail.summary, options: ["approve", "deny"], effect: String(detail.class || "gated_tool"), scope: { gate: "action", rule: rule.rule, cwd: sessionCwd }, evidence, toolCallId: event.toolCallId, decisionMode: "human_only", expiresAt }) })
       if (registered.ok) targetVersion = String((await registered.json() as any).targetVersion || "")
     } catch { /* unavailable control plane remains fail-closed */ }
     emit("decision_requested", { ...detail, consumer_owner: "extension", target_version: targetVersion })
@@ -516,10 +520,11 @@ export default function overload(pi: ExtensionApi): void {
       try {
         const response = await globalThis.fetch(`${base}/api/decision/consume/${encodeURIComponent(approvalId)}`, { method: "POST", headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumer_owner: "extension", target_version: targetVersion }) })
         if (response.status === 200) {
-          const payload = await response.json() as { answer?: unknown; actor?: unknown; receiptId?: unknown }
+          const payload = await response.json() as { answer?: unknown; actor?: unknown; receiptId?: unknown; attemptId?:unknown }
           const answer = typeof payload.answer === "string" ? payload.answer : ""
           const actor = typeof payload.actor === "string" ? payload.actor : "unknown"
           emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "resolved", selected: answer, actor, receipt_id: payload.receiptId })
+          if(answer === "approve" && typeof payload.receiptId === "string")receiptByToolCall.set(event.toolCallId,{receiptId:payload.receiptId,attemptId:typeof payload.attemptId==="string"?payload.attemptId:undefined,effect:String(detail.class||"gated_tool")})
           return answer === "approve" ? undefined : { block: true, reason: `overload approval gate: denied by ${actor}` }
         }
       } catch { /* Poll errors are fail-closed at expiry, not an early allow. */ }
@@ -765,12 +770,24 @@ export default function overload(pi: ExtensionApi): void {
 
   on("tool_result", (event, ctx) => {
     if (event?.toolName === "bash") probeHead(String(ctx?.cwd || process.cwd()), true)
+    const toolCallId=typeof event?.toolCallId==="string"?event.toolCallId:""
+    const pending=receiptByToolCall.get(toolCallId)
+    if(pending){
+      receiptByToolCall.delete(toolCallId)
+      const isError=event?.isError===true
+      const tool=String(event?.toolName||"unknown").toLowerCase()
+      const state:"succeeded"|"failed"|"unknown" = tool==="write"||tool==="edit"?(isError?"failed":"succeeded"):"unknown"
+      const evidence={tool,isError,output:truncateUtf8(textFrom(event),2000)}
+      emitEffect({receipt_id:pending.receiptId,toolCallId,attempt_id:pending.attemptId,effect:pending.effect,effect_state:state,evidence})
+    }
   })
 
   on("session_shutdown", async (event) => {
     working = false
     if (heartbeat) clearInterval(heartbeat)
     heartbeat = null
+    for(const [toolCallId,pending] of receiptByToolCall){emitEffect({receipt_id:pending.receiptId,toolCallId,attempt_id:pending.attemptId,effect:pending.effect,effect_state:"unknown",evidence:{reason:"session_ended_before_tool_result"}})}
+    receiptByToolCall.clear()
     emit("session_ended", { reason: event?.reason || "quit" })
     await spool.flushAndSeal().catch(() => {})
   })

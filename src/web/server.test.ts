@@ -1,20 +1,24 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { openMailbox, registerTarget } from "../decision-bot/mailbox";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { getTarget, openMailbox, registerTarget } from "../decision-bot/mailbox";
+import { loadPolicy, proposePolicyCandidate } from "../decision-bot/policy";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { queryArchive, queryQ2 } from "../shared/queries";
+import { createWork, getWork, getAttention, openControl, upsertAttention } from "../control/store";
 import { startWebServer } from "./server";
 
 const roots: string[] = [];
 const SCHEMA_SQL = readFileSync(join(import.meta.dir, "../ingest/schema.sql"), "utf8");
-const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
+const servers: Array<{ stop(closeActiveConnectionsConnections?: boolean): void }> = [];
+const originalHome = process.env.HOME;
 
 afterEach(() => {
   for (const server of servers.splice(0)) server.stop(true);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   delete process.env.OVERLOAD_ANSWERS_PATH;
+  if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
 });
 
 function seedLedger(): string {
@@ -46,8 +50,10 @@ function seedLedger(): string {
   return path;
 }
 
-async function runningServer(path: string, jump?: (target: { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null }) => Promise<{ opened: boolean }>) {
-  const server = startWebServer({ ledgerPath: path, port: 0, jump });
+async function runningServer(path: string, jumpOrOptions?: ((target: { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null }) => Promise<{ opened: boolean }>) | { controlPath: string; policyPath?: string }) {
+  const options = typeof jumpOrOptions === "function" ? { jump: jumpOrOptions } : jumpOrOptions ?? {};
+  const root = join(path, ".."); writeFileSync(join(root, "host"), "local\n");
+  const server = startWebServer({ ledgerPath: path, orchestratorPath: join(root, "web-orchestrator.db"), spoolRoot: root, publishIntervalMs: 60_000, port: 0, ...options });
   servers.push(server);
   return { server, base: `http://127.0.0.1:${server.port}` };
 }
@@ -223,7 +229,8 @@ describe("web API", () => {
 
   test("reports resume capability and launches pi and omp sessions through cmux", async () => {
     const calls: Array<{ command: string; args: string[] }> = [];
-    const server = startWebServer({ ledgerPath: seedLedger(), port: 0, processAlive: (pid) => pid === 4242, resume: async (command, args) => {
+    const ledgerPath = seedLedger(); const root = join(ledgerPath, ".."); writeFileSync(join(root, "host"), "local\n");
+    const server = startWebServer({ ledgerPath, orchestratorPath: join(root, "resume-orchestrator.db"), spoolRoot: root, publishIntervalMs: 60_000, port: 0, processAlive: (pid) => pid === 4242, resume: async (command, args) => {
       calls.push({ command, args });
       return { ok: true };
     } });
@@ -290,6 +297,24 @@ describe("web API", () => {
     const rows = await (await fetch(`${base}/api/sessions`)).json();
     expect(rows).toHaveLength(5);
     expect(rows.find((row: { stable_id: string }) => row.stable_id === "remote:pi:alpha")).toMatchObject({ stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung" });
+  });
+
+  describe("extension target authority", () => {
+    test("enabled exact rule derives scoped_auto while spoof cannot lower contract human-only", async () => {
+      const ledger = seedLedger(); const root = join(ledger, ".."); process.env.HOME = root; mkdirSync(join(root, ".overload")); writeFileSync(join(root, ".overload", "config.json"), JSON.stringify({ decision_bot: { enabled:true, model:"test", timeout_ms:1000, max_output_bytes:1024, rules:[] } })); const controlPath = join(root, "control.db"); const mailbox = openMailbox(controlPath);
+      const rule = { id:"safe", consumer_owner:"extension" as const, gate:"action", effect:"write", answers:["allow"], cwd:"/repo", command:"echo ok" };
+      const candidate = proposePolicyCandidate(mailbox, rule, 1); mailbox.run("UPDATE policy_candidates SET approved_by='owner',approved_at=2,observation_until=3,enabled_at=4 WHERE candidate_id=?", candidate.candidateId); mailbox.close();
+      const { base } = await runningServer(ledger, { controlPath, policyPath: join(root, ".overload", "config.json") });
+      const headers = { "sec-fetch-site":"same-origin", "content-type":"application/json" };
+      const payload = { consumerOwner:"extension", approvalId:"auto", options:["allow"], question:"write?", effect:"write", scope:{gate:"action",cwd:"/repo"}, evidence:{command:"echo ok"}, expiresAt:Date.now()+60_000, decisionMode:"human_only" };
+      expect((await fetch(`${base}/api/decision/target`, {method:"POST",headers,body:JSON.stringify(payload)})).status).toBe(200);
+      const check = openMailbox(controlPath); expect(getTarget(check,"extension","auto")?.decisionMode).toBe("scoped_auto");
+      const work=createWork(check,{title:"guard",source:"test",contract:{objective:"guard",acceptance:[{id:"human",kind:"human",description:"owner accepts"}],non_goals:[],scope:{human_only_effects:["write"]},budget:{},stop_conditions:[],decision_owner:"owner"}}); check.run("INSERT INTO control_attention(item_id,work_id,revision,state,effect_state,urgency,conclusion,trigger,impact,recommendation,options,owner,contract_revision,decision_mode,evidence,created_at,updated_at,approval_id,consumer_owner) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",["attn",work.work_id,1,"open","not_started","inbox","c","t","i",null,"[]","owner",1,"human_only","{}",1,1,"human","extension"]); check.close();
+      expect((await fetch(`${base}/api/decision/target`, {method:"POST",headers,body:JSON.stringify({...payload,approvalId:"human",decisionMode:"scoped_auto"})})).status).toBe(200);
+      const final = openMailbox(controlPath); expect(getTarget(final,"extension","human")?.decisionMode).toBe("human_only");
+      const auto=getTarget(final,"extension","auto")!, policy=loadPolicy(join(root, ".overload", "config.json"),final);final.run("INSERT INTO bot_attempts VALUES('web-try','bot','extension','auto',?,'owner',9999999999999,?,?, 'proposed',NULL,1,2)",[auto.targetVersion,policy.hash,auto.evidenceHash]);final.run("INSERT INTO bot_proposals VALUES('web-try','extension','auto',?,'answer','allow','ok',?, ?,1,NULL)",[auto.targetVersion,JSON.stringify([auto.evidenceHash]),policy.hash]); final.close();
+      const consumed=await fetch(`${base}/api/decision/consume/auto`,{method:"POST",headers,body:JSON.stringify({consumer_owner:"extension",target_version:auto.targetVersion})});expect(consumed.status).toBe(200);expect((await consumed.json()).actor).toBe("decision-bot");
+    });
   });
 
   describe("POST /api/orchestrator/answer/:approval_id", () => {
@@ -402,6 +427,38 @@ describe("web API", () => {
       delete process.env.OVERLOAD_ANSWERS_PATH;
     });
   });
+});
+
+test("generic stop changes work state and stale decision conflicts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "overload-control-web-")); roots.push(root);
+  const controlPath = join(root, "control.db");
+  const control = openControl(controlPath);
+  const work = createWork(control, { title: "release", source: "test" }, 100);
+  const item = upsertAttention(control, { item_id: "item-1", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "Choose release", trigger: "gate", impact: "deployment waits", recommendation: "approve", options: ["continue", "narrow", "stop"], owner: "operator", expires_at: Date.now() + 10000, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: { check: "passed" } }, 100);
+  control.close();
+  const { base } = await runningServer(seedLedger(), { controlPath });
+  const inbox = await (await fetch(`${base}/api/attention/inbox`)).json();
+  expect(inbox).toHaveLength(1);
+  const selected = await fetch(`${base}/api/attention/item-1/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "stop" }) });
+  expect(selected.status).toBe(200);
+  const inspect = openControl(controlPath); const event = inspect.query("SELECT detail FROM control_attention_events WHERE item_id=? AND kind='applying'").get("item-1") as {detail:string}; expect(JSON.parse(event.detail).selected_option).toBe("stop"); expect(getWork(inspect, work.work_id)?.state).toBe("stopped"); inspect.close();
+  const stale = await fetch(`${base}/api/attention/item-1/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "continue" }) });
+  expect(stale.status).toBe(409);
+});
+
+test("generic narrow without replacement contract stays open", async () => {
+  const root=mkdtempSync(join(tmpdir(),"overload-narrow-web-"));roots.push(root);const controlPath=join(root,"control.db"),control=openControl(controlPath);const work=createWork(control,{title:"scope",source:"test"});const item=upsertAttention(control,{item_id:"narrow-item",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"scope",trigger:"change",impact:"work",recommendation:"narrow",options:["continue","narrow","stop"],owner:"operator",expires_at:null,source_link:null,approval_id:null,consumer_owner:null,contract_revision:work.revision,decision_mode:"human_only",evidence:{} });control.close();const {base}=await runningServer(seedLedger(),{controlPath});const response=await fetch(`${base}/api/attention/narrow-item/resolve`,{method:"POST",headers:{origin:base,"content-type":"application/json"},body:JSON.stringify({expected_revision:item.revision,selected_option:"narrow"})});expect(response.status).toBe(400);const inspect=openControl(controlPath);expect(getAttention(inspect,"narrow-item")?.state).toBe("open");inspect.close();
+});
+
+test("approval-linked option writes human answer and leaves attention open", async () => {
+  const root=mkdtempSync(join(tmpdir(),"overload-approval-web-"));roots.push(root);const controlPath=join(root,"control.db"),control=openMailbox(controlPath);const work=createWork(control,{title:"approve",source:"test"});upsertAttention(control,{item_id:"approval-item",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"approve",trigger:"gate",impact:"wait",recommendation:"continue",options:["continue","stop"],owner:"operator",expires_at:Date.now()+60000,source_link:null,approval_id:"approval-1",consumer_owner:"extension",contract_revision:work.revision,decision_mode:"human_only",evidence:{}});registerTarget(control,{consumerOwner:"extension",approvalId:"approval-1",question:"continue?",options:["continue","stop"],effect:"write",scope:{gate:"action"},evidence:{},expiresAt:Date.now()+60000,decisionMode:"human_only"});control.close();const {base}=await runningServer(seedLedger(),{controlPath});const answer=await fetch(`${base}/api/orchestrator/answer/approval-1`,{method:"POST",headers:{origin:base,"sec-fetch-site":"same-origin","content-type":"application/json"},body:JSON.stringify({answer:"continue",consumer_owner:"extension"})});expect(answer.status).toBe(200);const inspect=openMailbox(controlPath);expect(inspect.query("SELECT answer FROM answers WHERE approval_id=?").get("approval-1")).toEqual({answer:"continue"});expect(getAttention(inspect,"approval-item")?.state).toBe("open");inspect.close();
+});
+
+test("dashboard derives attention counters without changing legacy summary JSON", async () => {
+  const source = readFileSync(join(import.meta.dir, "static/app.js"), "utf8");
+  expect(source).toContain('$("tile-now").textContent = state.attention.now.length');
+  expect(source).toContain('$("tile-inbox").textContent = state.attention.inbox.length');
+  expect(source).toContain('data-answer="${escapeHtml(answer)}"');
 });
 
 test("hung and zombie API rows expose resume capability", async () => {

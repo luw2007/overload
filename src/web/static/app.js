@@ -3,7 +3,7 @@
   // the attention zone that now owns their data (AGENTS.md 产品界面原则).
   const LEGACY_ZONE = { q1: "now", hung: "now", q2: "inbox", zombie: "inbox", archive: "done" };
   const ZONES = ["now", "inbox", "done", "sessions", "health"];
-  const state = { tab: "now", selected: new Set(), summary: null, q1: [], q2: [], archive: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
+  const state = { tab: "now", selected: new Set(), summary: null, attention: { now: [], inbox: [], done: [] }, works: [], candidates: [], q1: [], q2: [], archive: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? "-").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
   const formatTime = (value) => value == null ? "-" : new Date(value).toLocaleString();
@@ -38,9 +38,8 @@
   function renderSummary() {
     const summary = state.summary;
     if (!summary) return;
-    $("tile-now").textContent = (summary.q1 ?? 0) + (summary.hung ?? 0);
-    const zombies = state.zombie.groups.reduce((total, group) => total + group.rows.length, 0) + state.zombie.orphaned_requests.length;
-    $("tile-inbox").textContent = zombies;
+    $("tile-now").textContent = state.attention.now.length;
+    $("tile-inbox").textContent = state.attention.inbox.length;
     const unhealthy = summary.open_incidents + summary.coverage_gaps + summary.telemetry_gaps > 0;
     $("health-pill").classList.toggle("warn", unhealthy);
     $("health-label").textContent = unhealthy ? `${summary.open_incidents} open incident · ${summary.coverage_gaps + summary.telemetry_gaps} gaps` : "health OK";
@@ -90,6 +89,22 @@
     </article>`;
   }
 
+  const evidenceText = (evidence) => Object.keys(evidence || {}).length ? JSON.stringify(evidence) : "暂无附加证据";
+  function attentionCard(item) {
+    const effect = { not_started: "待决定", applying: "决定已接收，落实中", succeeded: "效果已确认", failed: "落实失败，需处理", unknown: "效果未知，需核查" }[item.effect_state] || item.effect_state;
+    const answers = item.options.map((answer) => {
+      const narrowUnavailable = !item.approval_id && answer === "narrow";
+      return `<button class="btn attention-option" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}" data-answer="${escapeHtml(answer)}" data-approval-id="${escapeHtml(item.approval_id || "")}" data-owner="${escapeHtml(item.consumer_owner || "")}" ${narrowUnavailable ? 'disabled title="需要先提供替代契约和变更原因；当前界面不支持编辑契约"' : ""}>${escapeHtml(answer)}</button>`;
+    }).join("");
+    return `<article class="decision-card"><div class="decision-card-head"><strong>${escapeHtml(item.conclusion)}</strong><span class="chip">${escapeHtml(effect)}</span></div><div class="impact-line">${escapeHtml(item.impact)}</div><div class="recommendation"><strong>触发：</strong>${escapeHtml(item.trigger)}<br><strong>建议：</strong>${escapeHtml(item.recommendation || "请按证据判断")}<br><strong>证据：</strong><code>${escapeHtml(evidenceText(item.evidence))}</code></div><div class="decision-card-meta">责任人 ${escapeHtml(item.owner)} · 契约 r${item.contract_revision}${item.expires_at ? ` · 有效期至 ${formatTime(item.expires_at)}` : ""}${item.defer_until ? ` · 延期至 ${formatTime(item.defer_until)}（不延长有效期）` : ""}</div><div class="decision-card-actions">${answers}${item.source_link ? `<a class="btn primary" href="${escapeHtml(item.source_link)}">返回原现场</a>` : ""}${item.state === "open" ? `<button class="btn attention-action" data-action="ack" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}">标记已读</button><button class="btn attention-action" data-action="defer" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}">稍后处理</button>` : ""}<button class="btn attention-feedback" data-useful="true" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}">有帮助</button><button class="btn attention-feedback" data-useful="false" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}">没帮助</button></div></article>`;
+  }
+
+  function candidateCard(candidate) {
+    const rule = candidate.rule;
+    const approved = !!candidate.approvedAt;
+    return `<article class="decision-card"><div class="decision-card-head"><strong>${escapeHtml(rule.id)}</strong><span class="chip">授权候选</span></div><div class="impact-line">${escapeHtml(rule.effect)} · ${escapeHtml(rule.gate)}</div><div class="recommendation"><strong>作用域：</strong><code>${escapeHtml(candidate.scopeHash)}</code><br><strong>样本：</strong>${candidate.sampleCount}<br><strong>允许答案：</strong>${escapeHtml(rule.answers.join("、"))}</div><div class="decision-card-meta">${approved ? `已由 ${escapeHtml(candidate.approvedBy)} 批准 · 观察至 ${formatTime(candidate.observationUntil)}` : "待人工批准"}</div><div class="decision-card-actions">${approved ? `<button class="btn primary candidate-action" data-id="${escapeHtml(candidate.candidateId)}" data-action="enable">观察完成后启用</button>` : `<button class="btn primary candidate-action" data-id="${escapeHtml(candidate.candidateId)}" data-action="approve">批准并观察</button>`}</div></article>`;
+  }
+
   function renderNow() {
     const groups = [];
     const byId = new Map();
@@ -102,7 +117,7 @@
       ? `<div class="decision-groups">${groups.map((group) => `<div class="decision-group"><div class="group-head"><strong>${sessionLink(group.stable_id)}</strong><span class="chip">${group.rows.length} 项待决策</span></div><div class="decision-cards">${group.rows.map(decisionCard).join("")}</div></div>`).join("")}</div>`
       : "<p class='empty'>没有待决策请求</p>";
     const hungHtml = state.hung.length ? `<h3>卡死会话</h3><div class="decision-cards">${state.hung.map(hungCard).join("")}</div>` : "";
-    $("content").innerHTML = `${state.q1.length ? `<p><label><input id="select-all" type="checkbox"> 全选待决策</label></p>` : ""}${groupsHtml}${hungHtml}`;
+    $("content").innerHTML = `${state.attention.now.map(attentionCard).join("")}${state.q1.length ? `<p><label><input id="select-all" type="checkbox"> 全选待决策</label></p>` : ""}${groupsHtml}${hungHtml}`;
     const selectAll = $("select-all");
     if (selectAll) {
       selectAll.checked = state.q1.every((row) => state.selected.has(row.request_uid));
@@ -114,6 +129,7 @@
   }
 
   function renderInbox() {
+    const attentionHtml = state.attention.inbox.map(attentionCard).join("");
     const q2Html = state.q2.length
       ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th></th><th>会话</th><th>来源</th><th>最后事件</th><th></th></tr></thead><tbody>${state.q2.map((row) => `<tr><td>${rowCheckbox(row.stable_id)}</td><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td><td><button class="btn closeout" data-id="${escapeHtml(row.stable_id)}">收尾</button></td></tr>`).join("")}</tbody></table></div>`
       : "<p class='empty'>没有待收尾会话</p>";
@@ -124,13 +140,15 @@
     }).join(" ")}</div></article>`).join("");
     const orphanedCards = state.zombie.orphaned_requests.map((row) => `<article class="hint-card"><div class="decision-card-head"><strong>orphaned_request</strong><span class="chip">${sessionLink(row.stable_id)}</span></div><p class="hint-text">会话已结束，请求随之失效。</p><div class="decision-card-actions"><button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></div></article>`).join("");
     const zombieHtml = groupCards || orphanedCards ? `<h3>Zombie</h3>${groupCards}${orphanedCards}` : "";
-    $("content").innerHTML = `<h3>待收尾</h3>${q2Html}${zombieHtml}`;
+    const candidates = state.candidates.length ? `<h3>任务候选</h3>${state.candidates.map(candidateCard).join("")}` : "";
+    $("content").innerHTML = `${attentionHtml}${candidates}<h3>待收尾</h3>${q2Html}${zombieHtml}`;
   }
 
   function renderDone() {
-    $("content").innerHTML = state.archive.length
+    const attentionHtml = state.attention.done.map(attentionCard).join("");
+    $("content").innerHTML = attentionHtml + (state.archive.length
       ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th>会话</th><th>来源</th><th>最后事件</th></tr></thead><tbody>${state.archive.map((row) => `<tr><td>${sessionLink(row.stable_id)} ${row.closed_out ? `<span class="chip">${escapeHtml("已收尾")}</span>` : ""}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("")}</tbody></table></div>`
-      : "<p class='empty'>没有已归档会话</p>";
+      : (attentionHtml ? "" : "<p class='empty'>没有已归档会话</p>"));
   }
 
   function renderSessions() {
@@ -251,6 +269,10 @@
     document.querySelectorAll(".copy-jump").forEach((button) => button.addEventListener("click", () => copyBinding(button.dataset.binding, button.parentElement.querySelector(".jump-status"))));
     document.querySelectorAll(".jump").forEach((button) => button.addEventListener("click", () => jump(button)));
     document.querySelectorAll(".resume-session").forEach((button) => button.addEventListener("click", () => resume(button)));
+    document.querySelectorAll(".attention-action").forEach((button) => button.addEventListener("click", () => attentionAction(button)));
+    document.querySelectorAll(".attention-feedback").forEach((button) => button.addEventListener("click", () => attentionFeedback(button)));
+    document.querySelectorAll(".attention-option").forEach((button) => button.addEventListener("click", () => attentionOption(button)));
+    document.querySelectorAll(".candidate-action").forEach((button) => button.addEventListener("click", () => candidateAction(button)));
     document.querySelectorAll(".drill").forEach((link) => link.addEventListener("click", (event) => {
       event.preventDefault();
       openSession(link.dataset.id);
@@ -303,6 +325,36 @@
     }
   }
 
+  async function attentionAction(button) {
+    const action = button.dataset.action;
+    const body = { expected_revision: Number(button.dataset.revision) };
+    if (action === "defer") body.defer_until = Date.now() + 60 * 60 * 1000;
+    await fetchJson(`/api/attention/${encodeURIComponent(button.dataset.id)}/${action}`, { method: "POST", body: JSON.stringify(body) });
+    await refresh();
+  }
+
+  async function attentionOption(button) {
+    button.disabled = true;
+    const approvalId = button.dataset.approvalId;
+    const endpoint = approvalId ? `/api/orchestrator/answer/${encodeURIComponent(approvalId)}` : `/api/attention/${encodeURIComponent(button.dataset.id)}/resolve`;
+    const body = approvalId ? { answer: button.dataset.answer, consumer_owner: button.dataset.owner } : { expected_revision: Number(button.dataset.revision), selected_option: button.dataset.answer };
+    try { await fetchJson(endpoint, { method: "POST", body: JSON.stringify(body) }); await refresh(); }
+    catch (error) { button.disabled = false; showError(error); }
+  }
+
+  async function candidateAction(button) {
+    button.disabled = true;
+    const body = button.dataset.action === "approve" ? { actor: "operator", observation_until: Date.now() + 24 * 60 * 60 * 1000 } : {};
+    try { await fetchJson(`/api/candidates/${encodeURIComponent(button.dataset.id)}/${button.dataset.action}`, { method: "POST", body: JSON.stringify(body) }); await refresh(); }
+    catch (error) { button.disabled = false; showError(error); }
+  }
+
+  async function attentionFeedback(button) {
+    await fetchJson(`/api/attention/${encodeURIComponent(button.dataset.id)}/feedback`, { method: "POST", body: JSON.stringify({ expected_revision: Number(button.dataset.revision), useful: button.dataset.useful === "true" }) });
+    button.textContent = "已记录";
+    button.disabled = true;
+  }
+
   async function ack(ids) {
     try {
       await Promise.all(ids.map((id) => fetchJson(`/api/ack/${encodeURIComponent(id)}`, { method: "POST" })));
@@ -337,10 +389,10 @@
   async function refresh() {
     try {
       const names = ["summary", "q1", "q2", "archive", "hung", "sessions", "zombie", "health", "decision-bot/status"];
-      const [summary, q1, q2, archive, hung, sessions, zombie, health, decisionBot] = await Promise.all(names.map((name) => fetchJson(`/api/${name}`)));
+      const [summary, q1, q2, archive, hung, sessions, zombie, health, decisionBot, attentionNow, attentionInbox, attentionDone, works, candidates] = await Promise.all([...names, "attention/now", "attention/inbox", "attention/done", "works", "candidates"].map((name) => fetchJson(`/api/${name}`)));
       const targetStatus = new Map((decisionBot.targets || []).map((target) => [`${target.consumer_owner}:${target.approval_id}`, target]));
       for (const row of q1) { const owner=row.detail?.consumer_owner ?? (row.detail?.gate==="action"?"extension":"orchestrator"); const target=targetStatus.get(`${owner}:${row.detail?.approval_id ?? row.detail?.request_id}`); if(target)row.detail={...row.detail,bot_status:target.state,bot_outcome:target.outcome}; }
-      Object.assign(state, { summary, q1, q2, archive, hung, sessions, zombie, health, decisionBot });
+      Object.assign(state, { summary, q1, q2, archive, hung, sessions, zombie, health, decisionBot, works, candidates, attention: { now: attentionNow, inbox: attentionInbox, done: attentionDone } });
       const q1Ids = q1.map((row) => row.request_uid);
       const q2Ids = q2.map((row) => row.stable_id);
       const liveIds = new Set([...q1Ids, ...q2Ids]);

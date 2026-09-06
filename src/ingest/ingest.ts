@@ -267,6 +267,13 @@ function parseEnvelope(line: string, key: string): Envelope | null {
       typeof value.host !== "string" || value.host !== parts[0] || typeof value.runtime !== "string" ||
       typeof value.session !== "string" || !value.session || typeof value.emitter_id !== "string" || value.emitter_id !== parts[1] ||
       typeof value.writer_id !== "string" || !value.writer_id || typeof value.kind !== "string" || !value.kind) return null;
+    if (value.kind === "control_event") {
+      const detail = value.detail;
+      if (!detail || typeof detail !== "object" || Array.isArray(detail)) return null;
+      const control = detail as Record<string, unknown>;
+      if (typeof control.event_id !== "string" || typeof control.payload_hash !== "string" ||
+        !control.payload || typeof control.payload !== "object" || Array.isArray(control.payload)) return null;
+    }
     return value as unknown as Envelope;
   } catch {
     return null;

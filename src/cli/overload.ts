@@ -9,6 +9,12 @@ import { audit, parseSince, printAudit } from "./audit";
 import { runCli as runOrchestratorCli } from "../orchestrator/cli";
 import { openMailbox, setBotDisabled, writeHumanAnswer } from "../decision-bot/mailbox";
 import { DecisionBotService } from "../decision-bot/service";
+import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate } from "../decision-bot/policy";
+import { actOnAttention, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract } from "../control/store";
+import type { Contract } from "../control/types";
+import { publishControlEvents } from "../control/outbox";
+import { openStore } from "../orchestrator/store";
+import { SpoolWriter } from "../orchestrator/spool";
 
 const path = process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
 type Output = (line: string) => void;
@@ -19,7 +25,59 @@ const note: Output = (line) => console.error(line);
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q4 | hung | zombie | health | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot run|once|status|disable|enable|takeover <owner> <id> <answer> | orch ..."); process.exit(2); }
+function usage(): never { console.error("usage: overload now|inbox|done | attention <id> [ack|defer|resolve|feedback <json>] | works|candidates|candidate <id> approve|enable <json> | work <id> | work create|revise|redirect|stop <json> | sessions | show <stable_id> | q1 | q4 | hung | zombie | health | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot run|once|status|disable|enable|takeover <owner> <id> <answer> | orch ..."); process.exit(2); }
+
+function jsonArg(value: string | undefined): Record<string, unknown> {
+  if (!value) usage();
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { throw new Error("argument must be valid JSON"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("argument must be a JSON object");
+  return parsed as Record<string, unknown>;
+}
+
+function publishControl(control: Database): void {
+  const orchestrator = openStore();
+  const spool = new SpoolWriter(orchestrator, process.env.OVERLOAD_ROOT ?? join(homedir(), ".overload"));
+  try { publishControlEvents(control, path, (event) => spool.emit(`control:${String(event.event_id)}`, "control_event", event)); }
+  finally { spool.close(); orchestrator.close(); }
+}
+
+function controlCommand(args: string[]): boolean {
+  const command = args[0];
+  if (command === "now" || command === "inbox" || command === "done") {
+    const control = openControl(); try { const rows = listAttention(control, command); if (!rows.length) note(`No ${command} items.`); for (const item of rows) console.log(`${item.item_id}\t${item.revision}\t${item.work_id}\t${item.effect_state}\t${item.owner}\t${item.expires_at ? time(item.expires_at) : "-"}\t${item.conclusion}`); } finally { control.close(); } return true;
+  }
+  if (command === "works") {
+    const control = openControl(); try { for (const work of listWorks(control)) console.log(JSON.stringify(work)); } finally { control.close(); } return true;
+  }
+  if (command === "candidates") {
+    const control = openControl(); try { for (const row of control.query("SELECT candidate_id FROM policy_candidates ORDER BY created_at DESC").all() as Array<{candidate_id:string}>) console.log(JSON.stringify(getPolicyCandidate(control, row.candidate_id))); } finally { control.close(); } return true;
+  }
+  if (command === "candidate") {
+    const id = args[1], action = args[2]; if (!id || !action) usage(); const input = jsonArg(args[3] ?? "{}"); const control = openControl();
+    try { if (action === "approve") { if (!approvePolicyCandidate(control, id, String(input.actor ?? ""), Number(input.observation_until))) throw new Error("candidate cannot be approved"); } else if (action === "enable") { if (!enablePolicyCandidate(control, id)) throw new Error("candidate observation incomplete or already enabled"); } else usage(); console.log(JSON.stringify(getPolicyCandidate(control, id))); return true; } finally { control.close(); }
+  }
+  if (command === "attention") {
+    const itemId = args[1]; if (!itemId) usage(); const action = args[2]; const input = jsonArg(args[3] ?? "{}"); const control = openControl();
+    try {
+      if (!action) { const item = getAttention(control, itemId); if (!item) throw new Error(`attention not found: ${itemId}`); console.log(JSON.stringify(item)); return true; }
+      const revision = Number(input.expected_revision); if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("expected_revision must be a positive integer");
+      if (action === "feedback") { recordAttentionFeedback(control, itemId, revision, input.useful === true, typeof input.reason === "string" ? input.reason : undefined); publishControl(control); console.log(JSON.stringify(getAttention(control, itemId))); return true; }
+      if (action !== "ack" && action !== "defer" && action !== "resolve") usage();
+      const result = actOnAttention(control, itemId, revision, action, { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined }); publishControl(control); console.log(JSON.stringify(result)); return true;
+    } finally { control.close(); }
+  }
+  if (command !== "work") return false;
+  const action = args[1]; if (!action) usage(); const control = openControl();
+  try {
+    if (!(["create", "revise", "redirect", "stop"] as string[]).includes(action)) { const work = getWork(control, action); if (!work) throw new Error(`work not found: ${action}`); console.log(JSON.stringify(work)); return true; }
+    const input = jsonArg(args[2]);
+    if (action === "create") console.log(JSON.stringify(createWork(control, input as Parameters<typeof createWork>[1])));
+    else { const workId = String(input.work_id ?? ""); const revision = Number(input.expected_revision); if (!workId || !Number.isSafeInteger(revision) || revision < 1) throw new Error("work_id and positive expected_revision required"); if (action === "revise") console.log(JSON.stringify(reviseContract(control, workId, revision, input.contract as Contract, String(input.reason ?? "")))); if (action === "redirect") console.log(JSON.stringify(redirectWork(control, workId, revision, { reason: String(input.reason ?? ""), affected_work_ids: input.affected_work_ids as string[], action: input.action as "activate" | "pause" | "stop", evidence: input.evidence as Record<string, unknown> | undefined }))); if (action === "stop") console.log(JSON.stringify(recordStopCondition(control, workId, String(input.condition_id ?? ""), (input.evidence ?? {}) as Record<string, unknown>, Date.now(), revision))); }
+    publishControl(control);
+    return true;
+  } finally { control.close(); }
+}
 
 function listSessions(db: Database): void {
   const rows = querySessions(db);
@@ -115,6 +173,7 @@ function runAudit(db: Database, args: string[]): void {
 }
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const [command, ...rest] = argv;
+  if (command && controlCommand([command, ...rest])) return;
   const simple = new Set(["sessions", "q1", "q4", "hung", "zombie", "health"]);
   const arity: Record<string, (count: number) => boolean> = {
     show: (count) => count === 1, jump: (count) => count === 1, ack: (count) => count >= 1,

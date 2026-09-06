@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { CommandExecutor } from "./worktree";
@@ -16,7 +16,9 @@ export async function collectEvidence(worktreeDir:string,taskId:string,baseRef:s
   // still attempted so the executor's spawn error is preserved as failed evidence.
   const checked=existsSync(check)?await executor(check,[],{cwd:worktreeDir}):null;
   const dir=join(artifactsRoot,taskId);mkdirSync(dir,{recursive:true,mode:0o700});chmodSync(dir,0o700);
-  const runnerPath=join(dir,"runner.log");const prior=existsSync(runnerPath)?readFileSync(runnerPath,"utf8"):"";
+  const attemptLogs=readdirSync(dir,{withFileTypes:true}).filter(entry=>entry.isFile()&&/^runner-[^.]+\.log$/.test(entry.name)).map(entry=>join(dir,entry.name)).sort();
+  const runnerPath=attemptLogs.at(-1)??join(dir,"runner.log");
+  const prior=existsSync(runnerPath)?readFileSync(runnerPath,"utf8"):"";
   const runnerLogTail=prior.slice(-64*1024);
   const evidence:Evidence={diff:diff.stdout,commits:commits.stdout,status:status.stdout,checksExitCode:checked===null?null:(checked.ok?0:1),checksOutput:checked===null?"":`${checked.stdout}${checked.stderr}`,runnerLogTail};
   for(const [name,value] of [["diff.patch",evidence.diff],["commits.txt",evidence.commits],["status.txt",evidence.status],["checks.txt",evidence.checksOutput],["runner.log",evidence.runnerLogTail]] as const)writeFileSync(join(dir,name),value,{mode:0o600});

@@ -9,6 +9,16 @@ function fakeGh(json: any): CommandExecutor {
 }
 
 describe("checkPr", () => {
+  it("observation failure is never treated as clean", async () => {
+    const failed: CommandExecutor = async () => ({ ok:false, stdout:"", stderr:"network unavailable" });
+    await expect(checkPr("https://github.com/org/repo/pull/1", failed)).resolves.toEqual({status:"observation_failed",detail:"gh pr view failed"});
+  });
+
+  it("invalid observation payload is explicit", async () => {
+    const invalid: CommandExecutor = async () => ({ ok:true, stdout:"not-json", stderr:"" });
+    await expect(checkPr("https://github.com/org/repo/pull/1", invalid)).resolves.toEqual({status:"observation_failed",detail:"gh pr view returned invalid JSON"});
+  });
+
   it("merged PR", async () => {
     const result = await checkPr("https://github.com/org/repo/pull/1", fakeGh({
       state: "MERGED", statusCheckRollup: [], reviewDecision: null, mergeable: "UNKNOWN", updatedAt: new Date().toISOString(),
@@ -57,12 +67,6 @@ describe("checkPr", () => {
       state: "OPEN", statusCheckRollup: [{ name: "build", conclusion: "SUCCESS" }],
       reviewDecision: null, mergeable: "MERGEABLE", updatedAt: new Date().toISOString(),
     }));
-    expect(result.status).toBe("clean");
-  });
-
-  it("gh failure returns clean (no action)", async () => {
-    const failExecutor: CommandExecutor = async () => ({ ok: false, stdout: "", stderr: "error" });
-    const result = await checkPr("https://github.com/org/repo/pull/1", failExecutor);
     expect(result.status).toBe("clean");
   });
 

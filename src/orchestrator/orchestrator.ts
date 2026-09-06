@@ -3,13 +3,14 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getTask, claim, listTasks, openStore, renewLeases, transition, getRecovery, setRecovery, bumpUnknown, resetUnknown, type Task, type TransitionDetail } from "./store";
+import { getWork, publishControlEvents } from "../control/store";
 import { SpoolWriter } from "./spool";
 import { ensureWorktree, worktreesRoot, gcCandidates, defaultCommandExecutor, defaultPidAlive, type CommandExecutor } from "./worktree";
 import { spawnRunner, bindRunnerSession, probeRunnerLiveness, defaultRunnerExecutor, type RunnerExecutor } from "./runner";
 import { collectEvidence, evidenceReady } from "./evidence";
 import { submitTask } from "./submit";
 import { checkPr } from "./pr";
-import { consumeAnswers, expireApprovals, openAnswersDb, requestApproval } from "./approval";
+import { consumeAnswers, expireApprovals, openAnswersDb, requestApproval, repairApprovalIntents, reconcileApprovalEffects } from "./approval";
 import type { Database } from "bun:sqlite";
 
 const BIND_TIMEOUT_TICKS = 12; // ~60s at the 5s tick interval, plan §3.3 bind_timeout.
@@ -37,6 +38,39 @@ export class Orchestrator {
   private bumpUnknownAndMaybeBlock(task:Task,now:number,reason:"spawn_unverified"|"liveness_unknown"):void{
     if(!getRecovery(this.db,task.task_id)&&task.attempt_id)setRecovery(this.db,task.task_id,task.attempt_id,"intent",now);
     if(bumpUnknown(this.db,task.task_id)>=BIND_TIMEOUT_TICKS)this.casTransition(task.task_id,reason,{},now);
+  }
+  private controlValid(task:Task):boolean{
+    if(!task.work_id)return true;
+    const control=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);
+    try { const work=getWork(control,task.work_id);return work?.state==="active"&&work.revision===task.contract_revision; }
+    finally { control.close(); }
+  }
+  private superseded(task:Task,now:number):boolean{
+    try { if(this.controlValid(task))return false; } catch {
+      this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,now,task.state,task.state,"contract_authority_unreadable",JSON.stringify({work_id:task.work_id})]);
+      return true;
+    }
+    // A revised contract never grants a new controlled action. Do not mark a
+    // live process terminal: occupancy remains until its authoritative runner
+    // session ends, then normal evidence/recovery paths surface the outcome.
+    const liveness=task.attempt_id?probeRunnerLiveness(this.ledgerPath,task.task_id,task.attempt_id):{kind:"absent" as const};
+    if((task.runner_pid!=null&&defaultPidAlive(task.runner_pid))||liveness.kind==="unreadable"||(liveness.kind==="found"&&!liveness.ended)){
+      // Unknown liveness is an occupancy gate, not proof of death. A human must
+      // confirm stop or explicitly keep the repo held; the partial index keeps
+      // the repo lock while this row remains active.
+      this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,now,task.state,task.state,"contract_superseded_occupancy_held",JSON.stringify({work_id:task.work_id,contract_revision:task.contract_revision,liveness:liveness.kind})]);
+      return true;
+    }
+    // No ledger record is unknown unless this task never acquired an attempt.
+    if(task.attempt_id){this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,now,task.state,task.state,"contract_superseded_occupancy_held",JSON.stringify({work_id:task.work_id,liveness:"absent"})]);return true;}
+    this.casTransition(task.task_id,"human_abandon",{reason:"contract_revision_invalidated",work_id:task.work_id,contract_revision:task.contract_revision},now);
+    return true;
+  }
+  private deadlineExceeded(task:Task,now:number):boolean{return task.budget_deadline_at!=null&&now>=task.budget_deadline_at;}
+  private budgetBlocked(task:Task,now:number):boolean{
+    if(!this.deadlineExceeded(task,now))return false;
+    this.casTransition(task.task_id,"human_abandon",{reason:"managed_budget_deadline_exceeded",deadline_at:task.budget_deadline_at},now);
+    return true;
   }
   private async collectAndResolve(task:Task,now:number):Promise<void>{
     if(!task.worktree)return;
@@ -99,6 +133,8 @@ export class Orchestrator {
       for(const task of claimed){this.spool.emit(task.task_id,"session_started",{parent:"orchestrator",cwd:task.repo,branch:task.branch,lease:{pid:process.pid,proc_boot_id:this.owner}});this.started.add(task.task_id);}
       for(const task of listTasks(this.db)) {
         if(!this.mine(task,now)||this.reconciled.has(task.task_id))continue;
+        if(["queued","starting","running","awaiting_human","submitted"].includes(task.state)&&this.superseded(task,now))continue;
+        if(["queued","starting","running"].includes(task.state)&&this.budgetBlocked(task,now))continue;
         try {
           if(task.state==="starting") await this.startRunner(task);
           else if(task.state==="running") await this.pollRunning(task,now);
@@ -109,7 +145,10 @@ export class Orchestrator {
         }
       }
       try {
-        const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{consumeAnswers(this.db,answers,this.spool,now);expireApprovals(this.db,this.spool,now,answers);}finally{answers.close();}
+        const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{
+          repairApprovalIntents(this.db,answers,now);consumeAnswers(this.db,answers,this.spool,now);expireApprovals(this.db,this.spool,now,answers);reconcileApprovalEffects(this.db,answers,now);
+          publishControlEvents(answers,this.ledgerPath,detail=>this.spool.emit("control", "control_event", detail),now);
+        }finally{answers.close();}
         renewLeases(this.db,this.owner,now);
         await this.collectWorktrees(now);
       } catch(error) { console.error(error); }
@@ -134,6 +173,7 @@ export class Orchestrator {
   // §3.6/§3.7: ensureWorktree -> spawnRunner -> transition. worktree_ok/spawn_ok both land on "running"
   // (store.ts's rules), matching the plan's combined "worktree_ok ∧ spawn_ok -> running" row.
   private async startRunner(task:Task):Promise<void> {
+    if(this.budgetBlocked(task,Date.now()))return;
     const attemptId=task.attempt_id; if(!attemptId){this.casTransition(task.task_id,"no_attempt",{reason:"no_attempt"},Date.now());return;} // claim() always sets attempt_id before "starting"; nothing to do without it.
     const recovery=getRecovery(this.db,task.task_id);
     if(recovery){ if(recovery.spawn_state==="failed")this.casTransition(task.task_id,"spawn_fail",{reason:"tool_missing"},Date.now()); return; }
@@ -179,14 +219,29 @@ export class Orchestrator {
     if(now-lastCheck<Orchestrator.CI_CHECK_INTERVAL) return;
     this.lastCiCheck.set(task.task_id,now);
     const pr=await checkPr(task.pr_url,this.worktreeExec);
-    if(pr.status==="merged"){ this.casTransition(task.task_id,"ci_merged",{},now); this.lastCiCheck.delete(task.task_id); }
-    else if(pr.status==="anomaly"){
-      // Dedup: only request approval if no unconsumed ci_anomaly approval exists.
+    if(pr.status==="merged"){
+      this.casTransition(task.task_id,"ci_merged",{},now);
+      this.lastCiCheck.delete(task.task_id);
+    } else if(pr.status==="anomaly"){
       const existing=this.db.query("SELECT approval_id FROM approvals WHERE task_id=? AND gate='ci_anomaly' AND consumed_at IS NULL").get(task.task_id);
-      if(!existing){ requestApproval(this.db,this.spool,task.task_id,"ci_anomaly",pr.detail??"CI anomaly detected",["rerun","new-task","abandon"]); }
-      this.casTransition(task.task_id,"ci_anomaly",{reason:pr.detail},now); this.lastCiCheck.delete(task.task_id);
+      if(!existing)requestApproval(this.db,this.spool,task.task_id,"ci_anomaly",pr.detail??"CI anomaly detected",["recheck","manual-followup","abandon"]);
+      this.casTransition(task.task_id,"ci_anomaly",{reason:pr.detail},now);
+      this.lastCiCheck.delete(task.task_id);
+    } else if(pr.status==="observation_failed"){
+      const failures=task.ci_observation_failures+1;
+      this.db.run("UPDATE tasks SET ci_observation_failures=?,updated_at=? WHERE task_id=?",[failures,now,task.task_id]);
+      this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,now,task.state,task.state,"ci_observation_failed",JSON.stringify({failures,reason:pr.detail})]);
+      // One transient retry is silent; persistent inability to observe is a
+      // bounded human escalation on the original item, never false clean.
+      if(failures>=2){
+        const existing=this.db.query("SELECT approval_id FROM approvals WHERE task_id=? AND gate='ci_anomaly' AND consumed_at IS NULL").get(task.task_id);
+        if(!existing)requestApproval(this.db,this.spool,task.task_id,"ci_anomaly","Unable to confirm PR/CI state",["recheck","manual-followup","abandon"]);
+        this.casTransition(task.task_id,"ci_anomaly",{reason:"ci_observation_failed",detail:pr.detail},now);
+        this.lastCiCheck.delete(task.task_id);
+      }
+    } else {
+      this.db.run("UPDATE tasks SET ci_observation_failures=0,updated_at=? WHERE task_id=?",[now,task.task_id]);
     }
-    // "clean" -> no action, wait for next poll.
   }
 }
 export async function main(argv=Bun.argv.slice(2)):Promise<void>{const i=argv.indexOf("--concurrency");const concurrency=i<0?2:Number(argv[i+1]);const db=openStore();const spool=new SpoolWriter(db);const orch=new Orchestrator(db,spool,concurrency);const stop=()=>{spool.close();db.close();process.exit(0)};process.on("SIGINT",stop);process.on("SIGTERM",stop);await orch.tick();setInterval(()=>orch.tick(),5000);}

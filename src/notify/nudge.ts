@@ -7,12 +7,19 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { queryHung, queryQ1 } from "../shared/queries";
+import { listAttention, openControl } from "../control/store";
 
 export type NudgeDeps = {
   ledgerPath: string;
+  controlPath?: string;
   statePath: string;
   notify: (message: string) => Promise<void>;
 };
+
+export type NotificationCapability = { available: boolean; platform: NodeJS.Platform; reason: string | null };
+export function notificationCapability(platform: NodeJS.Platform = process.platform): NotificationCapability {
+  return platform === "darwin" ? { available: true, platform, reason: null } : { available: false, platform, reason: "macOS notifications unavailable on this platform" };
+}
 
 /** Previous notified subject IDs persisted across runs; missing/corrupt file reads as empty set. */
 function readPrevious(statePath: string): Set<string> {
@@ -36,6 +43,9 @@ export async function nudgeOnce(deps: NudgeDeps): Promise<{ count: number; notif
   } finally {
     db.close();
   }
+  const control = openControl(deps.controlPath);
+  try { for (const item of listAttention(control, "now")) currentIds.add(`attention:${item.item_id}:${item.revision}`); }
+  finally { control.close(); }
   const previous = readPrevious(deps.statePath);
   let hasNew = false;
   for (const id of currentIds) {
@@ -48,6 +58,8 @@ export async function nudgeOnce(deps: NudgeDeps): Promise<{ count: number; notif
 
 /** Message is derived from a count only; still passed as argv, never interpolated into script source. */
 export async function macNotify(message: string): Promise<void> {
+  const capability = notificationCapability();
+  if (!capability.available) throw new Error(capability.reason!);
   const script = `display notification "${message.replaceAll('"', "")}" with title "Overload"`;
   const proc = Bun.spawn(["osascript", "-e", script], { stdout: "ignore", stderr: "ignore" });
   await proc.exited;

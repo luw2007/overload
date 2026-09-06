@@ -3,30 +3,42 @@ import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import type { Work } from "../control/types";
 
 const schema = readFileSync(join(import.meta.dir, "schema.sql"), "utf8");
 export const STATES = ["queued", "starting", "running", "awaiting_human", "submitted", "blocked", "done", "failed", "abandoned"] as const;
 export type TaskState = typeof STATES[number];
-export type Task = { task_id:string; title:string; repo:string; base_ref:string; worktree:string|null; branch:string|null; state:TaskState; attempt_id:string|null; owner_instance:string|null; lease_expires_at:number|null; heartbeat_at:number|null; runner_pid:number|null; runner_boot_id:string|null; retry_budget:number; stable_id:string|null; pr_url:string|null; blocked_reason:string|null; terminal_reason:string|null; created_at:number; updated_at:number };
+export type Task = { task_id:string; title:string; repo:string; base_ref:string; worktree:string|null; branch:string|null; state:TaskState; attempt_id:string|null; owner_instance:string|null; lease_expires_at:number|null; heartbeat_at:number|null; runner_pid:number|null; runner_boot_id:string|null; retry_budget:number; stable_id:string|null; pr_url:string|null; blocked_reason:string|null; terminal_reason:string|null; work_id:string|null; contract_revision:number|null; budget_deadline_at:number|null; ci_observation_failures:number; created_at:number; updated_at:number };
 export type TransitionDetail = Record<string, unknown>;
 export type Recovery={task_id:string;attempt_id:string;spawn_state:"intent"|"spawned"|"failed";spawn_at:number;unknown_ticks:number};
 const rules: Record<TaskState, Record<string, TaskState>> = {
   queued:{claim:"starting",human_abandon:"abandoned"},
   starting:{worktree_ok:"running",spawn_ok:"running",spawn_fail:"blocked",worktree_fail:"failed",bind_timeout:"running",session_bound:"running",runner_dead:"starting",spawn_unverified:"blocked",no_attempt:"blocked",human_abandon:"abandoned"},
   running:{session_bound:"running",bind_timeout:"running",runner_exit:"awaiting_human",runner_dead:"starting",check_absent:"blocked",liveness_unknown:"blocked",no_attempt:"blocked",human_abandon:"abandoned"},
-  awaiting_human:{"answer=approve":"submitted","answer=reject":"blocked","answer=abandon":"abandoned",gate_expire:"blocked","answer=rerun":"submitted","answer=new-task":"done",human_abandon:"abandoned"},
+  awaiting_human:{"answer=approve":"submitted","answer=reject":"blocked","answer=abandon":"abandoned","answer=recheck":"submitted","answer=manual-followup":"blocked",gate_expire:"blocked",human_abandon:"abandoned"},
   submitted:{push_pr_ok:"submitted",tool_missing:"blocked",push_fail:"blocked",ci_merged:"done",ci_anomaly:"awaiting_human",human_abandon:"abandoned"},
   blocked:{human_reopen:"starting",human_abandon:"abandoned"}, done:{}, failed:{}, abandoned:{}
 };
 
 export function openStore(path = process.env.OVERLOAD_ORCHESTRATOR_PATH ?? join(homedir(), ".overload", "orchestrator.db")): Database {
   mkdirSync(dirname(path), { recursive:true, mode:0o700 });
-  const db = new Database(path, { create:true }); db.exec(schema); chmodSync(path, 0o600);
+  const db = new Database(path, { create:true }); db.exec(schema);
+  // Existing M0 databases predate contract/budget observability. SQLite does
+  // not support ADD COLUMN IF NOT EXISTS, so make this migration idempotent.
+  const columns=db.query("PRAGMA table_info(tasks)").all() as {name:string}[];
+  for(const [name,sql] of [["work_id","TEXT"],["contract_revision","INTEGER"],["budget_deadline_at","INTEGER"],["ci_observation_failures","INTEGER NOT NULL DEFAULT 0"]] as const)
+    if(!columns.some(column=>column.name===name))db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
+  chmodSync(path, 0o600);
   db.run("INSERT OR IGNORE INTO spool_seq(id,seq,segment) VALUES(1,0,0)"); return db;
 }
-export function addTask(db:Database,title:string,repo:string,baseRef:string,now=Date.now()): Task {
-  const id=randomUUID(); db.run("INSERT INTO tasks(task_id,title,repo,base_ref,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",[id,title,repo,baseRef,"queued",now,now]);
+export function addTask(db:Database,title:string,repo:string,baseRef:string,now=Date.now(),binding?:{workId?:string;contractRevision?:number;deadlineAt?:number}): Task {
+  const id=randomUUID(); db.run("INSERT INTO tasks(task_id,title,repo,base_ref,state,work_id,contract_revision,budget_deadline_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",[id,title,repo,baseRef,"queued",binding?.workId??null,binding?.contractRevision??null,binding?.deadlineAt??null,now,now]);
   db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event) VALUES(?,?,?,?,?)",[id,now,null,"queued","add"]); return getTask(db,id)!;
+}
+export function bindTaskContract(db:Database,taskId:string,work:Work):Task {
+  if(!work.contract)throw new Error("work has no contract");
+  db.run("UPDATE tasks SET work_id=?,contract_revision=?,budget_deadline_at=?,retry_budget=?,updated_at=? WHERE task_id=?",[work.work_id,work.revision,work.contract.budget.deadline_at??null,work.contract.budget.retry_limit??2,Date.now(),taskId]);
+  const task=getTask(db,taskId);if(!task)throw new Error(`Task not found: ${taskId}`);return task;
 }
 export function getTask(db:Database,id:string):Task|null { return db.query("SELECT * FROM tasks WHERE task_id=?").get(id) as Task|null; }
 export function listTasks(db:Database,state?:TaskState):Task[] { return (state?db.query("SELECT * FROM tasks WHERE state=? ORDER BY created_at,task_id").all(state):db.query("SELECT * FROM tasks ORDER BY created_at,task_id").all()) as Task[]; }

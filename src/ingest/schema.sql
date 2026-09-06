@@ -22,6 +22,26 @@ CREATE TABLE IF NOT EXISTS requests(request_uid TEXT PRIMARY KEY, stable_id TEXT
   created_at INTEGER, resolved_at INTEGER, detail TEXT);
 CREATE TABLE IF NOT EXISTS reducer_cursor(id INTEGER PRIMARY KEY CHECK(id=1), journal_seq INTEGER NOT NULL);
 
+-- Durable business-event dedup and ledger-only attention projection. Source
+-- control state stays in control DB; this projection is audit/notification data.
+CREATE TABLE IF NOT EXISTS applied_control_events(
+  event_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, applied_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS control_attention(
+  item_id TEXT PRIMARY KEY, work_id TEXT NOT NULL, revision INTEGER NOT NULL,
+  state TEXT NOT NULL, effect_state TEXT NOT NULL, urgency TEXT NOT NULL, owner TEXT NOT NULL,
+  conclusion TEXT NOT NULL, trigger TEXT NOT NULL, impact TEXT NOT NULL, recommendation TEXT,
+  options TEXT NOT NULL, expires_at INTEGER, defer_until INTEGER, acknowledged_at INTEGER,
+  source_link TEXT, approval_id TEXT, consumer_owner TEXT, contract_revision INTEGER NOT NULL,
+  decision_mode TEXT NOT NULL, evidence TEXT NOT NULL, event_id TEXT NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS control_attention_zone ON control_attention(state,urgency,defer_until,updated_at);
+CREATE INDEX IF NOT EXISTS control_attention_work ON control_attention(work_id,updated_at);
+CREATE TABLE IF NOT EXISTS control_attention_feedback(
+  event_id TEXT PRIMARY KEY, item_id TEXT NOT NULL, revision INTEGER NOT NULL,
+  useful INTEGER NOT NULL, reason TEXT, created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS journal_stable_id_ingest_seq ON journal(stable_id, ingest_seq);
 CREATE INDEX IF NOT EXISTS requests_stable_id_state ON requests(stable_id, state);
 CREATE INDEX IF NOT EXISTS incarnations_stable_id_started_at ON session_incarnations(stable_id, started_at);

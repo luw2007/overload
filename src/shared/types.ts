@@ -32,6 +32,7 @@ export type EventKind =
   | "session_ended"        // session_shutdown
   | "events_dropped"       // {n} from resident counter
   | "classifier_activated" // admin spool only: {version}
+  | "control_event"        // durable control outbox envelope; detail carries stable event_id + snapshot
   // ── P2 reconciliation findings (admin spool, runtime="overload", emitter=recon process) ──
   | "emitter_dead"         // {emitter_id, stable_id, pid, verified: "kill0"|"comm_mismatch"|"lease"}
   | "emitter_drained"      // {emitter_id, stable_id} — verified dead + 5min grace + ingest cursors at EOF for all its files; SOLE trigger for orphaning

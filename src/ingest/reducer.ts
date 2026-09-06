@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { CLASSIFIER_VERSION, classify, queueAfter, type ClassifiableCurrent, type ClassifierEvent } from "./classifier";
 import { PROGRESS_KINDS } from "../shared/types";
+import { applyControlEvent } from "../control/projection";
 
 const SOURCE_TERMINALS = new Set(["resolved", "cancelled", "timed_out"]);
 const SESSION_TERMINALS = new Set(["done", "failed", "vanished"]);
@@ -80,6 +81,7 @@ export function reduceJournal(db: Database, batchSize = 500): number {
 
 function applyEvent(db: Database, row: JournalRow): void {
   const detail = objectDetail(row.detail);
+  if (row.kind === "control_event") { applyControlEvent(db, detail, row.at); return; }
   if (row.kind === "classifier_activated") {
     const version = typeof detail.version === "number" ? detail.version : CLASSIFIER_VERSION;
     db.query("INSERT OR IGNORE INTO classifier_activations(version, activated_at_journal_seq, activated_at) VALUES (?, ?, ?)").run(version, row.ingest_seq, row.at);

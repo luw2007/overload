@@ -1,6 +1,6 @@
 import type { CommandExecutor } from "./worktree";
 
-export type PrStatus = { status: "merged" | "anomaly" | "clean"; detail?: string };
+export type PrStatus = { status: "merged" | "anomaly" | "clean" | "observation_failed"; detail?: string };
 
 /**
  * §3.8 CI recon: `gh pr view <url> --json statusCheckRollup,reviewDecision,mergeable`.
@@ -11,10 +11,12 @@ export async function checkPr(prUrl: string, executor: CommandExecutor): Promise
     "pr", "view", prUrl,
     "--json", "state,statusCheckRollup,reviewDecision,mergeable,updatedAt",
   ]);
-  if (!result.ok) return { status: "clean", detail: "gh pr view failed" };
+  // A failed observation is not a healthy PR. Callers must retain the last
+  // known state, retry only within their persisted budget, then escalate.
+  if (!result.ok) return { status: "observation_failed", detail: "gh pr view failed" };
 
   let data: any;
-  try { data = JSON.parse(result.stdout); } catch { return { status: "clean", detail: "parse error" }; }
+  try { data = JSON.parse(result.stdout); } catch { return { status: "observation_failed", detail: "gh pr view returned invalid JSON" }; }
 
   // Merged check
   if (data.state === "MERGED") return { status: "merged" };

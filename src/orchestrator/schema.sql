@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   runner_pid INTEGER, runner_boot_id TEXT,   -- 绑定后由 ledger 回填
   retry_budget INTEGER NOT NULL DEFAULT 2,
   stable_id TEXT, pr_url TEXT, blocked_reason TEXT, terminal_reason TEXT,
+  work_id TEXT, contract_revision INTEGER, budget_deadline_at INTEGER,
+  ci_observation_failures INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 
 -- queued 不持锁；活跃态每 repo 至多一个，由 DB 强制而非查询强制。
@@ -21,7 +23,7 @@ CREATE TABLE IF NOT EXISTS task_events(
 
 CREATE TABLE IF NOT EXISTS approvals(
   approval_id TEXT PRIMARY KEY,     -- 同时是 spool 事件的 request_id
-  task_id TEXT NOT NULL, gate TEXT NOT NULL CHECK(gate IN ('ready','ci_anomaly')),
+  task_id TEXT NOT NULL, gate TEXT NOT NULL CHECK(gate IN ('ready','ci_anomaly','confirm_stopped','keep_held')),
   question TEXT NOT NULL, options TEXT NOT NULL,   -- JSON 白名单
   requested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
   consumed_at INTEGER, actor TEXT);                -- 'ui' | 'cli'；消费即转移，不双写 answer
@@ -35,3 +37,17 @@ CREATE TABLE IF NOT EXISTS task_recovery(
   spawn_state TEXT NOT NULL CHECK(spawn_state IN ('intent','spawned','failed')),
   spawn_at INTEGER NOT NULL,
   unknown_ticks INTEGER NOT NULL DEFAULT 0);
+
+-- Receipt application is local, transactional execution fact. It is deliberately
+-- separate from mailbox applied_at, which is only a rebuildable projection.
+CREATE TABLE IF NOT EXISTS applied_receipts(
+  receipt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, answer TEXT NOT NULL,
+  applied_at INTEGER NOT NULL, result TEXT NOT NULL);
+
+-- Local intent is written atomically with approval/state facts. A retry repairs
+-- the independent mailbox/control DB and emits the durable control event.
+CREATE TABLE IF NOT EXISTS approval_intents(
+  approval_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, gate TEXT NOT NULL,
+  question TEXT NOT NULL, options TEXT NOT NULL, expires_at INTEGER NOT NULL,
+  evidence TEXT NOT NULL, created_at INTEGER NOT NULL, repaired_at INTEGER,
+  control_event_id TEXT);

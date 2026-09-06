@@ -19,6 +19,20 @@ export type AuditSession = {
   handoff: Handoff | null;
   maxAwaitingHumanMs: number;
 };
+export type AuditControlMetrics = {
+  projectedEvents: number;
+  attentionOpened: number;
+  attentionResolved: number;
+  attentionSuperseded: number;
+  attentionApplying: number;
+  effectsSucceeded: number;
+  effectsFailed: number;
+  effectsUnknown: number;
+  acknowledgedOnly: number;
+  feedbackUseful: number;
+  feedbackNotUseful: number;
+  feedbackUnmeasured: number;
+};
 export type AuditReport = {
   sample: number;
   sinceMs: number;
@@ -27,6 +41,7 @@ export type AuditReport = {
   gatedResolved: number;
   gatedTerminal: number;
   passRate: number;
+  control: AuditControlMetrics;
   repeatedFailurePatterns: string[];
   rulesToAdd: string[];
 };
@@ -73,6 +88,24 @@ function uniqueSorted(values: Iterable<string>): string[] {
 
 function inWindow(at: number, cutoff: number, now: number): boolean {
   return at >= cutoff && at <= now;
+}
+
+function controlMetrics(db: Database, cutoff: number, now: number): AuditControlMetrics {
+  const empty: AuditControlMetrics = { projectedEvents:0,attentionOpened:0,attentionResolved:0,attentionSuperseded:0,attentionApplying:0,effectsSucceeded:0,effectsFailed:0,effectsUnknown:0,acknowledgedOnly:0,feedbackUseful:0,feedbackNotUseful:0,feedbackUnmeasured:0 };
+  const tables = new Set((db.query("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{name:string}>).map(row=>row.name));
+  if (!tables.has("applied_control_events") || !tables.has("control_attention")) return empty;
+  empty.projectedEvents = (db.query("SELECT COUNT(*) AS n FROM applied_control_events WHERE applied_at BETWEEN ? AND ?").get(cutoff,now) as {n:number}).n;
+  const rows = db.query("SELECT state,effect_state,acknowledged_at,evidence FROM control_attention WHERE updated_at BETWEEN ? AND ?").all(cutoff,now) as Array<{state:string;effect_state:string;acknowledged_at:number|null;evidence:string}>;
+  empty.attentionOpened=rows.filter(row=>row.state==="open").length; empty.attentionResolved=rows.filter(row=>row.state==="resolved").length;
+  empty.attentionSuperseded=rows.filter(row=>row.state==="superseded").length; empty.attentionApplying=rows.filter(row=>row.state==="applying").length;
+  empty.effectsSucceeded=rows.filter(row=>row.effect_state==="succeeded").length; empty.effectsFailed=rows.filter(row=>row.effect_state==="failed").length;
+  empty.effectsUnknown=rows.filter(row=>row.effect_state==="unknown").length; empty.acknowledgedOnly=rows.filter(row=>row.acknowledged_at!==null&&row.state==="open").length;
+  if (tables.has("control_attention_feedback")) {
+    const feedback=db.query("SELECT useful,COUNT(*) n FROM control_attention_feedback WHERE created_at BETWEEN ? AND ? GROUP BY useful").all(cutoff,now) as Array<{useful:number;n:number}>;
+    empty.feedbackUseful=feedback.find(row=>row.useful===1)?.n??0;empty.feedbackNotUseful=feedback.find(row=>row.useful===0)?.n??0;
+  }
+  empty.feedbackUnmeasured=Math.max(0,rows.length-empty.feedbackUseful-empty.feedbackNotUseful);
+  return empty;
 }
 
 /** `flag` names the caller's own option so a typo is reported against the flag the operator typed. */
@@ -247,6 +280,7 @@ export function audit(db: Database, options: AuditOptions): AuditReport {
     gatedResolved,
     gatedTerminal,
     passRate: gatedTerminal ? gatedResolved / gatedTerminal : 0,
+    control: controlMetrics(db, cutoff, options.now),
     repeatedFailurePatterns,
     rulesToAdd,
   };
@@ -255,6 +289,10 @@ export function audit(db: Database, options: AuditOptions): AuditReport {
 export function printAudit(report: AuditReport, output: (line: string) => void = console.log): void {
   output(`PASS_RATE ${(report.passRate * 100).toFixed(1)}% (${report.gatedResolved}/${report.gatedTerminal})`);
   output(`SESSIONS ${report.sessions.length}`);
+  const control = report.control;
+  output(`CONTROL events=${control.projectedEvents} open=${control.attentionOpened} applying=${control.attentionApplying} resolved=${control.attentionResolved} superseded=${control.attentionSuperseded}`);
+  output(`EFFECTS succeeded=${control.effectsSucceeded} failed=${control.effectsFailed} unknown=${control.effectsUnknown} ack_only=${control.acknowledgedOnly}`);
+  output(`INTERRUPTIONS useful=${control.feedbackUseful} not_useful=${control.feedbackNotUseful} unmeasured=${control.feedbackUnmeasured}`);
   for (const session of report.sessions) {
     const d = session.decisions;
     output(`SESSION ${session.stableId} cwd=${session.cwd ?? "-"}`);
