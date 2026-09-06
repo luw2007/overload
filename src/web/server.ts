@@ -5,6 +5,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
+import { consumeDecision, registerTarget, writeHumanAnswer } from "../decision-bot/mailbox";
+import { loadPolicy, policyAuthorizes } from "../decision-bot/policy";
+import { DecisionBotService } from "../decision-bot/service";
 import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
@@ -154,19 +157,16 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
           db.exec("PRAGMA busy_timeout=5000");
           try { return json({ acked: ackRequest(db, requestUid).changes === 1 }); } finally { db.close(); }
         }
-        if (request.method === "POST" && url.pathname.startsWith("/api/orchestrator/answer/")) {
-          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });
-          let body: unknown;
-          try { body = await request.json(); } catch { return json({ error: "invalid JSON" }, { status: 400 }); }
-          if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).answer !== "string") return json({ error: "missing answer" }, { status: 400 });
-          const approvalId = routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));
-          const answersPath = process.env.OVERLOAD_ANSWERS_PATH ?? defaultAnswersPath;
-          const db = openAnswersDb(answersPath);
-          db.exec("PRAGMA busy_timeout=5000");
-          try { db.run("INSERT OR IGNORE INTO answers(approval_id, answer, actor, at) VALUES (?, ?, 'ui', ?)", [approvalId, (body as Record<string, unknown>).answer, Date.now()]); } finally { db.close(); }
-          return json({ ok: true });
+        if (request.method === "POST" && url.pathname === "/api/decision/target") {
+          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({error:"forbidden"},{status:403});let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}if(body?.consumerOwner!=="extension"||typeof body.approvalId!=="string"||!Array.isArray(body.options))return json({error:"invalid target"},{status:400});const mailbox=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{return json(registerTarget(mailbox,{consumerOwner:"extension",approvalId:body.approvalId,stableId:body.stableId,requestUid:body.requestUid,question:String(body.question??""),options:body.options,effect:String(body.effect??"gated_tool"),scope:body.scope??{},evidence:body.evidence??{},expiresAt:Number(body.expiresAt)}));}finally{mailbox.close();}
         }
-        if (request.method === "GET" && url.pathname.startsWith("/api/orchestrator/answer/")) {
+        if (request.method === "POST" && url.pathname.startsWith("/api/orchestrator/answer/")) {
+          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}const approvalId=routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));if(!approvalId||typeof body?.answer!=="string")return json({error:"missing answer"},{status:400});const mailbox=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{const owner=body.consumer_owner==="extension"?"extension":"orchestrator";const result=writeHumanAnswer(mailbox,owner,approvalId,body.answer,"ui");return result.ok?json({ok:true}):json({error:result.reason},{status:result.reason==="already_consumed"?409:400});}finally{mailbox.close();}
+        }
+        if(request.method==="POST"&&url.pathname.startsWith("/api/decision/consume/")){if(!request.headers.get("sec-fetch-site")&&!request.headers.get("sec-fetch-mode"))return json({error:"forbidden"},{status:403});let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}const id=routeParameter(url.pathname.slice("/api/decision/consume/".length));if(!id||body?.consumer_owner!=="extension"||typeof body.target_version!=="string")return json({error:"invalid consume"},{status:400});const mailbox=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{const policy=loadPolicy();const r=consumeDecision(mailbox,{consumerOwner:"extension",approvalId:id,targetVersion:body.target_version,policyHash:policy.hash,liveValid:()=>true,policyValid:(t,p)=>!!p&&policyAuthorizes(policy,t,p.answer,p.policyHash)});return r?json(r):json({error:"not ready"},{status:404});}finally{mailbox.close();}}
+        if(request.method==="GET"&&url.pathname==="/api/decision-bot/status"){const mailbox=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{return json(new DecisionBotService(mailbox).status());}finally{mailbox.close();}}
+        /* Legacy GET/DELETE answer consumption was removed: registered targets use POST consume receipts. */
+        if (false && request.method === "GET" && url.pathname.startsWith("/api/orchestrator/answer/")) {
           const approvalId = routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));
           const answersPath = process.env.OVERLOAD_ANSWERS_PATH ?? defaultAnswersPath;
           const db = openAnswersDb(answersPath);
@@ -175,7 +175,7 @@ export function startWebServer(options: { ledgerPath?: string; port?: number; ju
             return row ? json(row) : json({ error: "not found" }, { status: 404 });
           } finally { db.close(); }
         }
-        if (request.method === "DELETE" && url.pathname.startsWith("/api/orchestrator/answer/")) {
+        if (false && request.method === "DELETE" && url.pathname.startsWith("/api/orchestrator/answer/")) {
           const approvalId = routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));
           const answersPath = process.env.OVERLOAD_ANSWERS_PATH ?? defaultAnswersPath;
           const db = openAnswersDb(answersPath);

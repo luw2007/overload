@@ -70,9 +70,10 @@
   function decisionCard(row) {
     const isOrchestratorGate = row.detail && typeof row.detail.gate === "string";
     const approvalId = row.detail?.approval_id ?? row.detail?.request_id;
+    const consumerOwner = row.detail?.consumer_owner ?? (row.detail?.gate === "action" ? "extension" : "orchestrator");
     const age = Date.now() - row.created_at;
-    const options = Array.isArray(row.options) && row.options.length ? `<div class="option-chips">${row.options.map((option) => isOrchestratorGate && approvalId ? `<button class="btn primary approve" data-approval-id="${escapeHtml(approvalId)}" data-answer="${escapeHtml(option)}">${escapeHtml(option)}</button>` : `<span class="option-chip">${escapeHtml(option)}</span>`).join("")}</div>` : "";
-    const gate = isOrchestratorGate ? `<div class="meta">门禁：${escapeHtml(row.detail.gate)}${row.detail.class ? ` · 类别：${escapeHtml(row.detail.class)}` : ""}${row.detail.rule ? ` · 规则：${escapeHtml(row.detail.rule)}` : ""}${row.detail.command ? ` · 命令：${escapeHtml(row.detail.command)}` : ""}</div>` : "";
+    const options = Array.isArray(row.options) && row.options.length ? `<div class="option-chips">${row.options.map((option) => isOrchestratorGate && approvalId ? `<button class="btn primary approve" data-approval-id="${escapeHtml(approvalId)}" data-consumer-owner="${escapeHtml(consumerOwner)}" data-answer="${escapeHtml(option)}">${escapeHtml(option)}</button>` : `<span class="option-chip">${escapeHtml(option)}</span>`).join("")}</div>` : "";
+    const gate = isOrchestratorGate ? `<div class="meta">门禁：${escapeHtml(row.detail.gate)}${row.detail.class ? ` · 类别：${escapeHtml(row.detail.class)}` : ""}${row.detail.rule ? ` · 规则：${escapeHtml(row.detail.rule)}` : ""}${row.detail.command ? ` · 命令：${escapeHtml(row.detail.command)}` : ""}${row.detail.bot_status ? ` · 决策机器人：${escapeHtml(row.detail.bot_status)}${row.detail.bot_outcome ? ` (${escapeHtml(row.detail.bot_outcome)})` : ""}` : ""}</div>` : "";
     return `<article class="card decision-card">${rowCheckbox(row.request_uid)}<div class="card-main"><div class="headline"><span class="dot red"></span>${escapeHtml(row.summary || row.detail?.question || row.detail?.prompt || `${row.kind} 需要决策`)}</div><div class="meta">${sessionLink(row.stable_id)} · ${escapeHtml(row.host || "未知主机")} · <span class="age-chip${age >= AGE_WARN_MS ? " age-warn" : ""}">等待 ${ageText(age)}</span></div>${gate}<div class="impact-line">${ASK_IMPACT}</div>${options}</div><div class="actions"><button class="btn danger ack" data-id="${escapeHtml(row.request_uid)}">确认并归档</button>${jumpActions(row, "request_uid", "q1")}</div></article>`;
   }
 
@@ -324,7 +325,7 @@
       await fetchJson(`/api/orchestrator/answer/${encodeURIComponent(button.dataset.approvalId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ answer: button.dataset.answer }),
+        body: JSON.stringify({ answer: button.dataset.answer, consumer_owner: button.dataset.consumerOwner }),
       });
       await refresh();
     } catch (error) {
@@ -335,9 +336,11 @@
 
   async function refresh() {
     try {
-      const names = ["summary", "q1", "q2", "archive", "hung", "sessions", "zombie", "health"];
-      const [summary, q1, q2, archive, hung, sessions, zombie, health] = await Promise.all(names.map((name) => fetchJson(`/api/${name}`)));
-      Object.assign(state, { summary, q1, q2, archive, hung, sessions, zombie, health });
+      const names = ["summary", "q1", "q2", "archive", "hung", "sessions", "zombie", "health", "decision-bot/status"];
+      const [summary, q1, q2, archive, hung, sessions, zombie, health, decisionBot] = await Promise.all(names.map((name) => fetchJson(`/api/${name}`)));
+      const targetStatus = new Map((decisionBot.targets || []).map((target) => [`${target.consumer_owner}:${target.approval_id}`, target]));
+      for (const row of q1) { const owner=row.detail?.consumer_owner ?? (row.detail?.gate==="action"?"extension":"orchestrator"); const target=targetStatus.get(`${owner}:${row.detail?.approval_id ?? row.detail?.request_id}`); if(target)row.detail={...row.detail,bot_status:target.state,bot_outcome:target.outcome}; }
+      Object.assign(state, { summary, q1, q2, archive, hung, sessions, zombie, health, decisionBot });
       const q1Ids = q1.map((row) => row.request_uid);
       const q2Ids = q2.map((row) => row.stable_id);
       const liveIds = new Set([...q1Ids, ...q2Ids]);

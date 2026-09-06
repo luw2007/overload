@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { openMailbox, registerTarget } from "../decision-bot/mailbox";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -84,29 +85,16 @@ describe("web API", () => {
     expect((await fetch(`${base}/api/closeout/missing`, { method: "POST", headers })).status).toBe(404);
   });
 
-  test("reads, creates, and deletes an orchestrator answer mailbox row", async () => {
+  test("rejects an answer without a registered actionable target", async () => {
     const path = seedLedger();
     const answerPath = join(roots[roots.length - 1], "answers.db");
     process.env.OVERLOAD_ANSWERS_PATH = answerPath;
     const { base } = await runningServer(path);
     const id = "stable#writer#tool";
-    expect((await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`)).status).toBe(404);
     const post = await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`, { method: "POST", headers: { origin: base, "sec-fetch-site": "same-origin" }, body: JSON.stringify({ answer: "approve" }) });
-    expect(post.status).toBe(200);
-    expect(await (await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`)).json()).toMatchObject({ answer: "approve", actor: "ui" });
-    const noOrigin = await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`, { method: "DELETE" });
-    expect(noOrigin.status).toBe(403);
-    const remove = await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`, { method: "DELETE", headers: { origin: base } });
-    expect(remove.status).toBe(200);
+    expect(post.status).toBe(400);
     expect((await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`)).status).toBe(404);
-  });
-  test("missing Origin blocks answer DELETE", async () => {
-    const path = seedLedger();
-    const answerPath = join(roots[roots.length - 1], "answers.db");
-    process.env.OVERLOAD_ANSWERS_PATH = answerPath;
-    const { base } = await runningServer(path);
-    const response = await fetch(`${base}/api/orchestrator/answer/id`, { method: "DELETE" });
-    expect(response.status).toBe(403);
+    expect((await fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(id)}`, { method: "DELETE", headers: { origin: base } })).status).toBe(404);
   });
   test("archive includes q4 and unproven q2 rows", async () => {
     const path = seedLedger();
@@ -317,6 +305,7 @@ describe("web API", () => {
       const root = mkdtempSync(join(tmpdir(), "overload-answer-"));
       roots.push(root);
       const aPath = answersDb(root);
+      const mailbox=openMailbox(aPath);registerTarget(mailbox,{consumerOwner:"orchestrator",approvalId:"test-approval-1",question:"approve?",options:["approve"],effect:"push_and_create_pr",scope:{gate:"ready",repo:"/repo"},evidence:{},expiresAt:Date.now()+60000});mailbox.close();
       process.env.OVERLOAD_ANSWERS_PATH = aPath;
       const { server } = await runningServer(seedLedger());
       const base = `http://127.0.0.1:${server.port}`;
@@ -367,6 +356,7 @@ describe("web API", () => {
 
     test("missing answers.db is created", async () => {
       process.env.OVERLOAD_ANSWERS_PATH = join(tmpdir(), "nonexistent-" + Date.now(), "answers.db");
+      const mailbox=openMailbox(process.env.OVERLOAD_ANSWERS_PATH);registerTarget(mailbox,{consumerOwner:"orchestrator",approvalId:"test-approval-4",question:"approve?",options:["approve"],effect:"push_and_create_pr",scope:{gate:"ready",repo:"/repo"},evidence:{},expiresAt:Date.now()+60000});mailbox.close();
       const { server } = await runningServer(seedLedger());
       const base = `http://127.0.0.1:${server.port}`;
       const response = await fetch(`${base}/api/orchestrator/answer/test-approval-4`, {

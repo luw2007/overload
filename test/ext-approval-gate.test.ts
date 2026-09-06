@@ -66,7 +66,8 @@ describe("approval gate", () => {
     const oldFetch = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(input), init });
-      return new Response(init?.method === "DELETE" ? "" : JSON.stringify({ answer: "approve", actor: "ui" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (String(input).endsWith("/api/decision/target")) return new Response(JSON.stringify({ targetVersion: "v1" }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ answer: "approve", actor: "ui", receiptId: "receipt-1" }), { status: 200, headers: { "content-type": "application/json" } });
     }) as typeof fetch;
     try {
       const h = await harness({ web_port: 4901, approval_gate: { enabled: true, require_approval_bash_patterns: ["^git push"] } });
@@ -76,7 +77,7 @@ describe("approval gate", () => {
       // The card must say what kind of action is being released, not only which regex matched.
       expect(events.find((item) => item.kind === "decision_requested")?.detail).toMatchObject({ request_id: "approve-call", gated: true, gate: "action", rule: "^git push", tool: "bash", command: "git push origin main", class: "push", summary: "放行 bash: git push origin main?", options: ["approve", "deny"] });
       expect(events.find((item) => item.kind === "decision_resolved")?.detail).toMatchObject({ request_id: "approve-call", gated: true, state: "resolved", selected: "approve", actor: "ui" });
-      expect(calls.some((call) => call.init?.method === "DELETE" && call.init.headers && new Headers(call.init.headers).get("Origin") === "http://127.0.0.1:4901")).toBe(true);
+      expect(calls.some((call) => call.init?.method === "POST" && call.url.includes("/api/decision/consume/"))).toBe(true);
     } finally {
       globalThis.fetch = oldFetch;
     }
@@ -84,7 +85,7 @@ describe("approval gate", () => {
 
   test("deny answer blocks tool", async () => {
     const oldFetch = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(JSON.stringify({ answer: "deny", actor: "ui" }), { status: 200 })) as typeof fetch;
+    globalThis.fetch = (async (input) => String(input).endsWith("/api/decision/target") ? new Response(JSON.stringify({ targetVersion: "v1" }), { status: 200 }) : new Response(JSON.stringify({ answer: "deny", actor: "ui", receiptId: "receipt-2" }), { status: 200 })) as typeof fetch;
     try {
       const h = await harness({ approval_gate: { enabled: true, require_approval_bash_patterns: ["^echo"] } });
       expect((await Promise.all(h.dispatch("tool_call", { toolName: "bash", toolCallId: "deny-call", input: { command: "echo hi" } })))[0]).toEqual({ block: true, reason: "overload approval gate: denied by ui" });

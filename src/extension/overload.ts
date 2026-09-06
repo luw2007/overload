@@ -503,23 +503,26 @@ export default function overload(pi: ExtensionApi): void {
     }
     const expiresAt = Date.now() + gate.timeoutMs
     const detail = approvalDetail(event, rule.rule, expiresAt)
-    emit("decision_requested", detail)
     const approvalId = String(detail.approval_id)
     const base = `http://127.0.0.1:${gate.webPort}`
-    while (Date.now() < expiresAt) {
+    const evidence = { tool: detail.tool, command: typeof event?.input?.command === "string" ? event.input.command : undefined, path: typeof event?.input?.path === "string" ? event.input.path : undefined, input: event?.input, cwd: sessionCwd, rule: rule.rule, class: detail.class, toolCallId: event.toolCallId }
+    let targetVersion = ""
+    try {
+      const registered = await globalThis.fetch(`${base}/api/decision/target`, { method: "POST", headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumerOwner: "extension", approvalId, stableId, requestUid: `${stableId}#${spool.writerId}#${event.toolCallId}`, question: detail.summary, options: ["approve", "deny"], effect: String(detail.class || "gated_tool"), scope: { gate: "action", rule: rule.rule, cwd: sessionCwd }, evidence, expiresAt }) })
+      if (registered.ok) targetVersion = String((await registered.json() as any).targetVersion || "")
+    } catch { /* unavailable control plane remains fail-closed */ }
+    emit("decision_requested", { ...detail, consumer_owner: "extension", target_version: targetVersion })
+    while (Date.now() < expiresAt && targetVersion) {
       try {
-        const response = await globalThis.fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(approvalId)}`)
+        const response = await globalThis.fetch(`${base}/api/decision/consume/${encodeURIComponent(approvalId)}`, { method: "POST", headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumer_owner: "extension", target_version: targetVersion }) })
         if (response.status === 200) {
-          const payload = await response.json() as { answer?: unknown; actor?: unknown }
+          const payload = await response.json() as { answer?: unknown; actor?: unknown; receiptId?: unknown }
           const answer = typeof payload.answer === "string" ? payload.answer : ""
           const actor = typeof payload.actor === "string" ? payload.actor : "unknown"
-          await globalThis.fetch(`${base}/api/orchestrator/answer/${encodeURIComponent(approvalId)}`, { method: "DELETE", headers: { Origin: base } })
-          emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "resolved", selected: answer, actor })
+          emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "resolved", selected: answer, actor, receipt_id: payload.receiptId })
           return answer === "approve" ? undefined : { block: true, reason: `overload approval gate: denied by ${actor}` }
         }
-      } catch {
-        // Poll errors are fail-closed at expiry, not an early allow.
-      }
+      } catch { /* Poll errors are fail-closed at expiry, not an early allow. */ }
       await sleep(Math.min(APPROVAL_POLL_INTERVAL_MS, Math.max(1, expiresAt - Date.now())))
     }
     emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "timed_out" })

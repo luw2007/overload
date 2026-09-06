@@ -109,8 +109,7 @@ export class Orchestrator {
         }
       }
       try {
-        const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{consumeAnswers(this.db,answers,this.spool,now);}finally{answers.close();}
-        expireApprovals(this.db,now);
+        const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{consumeAnswers(this.db,answers,this.spool,now);expireApprovals(this.db,this.spool,now,answers);}finally{answers.close();}
         renewLeases(this.db,this.owner,now);
         await this.collectWorktrees(now);
       } catch(error) { console.error(error); }

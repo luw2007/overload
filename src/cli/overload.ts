@@ -7,6 +7,8 @@ import { performJump, type JumpResult } from "../shared/jump";
 import { runDoctor, defaultDoctorDeps } from "./doctor";
 import { audit, parseSince, printAudit } from "./audit";
 import { runCli as runOrchestratorCli } from "../orchestrator/cli";
+import { openMailbox, setBotDisabled, writeHumanAnswer } from "../decision-bot/mailbox";
+import { DecisionBotService } from "../decision-bot/service";
 
 const path = process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
 type Output = (line: string) => void;
@@ -17,7 +19,7 @@ const note: Output = (line) => console.error(line);
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q4 | hung | zombie | health | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | orch ..."); process.exit(2); }
+function usage(): never { console.error("usage: overload sessions | show <stable_id> | q1 | q4 | hung | zombie | health | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot run|once|status|disable|enable|takeover <owner> <id> <answer> | orch ..."); process.exit(2); }
 
 function listSessions(db: Database): void {
   const rows = querySessions(db);
@@ -120,6 +122,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   };
   if (!command) usage();
   if (command === "orch") { await runOrchestratorCli(rest); return; }
+  if (command === "decision-bot") { const mailbox=openMailbox();const bot=new DecisionBotService(mailbox);try{if(rest[0]==="status"&&rest.length===1)console.log(JSON.stringify(bot.status(),null,2));else if(rest[0]==="once"&&rest.length===1)await bot.tick();else if(rest[0]==="disable"&&rest.length===1)setBotDisabled(mailbox,true,"cli");else if(rest[0]==="enable"&&rest.length===1)setBotDisabled(mailbox,false,"cli");else if(rest[0]==="takeover"&&rest.length===4){const owner=rest[1];if(owner!=="extension"&&owner!=="orchestrator")usage();const result=writeHumanAnswer(mailbox,owner,rest[2]!,rest[3]!,"cli");if(!result.ok){console.error(result.reason);process.exitCode=1;}}else if(rest[0]==="run"&&rest.length===1){for(;;){await bot.tick();await Bun.sleep(2000);}}else usage();}finally{mailbox.close();}return; }
   if (simple.has(command)) { if (rest.length) usage(); } else if (!arity[command]?.(rest.length)) usage();
   if (command === "ack") {
     const rw = new Database(path);

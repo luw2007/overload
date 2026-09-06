@@ -58,7 +58,15 @@ bun src/cli/overload.ts ack <request_uid>...
 bun src/cli/overload.ts doctor
 bun src/cli/overload.ts audit
 bun src/cli/overload.ts audit --sample 20 --since 24h
+bun src/cli/overload.ts decision-bot status
+bun src/cli/overload.ts decision-bot once   # bounded operational tick
+bun src/cli/overload.ts decision-bot run    # optional foreground daemon
+bun src/cli/overload.ts decision-bot disable
+bun src/cli/overload.ts decision-bot enable
+bun src/cli/overload.ts decision-bot takeover extension <approval_id> <answer>
 ```
+
+The restricted decision bot is disabled by default. Enable it only with an explicit `decision_bot` object in `~/.overload/config.json` containing a model and exact rules; each rule must bind `consumer_owner`, gate, effect, allowed answers, and exact repo/cwd plus command or path scope. It runs `pi` ephemerally with no tools, extensions, skills, prompt templates, context files, or saved session, treats output as an untrusted proposal, and revalidates policy and source state at consume time. Human answers committed before consume win; after a receipt is consumed the API returns a conflict rather than claiming retroactive cancellation. This is a same-UID workflow boundary, not an OS sandbox.
 
 `audit` is a read-only, deterministic report over recent journal evidence. It
 shows gated decisions, consequential tool classes, captured `HANDOFF.md`
@@ -69,22 +77,17 @@ Settled handoffs with `partial` or `blocked` status, or non-zero
 `uncertainties`, remain in the Inbox for human follow-up; complete,
 zero-uncertainty handoffs are archived normally.
 
-The CLI covers the same decision path as the dashboard: list what needs a human,
-reach that terminal, and acknowledge. Rows go to stdout and headings to stderr,
-so `q1 2>/dev/null | cut -f1 | xargs ... ack` is the shell equivalent of the
+The CLI and dashboard both list pending work and support local close-out. Rows go
+to stdout and headings to stderr, so
+`q1 2>/dev/null | cut -f1 | xargs ... ack` is the shell equivalent of the
 dashboard's multi-select 批量 Ack.
 
-Q1 **Ack** changes only Overload's local request state to `acked`. Pending
-decisions are shown in the loopback dashboard; it does not emit macOS
-notifications or approve, deny, answer, resume, or otherwise unblock the
-originating agent.
-
-The CLI covers the same decision path as the dashboard: list what needs a human,
-reach that terminal, and acknowledge. Rows go to stdout and headings to stderr,
-so `q1 2>/dev/null | cut -f1 | xargs ... ack` is the shell equivalent of the
-dashboard's multi-select 批量 Ack.
-
-Q1 **Ack** changes only Overload's local request state to `acked`. Pending decisions are shown in the loopback dashboard; it does not emit macOS notifications or approve, deny, answer, resume, or otherwise unblock the originating agent.
+Q1 **Ack** changes only Overload's local request state to `acked`; it never
+answers or unblocks the originating agent. Separately, cards for supported
+registered gates expose their existing approve/deny choices, and
+`decision-bot takeover` writes a human answer to that gate. Plain asks without
+an answer consumer remain jump/deep-link-only. See
+[decision bot configuration](docs/configuration.md#restricted-decision-bot).
 
 ## Data and privacy
 
