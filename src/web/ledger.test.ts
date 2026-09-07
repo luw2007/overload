@@ -1,0 +1,12 @@
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {afterAll,test,expect} from 'bun:test';
+import {openMailbox} from '../decision-bot/mailbox';
+import {createWork,recordStopCondition,resolveAttentionDecision,redirectWork,reviseContract} from '../control/store';
+import {ledgerReport} from './ledger';
+import type {Contract} from '../control/types';
+const dir=mkdtempSync(join(tmpdir(),'ledger-test-'));let seq=0;afterAll(()=>rmSync(dir,{recursive:true,force:true}));
+const contract:Contract={objective:'ship',acceptance:[{id:'a',kind:'human',description:'reviewed'}],non_goals:[],scope:{cwd:'.'},budget:{},stop_conditions:[{id:'s',kind:'judgment',description:'review'}],decision_owner:'operator'};
+test('wait and stop death use resolution time; overlapping waits union and slowest cap',()=>{const db=openMailbox(join(dir,`${seq++}.db`));const t=1000,h=3600000;for(let i=0;i<12;i++){const w=createWork(db,{title:`work${i}`,source:'operator',contract},t);const item=recordStopCondition(db,w.work_id,'s',{},t);resolveAttentionDecision(db,item.item_id,item.revision,{selected_option:'stop'},t+2*h);}const r=ledgerReport(db,{since:t,until:t+3*h});expect(r.waiting.total_ms).toBe(12*2*h);expect(r.death.median_ms).toBe(2*h);expect(r.bottleneck.total_ms).toBe(2*h);expect(r.bottleneck.work_count).toBe(12);expect(r.slowest).toHaveLength(10);expect(r.slowest[0].waited_ms).toBe(2*h);db.close();});
+test('redirect never-candidate work is unplanned and revision counts supersession',()=>{const db=openMailbox(join(dir,`${seq++}.db`));const a=createWork(db,{title:'a',source:'operator',contract},1),b=createWork(db,{title:'b',source:'operator',contract},1);recordStopCondition(db,a.work_id,'s',{},2);reviseContract(db,a.work_id,1,contract,'bounded',3);redirectWork(db,b.work_id,1,{reason:'switch',affected_work_ids:[a.work_id],action:'activate',evidence:{}},4);const r=ledgerReport(db,{since:0,until:10});expect(r.redirects.unplanned).toBe(1);expect(r.rework.caused).toBe(1);db.close();});

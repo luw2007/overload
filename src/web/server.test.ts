@@ -121,7 +121,10 @@ describe("web API", () => {
     const response = await fetch(`${base}/archive`);
 
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain('data-tab="done"');
+    const html = await response.text();
+    expect(html).toContain('id="main"');
+    expect(html).toContain('Decide');
+    expect(html).toContain('Agents');
   });
 
   test("Q1 JSON preserves the CLI query semantics", async () => {
@@ -288,7 +291,7 @@ describe("web API", () => {
     for (const path of ["/now", "/inbox", "/done", "/sessions", "/health", "/q1", "/q2", "/archive", "/hung", "/zombie", `/sessions/${encodeURIComponent("remote:pi:alpha")}`]) {
       const response = await fetch(`${base}${path}`);
       expect(response.status).toBe(200);
-      expect(await response.text()).toContain("Overload dashboard");
+      expect(await response.text()).toContain('id="main"');
     }
   });
 
@@ -312,7 +315,7 @@ describe("web API", () => {
       const work=createWork(check,{title:"guard",source:"test",contract:{objective:"guard",acceptance:[{id:"human",kind:"human",description:"owner accepts"}],non_goals:[],scope:{human_only_effects:["write"]},budget:{},stop_conditions:[],decision_owner:"owner"}}); check.run("INSERT INTO control_attention(item_id,work_id,revision,state,effect_state,urgency,conclusion,trigger,impact,recommendation,options,owner,contract_revision,decision_mode,evidence,created_at,updated_at,approval_id,consumer_owner) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",["attn",work.work_id,1,"open","not_started","inbox","c","t","i",null,"[]","owner",1,"human_only","{}",1,1,"human","extension"]); check.close();
       expect((await fetch(`${base}/api/decision/target`, {method:"POST",headers,body:JSON.stringify({...payload,approvalId:"human",decisionMode:"scoped_auto"})})).status).toBe(200);
       const final = openMailbox(controlPath); expect(getTarget(final,"extension","human")?.decisionMode).toBe("human_only");
-      const auto=getTarget(final,"extension","auto")!, policy=loadPolicy(join(root, ".overload", "config.json"),final);final.run("INSERT INTO bot_attempts VALUES('web-try','bot','extension','auto',?,'owner',9999999999999,?,?, 'proposed',NULL,1,2)",[auto.targetVersion,policy.hash,auto.evidenceHash]);final.run("INSERT INTO bot_proposals VALUES('web-try','extension','auto',?,'answer','allow','ok',?, ?,1,NULL)",[auto.targetVersion,JSON.stringify([auto.evidenceHash]),policy.hash]); final.close();
+      const auto=getTarget(final,"extension","auto")!, policy=loadPolicy(join(root, ".overload", "config.json"),final);final.run("INSERT INTO bot_attempts VALUES('web-try','bot','extension','auto',?,'owner',9999999999999,?,?, 'proposed',NULL,1,2)",[auto.targetVersion,policy.hash,auto.evidenceHash]);final.run("INSERT INTO bot_proposals VALUES('web-try','extension','auto',?,'answer','allow','ok',?, ?,1,NULL,NULL)",[auto.targetVersion,JSON.stringify([auto.evidenceHash]),policy.hash]); final.close();
       const consumed=await fetch(`${base}/api/decision/consume/auto`,{method:"POST",headers,body:JSON.stringify({consumer_owner:"extension",target_version:auto.targetVersion})});expect(consumed.status).toBe(200);expect((await consumed.json()).actor).toBe("decision-bot");
     });
   });
@@ -456,9 +459,11 @@ test("approval-linked option writes human answer and leaves attention open", asy
 
 test("dashboard derives attention counters without changing legacy summary JSON", async () => {
   const source = readFileSync(join(import.meta.dir, "static/app.js"), "utf8");
-  expect(source).toContain('$("tile-now").textContent = state.attention.now.length');
-  expect(source).toContain('$("tile-inbox").textContent = state.attention.inbox.length');
-  expect(source).toContain('data-answer="${escapeHtml(answer)}"');
+  expect(source).toContain('decideTopLine');
+  expect(source).toContain('[...state.attention.now,...state.attention.inbox]');
+  expect(source).toContain('state.today.rules.hits');
+  expect(source).toContain('state.ledger.waiting.median_ms');
+  expect(source).not.toContain('state.ledger.entries');
 });
 
 test("hung and zombie API rows expose resume capability", async () => {

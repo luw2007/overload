@@ -1,12 +1,42 @@
 (() => {
-  // Legacy internal-queue paths still resolve; the client redirects them into
-  // the attention zone that now owns their data (AGENTS.md 产品界面原则).
-  const LEGACY_ZONE = { q1: "now", hung: "now", q2: "inbox", zombie: "inbox", archive: "done" };
-  const ZONES = ["now", "inbox", "done", "sessions", "health"];
-  const state = { tab: "now", selected: new Set(), summary: null, attention: { now: [], inbox: [], done: [] }, works: [], candidates: [], q1: [], q2: [], archive: [], hung: [], sessions: [], session: null, detail: null, zombie: { groups: [], orphaned_requests: [] }, health: null };
-  const $ = (id) => document.getElementById(id);
-  const escapeHtml = (value) => String(value ?? "-").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
-  const formatTime = (value) => value == null ? "-" : new Date(value).toLocaleString();
+  const $ = id => document.getElementById(id);
+  const escapeHtml = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const e = escapeHtml;
+  const pages = ['decide','ledger','works','candidates','rules','agents'];
+  const LEGACY_ZONE = {now:'decide',inbox:'decide',done:'decide',q1:'agents',hung:'agents',q2:'agents',zombie:'agents',archive:'agents',sessions:'agents',health:'agents'};
+  const state = {page:'decide',attention:{now:[],inbox:[],done:[]},rules:null,ledger:null,works:[],selected:new Set(),session:null,detail:null,q1:[],q2:[],archive:[],hung:[],zombie:{groups:[],orphaned_requests:[]},sessions:[],health:null,range:'week'};
+  let generation = 0;
+  const formatTime = value => value == null ? '—' : new Date(value).toLocaleString();
+  const humanDuration = ms => ms == null ? '—' : ms < 60000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`;
+  function showError(error) { $('error').hidden = false; $('error').textContent = error.message || String(error); }
+  async function fetchJson(path, options) { const response = await fetch(path, options); const data = await response.json(); if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); return data; }
+  const post = (path, body = {}) => fetchJson(path, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const button = (label, action, id = '', extra = '') => `<button data-action="${action}" data-id="${e(id)}" ${extra}>${e(label)}</button>`;
+  const empty = text => `<div class="empty">${e(text)}</div>`;
+  const head = (title,subtitle) => `<div class="page-head"><div><h1>${e(title)}</h1><p class="subtitle">${e(subtitle)}</p></div></div>`;
+  const json = data => `<pre>${e(JSON.stringify(data,null,2))}</pre>`;
+  function sourceLink(value) { if (!value) return ''; try { const url = new URL(value,location.origin); if (!['http:','https:'].includes(url.protocol)) return `<code>${e(value)}</code>`; return `<a href="${e(url.href)}" target="_blank" rel="noopener noreferrer">↗ open session</a>`; } catch { return `<code>${e(value)}</code>`; } }
+  function dialog(id,title,body,footer='') { const el=$(id); el.innerHTML=`<div class="dialog-head"><h2 id="${id}-title">${e(title)}</h2>${button('×','dismiss',id,'aria-label="Close"')}</div><div class="dialog-body">${body}</div>${footer?`<div class="dialog-foot">${footer}</div>`:''}`; if (!el.open) el.showModal(); }
+  const duration = ms => {const hours=Math.max(0,ms||0)/3600000;return hours>=1?`${Number(hours.toFixed(1))}h`:`${Math.round(hours*60)}m`;};
+  const stamp = value => value == null?'—':new Date(value).toLocaleTimeString('en-GB',{hour12:false});
+  const dot = color => `<span class="dot ${color}"></span>`;
+  const expanded = new Set(), receipts = new Map();
+  const consequence={stop:'releases repo, work → stopped',continue:'spends nothing new; you accept the remaining budget',narrow:'requires new contract; supersedes other open cards'};
+  function spark(series) {const max=Math.max(1,...series);return `<svg class="sparkline" viewBox="0 0 100 28" aria-hidden="true"><polyline points="${series.map((v,i)=>`${i*100/Math.max(1,series.length-1)},${27-v/max*25}`).join(' ')}"/></svg>`;}
+  function metric(label,value,detail,series){return `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-detail">${detail}</div>${spark(series)}</div>`;}
+  function decideTopLine(items,selfResolved) {const expiring=items.filter(x=>x.expires_at!=null),oldest=Math.max(0,...items.map(x=>Date.now()-x.created_at));return `${items.length} decisions owed · ${expiring.length?`${expiring.length} expires in ${duration(Math.min(...expiring.map(x=>x.expires_at))-Date.now())}`:'0 expiring'} · oldest waiting ${duration(oldest)} · <button class="text-button" data-done="automatic">agents self-resolved ${selfResolved} today</button> · ${state.today.rules.hits} answered by rules today`;}
+  function automationReason(item) {if(state.rules.bot_disabled)return 'bot disabled';if(item.decision_mode==='human_only')return 'human-only by contract';const r=state.rules.rules.find(r=>r.state==='observing' && (r.scope.includes(item.work_id)||(item.evidence?.repo && r.scope.includes(item.evidence.repo))));return r?`rule ${r.id} proposed · observing ${r.observed}/5`:'no enabled rule matches';}
+  function decisionRow(item) {const waited=duration(Date.now()-item.created_at),red=(item.decision_mode==='human_only'&&!item.item_id.startsWith('stop:'))||(item.expires_at!=null&&item.expires_at<=Date.now());return `<div class="row"><div>${dot(red?'red':'yellow')}</div><div><div class="row-title"><button class="text-button" data-action="expand" data-id="${e(item.item_id)}" aria-expanded="${expanded.has(item.item_id)}">${e(item.conclusion)}${item.conclusion.endsWith('?')?'':'?'}</button><span class="mono muted">${e(item.owner)} · r${item.contract_revision}</span></div><div class="row-note">${e(item.trigger)}</div>${expanded.has(item.item_id)?`<div class="facts"><b>Why now</b><span>${e(item.trigger)}</span><b>Impact</b><span>${e(item.impact)}</span><b>Evidence</b><span class="mono">${e(JSON.stringify(item.evidence))}</span><b>Options</b><span>${item.options.map(option=>`${e(option)} → ${e(consequence[option]||option)}`).join('<br>')}</span><b>Waiting</b><span>${waited} (your median this week: ${duration(state.ledger.waiting.median_ms)})</span><b>Automation</b><span>${e(automationReason(item))}</span></div>`:''}</div><span class="mono muted">${waited}</span><div class="actions">${item.options.map(option=>button(option,'resolve',item.item_id,`data-option="${e(option)}"`)).join('')}${sourceLink(item.source_link)}</div></div>`;}
+  function receipt(item) {return `<div class="row receipt"><div>✓</div><div><div class="row-title">${e(item.conclusion)}</div><span class="mono muted">${e(item.owner)} · ${stamp(item.updated_at)} · effect ${item.effect_state==='succeeded'?'verified':'pending'}</span></div></div>`;}
+  function renderDecide() {const items=[...state.attention.now,...state.attention.inbox],automatic=state.attention.done.filter(x=>x.decision_mode==='scoped_auto'&&x.state==='resolved'&&x.updated_at>=Date.now()-86400000);return `<h1>Decide</h1><div class="summary">${decideTopLine(items,automatic.length)}</div>${items.length||receipts.size?`<div class="section-heading"><h2>Owed to the system</h2><small>Now · ${items.length} decisions · expand for evidence</small></div><div class="list">${items.map(x=>receipts.get(x.item_id)||decisionRow(x)).join('')}${[...receipts].filter(([id])=>!items.some(x=>x.item_id===id)).map(([,html])=>html).join('')}</div>`:empty(`Nothing owed. Agents self-resolved ${automatic.length} decisions today.`)}<div class="section-heading"><h2>Within contract</h2><small>Automatic · no decision required</small></div><div class="list auto">${dot('blue')}<span><strong class="mono">${automatic.length}</strong> handled without you</span><button class="text-button" data-done="automatic">Inspect Done ↗</button></div><div class="section-heading"><h2>Done <span class="muted mono">${state.attention.done.length}</span></h2><button data-done="all">Show receipts</button></div>`;}
+  function renderLedger() {const m=state.ledger,pct=m.rework.total?Math.round(m.rework.caused/m.rework.total*100):0;return `<div class="toolbar"><h1>Ledger</h1><select id="period" aria-label="Ledger period"><option value="week" ${state.range==='week'?'selected':''}>This week</option><option value="day" ${state.range==='day'?'selected':''}>Today</option></select><button data-action="export">Export CSV</button></div><p class="summary">${state.range==='week'?'This week':'Today'} you were the bottleneck for ${duration(m.bottleneck.total_ms)} across ${m.bottleneck.work_count} works.${m.coverage<1?` · coverage ${Math.round(m.coverage*100)}%`:''}</p><div class="metrics">${metric('Waiting',duration(m.waiting.total_ms),`median ${duration(m.waiting.median_ms)}`,m.waiting.series)}${metric('Rework you caused',`${m.rework.caused} / ${m.rework.total}`,`${pct}%`,m.rework.series)}${metric('Redirects',`${m.redirects.count} (${m.redirects.unplanned} unplanned)`,`lost ${duration(m.redirects.lost_ms)}`,m.redirects.series)}${metric('Sunk to rules',`${m.rules.hits} ${m.rules.delta>=0?'↑':'↓'}${Math.abs(m.rules.delta)}`,`${m.rules.share.toFixed(0)}% of decisions`,m.rules.series)}${metric('Death delay',duration(m.death.median_ms),`oldest: &quot;${e(m.death.oldest?.title??'—')}&quot;`,m.death.series)}</div><h2>Slowest decisions</h2><p class="muted">Waiting = asked → decided, or now while still owed. Raw rows behind the median.</p><table><thead><tr><th>Work</th><th>Asked</th><th>Decided</th><th>Waited</th><th>Chose</th><th>Effect</th></tr></thead><tbody>${m.slowest.map(r=>`<tr><td>${e(r.title)}</td><td class="mono">${stamp(r.asked_at)}</td><td class="mono">${stamp(r.decided_at)}</td><td class="mono">${duration(r.waited_ms)}</td><td>${e(r.chose??'—')}</td><td>${e(r.effect_state??'—')}</td></tr>`).join('')}</tbody></table>`;}
+  function contractFacts(w) {const c=w.contract;return `<div class="facts"><b>Objective</b><span>${e(c?.objective??'—')}</span><b>Acceptance</b><span>${(c?.acceptance||[]).map(x=>e(x.description)).join('<br>')||'—'}</span><b>Scope</b><span class="mono">${e(JSON.stringify(c?.scope??null))}</span><b>Budget</b><span class="mono">${e(JSON.stringify(c?.budget??null))}</span><b>Stop conditions</b><span>${(c?.stop_conditions||[]).map(x=>e(x.description)).join('<br>')||'—'}</span><b>Decision owner</b><span>${e(c?.decision_owner??'—')}</span></div><p class="mono muted">updated ${stamp(w.updated_at)}</p>`;}
+  function renderWorks() {return `<h1>Works</h1><p class="muted">Contracts, not agent transcripts.</p>${state.works.filter(w=>w.state!=='candidate').map(w=>`<details class="work"><summary>${e(w.title)} <span class="mono muted">${e(w.state)} · r${w.revision}</span></summary>${contractFacts(w)}</details>`).join('')}`;}
+  function renderCandidates() {const candidates=state.works.filter(w=>w.state==='candidate');
+    // Active operator works created this week are the best available promotion signal; no promoted_at exists.
+    const promoted=state.works.filter(w=>w.state==='active'&&w.source==='operator'&&w.created_at>=Date.now()-7*86400000).length;
+    return `<h1>Candidates</h1><p class="summary">${candidates.length} candidates · ${promoted} promoted this week · ${candidates.filter(w=>w.created_at<Date.now()-14*86400000).length} older than 14 days</p><form id="capture" class="capture"><input name="idea" id="candidate-title" aria-label="New candidate" placeholder="Capture an idea without interrupting active work…" required><button>Add candidate</button></form><div class="list">${candidates.map(w=>`<div class="row"><span>${dot('blue')}</span><div><div class="row-title">${e(w.title)} <span class="mono muted">${Math.floor((Date.now()-w.created_at)/86400000)}d old</span></div><details><summary>Promote to work</summary><form class="promote" data-id="${e(w.work_id)}"><label>Objective<textarea name="objective" required></textarea></label><label>Acceptance<textarea name="acceptance" required></textarea></label><button disabled>Promote</button></form></details></div><span class="mono muted">candidate</span></div>`).join('')}</div>`;}
+  function renderRules() {const rows=state.rules.rules;return `<h1>Rules</h1><p class="summary">${rows.length} rules · ${rows.filter(r=>r.state==='enabled').length} enabled · ${rows.filter(r=>r.state==='observing').length} observing · ${state.rules.hits_week} hits this week</p><table><thead><tr><th>Rule</th><th>Scope</th><th>Answer</th><th>Observed</th><th>Matched</th><th>State</th><th>Enabled</th><th>Action</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${e(r.name)}<br><span class="mono muted">${e(r.id)}</span></td><td>${e(r.scope)}</td><td>${e(r.answers.join(', '))}</td><td class="mono">${r.observed}</td><td class="mono">${r.matched}</td><td><span class="badge">${e(r.state)}</span></td><td>${r.state==='enabled'?`yes<br><span class="mono muted">enabled · ${e(r.enabled_by??'you')} · ${stamp(r.enabled_at)}</span>`:'no'}</td><td>${r.source==='config'?'':r.state==='awaiting_approval'?button('approve','approve-rule',r.candidate_id):r.state==='observing'?`${button('enable','enable-rule',r.candidate_id,r.observed>=5&&r.matched===r.observed?'':'disabled')}${r.observed>=5&&r.matched===r.observed?'':'<span class="mono muted">needs 5 observed</span>'}`:''}</td></tr>`).join('')}</tbody></table><p class="muted">Rules answer on your behalf only when they match exactly. Every enable is signed by you.</p>`;}
   const bindingFor = (row) => row.binding ?? (row.host && row.host !== "local" ? `ssh ${row.host}` : "-");
   const formatDuration = (ms) => {
     const minutes = Math.floor(ms / 60000);
@@ -24,27 +54,9 @@
     ? `<div class="impact-line">${escapeHtml(handoffStatus[handoff.status] ?? handoff.status)} · 未决 ${escapeHtml(handoff.uncertainties)} 项${handoff.task ? ` · ${escapeHtml(handoff.task)}` : ""}${handoff.next_owner ? ` · 下一责任人 ${escapeHtml(handoff.next_owner)}` : ""} · <code>${escapeHtml(handoff.path)}</code></div>`
     : "";
 
-  async function fetchJson(path, options) {
-    const response = await fetch(path, options);
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-    return response.json();
-  }
-
-  function showError(error) {
-    $("error").textContent = `刷新失败：${error.message}`;
-    $("error").classList.remove("hidden");
-  }
-
-  function renderSummary() {
-    const summary = state.summary;
-    if (!summary) return;
-    $("tile-now").textContent = state.attention.now.length;
-    $("tile-inbox").textContent = state.attention.inbox.length;
-    const unhealthy = summary.open_incidents + summary.coverage_gaps + summary.telemetry_gaps > 0;
-    $("health-pill").classList.toggle("warn", unhealthy);
-    $("health-label").textContent = unhealthy ? `${summary.open_incidents} open incident · ${summary.coverage_gaps + summary.telemetry_gaps} gaps` : "health OK";
-  }
-
+  const ageChip = value => e(value == null ? '—' : humanDuration(Date.now()-value));
+  const keyValueTable = rows => `<dl>${rows.map(([key,value])=>`<dt>${e(key)}</dt><dd>${value}</dd>`).join('')}</dl>`;
+  function resumeCapability(row) { const available=row.resume_capability?.resumable; const adapter=row.resume_capability?.runtime; return available ? `<button class="resume" data-id="${e(row.stable_id)}" data-adapter="${e(adapter)}">Resume</button>` : `<span class="meta">${e(row.resume_capability?.reason || 'Resume unavailable')}</span>`; }
   function rowCheckbox(id) {
     return `<input class="row-select" type="checkbox" data-id="${escapeHtml(id)}" ${state.selected.has(id) ? "checked" : ""} aria-label="选择 ${escapeHtml(id)}">`;
   }
@@ -78,8 +90,7 @@
 
   function hungCard(row) {
     const evidence = row.detail?.local ? `${row.detail.local} -> ${row.detail.peer}` : bindingFor(row);
-    const capability = row.resume_capability;
-    const resumeBtn = capability?.resumable ? `<button class="btn primary resume-session" data-id="${escapeHtml(row.stable_id)}">Resume</button><span class="resume-status" aria-live="polite"></span>` : "";
+    const resumeBtn = resumeCapability(row);
     return `<article class="decision-card hung">
       <div class="decision-card-head"><strong>${sessionLink(row.stable_id)}</strong><span class="chip">${escapeHtml(hungLabel[row.q5_reason] ?? row.q5_reason)}</span></div>
       <div class="impact-line">${escapeHtml(hungImpact[row.q5_reason] ?? "会话异常，需人工确认")}</div>
@@ -90,81 +101,8 @@
   }
 
   const evidenceText = (evidence) => Object.keys(evidence || {}).length ? JSON.stringify(evidence) : "暂无附加证据";
-  function attentionCard(item) {
-    const effect = { not_started: "待决定", applying: "决定已接收，落实中", succeeded: "效果已确认", failed: "落实失败，需处理", unknown: "效果未知，需核查" }[item.effect_state] || item.effect_state;
-    const answers = item.options.map((answer) => {
-      const narrowUnavailable = !item.approval_id && answer === "narrow";
-      return `<button class="btn attention-option" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}" data-answer="${escapeHtml(answer)}" data-approval-id="${escapeHtml(item.approval_id || "")}" data-owner="${escapeHtml(item.consumer_owner || "")}" ${narrowUnavailable ? 'disabled title="需要先提供替代契约和变更原因；当前界面不支持编辑契约"' : ""}>${escapeHtml(answer)}</button>`;
-    }).join("");
-    return `<article class="decision-card"><div class="decision-card-head"><strong>${escapeHtml(item.conclusion)}</strong><span class="chip">${escapeHtml(effect)}</span></div><div class="impact-line">${escapeHtml(item.impact)}</div><div class="recommendation"><strong>触发：</strong>${escapeHtml(item.trigger)}<br><strong>建议：</strong>${escapeHtml(item.recommendation || "请按证据判断")}<br><strong>证据：</strong><code>${escapeHtml(evidenceText(item.evidence))}</code></div><div class="decision-card-meta">责任人 ${escapeHtml(item.owner)} · 契约 r${item.contract_revision}${item.expires_at ? ` · 有效期至 ${formatTime(item.expires_at)}` : ""}${item.defer_until ? ` · 延期至 ${formatTime(item.defer_until)}（不延长有效期）` : ""}</div><div class="decision-card-actions">${answers}${item.source_link ? `<a class="btn primary" href="${escapeHtml(item.source_link)}">返回原现场</a>` : ""}${item.state === "open" ? `<button class="btn attention-action" data-action="ack" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}">标记已读</button><button class="btn attention-action" data-action="defer" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}">稍后处理</button>` : ""}<button class="btn attention-feedback" data-useful="true" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}">有帮助</button><button class="btn attention-feedback" data-useful="false" data-id="${escapeHtml(item.item_id)}" data-revision="${item.revision}">没帮助</button></div></article>`;
-  }
-
-  function candidateCard(candidate) {
-    const rule = candidate.rule;
-    const approved = !!candidate.approvedAt;
-    return `<article class="decision-card"><div class="decision-card-head"><strong>${escapeHtml(rule.id)}</strong><span class="chip">授权候选</span></div><div class="impact-line">${escapeHtml(rule.effect)} · ${escapeHtml(rule.gate)}</div><div class="recommendation"><strong>作用域：</strong><code>${escapeHtml(candidate.scopeHash)}</code><br><strong>样本：</strong>${candidate.sampleCount}<br><strong>允许答案：</strong>${escapeHtml(rule.answers.join("、"))}</div><div class="decision-card-meta">${approved ? `已由 ${escapeHtml(candidate.approvedBy)} 批准 · 观察至 ${formatTime(candidate.observationUntil)}` : "待人工批准"}</div><div class="decision-card-actions">${approved ? `<button class="btn primary candidate-action" data-id="${escapeHtml(candidate.candidateId)}" data-action="enable">观察完成后启用</button>` : `<button class="btn primary candidate-action" data-id="${escapeHtml(candidate.candidateId)}" data-action="approve">批准并观察</button>`}</div></article>`;
-  }
-
-  function renderNow() {
-    const groups = [];
-    const byId = new Map();
-    for (const row of state.q1) {
-      let group = byId.get(row.stable_id);
-      if (!group) { group = { stable_id: row.stable_id, rows: [] }; byId.set(row.stable_id, group); groups.push(group); }
-      group.rows.push(row);
-    }
-    const groupsHtml = groups.length
-      ? `<div class="decision-groups">${groups.map((group) => `<div class="decision-group"><div class="group-head"><strong>${sessionLink(group.stable_id)}</strong><span class="chip">${group.rows.length} 项待决策</span></div><div class="decision-cards">${group.rows.map(decisionCard).join("")}</div></div>`).join("")}</div>`
-      : "<p class='empty'>没有待决策请求</p>";
-    const hungHtml = state.hung.length ? `<h3>卡死会话</h3><div class="decision-cards">${state.hung.map(hungCard).join("")}</div>` : "";
-    $("content").innerHTML = `${state.attention.now.map(attentionCard).join("")}${state.q1.length ? `<p><label><input id="select-all" type="checkbox"> 全选待决策</label></p>` : ""}${groupsHtml}${hungHtml}`;
-    const selectAll = $("select-all");
-    if (selectAll) {
-      selectAll.checked = state.q1.every((row) => state.selected.has(row.request_uid));
-      selectAll.addEventListener("change", () => {
-        state.selected = selectAll.checked ? new Set(state.q1.map((row) => row.request_uid)) : new Set();
-        renderZone();
-      });
-    }
-  }
-
-  function renderInbox() {
-    const attentionHtml = state.attention.inbox.map(attentionCard).join("");
-    const q2Html = state.q2.length
-      ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th></th><th>会话</th><th>来源</th><th>最后事件</th><th></th></tr></thead><tbody>${state.q2.map((row) => `<tr><td>${rowCheckbox(row.stable_id)}</td><td>${sessionLink(row.stable_id)}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td><td><button class="btn closeout" data-id="${escapeHtml(row.stable_id)}">收尾</button></td></tr>`).join("")}</tbody></table></div>`
-      : "<p class='empty'>没有待收尾会话</p>";
-    const groupCards = state.zombie.groups.map((group) => `<article class="hint-card"><div class="decision-card-head"><strong>${escapeHtml(group.q5_reason)}</strong><span class="chip">${group.rows.length} 个会话</span></div><p class="hint-text">${escapeHtml(zombieHint[group.q5_reason] ?? "需人工核查。")}</p><div class="decision-cards">${group.rows.map((row) => {
-      const capability = row.resume_capability;
-      const resumeBtn = capability?.resumable ? `<button class="btn primary resume-session" data-id="${escapeHtml(row.stable_id)}">Resume</button><span class="resume-status" aria-live="polite"></span>` : "";
-      return `<span class="chip">${sessionLink(row.stable_id)} · ${escapeHtml(formatTime(row.last_event_at))}</span>${resumeBtn}${handoffLine(row.handoff)}`;
-    }).join(" ")}</div></article>`).join("");
-    const orphanedCards = state.zombie.orphaned_requests.map((row) => `<article class="hint-card"><div class="decision-card-head"><strong>orphaned_request</strong><span class="chip">${sessionLink(row.stable_id)}</span></div><p class="hint-text">会话已结束，请求随之失效。</p><div class="decision-card-actions"><button class="btn ack" data-id="${escapeHtml(row.request_uid)}">Ack</button></div></article>`).join("");
-    const zombieHtml = groupCards || orphanedCards ? `<h3>Zombie</h3>${groupCards}${orphanedCards}` : "";
-    const candidates = state.candidates.length ? `<h3>任务候选</h3>${state.candidates.map(candidateCard).join("")}` : "";
-    $("content").innerHTML = `${attentionHtml}${candidates}<h3>待收尾</h3>${q2Html}${zombieHtml}`;
-  }
-
-  function renderDone() {
-    const attentionHtml = state.attention.done.map(attentionCard).join("");
-    $("content").innerHTML = attentionHtml + (state.archive.length
-      ? `<div class="b-table-wrap"><table class="b-table"><thead><tr><th>会话</th><th>来源</th><th>最后事件</th></tr></thead><tbody>${state.archive.map((row) => `<tr><td>${sessionLink(row.stable_id)} ${row.closed_out ? `<span class="chip">${escapeHtml("已收尾")}</span>` : ""}</td><td>${escapeHtml(row.origin)}</td><td>${escapeHtml(formatTime(row.last_event_at))}</td></tr>`).join("")}</tbody></table></div>`
-      : (attentionHtml ? "" : "<p class='empty'>没有已归档会话</p>"));
-  }
-
-  function renderSessions() {
-    $("content").innerHTML = state.sessions.length ? `<div class="session-grid">${state.sessions.map((row) => {
-      const capability = row.resume_capability;
-      const action = capability?.resumable
-        ? `<button class="btn primary resume-session" data-id="${escapeHtml(row.stable_id)}">Resume</button>`
-        : `<span class="chip">${escapeHtml(capability?.reason === "process_alive" ? "进程运行中" : capability?.reason === "orchestrator_owned" ? "编排器托管" : "仅查看")}</span>`;
-      return `<article class="session-card"><div class="session-card-head"><strong>${sessionLink(row.stable_id)}</strong><span class="chip">${escapeHtml(row.runtime)}</span></div><div class="session-meta">${escapeHtml(row.origin)} · ${escapeHtml(row.state)}${row.queue ? ` · ${escapeHtml(row.q5_reason ? `${row.queue}/${row.q5_reason}` : row.queue)}` : ""}</div><div class="session-time">最后事件 ${escapeHtml(formatTime(row.last_event_at))}</div><div class="session-actions">${action}<span class="resume-status" aria-live="polite"></span></div></article>`;
-    }).join("")}</div>` : "<p class='empty'>没有会话</p>";
-  }
-
-  function keyValueTable(pairs) {
-    return `<table class="b-table"><tbody>${pairs.map(([key, value]) => `<tr><th style="width:160px">${escapeHtml(key)}</th><td>${value}</td></tr>`).join("")}</tbody></table>`;
-  }
-
+  function closeoutCard(row) { return `<article class="card">${rowCheckbox(row.stable_id)}<div class="card-main">${sessionLink(row.stable_id)}<div class="meta">${e(row.origin)} · ${e(formatTime(row.last_event_at))}</div></div><button class="closeout" data-id="${e(row.stable_id)}">Close out</button></article>`; }
+  function zombieCard(group) { return `<article class="card"><div class="card-main"><h3>${e(group.q5_reason)}</h3><p>${e(zombieHint[group.q5_reason] || 'Needs review.')}</p>${(group.rows||[]).map(row=>`<div class="inline">${sessionLink(row.stable_id)} · ${e(formatTime(row.last_event_at))}${resumeCapability(row)}${jumpActions(row,'stable_id','jump-session')}${handoffLine(row.handoff)}</div>`).join('')}</div></article>`; }
   function renderDetail() {
     const view = state.detail;
     if (!view) { $("detail").innerHTML = "<p class='empty'>加载中…</p>"; return; }
@@ -177,7 +115,7 @@
       ["宿主 App", escapeHtml(s.app ?? "-")],
       ["工作区", `${escapeHtml(s.cwd)}${s.branch ? ` (${escapeHtml(s.branch)})` : ""}`],
       ["时钟", escapeHtml(clocks)],
-      ["跳转", s.binding ? `<span class="chip">${escapeHtml(s.binding)}</span> <button class="btn primary jump" data-route="jump-session" data-id="${escapeHtml(s.stable_id)}" data-binding="${escapeHtml(s.binding)}">打开</button><span class="jump-status" aria-live="polite"></span>` : missingJumpTarget(s)],
+      ["跳转", jumpActions(s,"stable_id","jump-session")],
     ]);
     const replacement = view.latest_surface_session
       ? `<article class="decision-card"><strong>此 surface 已有较新会话</strong><div class="session-meta">${escapeHtml(view.latest_surface_session.state ?? "unknown")} · 最后事件 ${escapeHtml(formatTime(view.latest_surface_session.last_event_at))}</div><div class="session-actions">${sessionLink(view.latest_surface_session.stable_id)}</div></article>`
@@ -191,234 +129,96 @@
     const events = view.events.length
       ? `<table class="b-table"><thead><tr><th>#</th><th>时间</th><th>事件</th><th>详情</th></tr></thead><tbody>${view.events.map((row) => `<tr><td>${escapeHtml(row.ingest_seq)}</td><td>${escapeHtml(formatTime(row.at))}</td><td>${escapeHtml(row.kind)}</td><td><code>${escapeHtml(JSON.stringify(row.detail ?? {}))}</code></td></tr>`).join("")}</tbody></table>`
       : "<p class='empty'>没有事件</p>";
-    $("detail").innerHTML = `<p><button class="btn" id="detail-back">← 返回会话列表</button></p>${replacement}${head}
+    $("detail").innerHTML = `<p><button class="btn" id="detail-back">← 返回会话列表</button></p>${replacement}${head}${resumeCapability(state.sessions.find(row=>row.stable_id===s.stable_id)||s)}
       <h3>进程</h3>${incarnations}<h3>待决策</h3>${requests}
       <h3>事件（最新在前，已隐藏 heartbeat）</h3>${events}`;
-    $("detail-back").addEventListener("click", () => { state.session = null; state.detail = null; navigate("/sessions"); renderZone(); });
+
   }
 
-  async function openSession(stableId, push = true) {
-    state.tab = "sessions";
-    state.session = stableId;
-    state.detail = null;
-    if (push) navigate(`/sessions/${encodeURIComponent(stableId)}`);
-    syncActiveTab();
-    renderZone();
-    try {
-      state.detail = await fetchJson(`/api/sessions/${encodeURIComponent(stableId)}`);
-    } catch (error) {
-      state.session = null;
-      showError(error);
-    }
-    renderZone();
+  function renderAgents() {
+    return head('Agents','Session diagnostics and legacy recovery actions.')+`<div id="agent-summary" class="meta">${e(state.health?.open_incidents?.length||0)} open incidents · ${e(state.health?.coverage_gaps||0)} coverage gaps · ${e(state.health?.telemetry_gaps||0)} telemetry gaps</div><div id="agent-status" role="status"></div><section id="detail"></section><section id="content"><h2>Decision requests</h2>${button('Acknowledge selected','bulk-ack')}${state.q1.map(decisionCard).join('')||empty('No decision requests.')}<h2>Hung sessions</h2>${state.hung.map(hungCard).join('')||empty('No hung sessions.')}<h2>Closeout</h2>${button('Close out selected','bulk-closeout')}${button('Clear selection','clear-selection')}${state.q2.map(closeoutCard).join('')||empty('No closeout requests.')}<h2>Zombie / handoff</h2>${state.zombie.groups.map(zombieCard).join('')||empty('No zombie groups.')}<h3>Orphaned requests</h3>${state.zombie.orphaned_requests.map(r=>`<article class="card">${e(r.summary || r.request_uid)}${button('Acknowledge','orphan-ack',r.request_uid)}</article>`).join('')||empty('No orphaned requests.')}<h2>Sessions</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Agent</th><th>Host</th><th>State / queue</th><th>Last event</th></tr></thead><tbody>${state.sessions.map(r=>`<tr><td>${sessionLink(r.stable_id)} ${resumeCapability(r)} ${jumpActions(r, "stable_id", "jump-session")}</td><td>${e(r.agent)}</td><td>${e(r.host)}</td><td>${e(r.run_state)} · ${e(r.queue)}</td><td>${e(formatTime(r.last_event_at))}</td></tr>`).join('')}</tbody></table></div><h2>Archive</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Kind</th><th>Status</th><th>Time</th><th>Summary</th></tr></thead><tbody>${state.archive.map(r=>`<tr><td>${sessionLink(r.stable_id)}</td><td>${e(r.origin)}</td><td>${r.closed_out?'Closed out':'Archived'}</td><td>${e(formatTime(r.last_event_at))}</td><td>${e(r.state || r.run_state)}</td></tr>`).join('')}</tbody></table></div><h2>Health</h2>${json(state.health)}</section>`;
   }
-
-  function renderHealth() {
-    const health = state.health;
-    const rows = health?.open_incidents.length
-      ? health.open_incidents.map((row) => `<tr><td>${escapeHtml(row.source)}</td><td>${escapeHtml(formatTime(row.opened_at))}</td><td><code>${escapeHtml(JSON.stringify(row.detail ?? {}))}</code></td></tr>`).join("")
-      : `<tr><td class='empty' colspan='3'>无开放事件 · coverage gaps ${health?.coverage_gaps ?? 0} · telemetry gaps ${health?.telemetry_gaps ?? 0}</td></tr>`;
-    $("content").innerHTML = `<div class="b-table-wrap"><table class="b-table"><thead><tr><th>来源</th><th>打开时间</th><th>详情</th></tr></thead><tbody>${rows}</tbody></table></div>`;
-  }
-
-  function navigate(path) {
-    if (location.pathname !== path) history.pushState(null, "", path);
-  }
-
-  function syncActiveTab() {
-    document.querySelectorAll(".b-tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.tab));
-  }
-
-  function restoreRoute() {
-    const parts = location.pathname.split("/").filter(Boolean);
-    let zone = LEGACY_ZONE[parts[0]] ?? parts[0];
-    if (!ZONES.includes(zone)) zone = "now";
-    if (zone === "sessions" && parts[1]) return openSession(decodeURIComponent(parts[1]), false);
-    state.tab = zone;
-    const canonical = `/${zone}`;
-    if (location.pathname !== canonical) history.replaceState(null, "", canonical);
-    syncActiveTab();
-  }
-
-  function renderToolbar() {
-    const show = (state.tab === "now" || state.tab === "inbox") && state.selected.size > 0;
-    $("toolbar").classList.toggle("show", show);
-    $("selected-count").textContent = `${state.selected.size} 项已选`;
-    $("bulk-ack").classList.toggle("hidden", state.tab !== "now");
-    $("bulk-closeout").classList.toggle("hidden", state.tab !== "inbox");
-  }
-
-  function renderZone() {
-    const detailMode = state.tab === "sessions" && state.session;
-    $("detail").classList.toggle("hidden", !detailMode);
-    $("content").classList.toggle("hidden", !!detailMode);
-    if (detailMode) renderDetail();
-    else if (state.tab === "now") renderNow();
-    else if (state.tab === "inbox") renderInbox();
-    else if (state.tab === "done") renderDone();
-    else if (state.tab === "sessions") renderSessions();
-    else renderHealth();
-    renderToolbar();
-    document.querySelectorAll(".row-select").forEach((checkbox) => checkbox.addEventListener("change", () => {
-      if (checkbox.checked) state.selected.add(checkbox.dataset.id); else state.selected.delete(checkbox.dataset.id);
-      renderZone();
-    }));
-    document.querySelectorAll(".ack").forEach((button) => button.addEventListener("click", () => ack([button.dataset.id])));
-    document.querySelectorAll(".closeout").forEach((button) => button.addEventListener("click", () => closeout([button.dataset.id])));
-    document.querySelectorAll(".approve").forEach((button) => button.addEventListener("click", () => approve(button)));
-    document.querySelectorAll(".copy-jump").forEach((button) => button.addEventListener("click", () => copyBinding(button.dataset.binding, button.parentElement.querySelector(".jump-status"))));
-    document.querySelectorAll(".jump").forEach((button) => button.addEventListener("click", () => jump(button)));
-    document.querySelectorAll(".resume-session").forEach((button) => button.addEventListener("click", () => resume(button)));
-    document.querySelectorAll(".attention-action").forEach((button) => button.addEventListener("click", () => attentionAction(button)));
-    document.querySelectorAll(".attention-feedback").forEach((button) => button.addEventListener("click", () => attentionFeedback(button)));
-    document.querySelectorAll(".attention-option").forEach((button) => button.addEventListener("click", () => attentionOption(button)));
-    document.querySelectorAll(".candidate-action").forEach((button) => button.addEventListener("click", () => candidateAction(button)));
-    document.querySelectorAll(".drill").forEach((link) => link.addEventListener("click", (event) => {
-      event.preventDefault();
-      openSession(link.dataset.id);
-    }));
-  }
-
-  async function copyBinding(binding, status) {
-    try {
-      await navigator.clipboard.writeText(binding);
-      status.textContent = "已复制";
-      setTimeout(() => { status.textContent = ""; }, 2000);
-      return true;
-    } catch {
-      status.textContent = "复制失败";
-      setTimeout(() => { status.textContent = ""; }, 2000);
-      return false;
-    }
-  }
-
-  async function jump(button) {
-    const status = button.parentElement.querySelector(".jump-status");
-    const fallback = async (reason) => {
-      const copied = await copyBinding(button.dataset.binding, status);
-      const suffix = reason ? `（${reason}）` : "";
-      status.textContent = copied ? `打开失败${suffix}，已复制跳转标识` : `打开失败${suffix}，复制跳转标识失败`;
-    };
-    try {
-      const result = await fetchJson(`/api/${button.dataset.route ?? "jump"}/${encodeURIComponent(button.dataset.id)}`, { method: "POST" });
-      if (!result.opened) await fallback(result.error);
-      else {
-        status.textContent = "已打开并聚焦目标终端";
-        setTimeout(() => { status.textContent = ""; }, 2000);
-      }
-    } catch {
-      await fallback();
-    }
-  }
-
-  async function resume(button) {
-    const status = button.parentElement.querySelector(".resume-status");
-    button.disabled = true;
-    status.textContent = "正在恢复…";
-    try {
-      await fetchJson(`/api/resume-session/${encodeURIComponent(button.dataset.id)}`, { method: "POST" });
-      status.textContent = "已拉起";
-      await refresh();
-    } catch (error) {
-      status.textContent = `恢复失败：${error.message}`;
-      button.disabled = false;
-    }
-  }
-
-  async function attentionAction(button) {
-    const action = button.dataset.action;
-    const body = { expected_revision: Number(button.dataset.revision) };
-    if (action === "defer") body.defer_until = Date.now() + 60 * 60 * 1000;
-    await fetchJson(`/api/attention/${encodeURIComponent(button.dataset.id)}/${action}`, { method: "POST", body: JSON.stringify(body) });
-    await refresh();
-  }
-
-  async function attentionOption(button) {
-    button.disabled = true;
-    const approvalId = button.dataset.approvalId;
-    const endpoint = approvalId ? `/api/orchestrator/answer/${encodeURIComponent(approvalId)}` : `/api/attention/${encodeURIComponent(button.dataset.id)}/resolve`;
-    const body = approvalId ? { answer: button.dataset.answer, consumer_owner: button.dataset.owner } : { expected_revision: Number(button.dataset.revision), selected_option: button.dataset.answer };
-    try { await fetchJson(endpoint, { method: "POST", body: JSON.stringify(body) }); await refresh(); }
-    catch (error) { button.disabled = false; showError(error); }
-  }
-
-  async function candidateAction(button) {
-    button.disabled = true;
-    const body = button.dataset.action === "approve" ? { actor: "operator", observation_until: Date.now() + 24 * 60 * 60 * 1000 } : {};
-    try { await fetchJson(`/api/candidates/${encodeURIComponent(button.dataset.id)}/${button.dataset.action}`, { method: "POST", body: JSON.stringify(body) }); await refresh(); }
-    catch (error) { button.disabled = false; showError(error); }
-  }
-
-  async function attentionFeedback(button) {
-    await fetchJson(`/api/attention/${encodeURIComponent(button.dataset.id)}/feedback`, { method: "POST", body: JSON.stringify({ expected_revision: Number(button.dataset.revision), useful: button.dataset.useful === "true" }) });
-    button.textContent = "已记录";
-    button.disabled = true;
-  }
-
-  async function ack(ids) {
-    try {
-      await Promise.all(ids.map((id) => fetchJson(`/api/ack/${encodeURIComponent(id)}`, { method: "POST" })));
-      ids.forEach((id) => state.selected.delete(id));
-      await refresh();
-    } catch (error) { showError(error); }
-  }
-
-  async function closeout(ids) {
-    try {
-      await Promise.all(ids.map((id) => fetchJson(`/api/closeout/${encodeURIComponent(id)}`, { method: "POST" })));
-      ids.forEach((id) => state.selected.delete(id));
-      await refresh();
-    } catch (error) { showError(error); }
-  }
-
-  async function approve(button) {
-    button.disabled = true;
-    try {
-      await fetchJson(`/api/orchestrator/answer/${encodeURIComponent(button.dataset.approvalId)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ answer: button.dataset.answer, consumer_owner: button.dataset.consumerOwner }),
-      });
-      await refresh();
-    } catch (error) {
-      showError(error);
-      button.disabled = false;
-    }
-  }
-
+  function render() { document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.page)); $('main').innerHTML=({decide:renderDecide,ledger:renderLedger,works:renderWorks,candidates:renderCandidates,rules:renderRules,agents:renderAgents})[state.page](); if(state.page==='agents' && state.session) { $('content').hidden=true; renderDetail(); } }
   async function refresh() {
+    const current=++generation, page=state.page;
+    const since=state.range==='all'?0:Date.now()-(state.range==='week'?7:1)*86400000;
     try {
-      const names = ["summary", "q1", "q2", "archive", "hung", "sessions", "zombie", "health", "decision-bot/status"];
-      const [summary, q1, q2, archive, hung, sessions, zombie, health, decisionBot, attentionNow, attentionInbox, attentionDone, works, candidates] = await Promise.all([...names, "attention/now", "attention/inbox", "attention/done", "works", "candidates"].map((name) => fetchJson(`/api/${name}`)));
-      const targetStatus = new Map((decisionBot.targets || []).map((target) => [`${target.consumer_owner}:${target.approval_id}`, target]));
-      for (const row of q1) { const owner=row.detail?.consumer_owner ?? (row.detail?.gate==="action"?"extension":"orchestrator"); const target=targetStatus.get(`${owner}:${row.detail?.approval_id ?? row.detail?.request_id}`); if(target)row.detail={...row.detail,bot_status:target.state,bot_outcome:target.outcome}; }
-      Object.assign(state, { summary, q1, q2, archive, hung, sessions, zombie, health, decisionBot, works, candidates, attention: { now: attentionNow, inbox: attentionInbox, done: attentionDone } });
-      const q1Ids = q1.map((row) => row.request_uid);
-      const q2Ids = q2.map((row) => row.stable_id);
-      const liveIds = new Set([...q1Ids, ...q2Ids]);
-      state.selected = new Set([...state.selected].filter((id) => liveIds.has(id)));
-      // An open drill-down owns the pane; refreshing under it would scroll the
-      // reader back to the top every three seconds.
-      if (state.session) { $("error").classList.add("hidden"); renderSummary(); return; }
-      $("error").classList.add("hidden");
-      renderSummary(); renderZone();
-    } catch (error) { showError(error); }
+      let data={};
+      const rulesPromise=fetchJson('/api/rules');
+      const pagePromise=(async()=>{
+        if(page==='decide') { const [now,inbox,done,today,ledger]=await Promise.all(['now','inbox','done'].map(z=>fetchJson(`/api/attention/${z}`)).concat(fetchJson(`/api/ledger?since=${Date.now()-86400000}`),fetchJson(`/api/ledger?since=${Date.now()-7*86400000}`))); return {attention:{now,inbox,done},today,ledger}; }
+        if(page==='ledger') return {ledger:await fetchJson(`/api/ledger?since=${since}`)};
+        if(page==='works'||page==='candidates') return {works:await fetchJson('/api/works')};
+        if(page==='agents') { const keys=['q1','q2','hung','zombie','sessions','health','archive']; const rows=await Promise.all(keys.map(k=>fetchJson(`/api/${k}`))); const result=Object.fromEntries(keys.map((k,i)=>[k,rows[i]])); if(state.session)result.detail=await fetchJson(`/api/sessions/${encodeURIComponent(state.session)}`); return result; }
+        return {};
+      })();
+      const [rules,result]=await Promise.all([rulesPromise,pagePromise]); data={...result,rules};
+      if(current!==generation || page!==state.page)return;
+      Object.assign(state,data); $('bot-toggle').textContent=`bot · ${rules.bot_disabled?'off':'on'}`; $('bot-toggle').setAttribute('aria-pressed',String(!rules.bot_disabled)); render();
+    } catch(error) { if(current===generation)showError(error); }
   }
-
-  document.querySelectorAll(".b-tab").forEach((tab) => tab.addEventListener("click", () => {
-    state.tab = tab.dataset.tab;
-    state.session = null;
-    state.detail = null;
-    navigate(`/${state.tab}`);
-    syncActiveTab();
-    renderZone();
-  }));
-  $("clear-selection").addEventListener("click", () => { state.selected.clear(); renderZone(); });
-  $("bulk-ack").addEventListener("click", () => ack([...state.selected]));
-  $("bulk-closeout").addEventListener("click", () => closeout([...state.selected]));
+  async function restoreRoute() { const parts=location.pathname.split('/').filter(Boolean), original=parts[0]; state.page=LEGACY_ZONE[original]||original||'decide'; if(!pages.includes(state.page))state.page='decide'; state.session=state.page==='agents' && (original==='sessions'||original==='agents') && parts[1]?decodeURIComponent(parts[1]):null; history.replaceState(null,'',`/${state.page}${state.session?'/'+encodeURIComponent(state.session):''}`); $('main').innerHTML=empty('Loading…'); await refresh(); if(original==='done')showDone(); }
+  async function navigate(page,session=null) { $('drawer').close(); $('modal').close(); state.selected.clear(); history.pushState(null,'',`/${page}${session?'/'+encodeURIComponent(session):''}`); await restoreRoute(); }
+  function findAttention(id) { return [...state.attention.now,...state.attention.inbox,...state.attention.done].find(x=>x.item_id===id); }
+  function showDone() { dialog('drawer','Done',state.attention.done.map(x=>`<article class="receipt"><h3>${e(x.conclusion)}</h3><p>${e(x.state)} · ${e(x.effect_state)}</p>${sourceLink(x.source_link)}${json(x.evidence)}</article>`).join('')||empty('Nothing done yet.')); }
+  async function openWork(id) {const w=await fetchJson(`/api/works/${encodeURIComponent(id)}`);dialog('drawer',w.title,`<p class="mono">r${w.revision}</p>${contractFacts(w)}`);}
+  let editor=null;
+  async function openNarrow(item) { const [detail,now,inbox]=await Promise.all([fetchJson(`/api/works/${encodeURIComponent(item.work_id)}`),fetchJson('/api/attention/now'),fetchJson('/api/attention/inbox')]); const n=[...now,...inbox].filter(x=>x.work_id===item.work_id && x.item_id!==item.item_id && x.state==='open').length; editor={kind:'narrow',item}; dialog('drawer','Narrow scope',`<label class="field">Replacement contract JSON<textarea id="replacement" rows="18">${e(JSON.stringify(detail.contract,null,2))}</textarea></label><label class="field">Reason<input id="reason" required></label><p id="editor-error" class="form-error" role="status"></p>`,`<span>This revision will supersede ${n} open cards.</span>${button('Apply','apply-editor','','class="primary" disabled')}`); }
+  function validateEditor() {const apply=document.querySelector('[data-action="apply-editor"]');if(!apply)return;try {const c=JSON.parse($('replacement').value);if(!c||Array.isArray(c)||typeof c!=='object')throw new Error('Contract must be a JSON object.');if(!$('reason').value.trim())throw new Error('Reason is required.');apply.disabled=false;$('editor-error').textContent='';}catch(error){apply.disabled=true;$('editor-error').textContent=error.message;}}
+  async function applyEditor() {await post(`/api/attention/${encodeURIComponent(editor.item.item_id)}/resolve`,{expected_revision:editor.item.revision,selected_option:'narrow',replacement_contract:JSON.parse($('replacement').value),reason:$('reason').value.trim()});$('drawer').close();await refresh();}
+  async function resolveItem(id,option) {const item=findAttention(id);if(option==='narrow')return openNarrow(item);const result=await post(item.approval_id?`/api/orchestrator/answer/${encodeURIComponent(item.approval_id)}`:`/api/attention/${encodeURIComponent(id)}/resolve`,item.approval_id?{answer:option,consumer_owner:item.consumer_owner}:{expected_revision:item.revision,selected_option:option});receipts.set(id,`<div class="row receipt">✓ ${e(option)} · you · ${stamp(Date.now())} · effect ${result.effect_state==='succeeded'?'verified':'pending'}</div>`);render();setTimeout(()=>{receipts.delete(id);refresh();},3000);}
+  async function resume(button) {
+    const stableId=button.dataset.id;
+    if(button.dataset.adapter==='claude-code') { dialog('modal','Confirm resume',`<p>Claude Code resume creates a new tmux window. Confirm that you want to restart this terminated session.</p>`,`${buttonHtmlResume(stableId)}${windowCancel()}`); return; }
+    await performResume(stableId);
+  }
+  function buttonHtmlResume(id) { return button('Resume','confirm-resume',id,'class="primary"'); }
+  function windowCancel() { return button('Cancel','dismiss','modal'); }
+  async function performResume(id) { const result=await post(`/api/resume-session/${encodeURIComponent(id)}`); $('modal').close(); await refresh(); const status=$('agent-status'); if(status)status.textContent=`Resume: ${result.resumed ? 'started' : result.reason || 'submitted'}${result.new_binding?' · '+result.new_binding:''}`; }
+  async function jump(target) {
+    const status=target.parentElement.querySelector('.jump-status');
+    try { const result=await post(`/api/${target.dataset.route || 'jump'}/${encodeURIComponent(target.dataset.id)}`); if(result.opened) {if(status)status.textContent='已打开并聚焦目标终端';return;} if(result.error)showError(new Error(result.error)); }
+    catch(error) {showError(error);}
+    try {await navigator.clipboard.writeText(target.dataset.binding);if(status)status.textContent='打开失败，已复制跳转标识';} catch(error) {showError(error);if(status)status.textContent='打开失败，复制跳转标识失败';}
+  }
+  async function handleAction(target) {
+    const action=target.dataset.action,id=target.dataset.id;
+    if(action==='dismiss')return $(id).close();
+    if(action==='done'||target.dataset.done)return showDone();
+    if(action==='expand'){if(expanded.has(id))expanded.delete(id);else expanded.add(id);render();return;}
+    if(action==='export')return exportCsv();
+    if(action==='clear-selection') {state.selected.clear();render();return;}
+    if(action==='range') {state.range=id;return refresh();}
+    if(action==='resolve')return resolveItem(id,target.dataset.option);
+    if(action==='attention-evidence') {const item=findAttention(id);return dialog('drawer',item.conclusion,json(item.evidence)+sourceLink(item.source_link));}
+    if(action==='work')return openWork(id);
+    if(action==='apply-editor')return applyEditor();
+    if(action==='approve-rule') {await post(`/api/rules/${encodeURIComponent(id)}/approve`);return refresh();}
+    if(action==='enable-rule') {await post(`/api/rules/${encodeURIComponent(id)}/enable`,{});return refresh();}
+    if(action==='bulk-ack'||action==='bulk-closeout'||action==='orphan-ack') {
+      const closing=action==='bulk-closeout';
+      const ids=action==='orphan-ack'?[id]:[...state.selected].filter(uid=>(closing?state.q2:state.q1).some(r=>(closing?r.stable_id:r.request_uid)===uid));
+      for(const uid of ids) {await post(`/api/${closing?'closeout':'ack'}/${encodeURIComponent(uid)}`);state.selected.delete(uid);}
+      return refresh();
+    }
+    if(action==='confirm-resume')return performResume(id);
+    if(target.classList.contains('drill'))return navigate('agents',id);
+    if(target.classList.contains('resume'))return resume(target);
+    if(target.classList.contains('jump'))return jump(target);
+    if(target.classList.contains('copy-jump')) {await navigator.clipboard.writeText(target.dataset.binding);target.textContent='已复制';return;}
+    if(target.classList.contains('ack')||target.classList.contains('closeout')) {await post(`/api/${target.classList.contains('ack')?'ack':'closeout'}/${encodeURIComponent(id)}`);state.selected.delete(id);return refresh();}
+    if(target.classList.contains('approve')) {await post(`/api/orchestrator/answer/${encodeURIComponent(target.dataset.approvalId)}`,{answer:target.dataset.answer,consumer_owner:target.dataset.consumerOwner});return refresh();}
+    if(target.id==='detail-back')return navigate('agents');
+    if(target.id==='bot-toggle') {if(!state.rules)throw new Error('Rules have not loaded.');await post(`/api/decision-bot/${state.rules.bot_disabled?'enable':'disable'}`);return refresh();}
+  }
+  function exportCsv() {const rows=[['Work','Asked','Decided','Waited','Chose','Effect'],...state.ledger.slowest.map(r=>[r.title,r.asked_at,r.decided_at??'—',r.waited_ms,r.chose??'—',r.effect_state??'—'])];const csv=rows.map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='overload-ledger.csv';a.click();URL.revokeObjectURL(url);}
+  document.addEventListener('submit',async event=>{const form=event.target;if(form.id!=='capture'&&!form.matches('form.promote'))return;event.preventDefault();const submit=form.querySelector('button');submit.disabled=true;try {if(form.id==='capture')await post('/api/works',{title:form.elements.idea.value.trim(),source:'operator',candidate:true});else {const work=state.works.find(w=>w.work_id===form.dataset.id);await post(`/api/works/${encodeURIComponent(work.work_id)}/promote`,{expected_revision:work.revision,reason:'promoted from candidates',contract:{objective:form.elements.objective.value.trim(),acceptance:[{id:'a1',kind:'human',description:form.elements.acceptance.value.trim()}],non_goals:[],scope:{cwd:'.'},budget:{},stop_conditions:[{id:'s1',kind:'judgment',description:'operator review'}],decision_owner:'operator'}});}await refresh();}catch(error){showError(error);}finally{submit.disabled=false;}});
+  document.addEventListener('click',async event=>{const target=event.target.closest('button,a[data-nav],a.drill');if(!target)return;if(target.closest('form'))return;event.preventDefault();if(target.dataset.nav)return navigate(target.dataset.nav);target.disabled=true;try {await handleAction(target);}catch(error){showError(error);}finally{target.disabled=false;if(target.dataset.action==='apply-editor')validateEditor();}});
+  document.addEventListener('input',event=>{if(event.target.closest('#drawer'))validateEditor();const form=event.target.closest('form.promote');if(form)form.querySelector('button').disabled=!(form.elements.objective.value.trim()&&form.elements.acceptance.value.trim());});
+  document.addEventListener('change',event=>{if(event.target.id==='period'){state.range=event.target.value;refresh();}if(event.target.matches('.row-select')) {if(event.target.checked)state.selected.add(event.target.dataset.id);else state.selected.delete(event.target.dataset.id);}});
+  window.addEventListener('popstate',restoreRoute);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
+  document.addEventListener('keydown',event=>{if((event.metaKey||event.ctrlKey)&&event.key.toLowerCase()==='k'){event.preventDefault();dialog('modal','Navigate',pages.map(page=>`<a class="command-link" href="/${page}" data-nav="${page}">${e(page[0].toUpperCase()+page.slice(1))}</a>`).join(''));}});
+  setInterval(()=>{if(!document.hidden)refresh();},15000);
   restoreRoute();
-  refresh();
-  addEventListener("popstate", () => { state.session = null; state.detail = null; restoreRoute(); refresh(); });
-  setInterval(refresh, 15000);
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });
 })();

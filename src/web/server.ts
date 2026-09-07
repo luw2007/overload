@@ -5,18 +5,20 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
-import { consumeDecision, reconcileEffectEvents, registerTarget, writeHumanAnswer } from "../decision-bot/mailbox";
-import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate, loadPolicy, matchingRule, policyAuthorizes } from "../decision-bot/policy";
+import { consumeDecision, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
+import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate, loadPolicy, matchingRule, policyAuthorizes, rulesReport } from "../decision-bot/policy";
 import { DecisionBotService } from "../decision-bot/service";
 import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
-import { actOnAttention, ControlError, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract } from "../control/store";
+import { actOnAttention, ControlError, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract, promoteWork } from "../control/store";
 import type { Contract } from "../control/types";
 import { notificationCapability } from "../notify/nudge";
 import { publishControlEvents } from "../control/outbox";
 import { openStore } from "../orchestrator/store";
 import { SpoolWriter } from "../orchestrator/spool";
+
+import { ledgerReport } from "./ledger";
 
 const DEFAULT_WEB_PORT = 4870;
 /** The list is a launchpad for drill-down, not an inventory: 1000 rows serve nobody. */
@@ -48,20 +50,8 @@ function warnInvalidConfig(path: string): void {
   console.error(`overload web: ignoring invalid config ${path}`);
 }
 
-const dashboardHtml = `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Overload dashboard</title><style>
-:root{--blue:#1a73e8;--blue-dark:#1557b0;--red:#d93025;--red-bg:#fef7f6;--gray-900:#202124;--gray-700:#3c4043;--gray-500:#5f6368;--gray-300:#dadce0;--gray-100:#f1f3f4;--gray-50:#f8f9fa;--surface:#fff;--shadow:0 1px 2px rgba(60,64,67,.3),0 1px 3px 1px rgba(60,64,67,.15)}
-*{box-sizing:border-box}body{margin:0;font-family:Roboto,Arial,sans-serif;color:var(--gray-900);background:var(--gray-50)}.brand,.num{font-family:"Google Sans",Roboto,Arial,sans-serif}.app-bar{display:flex;align-items:center;padding:12px 24px;background:#fff;border-bottom:1px solid var(--gray-300);position:sticky;top:0;z-index:5}.brand{font-size:20px;color:var(--gray-700)}.health-pill{margin-left:auto;font-size:12px;color:#137333;background:#e6f4ea;padding:6px 12px;border-radius:16px;display:flex;align-items:center;gap:7px}.health-pill.warn{color:#b06000;background:#fef7e0}.dot{width:8px;height:8px;border-radius:50%;background:#188038}.warn .dot{background:#f9ab00}.b-wrap{padding:20px 28px;max-width:1100px;margin:auto}.b-tiles{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-bottom:20px}.b-tile{background:#fff;border-radius:12px;padding:16px 18px;box-shadow:var(--shadow);border-left:4px solid var(--blue)}.b-tile.alert{border-left-color:var(--red)}.num{font-size:28px;font-weight:700}.label{font-size:12px;color:var(--gray-500);margin-top:4px}.b-tabs{display:flex;align-items:center;border-bottom:1px solid var(--gray-300)}.b-tab{appearance:none;background:transparent;border:0;border-bottom:3px solid transparent;padding:12px 18px;font-size:14px;color:var(--gray-500);cursor:pointer}.b-tab.active{color:var(--blue);border-bottom-color:var(--blue);font-weight:500}.b-tabs-secondary{margin-left:auto;display:flex}.b-tab.secondary{font-size:12px;padding:12px 14px}.b-table-wrap{background:#fff;box-shadow:var(--shadow);border-radius:0 0 8px 8px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;padding:12px 16px;color:var(--gray-500);font-weight:500;font-size:12px;border-bottom:1px solid var(--gray-300)}td{padding:12px 16px;border-bottom:1px solid var(--gray-100);vertical-align:middle}tr:hover td{background:var(--gray-50)}tr.failed td:first-child{border-left:3px solid var(--red)}.b-toolbar{display:none;align-items:center;gap:12px;padding:10px 16px;background:#e8f0fe;font-size:13px}.b-toolbar.show{display:flex}.btn{border-radius:6px;padding:7px 14px;font:500 13px inherit;border:1px solid var(--gray-300);background:#fff;color:var(--gray-700);cursor:pointer}.btn:hover{background:var(--gray-100)}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.btn.primary:hover{background:var(--blue-dark)}.btn.danger{color:var(--red)}.chip{font:11px ui-monospace,monospace;padding:3px 8px;border-radius:10px;background:var(--gray-100);color:var(--gray-700)}.empty{text-align:center;color:var(--gray-500);padding:28px}.error{margin:16px 0;padding:12px;color:var(--red);background:var(--red-bg);border-radius:8px}.hidden{display:none}@media(max-width:720px){.b-wrap{padding:14px}}
-.session-grid,.decision-groups,.decision-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}.decision-groups{grid-template-columns:1fr}.session-card,.decision-card,.decision-group,.hint-card{background:var(--surface);border-radius:12px;padding:16px}.session-card,.decision-card{border:1px solid var(--gray-300);box-shadow:0 1px 2px rgba(60,64,67,.12)}.decision-group,.hint-card{box-shadow:var(--shadow);margin-bottom:16px}.session-card-head,.session-actions,.decision-card-head,.decision-card-actions,.group-head{display:flex;align-items:center;gap:10px}.session-card-head,.group-head,.decision-card-head{justify-content:space-between}.session-card-head a{overflow-wrap:anywhere}.session-meta,.session-time,.decision-card-meta{color:var(--gray-500);font-size:13px;margin-top:8px}.session-actions,.decision-card-actions{margin-top:16px;flex-wrap:wrap}.resume-status{font-size:12px;color:var(--gray-500)}.session-grid .btn:disabled{opacity:.55}.group-head{margin-bottom:12px}.decision-card-summary{font-size:14px;font-weight:500;flex:1}.decision-card.hung{border-left:3px solid var(--red)}.option-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.hint-text{color:var(--gray-500);font-size:13px;margin:8px 0}
-</style></head><body>
-<header class="app-bar"><span class="brand">Overload</span><span class="health-pill" id="health-pill"><span class="dot"></span><span id="health-label">正在连接…</span></span></header>
-<main class="b-wrap"><div id="error" class="error hidden"></div><section class="b-tiles">
-<div class="b-tile alert"><div class="num" id="tile-now">—</div><div class="label">Now 待处理</div></div><div class="b-tile"><div class="num" id="tile-inbox">—</div><div class="label">Inbox 待批量</div></div>
-</section><nav class="b-tabs" aria-label="数据集"><button class="b-tab active" data-tab="now">Now</button><button class="b-tab" data-tab="inbox">Inbox</button><button class="b-tab" data-tab="done">Done</button><span class="b-tabs-secondary"><button class="b-tab secondary" data-tab="sessions">会话</button><button class="b-tab secondary" data-tab="health">Health</button></span></nav>
-<div class="b-toolbar" id="toolbar"><span id="selected-count">0 项已选</span><button class="btn primary" id="bulk-ack">批量 Ack</button><button class="btn primary hidden" id="bulk-closeout">批量收尾</button><button class="btn" id="clear-selection">取消</button></div><div id="detail" class="hidden"></div><div class="b-content" id="content"></div></main><script src="/static/app.js"></script></body></html>`;
+const staticRoot = fileURLToPath(new URL("./static/", import.meta.url));
 
-const staticAppPath = fileURLToPath(new URL("./static/app.js", import.meta.url));
 
 function json(value: unknown, init?: ResponseInit): Response {
   return Response.json(value, init);
@@ -143,8 +133,14 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
     async fetch(request, server) {
       const url = new URL(request.url);
       try {
-        if (request.method === "GET" && (url.pathname === "/" || dashboardRoute(url.pathname))) return new Response(dashboardHtml, { headers: { "content-type": "text/html; charset=utf-8" } });
-        if (request.method === "GET" && url.pathname === "/static/app.js") return new Response(Bun.file(staticAppPath), { headers: { "content-type": "text/javascript; charset=utf-8" } });
+        if (request.method === "GET" && (url.pathname === "/" || dashboardRoute(url.pathname))) return new Response(Bun.file(join(staticRoot, "index.html")), { headers: { "content-type": "text/html; charset=utf-8" } });
+        if (request.method === "GET" && url.pathname.startsWith("/static/")) {
+          const name = decodeURIComponent(url.pathname.slice(8));
+          if (name.includes("..") || name.includes("/") || name.includes("\\")) return new Response("invalid path", {status:400});
+          const file = Bun.file(join(staticRoot, name));
+          if (!await file.exists()) return new Response("not found", {status:404});
+          return new Response(file, {headers:{"content-type":name.endsWith(".js")?"text/javascript; charset=utf-8":name.endsWith(".css")?"text/css; charset=utf-8":"application/octet-stream"}});
+        }
         const originError = checkOrigin(request, port === 0 ? server.port : port);
         if (originError) return originError;
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
@@ -157,6 +153,21 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
           const control = openControl(controlPath); try { return json(listAttention(control, url.pathname.slice("/api/attention/".length) as "now" | "inbox" | "done")); } finally { control.close(); }
         }
         if (request.method === "GET" && url.pathname === "/api/capabilities") return json({ notifications: notificationCapability(), web: { available: true, bind: "127.0.0.1", port: server.port } });
+        if (request.method === "GET" && url.pathname === "/api/ledger") {
+          const until = url.searchParams.has("until") ? Number(url.searchParams.get("until")) : Date.now();
+          const since = url.searchParams.has("since") ? Number(url.searchParams.get("since")) : until - 7*86400000;
+          if (!Number.isFinite(since)||!Number.isFinite(until)||since<0||since>until) return json({error:"invalid time window"},{status:400});
+          const db=openAnswersDb(controlPath);try{return json(ledgerReport(db,{since,until}));}finally{db.close();}
+        }
+        if (request.method === "GET" && url.pathname === "/api/rules") {
+          const db=openAnswersDb(controlPath);try{return json(rulesReport(db,loadPolicy(options.policyPath,db),Date.now()));}finally{db.close();}
+        }
+        if (request.method === "POST" && /^\/api\/rules\/[^/]+\/(approve|enable)$/.test(url.pathname)) {
+          const parts=url.pathname.split("/");const db=openAnswersDb(controlPath);try{if(parts[4]==="enable"){const samples=db.query("SELECT COUNT(*) n,MIN(matched) matched FROM policy_candidate_samples WHERE candidate_id=?").get(routeParameter(parts[3])) as {n:number;matched:number};if(samples.n<5||samples.matched!==1)return json({error:"needs 5 matching observations"},{status:409});}const result=parts[4]==="approve"?approvePolicyCandidate(db,routeParameter(parts[3]),"operator",Date.now()+7*86400000):enablePolicyCandidate(db,routeParameter(parts[3]));return result?json(result):json({error:"candidate not eligible"},{status:409});}catch(error){return json({error:String((error as Error).message)},{status:409});}finally{db.close();}
+        }
+        if (request.method === "POST" && /^\/api\/decision-bot\/(disable|enable)$/.test(url.pathname)) {
+          const db=openAnswersDb(controlPath);const disabled=url.pathname.endsWith("/disable");try{const body=await bodyObject(request);setBotDisabled(db,disabled,String(body.reason??(disabled?"disabled by operator":"enabled by operator")));return json({disabled});}finally{db.close();}
+        }
         if (request.method === "GET" && url.pathname === "/api/works") {
           const control = openControl(controlPath); try { return json(listWorks(control)); } finally { control.close(); }
         }
@@ -172,6 +183,10 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (request.method === "POST" && url.pathname === "/api/works") {
           const input = await bodyObject(request); const control = openControl(controlPath);
           try { return json(createWork(control, input as Parameters<typeof createWork>[1]), { status: 201 }); } catch (error) { return controlError(error); } finally { control.close(); }
+        }
+        const promoteRoute = url.pathname.match(/^\/api\/works\/([^/]+)\/promote$/);
+        if (request.method === "POST" && promoteRoute) {
+          const db=openControl(controlPath);try{const body=await bodyObject(request);return json(promoteWork(db,routeParameter(promoteRoute[1]),Number(body.expected_revision),body.contract as Contract,String(body.reason??"")));}catch(error){return controlError(error);}finally{db.close();}
         }
         const workRoute = url.pathname.match(/^\/api\/works\/([^/]+)(?:\/(contract|redirect|stop))?$/);
         if (workRoute) {
@@ -284,8 +299,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
   return server;
 }
 
-function dashboardRoute(pathname: string): boolean {
-  return /^\/(?:now|inbox|done|sessions|health|q1|q2|archive|hung|zombie)(?:\/[^/]+)?\/$/.test(`${pathname}/`);
+function dashboardRoute(path: string): boolean {
+  return /^\/(decide|ledger|works|candidates|rules|agents|now|inbox|done|sessions|health|q1|q2|archive|hung|zombie)(?:\/.*)?$/.test(path);
 }
 
 if (import.meta.main) {

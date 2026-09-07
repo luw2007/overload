@@ -212,3 +212,19 @@ export function actOnAttention(db:Database,itemId:string,expectedRevision:number
     const item={...old,revision:old.revision+1,updated_at:now};if(action==="ack")item.acknowledged_at=now;else if(action==="defer")item.defer_until=input.defer_until!;else item.state="resolved";persistAttention(db,old,item,action,input as Record<string,unknown>,now);return item;});return tx.immediate() as AttentionItem;
 }
 export function recordAttentionFeedback(db:Database,itemId:string,expectedRevision:number,useful:boolean,reason?:string,now=Date.now()):void {ensureControlSchema(db);const tx=db.transaction(()=>{const item=getAttention(db,itemId);if(!item)throw new ControlError("not_found","attention item not found");if(item.revision!==expectedRevision)throw new ControlError("conflict","stale attention revision");try{db.query("INSERT INTO control_feedback VALUES (?,?,?,?,?)").run(itemId,expectedRevision,useful?1:0,reason??null,now);}catch{throw new ControlError("conflict","feedback already recorded");}enqueueControlEvent(db,{entity_id:itemId,entity_version:expectedRevision,kind:"attention.feedback",work_id:item.work_id,item_id:itemId,payload:{item_id:itemId,revision:expectedRevision,useful,reason:reason??null}},now);});tx.immediate();}
+
+/** Atomically activate a candidate and publish the same audited revision as contract edits. */
+export function promoteWork(db: Database, workId: string, expectedRevision: number, contract: Contract, reason: string, now = Date.now()): Work {
+  return db.transaction(() => {
+    const work = getWork(db, workId);
+    if (!work) throw new ControlError("not_found", "work not found");
+    if (work.state !== "candidate") throw new ControlError("conflict", "work is not a candidate");
+    if (work.revision !== expectedRevision) throw new ControlError("conflict", "work revision changed");
+    validateContract(contract);
+    reviseContract(db, workId, expectedRevision, contract, reason, now);
+    db.run("UPDATE control_works SET state='active',updated_at=? WHERE work_id=? AND state='candidate'", [now,workId]);
+    const promoted = getWork(db, workId)!;
+    emitWork(db, promoted, "work.promoted", {reason});
+    return getWork(db, workId)!;
+  }).immediate();
+}

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS policy_candidates(candidate_id TEXT PRIMARY KEY,rule_
 CREATE TABLE IF NOT EXISTS policy_candidate_samples(candidate_id TEXT NOT NULL,receipt_id TEXT NOT NULL,evaluated_at INTEGER,matched INTEGER,PRIMARY KEY(candidate_id,receipt_id),FOREIGN KEY(candidate_id) REFERENCES policy_candidates(candidate_id),FOREIGN KEY(receipt_id) REFERENCES decision_receipts(receipt_id));
 CREATE TABLE IF NOT EXISTS effect_reconcile_cursor(id INTEGER PRIMARY KEY CHECK(id=1),ingest_seq INTEGER NOT NULL);`);
   for(const [name,definition] of [["work_id","TEXT"],["contract_revision","INTEGER"],["decision_mode","TEXT"],["tool_call_id","TEXT"],["attempt_id","TEXT"]] as const)if(!columns(db,"approval_targets").has(name))db.exec(`ALTER TABLE approval_targets ADD COLUMN ${name} ${definition}`);
+  for(const [name,definition] of [["rule_id","TEXT"]] as const)if(!columns(db,"bot_proposals").has(name))db.exec(`ALTER TABLE bot_proposals ADD COLUMN ${name} ${definition}`);
   const c=columns(db,"answers");if(c.has("consumer_owner")){db.exec("INSERT OR IGNORE INTO answer_metadata(approval_id,consumer_owner,provenance) SELECT approval_id,consumer_owner,provenance FROM answers");}
   ensureControlSchema(db);
   chmodSync(path,0o600); return db;

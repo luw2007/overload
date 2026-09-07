@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { actOnAttention, ControlError, createWork, ensureControlSchema, getAttention, getWork, recordStopCondition, resolveAttentionDecision, reviseContract, upsertAttention } from "./store";
+import { actOnAttention, promoteWork, ControlError, createWork, ensureControlSchema, getAttention, getWork, recordStopCondition, resolveAttentionDecision, reviseContract, upsertAttention } from "./store";
 import type { Contract } from "./types";
 
 const contract: Contract = { objective:"ship",acceptance:[{id:"human",kind:"human",description:"owner accepts"}],non_goals:[],scope:{allowed_effects:["write"]},budget:{retry_limit:1},stop_conditions:[{id:"risk",kind:"hard",description:"unexpected destructive effect"}],decision_owner:"owner" };
@@ -39,4 +39,15 @@ describe("control store CAS and attention semantics",()=>{
     expect(()=>actOnAttention(db,"i",1,"defer",{defer_until:10},4)).toThrow(ControlError);
     expect(()=>actOnAttention(db,"i",2,"resolve",{},4)).toThrow(ControlError);db.close();
   });
+});
+
+test("promotion requires candidate and current revision and emits a new contract",()=>{
+ const db=fixture();const w=createWork(db,{title:"idea",source:"operator",candidate:true},1);
+ const promoted=promoteWork(db,w.work_id,1,contract,"promoted",2);
+ expect(promoted.state).toBe("active");expect(promoted.revision).toBe(2);
+ expect(()=>promoteWork(db,w.work_id,2,contract,"again",3)).toThrow();
+ const candidate=createWork(db,{title:"next",source:"operator",candidate:true},3);
+ expect(()=>promoteWork(db,candidate.work_id,2,contract,"stale",4)).toThrow();
+ expect(()=>promoteWork(db,candidate.work_id,1,{...contract,acceptance:[]},"invalid",4)).toThrow();
+ expect(getWork(db,candidate.work_id)?.state).toBe("candidate");db.close();
 });
