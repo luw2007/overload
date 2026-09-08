@@ -494,7 +494,7 @@ export default function overload(pi: ExtensionApi): void {
   function canonicalValue(value:unknown):string{if(value===null||typeof value!=="object")return JSON.stringify(value);if(Array.isArray(value))return `[${value.map(canonicalValue).join(",")}]`;const row=value as Record<string,unknown>;return `{${Object.keys(row).sort().map(key=>`${JSON.stringify(key)}:${canonicalValue(row[key])}`).join(",")}}`}
   function emitEffect(payload:Record<string,unknown>):void{const receiptId=String(payload.receipt_id),toolCallId=String(payload.toolCallId),eventId=`extension:${receiptId}:${toolCallId}:effect_observed`;emit("control_event",{event_id:eventId,producer_id:`extension:${spool.emitterId}`,entity_id:receiptId,entity_version:1,event_kind:"effect_observed",payload,payload_hash:createHash("sha256").update(canonicalValue(payload)).digest("hex")})}
 
-  async function waitForApproval(event: any, rule: GateRule): Promise<{ block: true; reason: string } | undefined> {
+  async function waitForApproval(event: { toolCallId: string; toolName: string; input?: Record<string, unknown> }, rule: GateRule, signal?: AbortSignal): Promise<{ block: true; reason: string } | undefined> {
     const gate = approvalGate
     if (!gate || typeof event?.toolCallId !== "string") return { block: true, reason: `overload approval gate: ${rule.rule}` }
     if (rule.kind === "block") {
@@ -511,16 +511,33 @@ export default function overload(pi: ExtensionApi): void {
     const base = `http://127.0.0.1:${gate.webPort}`
     const evidence = { tool: detail.tool, command: typeof event?.input?.command === "string" ? event.input.command : undefined, path: typeof event?.input?.path === "string" ? event.input.path : undefined, input: event?.input, cwd: sessionCwd, rule: rule.rule, class: detail.class, toolCallId: event.toolCallId }
     let targetVersion = ""
+    const cancelApproval = async (): Promise<{ block: true; reason: string }> => {
+      let closed = false
+      try {
+        const response = await globalThis.fetch(`${base}/api/decision/cancel/${encodeURIComponent(approvalId)}`, { method: "POST", headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, signal: AbortSignal.timeout(2000), body: JSON.stringify({ consumer_owner: "extension", target_version: targetVersion }) })
+        closed = response.ok
+      } catch { /* Never allow execution when cancellation cannot be confirmed. */ }
+      emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "cancelled", cancellation_confirmed: closed })
+      return { block: true, reason: closed ? "overload approval gate: cancelled" : "overload approval gate: cancelled; target closure unconfirmed" }
+    }
     try {
-      const registered = await globalThis.fetch(`${base}/api/decision/target`, { method: "POST", headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumerOwner: "extension", approvalId, stableId, requestUid: `${stableId}#${spool.writerId}#${event.toolCallId}`, question: detail.summary, options: ["approve", "deny"], effect: String(detail.class || "gated_tool"), scope: { gate: "action", rule: rule.rule, cwd: sessionCwd }, evidence, toolCallId: event.toolCallId, decisionMode: "human_only", expiresAt }) })
-      if (registered.ok) targetVersion = String((await registered.json() as any).targetVersion || "")
+      const registered = await globalThis.fetch(`${base}/api/decision/target`, { method: "POST", signal: AbortSignal.timeout(2000), headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumerOwner: "extension", approvalId, stableId, requestUid: `${stableId}#${spool.writerId}#${event.toolCallId}`, question: detail.summary, options: ["approve", "deny"], effect: String(detail.class || "gated_tool"), scope: { gate: "action", rule: rule.rule, cwd: sessionCwd }, evidence, toolCallId: event.toolCallId, decisionMode: "human_only", expiresAt }) })
+      if (registered.ok) {
+        const payload: unknown = await registered.json()
+        if (payload && typeof payload === "object" && "targetVersion" in payload && typeof payload.targetVersion === "string") targetVersion = payload.targetVersion
+      }
     } catch { /* unavailable control plane remains fail-closed */ }
     emit("decision_requested", { ...detail, consumer_owner: "extension", target_version: targetVersion })
     while (Date.now() < expiresAt && targetVersion) {
+      if (signal?.aborted) return cancelApproval()
       try {
-        const response = await globalThis.fetch(`${base}/api/decision/consume/${encodeURIComponent(approvalId)}`, { method: "POST", headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumer_owner: "extension", target_version: targetVersion }) })
+        const response = await globalThis.fetch(`${base}/api/decision/consume/${encodeURIComponent(approvalId)}`, { method: "POST", signal: AbortSignal.timeout(2000), headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }, body: JSON.stringify({ consumer_owner: "extension", target_version: targetVersion }) })
         if (response.status === 200) {
           const payload = await response.json() as { answer?: unknown; actor?: unknown; receiptId?: unknown; attemptId?:unknown }
+          if (signal?.aborted) {
+            if (typeof payload.receiptId === "string") emitEffect({ receipt_id: payload.receiptId, toolCallId: event.toolCallId, effect: String(detail.class || "gated_tool"), effect_state: "failed", evidence: { reason: "cancelled_before_tool_execution" } })
+            return cancelApproval()
+          }
           const answer = typeof payload.answer === "string" ? payload.answer : ""
           const actor = typeof payload.actor === "string" ? payload.actor : "unknown"
           emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "resolved", selected: answer, actor, receipt_id: payload.receiptId })
@@ -528,8 +545,14 @@ export default function overload(pi: ExtensionApi): void {
           return answer === "approve" ? undefined : { block: true, reason: `overload approval gate: denied by ${actor}` }
         }
       } catch { /* Poll errors are fail-closed at expiry, not an early allow. */ }
-      await sleep(Math.min(APPROVAL_POLL_INTERVAL_MS, Math.max(1, expiresAt - Date.now())))
+      await new Promise<void>((resolve) => {
+        const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); resolve() }
+        const timer = setTimeout(finish, Math.min(APPROVAL_POLL_INTERVAL_MS, Math.max(1, expiresAt - Date.now())))
+        signal?.addEventListener("abort", finish, { once: true })
+        if (signal?.aborted) finish()
+      })
     }
+    if (signal?.aborted) return cancelApproval()
     emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "timed_out" })
     return { block: true, reason: "overload approval gate: timed out" }
   }
@@ -647,11 +670,11 @@ export default function overload(pi: ExtensionApi): void {
           // Async handlers reject instead of throwing synchronously; swallow
           // both paths so telemetry can never propagate into the host.
           if (result && typeof (result as Promise<unknown>).catch === "function") {
-            return (result as Promise<unknown>).catch(() => {})
+            return (result as Promise<unknown>).catch(() => event === "tool_call" ? { block: true, reason: "overload tool gate failed" } : undefined)
           }
           return result
         } catch {
-          // Telemetry must never throw out of an extension handler.
+          if (event === "tool_call") return { block: true, reason: "overload tool gate failed" }
         }
       })
       return true
@@ -709,7 +732,7 @@ export default function overload(pi: ExtensionApi): void {
     if (event?.message?.role === "assistant") lastAssistantText = textFrom(event.message)
   })
 
-  on("tool_call", async (event) => {
+  on("tool_call", async (event, ctx) => {
     const now = Date.now()
     const tool = String(event?.toolName || "unknown")
     const command = typeof event?.input?.command === "string" ? event.input.command : ""
@@ -737,7 +760,7 @@ export default function overload(pi: ExtensionApi): void {
     }
     const rule = gateRule(event)
     if (rule) {
-      const decision = await waitForApproval(event, rule)
+      const decision = await waitForApproval(event, rule, ctx?.signal)
       if (decision) return decision
     }
     if (event?.toolName !== "bash" || !command) return

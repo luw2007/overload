@@ -47,6 +47,27 @@ afterEach(() => {
 });
 
 describe("approval gate", () => {
+  test("abort interrupts pending approval and blocks the tool", async () => {
+    const controller = new AbortController();
+    const originalFetch = globalThis.fetch;
+    let polling: (() => void) | undefined;
+    const polled = new Promise<void>((resolve) => { polling = resolve; });
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/target")) return Response.json({ targetVersion: "v1" });
+      if (String(input).includes("/cancel/")) return Response.json({ closed: true });
+      polling?.();
+      return new Response(null, { status: 404 });
+    }) as typeof fetch;
+    try {
+      const h = await harness({ approval_gate: { enabled: true, require_approval_bash_patterns: ["^git push"], timeout_ms: 60_000 } });
+      const pending = Promise.all(h.dispatch("tool_call", { toolName: "bash", toolCallId: "cancel-call", input: { command: "git push" } }, { signal: controller.signal }));
+      await polled;
+      controller.abort();
+      expect((await pending)[0]).toMatchObject({ block: true });
+      const events = await h.close();
+      expect(events.some((event) => event.kind === "decision_resolved" && event.detail?.state === "cancelled" && event.detail?.cancellation_confirmed === true)).toBe(true);
+    } finally { globalThis.fetch = originalFetch; }
+  });
   test("invalid enabled config fails closed and emits a cancelled pair", async () => {
     const h = await harness({ approval_gate: { enabled: true, block_bash_patterns: "not-an-array" } });
     const event = { toolName: "bash", toolCallId: "invalid-call", input: { command: "echo hi" } };

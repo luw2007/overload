@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
-import { consumeDecision, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
+import { cancelTarget, consumeDecision, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate, loadPolicy, matchingRule, policyAuthorizes, rulesReport } from "../decision-bot/policy";
 import { DecisionBotService } from "../decision-bot/service";
 import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
@@ -267,6 +267,17 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/orchestrator/answer/")) {
           if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}const approvalId=routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));if(!approvalId||typeof body?.answer!=="string")return json({error:"missing answer"},{status:400});const mailbox=openAnswersDb(controlPath);try{const owner=body.consumer_owner==="extension"?"extension":"orchestrator";const result=writeHumanAnswer(mailbox,owner,approvalId,body.answer,"ui");return result.ok?json({ok:true}):json({error:result.reason},{status:result.reason==="already_consumed"?409:400});}finally{mailbox.close();}
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/api/decision/cancel/")) {
+          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });
+          let body: unknown;
+          try { body = await request.json(); } catch { return json({ error: "invalid JSON" }, { status: 400 }); }
+          if (!body || typeof body !== "object" || !("consumer_owner" in body) || body.consumer_owner !== "extension" || !("target_version" in body) || typeof body.target_version !== "string") return json({ error: "invalid cancellation" }, { status: 400 });
+          const mailbox = openAnswersDb(controlPath);
+          try {
+            const closed = cancelTarget(mailbox, "extension", routeParameter(url.pathname.slice("/api/decision/cancel/".length)), body.target_version);
+            return json({ closed }, { status: closed ? 200 : 409 });
+          } finally { mailbox.close(); }
         }
         if(request.method==="POST"&&url.pathname.startsWith("/api/decision/consume/")){if(!request.headers.get("sec-fetch-site")&&!request.headers.get("sec-fetch-mode"))return json({error:"forbidden"},{status:403});let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}const id=routeParameter(url.pathname.slice("/api/decision/consume/".length));if(!id||body?.consumer_owner!=="extension"||typeof body.target_version!=="string")return json({error:"invalid consume"},{status:400});const mailbox=openAnswersDb(controlPath);try{const policy=loadPolicy(options.policyPath,mailbox);const r=consumeDecision(mailbox,{consumerOwner:"extension",approvalId:id,targetVersion:body.target_version,policyHash:policy.hash,liveValid:()=>true,policyValid:(t,p)=>!!p&&policyAuthorizes(policy,t,p.answer,p.policyHash)});return r?json(r):json({error:"not ready"},{status:404});}finally{mailbox.close();}}
         if(request.method==="GET"&&url.pathname==="/api/decision-bot/status"){const mailbox=openAnswersDb(controlPath);try{return json(new DecisionBotService(mailbox).status());}finally{mailbox.close();}}

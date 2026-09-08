@@ -1,5 +1,17 @@
+import { cancelTarget } from "./mailbox";
 import {expect,test} from "bun:test";import {mkdtempSync,rmSync} from "node:fs";import {tmpdir} from "node:os";import {join} from "node:path";import {botDisabled,consumeDecision,getTarget,markReceipt,observeReceiptEffect,openMailbox,receipt,reconcileOutstandingReceipts,registerTarget,setBotDisabled,writeHumanAnswer} from "./mailbox";
 function fixture(){const root=mkdtempSync(join(tmpdir(),"decision-mailbox-")),path=join(root,"mail.db"),db=openMailbox(path),target=registerTarget(db,{consumerOwner:"extension",approvalId:"a",question:"Q",options:["approve","deny"],effect:"push",scope:{gate:"action",cwd:"/repo"},evidence:{command:"git push"},expiresAt:Date.now()+60_000});return{root,path,db,target,close(){db.close();rmSync(root,{recursive:true,force:true});}}}
+test("cancelled target rejects late answers and previously queued approval consumption", () => {
+  const f = fixture();
+  try {
+    expect(writeHumanAnswer(f.db, "extension", "a", "approve")).toEqual({ ok: true });
+    expect(cancelTarget(f.db, "extension", "a", "stale-version")).toBe(false);
+    expect(getTarget(f.db, "extension", "a")?.state).toBe("active");
+    expect(cancelTarget(f.db, "extension", "a", f.target.targetVersion)).toBe(true);
+    expect(writeHumanAnswer(f.db, "extension", "a", "approve").ok).toBe(false);
+    expect(consumeDecision(f.db, { consumerOwner: "extension", approvalId: "a", targetVersion: f.target.targetVersion, policyHash: "p", liveValid: () => true, policyValid: () => true })).toBeNull();
+  } finally { f.close(); }
+});
 test("human answer is accepted before consume and conflicts after consume",()=>{const f=fixture();expect(writeHumanAnswer(f.db,"extension","a","deny")).toEqual({ok:true});const r=consumeDecision(f.db,{consumerOwner:"extension",approvalId:"a",targetVersion:f.target.targetVersion,policyHash:"p",liveValid:()=>true,policyValid:()=>false});expect(r?.answer).toBe("deny");expect(writeHumanAnswer(f.db,"extension","a","approve")).toEqual({ok:false,reason:"already_consumed"});f.close();});
 test("human_only rejects bot proposal but consumes valid human answer",()=>{const f=fixture();f.db.run("UPDATE approval_targets SET decision_mode='human_only' WHERE approval_id='a'");f.db.run("INSERT INTO bot_attempts VALUES('try','bot','extension','a',?,'owner',9999999999999,'p',?,'proposed',NULL,1,2)",[f.target.targetVersion,f.target.evidenceHash]);f.db.run("INSERT INTO bot_proposals VALUES('try','extension','a',?,'answer','approve','ok','[]','p',1,NULL,NULL)",f.target.targetVersion);expect(consumeDecision(f.db,{consumerOwner:"extension",approvalId:"a",targetVersion:f.target.targetVersion,policyHash:"p",liveValid:()=>true,contractValid:()=>true,policyValid:()=>true})).toBeNull();expect(writeHumanAnswer(f.db,"extension","a","approve").ok).toBe(true);expect(consumeDecision(f.db,{consumerOwner:"extension",approvalId:"a",targetVersion:f.target.targetVersion,policyHash:"p",liveValid:()=>true,contractValid:()=>true,policyValid:()=>true})?.actor).toBe("ui");f.close();});
 test("contract revision invalidation blocks stale consume",()=>{const f=fixture();writeHumanAnswer(f.db,"extension","a","approve");expect(consumeDecision(f.db,{consumerOwner:"extension",approvalId:"a",targetVersion:f.target.targetVersion,policyHash:"p",liveValid:()=>true,contractValid:()=>false,policyValid:()=>true})).toBeNull();f.close();});

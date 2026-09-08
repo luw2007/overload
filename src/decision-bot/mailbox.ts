@@ -46,6 +46,15 @@ export function registerTarget(db:Database,input:Omit<ApprovalTarget,"targetVers
   return {...input,targetVersion,evidenceHash,state:"active"};
 }
 export function getTarget(db:Database,owner:ConsumerOwner,id:string):ApprovalTarget|null { const r=db.query("SELECT * FROM approval_targets WHERE consumer_owner=? AND approval_id=?").get(owner,id) as any; if(!r)return null; return {consumerOwner:r.consumer_owner,approvalId:r.approval_id,stableId:r.stable_id??undefined,requestUid:r.request_uid??undefined,targetVersion:r.target_version,question:r.question,options:JSON.parse(r.options),effect:r.effect,scope:JSON.parse(r.scope),evidence:JSON.parse(r.evidence),evidenceHash:r.evidence_hash,expiresAt:r.expires_at,state:r.state,workId:r.work_id??undefined,contractRevision:r.contract_revision??undefined,decisionMode:r.decision_mode??undefined,toolCallId:r.tool_call_id??undefined,attemptId:r.attempt_id??undefined}; }
+export function cancelTarget(db: Database, owner: ConsumerOwner, id: string, version: string): boolean {
+  return db.transaction(() => {
+    const target = getTarget(db, owner, id);
+    if (!target || target.targetVersion !== version) return false;
+    if (target.state === "consumed") return false;
+    db.query("UPDATE approval_targets SET state='closed',outcome='cancelled' WHERE consumer_owner=? AND approval_id=? AND target_version=? AND state='active'").run(owner, id, version);
+    return true;
+  })();
+}
 export function writeHumanAnswer(db:Database, owner:ConsumerOwner,id:string,answer:string,actor="ui",now=Date.now()):{ok:true}|{ok:false;reason:string}{
   return db.transaction(()=>{const target=getTarget(db,owner,id);if(!target||target.state!=="active")return {ok:false,reason:target?.state==="consumed"?"already_consumed":"unknown_target"} as const;if(now>=target.expiresAt)return {ok:false,reason:"expired"} as const;if(!target.options.includes(answer))return {ok:false,reason:"invalid_option"} as const;const prior=db.query("SELECT consumer_owner FROM answer_metadata WHERE approval_id=?").get(id) as any;if(prior&&prior.consumer_owner&&prior.consumer_owner!==owner)return {ok:false,reason:"owner_conflict"} as const;db.run("INSERT INTO answers(approval_id,answer,actor,at) VALUES(?,?,?,?) ON CONFLICT(approval_id) DO UPDATE SET answer=excluded.answer,actor=excluded.actor,at=excluded.at",[id,answer,actor,now]);db.run("INSERT INTO answer_metadata(approval_id,consumer_owner,provenance) VALUES(?,?,'human') ON CONFLICT(approval_id) DO UPDATE SET consumer_owner=excluded.consumer_owner,provenance='human'",[id,owner]);db.run("UPDATE bot_proposals SET invalidated_at=? WHERE consumer_owner=? AND approval_id=? AND invalidated_at IS NULL",[now,owner,id]);return {ok:true} as const;}).immediate();
 }

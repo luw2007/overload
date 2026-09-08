@@ -4,6 +4,8 @@ Overload is a local-first macOS attention control plane for agent work. It turns
 
 It is designed for a single operator managing local and SSH-reachable agent sessions. It is not a hosted service or a multi-user control plane. The ingest path is one-way: telemetry only, never a channel back into an agent. Two opt-in paths do write back, and both are disabled until you turn them on. The pi-family extension's `approval_gate` pauses a matching bash/write/edit call in any session that installed the extension and waits for a human answer from the loopback answers mailbox. The optional `src/orchestrator/` module launches its own `pi` children and gates them the same way. Both surface as ordinary Now decisions. These gates are a **workflow** boundary, not a security boundary: on a single-UID machine any same-UID process can bypass them. Product and engineering decisions follow [AGENTS.md](AGENTS.md).
 
+On runtimes exposing an abort signal to extensions, cancelling an approval wait interrupts polling and requests version-checked closure of the mailbox target before returning. Closed targets reject late answers and consumption. If closure cannot be confirmed (including an already-consumed approval), the tool remains blocked and cancellation is reported as unconfirmed; an approval receipt is not evidence that execution succeeded. HTTP waits are bounded. Runtime cancellation does not roll back earlier effects or guarantee termination of detached processes.
+
 ## Status
 
 The supported v0 surface is the Bun/SQLite ingest pipeline, CLI, recon, pull, and loopback dashboard. Pending decisions are read from the dashboard; when the Now zone goes from empty to non-empty, the maintenance job emits one aggregated macOS notification (`osascript`), never per-event.
