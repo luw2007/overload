@@ -18,6 +18,8 @@ import { publishControlEvents } from "../control/outbox";
 import { openStore } from "../orchestrator/store";
 import { SpoolWriter } from "../orchestrator/spool";
 
+import {ensureAdapterSchema,type Conversation,type StoredTurn} from '../adapters/store';
+import {randomUUID} from 'node:crypto';
 import { ledgerReport } from "./ledger";
 
 const DEFAULT_WEB_PORT = 4870;
@@ -155,6 +157,9 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (request.method === "GET" && url.pathname === "/api/capabilities") return json({ notifications: notificationCapability(), web: { available: true, bind: "127.0.0.1", port: server.port } });
         if (request.method === "GET" && url.pathname === "/api/ledger") {
           const until = url.searchParams.has("until") ? Number(url.searchParams.get("until")) : Date.now();
+        if(request.method==='GET'&&url.pathname==='/api/conversations'){const db=openControl(controlPath);try{ensureAdapterSchema(db);const rows=db.query('SELECT * FROM conversations ORDER BY created_at DESC').all() as Conversation[];return json(rows.map(c=>({...c,address:JSON.parse(c.address),session_reference:c.session_reference?JSON.parse(c.session_reference):null,turns:db.query('SELECT * FROM conversation_turns WHERE conversation_id=? ORDER BY sequence').all(c.id)})));}finally{db.close();}}
+        const conversationMessage=url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
+        if(request.method==='POST'&&conversationMessage){const db=openControl(controlPath);try{ensureAdapterSchema(db);const input=await bodyObject(request);if(typeof input.text!=='string'||!input.text.trim()||input.text.length>100000)return json({error:'invalid message'},{status:400});const id=routeParameter(conversationMessage[1]);const c=db.query('SELECT * FROM conversations WHERE id=?').get(id) as Conversation|null;if(!c)return json({error:'not_found'},{status:404});const turnId=randomUUID();db.transaction(()=>{const row=db.query('SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_turns WHERE conversation_id=?').get(id) as {n:number};db.run('INSERT INTO conversation_turns(id,conversation_id,sequence,text,state,created_at) VALUES(?,?,?,?,?,?)',[turnId,id,row.n,input.text as string,'queued',Date.now()]);}).immediate();return json({turn_id:turnId},{status:201});}finally{db.close();}}
           const since = url.searchParams.has("since") ? Number(url.searchParams.get("since")) : until - 7*86400000;
           if (!Number.isFinite(since)||!Number.isFinite(until)||since<0||since>until) return json({error:"invalid time window"},{status:400});
           const db=openAnswersDb(controlPath);try{return json(ledgerReport(db,{since,until}));}finally{db.close();}

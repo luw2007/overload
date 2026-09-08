@@ -1,5 +1,21 @@
 # Integrations
 
+## Feishu channel and owned pi runtime
+
+Run `bun install` once, then `bun src/adapters/daemon.ts`. The daemon uses the official `@larksuiteoapi/node-sdk` WebSocket long connection; no public inbound port or webhook reverse proxy is required. Set `FEISHU_APP_FILE` to a mode-0600 JSON file containing exactly `{ "app_id": "cli_…", "app_secret": "…" }`, or set `FEISHU_APP_ID` and `FEISHU_APP_SECRET` directly. Set `FEISHU_INSTANCE_ID`, `OVERLOAD_RUNTIME_CWD`, and `OVERLOAD_CHANNEL_AUTH_FILE`. The authorization file is a JSON array of `{ "instanceId": "…", "tenantId": "…", "userId": "…", "ownerId": "…" }` mappings. Keep credentials outside the repository.
+
+Each authorization entry also requires `appId` and `chatId`. Authorization matches the configured application, instance, tenant, user, and chat together; it does not authorize the same user in other chats. Unknown senders receive an access-denied reply rather than being silently enrolled or forwarded to the Agent.
+
+The built-in registry selects `feishu` and `pi` by default; override only with `OVERLOAD_CHANNEL` and `OVERLOAD_RUNTIME` when another built-in choice exists. Group messages require an explicit bot mention; direct messages are accepted. Each root message binds its own thread. The same `OVERLOAD_ANSWERS_PATH` is used by the channel daemon and Web control database. Select the actual pi provider/model with `OVERLOAD_PI_PROVIDER` and `OVERLOAD_PI_MODEL`; pi owns provider credentials.
+
+`Conversations` displays durable queued turns; sending text never approves a request or steers an active turn. Send `/cancel` in the bound conversation to request cancellation; pending native approvals are closed first, the runtime cancellation result is retained, and no turn is automatically retried. Native select/confirm requests create existing control attention items, consume human mailbox receipts, and update the original Feishu card. Unknown sends are not automatically retried. Temporary known delivery errors have five attempts. The owned Unix-socket broker preserves a running pi process across control reconnection; channel shutdown detaches, not terminates the Agent.
+
+Pi completion is determined by `agent_settled`, not prompt acceptance or a single `agent_end`. Native confirmation can precede prompt acceptance; decision delivery remains active during that wait. `/cancel` keeps subsequent turns fenced as unknown until effects are inspected; Runtime idle is not proof that detached processes stopped. `PiRuntime.shutdown(reference)` explicitly terminates the owned pi child; closing a session handle only detaches the control connection.
+
+Native select/confirm receipts verify answer delivery and subsequent runtime completion, not arbitrary tool effects or business acceptance. The existing Overload extension's HTTP `approval_gate` remains a separate protocol; do not treat native UI confirmation as proof that those tool approvals have been delivered through Feishu. Runtime input/editor requests currently remain unknown rather than silently fabricating answers.
+
+Deployment acceptance remains separate: SDK construction and local fake-credential failures do not establish real tenant connectivity, event subscriptions, card callback permissions, or successful model execution. Real verification requires a Feishu self-built app configured for persistent WebSocket event/callback subscription, IM message and card-action permissions, an authorized tenant/user mapping, and credentials provisioned in `FEISHU_APP_FILE`. Input/editor dialogs remain unknown rather than exposed as structured approvals; no successful continuation is claimed for these dialogs.
+
 ## pi, omp, and prime-agent
 
 `src/extension/overload.ts` uses the compatible pi-family extension API. Install it in the relevant runtime extension directory. It writes lifecycle, ask, heartbeat, tool-activity, and commit-observation events to the local spool.

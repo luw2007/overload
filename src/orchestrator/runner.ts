@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Task } from "./store";
+import { buildPiRunnerInvocation } from "../adapters/pi";
 
 export type RunnerExecutor = (command: string, args: string[]) => Promise<{ ok: boolean; error?: string; stdout?:string; stderr?:string }>;
 export type RunnerProbe={kind:"absent"}|{kind:"unreadable"}|{kind:"found";stable_id:string;pid:number|null;boot_id:string|null;has_incarnation:boolean;ended:boolean};
@@ -19,7 +20,6 @@ export const defaultRunnerExecutor: RunnerExecutor = async (command, args) => {
   }
 };
 
-const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
 export function taskOrigin(taskId: string, attemptId: string): string { return `orch:task:${taskId}:${attemptId}`; }
 
@@ -38,9 +38,8 @@ export async function spawnRunner(task: Task, worktreeDir: string, attemptId: st
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const promptFile = join(dir, `prompt-${attemptId}.txt`);
   writeFileSync(promptFile, promptText, { mode: 0o600 });
-  const origin = taskOrigin(task.task_id, attemptId);
-  const command = `OVERLOAD_PARENT=${shellQuote(origin)} OVERLOAD_ORCH_TASK=${shellQuote(task.task_id)} pi -p ${shellQuote(`@${promptFile}`)}`;
-  const result=await executor("cmux", ["new-workspace", "--cwd", worktreeDir, "--command", command, "--focus", "false"]);
+  const invocation=buildPiRunnerInvocation(task.task_id,attemptId,worktreeDir,promptFile);
+  const result=await executor(invocation.command,invocation.args);
   // Executor output is attempt-scoped evidence; never overwrite another retry.
   appendFileSync(join(dir,`runner-${attemptId}.log`),`[${new Date().toISOString()}] spawn ${result.ok?"ok":"failed"}\nstdout: ${result.stdout??""}\nstderr: ${result.stderr??""}\nerror: ${result.error??""}\n`,{mode:0o600});
   return result;
