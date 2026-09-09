@@ -1,5 +1,17 @@
 # Operations
 
+## Conversations
+
+`/conversations` displays channel-bound messages and ordered runtime turns from the control database. Select a conversation to inspect its owner, channel address, runtime reference, queued input, output, and failure state. The final input area queues an ordinary message; it does not approve a decision or steer a running turn. Successful submission clears the composer; rejected submission retains the draft. `unknown` means execution evidence is incomplete, not permission to repeat the task. Resolve approvals in their decision cards, not by submitting ordinary chat text.
+
+## Rule and contract decisions
+
+The loopback web UI uses live control data. In Decide, an eligible approval-linked card offers **propose rule** after expansion. Choose an answer; exact scope comes from the durable approval target, not browser input. Proposal creation leaves the decision open. Human-only, expired, or stale targets are rejected.
+
+Rules supports individual disable/enable. Disable records operator, reason, and time, invalidates pending proposals, and is checked again when consuming an answer. It does not undo a consumed effect or switch off other rules. Candidate enable requires human approval, an elapsed observation window, and at least five matching observations. The global bot switch remains separate.
+
+For **narrow**, the main workspace provides three stages: edit the replacement contract and reason, preview changed fields and affected cards, then explicitly confirm and approve using the fixed action bar. Background refresh preserves the draft. Returning to edit requires a fresh preview. Approval checks the contract revision and the reviewed card revisions/set atomically. Concurrent changes return `409`; use **Reload current decisions** and review again rather than retrying stale input. The final screen displays the real effect receipt. Pending or unknown effects block unsafe contract changes. Stop/continue/narrow preserve their selected receipt and supersede eligible stale sibling cards.
+
 ## LaunchAgents
 
 Install supported services from any checkout location:

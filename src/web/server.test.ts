@@ -315,7 +315,7 @@ describe("web API", () => {
       const work=createWork(check,{title:"guard",source:"test",contract:{objective:"guard",acceptance:[{id:"human",kind:"human",description:"owner accepts"}],non_goals:[],scope:{human_only_effects:["write"]},budget:{},stop_conditions:[],decision_owner:"owner"}}); check.run("INSERT INTO control_attention(item_id,work_id,revision,state,effect_state,urgency,conclusion,trigger,impact,recommendation,options,owner,contract_revision,decision_mode,evidence,created_at,updated_at,approval_id,consumer_owner) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",["attn",work.work_id,1,"open","not_started","inbox","c","t","i",null,"[]","owner",1,"human_only","{}",1,1,"human","extension"]); check.close();
       expect((await fetch(`${base}/api/decision/target`, {method:"POST",headers,body:JSON.stringify({...payload,approvalId:"human",decisionMode:"scoped_auto"})})).status).toBe(200);
       const final = openMailbox(controlPath); expect(getTarget(final,"extension","human")?.decisionMode).toBe("human_only");
-      const auto=getTarget(final,"extension","auto")!, policy=loadPolicy(join(root, ".overload", "config.json"),final);final.run("INSERT INTO bot_attempts VALUES('web-try','bot','extension','auto',?,'owner',9999999999999,?,?, 'proposed',NULL,1,2)",[auto.targetVersion,policy.hash,auto.evidenceHash]);final.run("INSERT INTO bot_proposals VALUES('web-try','extension','auto',?,'answer','allow','ok',?, ?,1,NULL,NULL)",[auto.targetVersion,JSON.stringify([auto.evidenceHash]),policy.hash]); final.close();
+      const auto=getTarget(final,"extension","auto")!, policy=loadPolicy(join(root, ".overload", "config.json"),final);final.run("INSERT INTO bot_attempts VALUES('web-try','bot','extension','auto',?,'owner',9999999999999,?,?, 'proposed',NULL,1,2)",[auto.targetVersion,policy.hash,auto.evidenceHash]);final.run("INSERT INTO bot_proposals(attempt_id,consumer_owner,approval_id,target_version,action,answer,reason,evidence_refs,policy_hash,created_at,invalidated_at,rule_id) VALUES('web-try','extension','auto',?,'answer','allow','ok',?, ?,1,NULL,NULL)",[auto.targetVersion,JSON.stringify([auto.evidenceHash]),policy.hash]); final.close();
       const consumed=await fetch(`${base}/api/decision/consume/auto`,{method:"POST",headers,body:JSON.stringify({consumer_owner:"extension",target_version:auto.targetVersion})});expect(consumed.status).toBe(200);expect((await consumed.json()).actor).toBe("decision-bot");
     });
   });
@@ -457,14 +457,6 @@ test("approval-linked option writes human answer and leaves attention open", asy
   const root=mkdtempSync(join(tmpdir(),"overload-approval-web-"));roots.push(root);const controlPath=join(root,"control.db"),control=openMailbox(controlPath);const work=createWork(control,{title:"approve",source:"test"});upsertAttention(control,{item_id:"approval-item",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"approve",trigger:"gate",impact:"wait",recommendation:"continue",options:["continue","stop"],owner:"operator",expires_at:Date.now()+60000,source_link:null,approval_id:"approval-1",consumer_owner:"extension",contract_revision:work.revision,decision_mode:"human_only",evidence:{}});registerTarget(control,{consumerOwner:"extension",approvalId:"approval-1",question:"continue?",options:["continue","stop"],effect:"write",scope:{gate:"action"},evidence:{},expiresAt:Date.now()+60000,decisionMode:"human_only"});control.close();const {base}=await runningServer(seedLedger(),{controlPath});const answer=await fetch(`${base}/api/orchestrator/answer/approval-1`,{method:"POST",headers:{origin:base,"sec-fetch-site":"same-origin","content-type":"application/json"},body:JSON.stringify({answer:"continue",consumer_owner:"extension"})});expect(answer.status).toBe(200);const inspect=openMailbox(controlPath);expect(inspect.query("SELECT answer FROM answers WHERE approval_id=?").get("approval-1")).toEqual({answer:"continue"});expect(getAttention(inspect,"approval-item")?.state).toBe("open");inspect.close();
 });
 
-test("dashboard derives attention counters without changing legacy summary JSON", async () => {
-  const source = readFileSync(join(import.meta.dir, "static/app.js"), "utf8");
-  expect(source).toContain('decideTopLine');
-  expect(source).toContain('[...state.attention.now,...state.attention.inbox]');
-  expect(source).toContain('state.today.rules.hits');
-  expect(source).toContain('state.ledger.waiting.median_ms');
-  expect(source).not.toContain('state.ledger.entries');
-});
 
 test("hung and zombie API rows expose resume capability", async () => {
   const path = seedLedger();

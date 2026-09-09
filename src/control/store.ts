@@ -4,9 +4,9 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { enqueueControlEvent, ensureOutbox } from "./outbox";
-import type { AttentionItem, Contract, Work } from "./types";
+import type { AffectedAttentionCard, AttentionCardSnapshot, AttentionDecisionInput, AttentionItem, Contract, ContractRevisionPreview, Work } from "./types";
 
-export { type AttentionItem, type Contract, type Work } from "./types";
+export { type AffectedAttentionCard, type AttentionCardSnapshot, type AttentionDecisionInput, type AttentionItem, type Contract, type ContractRevisionPreview, type Work } from "./types";
 export { ensureOutbox, enqueueControlEvent, publishControlEvents } from "./outbox";
 export { applyControlEvent } from "./projection";
 
@@ -148,14 +148,26 @@ export function createWork(db: Database,input:{title:string;source:string;source
 export function getWork(db:Database,workId:string):Work|null { ensureControlSchema(db); const row=db.query("SELECT * FROM control_works WHERE work_id=?").get(workId) as Record<string,unknown>|null; return row?workFrom(row):null; }
 export function listWorks(db:Database):Work[] { ensureControlSchema(db); return (db.query("SELECT * FROM control_works ORDER BY updated_at DESC,work_id").all() as Record<string,unknown>[]).map(workFrom); }
 
-export function reviseContract(db:Database,workId:string,expectedRevision:number,contract:Contract,reason:string,now=Date.now()):Work {
-  ensureControlSchema(db); validateContract(contract); if(typeof reason!=="string"||!reason.trim()) throw new ControlError("invalid","reason is required");if(!Number.isSafeInteger(expectedRevision)||expectedRevision<1)throw new ControlError("invalid","expected revision must be a positive integer");
-  const tx=db.transaction(()=>{ const old=getWork(db,workId); if(!old) throw new ControlError("not_found","work not found"); if(old.revision!==expectedRevision) throw new ControlError("conflict","stale work revision");
-    const revision=old.revision+1; const changed=db.query("UPDATE control_works SET revision=?,contract=?,updated_at=? WHERE work_id=? AND revision=?").run(revision,JSON.stringify(contract),now,workId,expectedRevision); if(!changed.changes) throw new ControlError("conflict","stale work revision");
-    db.query("INSERT INTO control_contract_revisions VALUES (?,?,?,?,?)").run(workId,revision,JSON.stringify(contract),reason,now);
-    const stale=db.query("SELECT * FROM control_attention WHERE work_id=? AND state='open' AND effect_state='not_started' AND contract_revision<?").all(workId,revision) as Record<string,unknown>[];
-    for(const row of stale){const item=attentionFrom(row); item.revision++;item.state="superseded";item.updated_at=now;db.query("UPDATE control_attention SET revision=?,state='superseded',updated_at=? WHERE item_id=?").run(item.revision,now,item.item_id);emitAttention(db,item,"attention.superseded");}
-    const work={...old,revision,contract,updated_at:now};emitWork(db,work,"contract.revised");return work; }); return tx.immediate() as Work;
+export function reviseContract(db: Database, workId: string, expectedRevision: number, contract: Contract, reason: string, now = Date.now()): Work {
+  ensureControlSchema(db);
+  validateContract(contract);
+  if (typeof reason !== "string" || !reason.trim()) throw new ControlError("invalid", "reason is required");
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw new ControlError("invalid", "expected revision must be a positive integer");
+  const tx = db.transaction(() => {
+    const old = getWork(db, workId);
+    if (!old) throw new ControlError("not_found", "work not found");
+    if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale work revision");
+    const revision = old.revision + 1;
+    assertNoInFlightAttention(db, workId, revision);
+    if (!db.query("UPDATE control_works SET revision=?,contract=?,updated_at=? WHERE work_id=? AND revision=?").run(revision, JSON.stringify(contract), now, workId, expectedRevision).changes) throw new ControlError("conflict", "stale work revision");
+    db.query("INSERT INTO control_contract_revisions VALUES (?,?,?,?,?)").run(workId, revision, JSON.stringify(contract), reason, now);
+    const stale = affectedAttention(db, workId, revision);
+    for (const item of stale) supersedeAttention(db, item, revision, { superseded_reason: reason }, now);
+    const work = { ...old, revision, contract, updated_at: now };
+    emitWork(db, work, "contract.revised");
+    return work;
+  });
+  return tx.immediate() as Work;
 }
 
 export function redirectWork(db:Database,workId:string,expectedRevision:number,input:{reason:string;affected_work_ids:string[];action:"activate"|"pause"|"stop";evidence?:Record<string,unknown>},now=Date.now()):Work {
@@ -186,30 +198,138 @@ export function upsertAttention(db:Database,input:Omit<AttentionItem,"revision"|
 }
 export function getAttention(db:Database,itemId:string):AttentionItem|null {ensureControlSchema(db);const row=db.query("SELECT * FROM control_attention WHERE item_id=?").get(itemId) as Record<string,unknown>|null;return row?attentionFrom(row):null;}
 export function listAttention(db:Database,zone?:"now"|"inbox"|"done",now=Date.now()):AttentionItem[]{ensureControlSchema(db);const rows=(db.query("SELECT * FROM control_attention ORDER BY updated_at DESC,item_id").all() as Record<string,unknown>[]).map(attentionFrom);return rows.filter(item=>{if(!zone)return true;if(zone==="done")return item.state==="resolved"||item.state==="superseded";if(item.state!=="open"||item.defer_until!==null&&item.defer_until>now)return false;return zone==="now"?item.urgency==="now"||item.expires_at!==null&&item.expires_at<=now:item.urgency==="inbox"&&!(item.expires_at!==null&&item.expires_at<=now);});}
-export type AttentionDecisionInput={selected_option:string;replacement_contract?:Contract;reason?:string};
-function persistAttention(db:Database,old:AttentionItem,item:AttentionItem,kind:string,detail:Record<string,unknown>,now:number):void {
-  if(!db.query("UPDATE control_attention SET revision=?,state=?,effect_state=?,contract_revision=?,evidence=?,defer_until=?,acknowledged_at=?,updated_at=? WHERE item_id=? AND revision=?").run(item.revision,item.state,item.effect_state,item.contract_revision,JSON.stringify(item.evidence),item.defer_until,item.acknowledged_at,now,item.item_id,old.revision).changes)throw new ControlError("conflict","stale attention revision");
-  db.query("INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES (?,?,?,?,?)").run(item.item_id,item.revision,kind,JSON.stringify(detail),now);emitAttention(db,item,`attention.${kind}`);
+
+function affectedAttention(db: Database, workId: string, nextRevision: number, excludeItemId?: string): AttentionItem[] {
+  const rows = excludeItemId === undefined
+    ? db.query("SELECT * FROM control_attention WHERE work_id=? AND state='open' AND effect_state='not_started' AND contract_revision<? ORDER BY item_id").all(workId, nextRevision)
+    : db.query("SELECT * FROM control_attention WHERE work_id=? AND item_id<>? AND state='open' AND effect_state='not_started' AND contract_revision<? ORDER BY item_id").all(workId, excludeItemId, nextRevision);
+  return (rows as Record<string, unknown>[]).map(attentionFrom);
 }
-export function resolveAttentionDecision(db:Database,itemId:string,expectedRevision:number,input:AttentionDecisionInput,now=Date.now()):AttentionItem {
-  ensureControlSchema(db);if(!Number.isSafeInteger(expectedRevision)||expectedRevision<1||!input||typeof input!=="object"||typeof input.selected_option!=="string"||!input.selected_option.trim())throw new ControlError("invalid","selected_option is required");
-  const tx=db.transaction(()=>{const old=getAttention(db,itemId);if(!old)throw new ControlError("not_found","attention item not found");if(old.revision!==expectedRevision)throw new ControlError("conflict","stale attention revision");if(old.state!=="open"||old.effect_state!=="not_started")throw new ControlError("blocked","attention decision is not open");if(old.approval_id)throw new ControlError("blocked","approval-linked attention must use answer consumer");if(!old.options.includes(input.selected_option))throw new ControlError("invalid","selected_option is not an available option");if(!["stop","continue","narrow"].includes(input.selected_option))throw new ControlError("invalid","unsupported generic decision option");
-    if(input.selected_option==="narrow"){if(!input.replacement_contract||typeof input.reason!=="string"||!input.reason.trim())throw new ControlError("invalid","narrow requires replacement_contract and reason");validateContract(input.replacement_contract);}else if(input.replacement_contract!==undefined)throw new ControlError("invalid","replacement_contract is only valid for narrow");
-    const work=getWork(db,old.work_id);if(!work)throw new ControlError("not_found","work not found");if(work.revision!==old.contract_revision)throw new ControlError("conflict","attention contract revision is stale");if(work.state!=="active")throw new ControlError("blocked","work is not active");
-    const applying:AttentionItem={...old,revision:old.revision+1,state:"applying",effect_state:"applying",updated_at:now,evidence:{...old.evidence,selected_option:input.selected_option,decision_reason:input.reason??null,decided_at:now}};persistAttention(db,old,applying,"applying",{selected_option:input.selected_option},now);
-    const workRevision=work.revision+1;let contract=work.contract;let state:Work["state"]=work.state;let workKind="work.continued";
-    if(input.selected_option==="stop"){state="stopped";workKind="work.stopped";}
-    if(input.selected_option==="narrow"){contract=input.replacement_contract!;workKind="contract.revised";db.query("INSERT INTO control_contract_revisions VALUES (?,?,?,?,?)").run(work.work_id,workRevision,JSON.stringify(contract),input.reason,now);}
-    if(!db.query("UPDATE control_works SET revision=?,state=?,contract=?,updated_at=? WHERE work_id=? AND revision=? AND state='active'").run(workRevision,state,contract?JSON.stringify(contract):null,now,work.work_id,work.revision).changes)throw new ControlError("conflict","stale work revision");
-    if(input.selected_option==="narrow"){const stale=db.query("SELECT * FROM control_attention WHERE work_id=? AND item_id<>? AND state='open' AND effect_state='not_started' AND contract_revision<?").all(work.work_id,itemId,workRevision) as Record<string,unknown>[];for(const row of stale){const prior=attentionFrom(row);const superseded={...prior,revision:prior.revision+1,state:"superseded" as const,updated_at:now};persistAttention(db,prior,superseded,"superseded",{reason:input.reason},now);}}
-    const changedWork:Work={...work,revision:workRevision,state,contract,updated_at:now};emitWork(db,changedWork,workKind);
-    const resolved:AttentionItem={...applying,revision:applying.revision+1,state:"resolved",effect_state:"succeeded",contract_revision:workRevision,updated_at:now,evidence:{...applying.evidence,effect_verified_at:now}};persistAttention(db,applying,resolved,"resolved",{selected_option:input.selected_option,work_revision:workRevision},now);return resolved;
-  });return tx.immediate() as AttentionItem;
+
+function validateCardSnapshot(value: unknown): AttentionCardSnapshot[] {
+  if (!Array.isArray(value)) throw new ControlError("invalid", "affected_cards must be an array");
+  const seen = new Set<string>();
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new ControlError("invalid", "invalid affected card");
+    const card = entry as Record<string, unknown>;
+    if (typeof card.item_id !== "string" || !card.item_id.trim() || seen.has(card.item_id)
+      || !Number.isSafeInteger(card.revision) || (card.revision as number) < 1) throw new ControlError("invalid", "invalid affected card");
+    seen.add(card.item_id);
+    return { item_id: card.item_id, revision: card.revision as number };
+  });
 }
-export function actOnAttention(db:Database,itemId:string,expectedRevision:number,action:"ack"|"defer"|"resolve",input:{defer_until?:number;reason?:string;selected_option?:string;replacement_contract?:Contract}={},now=Date.now()):AttentionItem {
-  if(action==="resolve"&&input.selected_option!==undefined)return resolveAttentionDecision(db,itemId,expectedRevision,{selected_option:input.selected_option,replacement_contract:input.replacement_contract,reason:input.reason},now);
-  ensureControlSchema(db);const tx=db.transaction(()=>{const old=getAttention(db,itemId);if(!old)throw new ControlError("not_found","attention item not found");if(old.revision!==expectedRevision)throw new ControlError("conflict","stale attention revision");if(action==="defer"&&(!input.defer_until||input.defer_until<=now))throw new ControlError("invalid","defer_until must be in future");if(action==="resolve"&&old.approval_id&&(old.effect_state==="not_started"||old.effect_state==="applying"||old.effect_state==="unknown"))throw new ControlError("blocked","external effect is not confirmed");
-    const item={...old,revision:old.revision+1,updated_at:now};if(action==="ack")item.acknowledged_at=now;else if(action==="defer")item.defer_until=input.defer_until!;else item.state="resolved";persistAttention(db,old,item,action,input as Record<string,unknown>,now);return item;});return tx.immediate() as AttentionItem;
+
+function assertNoInFlightAttention(db: Database, workId: string, nextRevision: number): void {
+  const row = db.query("SELECT item_id FROM control_attention WHERE work_id=? AND contract_revision<? AND (state='applying' OR effect_state IN ('applying','unknown')) LIMIT 1").get(workId, nextRevision) as { item_id: string } | null;
+  if (row) throw new ControlError("blocked", `attention effect is still in flight: ${row.item_id}`);
+}
+
+function supersedeAttention(db: Database, prior: AttentionItem, workRevision: number, detail: Record<string, unknown>, now: number): void {
+  const superseded: AttentionItem = {
+    ...prior,
+    revision: prior.revision + 1,
+    state: "superseded",
+    updated_at: now,
+    evidence: { ...prior.evidence, superseded_by_work_revision: workRevision, ...detail },
+  };
+  persistAttention(db, prior, superseded, "superseded", detail, now);
+}
+
+export function previewContractRevision(db: Database, workId: string, expectedRevision: number, replacementContract: Contract): ContractRevisionPreview {
+  ensureControlSchema(db);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw new ControlError("invalid", "expected revision must be a positive integer");
+  validateContract(replacementContract);
+  const work = getWork(db, workId);
+  if (!work) throw new ControlError("not_found", "work not found");
+  if (work.revision !== expectedRevision) throw new ControlError("conflict", "stale work revision");
+  assertNoInFlightAttention(db, workId, expectedRevision + 1);
+  return {
+    current_contract: work.contract,
+    current_revision: work.revision,
+    affected_cards: affectedAttention(db, workId, expectedRevision + 1).map(({ item_id, conclusion, revision }) => ({ item_id, conclusion, revision })),
+  };
+}
+
+function verifyAffectedSnapshot(snapshot: AttentionCardSnapshot[] | undefined, selectedItem: AttentionItem, applicable: AttentionItem[]): void {
+  if (snapshot === undefined) return;
+  const selected = snapshot.find((card) => card.item_id === selectedItem.item_id);
+  if (!selected || selected.revision !== selectedItem.revision) throw new ControlError("conflict", "selected attention card changed");
+  if (snapshot.length !== applicable.length + 1) throw new ControlError("conflict", "affected attention cards changed");
+  const expected = new Map(applicable.map((item) => [item.item_id, item.revision]));
+  for (const card of snapshot) {
+    if (card.item_id === selectedItem.item_id) continue;
+    if (expected.get(card.item_id) !== card.revision) throw new ControlError("conflict", "affected attention cards changed");
+  }
+}
+
+function persistAttention(db: Database, old: AttentionItem, item: AttentionItem, kind: string, detail: Record<string, unknown>, now: number): void {
+  if (!db.query("UPDATE control_attention SET revision=?,state=?,effect_state=?,contract_revision=?,evidence=?,defer_until=?,acknowledged_at=?,updated_at=? WHERE item_id=? AND revision=?").run(item.revision, item.state, item.effect_state, item.contract_revision, JSON.stringify(item.evidence), item.defer_until, item.acknowledged_at, now, item.item_id, old.revision).changes) throw new ControlError("conflict", "stale attention revision");
+  db.query("INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES (?,?,?,?,?)").run(item.item_id, item.revision, kind, JSON.stringify(detail), now); emitAttention(db, item, `attention.${kind}`);
+}
+
+export function resolveAttentionDecision(db: Database, itemId: string, expectedRevision: number, input: AttentionDecisionInput, now = Date.now()): AttentionItem {
+  ensureControlSchema(db);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || !input || typeof input !== "object" || typeof input.selected_option !== "string" || !input.selected_option.trim()) throw new ControlError("invalid", "selected_option is required");
+  if (input.expected_contract_revision !== undefined && (!Number.isSafeInteger(input.expected_contract_revision) || input.expected_contract_revision < 1)) throw new ControlError("invalid", "expected contract revision must be a positive integer");
+  const snapshot = input.affected_cards === undefined ? undefined : validateCardSnapshot(input.affected_cards);
+  const tx = db.transaction(() => {
+    const old = getAttention(db, itemId);
+    if (!old) throw new ControlError("not_found", "attention item not found");
+    if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
+    if (old.state !== "open" || old.effect_state !== "not_started") throw new ControlError("blocked", "attention decision is not open");
+    if (old.approval_id) throw new ControlError("blocked", "approval-linked attention must use answer consumer");
+    if (!old.options.includes(input.selected_option)) throw new ControlError("invalid", "selected_option is not an available option");
+    if (!["stop", "continue", "narrow"].includes(input.selected_option)) throw new ControlError("invalid", "unsupported generic decision option");
+    if (input.selected_option === "narrow") {
+      if (!input.replacement_contract || typeof input.reason !== "string" || !input.reason.trim()) throw new ControlError("invalid", "narrow requires replacement_contract and reason");
+      validateContract(input.replacement_contract);
+    } else if (input.replacement_contract !== undefined || input.expected_contract_revision !== undefined || snapshot !== undefined) {
+      throw new ControlError("invalid", "contract revision fields are only valid for narrow");
+    }
+    const work = getWork(db, old.work_id);
+    if (!work) throw new ControlError("not_found", "work not found");
+    if (work.revision !== old.contract_revision) throw new ControlError("conflict", "attention contract revision is stale");
+    if (input.expected_contract_revision !== undefined && input.expected_contract_revision !== work.revision) throw new ControlError("conflict", "stale contract revision");
+    if (work.state !== "active") throw new ControlError("blocked", "work is not active");
+    const workRevision = work.revision + 1;
+    assertNoInFlightAttention(db, work.work_id, workRevision);
+    const applicable = affectedAttention(db, work.work_id, workRevision, itemId);
+    verifyAffectedSnapshot(snapshot, old, applicable);
+    const applying: AttentionItem = { ...old, revision: old.revision + 1, state: "applying", effect_state: "applying", updated_at: now, evidence: { ...old.evidence, selected_option: input.selected_option, decision_reason: input.reason ?? null, decided_at: now } };
+    persistAttention(db, old, applying, "applying", { selected_option: input.selected_option }, now);
+    let contract = work.contract;
+    let state: Work["state"] = work.state;
+    let workKind = "work.continued";
+    if (input.selected_option === "stop") { state = "stopped"; workKind = "work.stopped"; }
+    if (input.selected_option === "narrow") { contract = input.replacement_contract!; workKind = "contract.revised"; db.query("INSERT INTO control_contract_revisions VALUES (?,?,?,?,?)").run(work.work_id, workRevision, JSON.stringify(contract), input.reason, now); }
+    if (!db.query("UPDATE control_works SET revision=?,state=?,contract=?,updated_at=? WHERE work_id=? AND revision=? AND state='active'").run(workRevision, state, contract ? JSON.stringify(contract) : null, now, work.work_id, work.revision).changes) throw new ControlError("conflict", "stale work revision");
+    for (const prior of applicable) supersedeAttention(db, prior, workRevision, { superseded_by_item_id: itemId, superseded_reason: input.reason ?? null }, now);
+    const changedWork: Work = { ...work, revision: workRevision, state, contract, updated_at: now };
+    emitWork(db, changedWork, workKind);
+    const resolved: AttentionItem = { ...applying, revision: applying.revision + 1, state: "resolved", effect_state: "succeeded", contract_revision: workRevision, updated_at: now, evidence: { ...applying.evidence, effect_verified_at: now } };
+    persistAttention(db, applying, resolved, "resolved", { selected_option: input.selected_option, work_revision: workRevision }, now);
+    return resolved;
+  });
+  return tx.immediate() as AttentionItem;
+}
+
+export function actOnAttention(db: Database, itemId: string, expectedRevision: number, action: "ack" | "defer" | "resolve", input: { defer_until?: number; reason?: string; selected_option?: string; replacement_contract?: Contract; expected_contract_revision?: number; affected_cards?: AttentionCardSnapshot[] } = {}, now = Date.now()): AttentionItem {
+  if (action === "resolve" && input.selected_option !== undefined) return resolveAttentionDecision(db, itemId, expectedRevision, input as AttentionDecisionInput, now);
+  ensureControlSchema(db);
+  const tx = db.transaction(() => {
+    const old = getAttention(db, itemId);
+    if (!old) throw new ControlError("not_found", "attention item not found");
+    if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
+    if (action === "defer" && (!input.defer_until || input.defer_until <= now)) throw new ControlError("invalid", "defer_until must be in future");
+    if (action === "resolve" && old.approval_id && (old.effect_state === "not_started" || old.effect_state === "applying" || old.effect_state === "unknown")) throw new ControlError("blocked", "external effect is not confirmed");
+    const item = { ...old, revision: old.revision + 1, updated_at: now };
+    if (action === "ack") item.acknowledged_at = now;
+    else if (action === "defer") item.defer_until = input.defer_until!;
+    else item.state = "resolved";
+    persistAttention(db, old, item, action, input as Record<string, unknown>, now);
+    return item;
+  });
+  return tx.immediate() as AttentionItem;
 }
 export function recordAttentionFeedback(db:Database,itemId:string,expectedRevision:number,useful:boolean,reason?:string,now=Date.now()):void {ensureControlSchema(db);const tx=db.transaction(()=>{const item=getAttention(db,itemId);if(!item)throw new ControlError("not_found","attention item not found");if(item.revision!==expectedRevision)throw new ControlError("conflict","stale attention revision");try{db.query("INSERT INTO control_feedback VALUES (?,?,?,?,?)").run(itemId,expectedRevision,useful?1:0,reason??null,now);}catch{throw new ControlError("conflict","feedback already recorded");}enqueueControlEvent(db,{entity_id:itemId,entity_version:expectedRevision,kind:"attention.feedback",work_id:item.work_id,item_id:itemId,payload:{item_id:itemId,revision:expectedRevision,useful,reason:reason??null}},now);});tx.immediate();}
 

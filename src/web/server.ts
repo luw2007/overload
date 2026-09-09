@@ -7,19 +7,21 @@ import { fileURLToPath } from "node:url";
 import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
 import { cancelTarget, consumeDecision, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate, loadPolicy, matchingRule, policyAuthorizes, rulesReport } from "../decision-bot/policy";
+import { disablePolicyRule, enablePolicyRule, proposeRuleFromAttention } from "../decision-bot/policy";
 import { DecisionBotService } from "../decision-bot/service";
 import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
 import { actOnAttention, ControlError, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract, promoteWork } from "../control/store";
+import { previewContractRevision } from "../control/store";
 import type { Contract } from "../control/types";
 import { notificationCapability } from "../notify/nudge";
 import { publishControlEvents } from "../control/outbox";
 import { openStore } from "../orchestrator/store";
-import { SpoolWriter } from "../orchestrator/spool";
-
 import {ensureAdapterSchema,type Conversation,type StoredTurn} from '../adapters/store';
 import {randomUUID} from 'node:crypto';
+import { SpoolWriter } from "../orchestrator/spool";
+
 import { ledgerReport } from "./ledger";
 
 const DEFAULT_WEB_PORT = 4870;
@@ -167,9 +169,18 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (request.method === "GET" && url.pathname === "/api/rules") {
           const db=openAnswersDb(controlPath);try{return json(rulesReport(db,loadPolicy(options.policyPath,db),Date.now()));}finally{db.close();}
         }
-        if (request.method === "POST" && /^\/api\/rules\/[^/]+\/(approve|enable)$/.test(url.pathname)) {
-          const parts=url.pathname.split("/");const db=openAnswersDb(controlPath);try{if(parts[4]==="enable"){const samples=db.query("SELECT COUNT(*) n,MIN(matched) matched FROM policy_candidate_samples WHERE candidate_id=?").get(routeParameter(parts[3])) as {n:number;matched:number};if(samples.n<5||samples.matched!==1)return json({error:"needs 5 matching observations"},{status:409});}const result=parts[4]==="approve"?approvePolicyCandidate(db,routeParameter(parts[3]),"operator",Date.now()+7*86400000):enablePolicyCandidate(db,routeParameter(parts[3]));return result?json(result):json({error:"candidate not eligible"},{status:409});}catch(error){return json({error:String((error as Error).message)},{status:409});}finally{db.close();}
+        if (request.method === "POST" && /^\/api\/rules\/[^/]+\/(approve|enable|disable)$/.test(url.pathname)) {
+          const parts=url.pathname.split("/"),id=routeParameter(parts[3]);const db=openAnswersDb(controlPath);
+          try {
+            const input=await bodyObject(request);
+            if(parts[4]==="approve"){const approved=approvePolicyCandidate(db,id,"operator",Date.now()+86400000);return approved?json(getPolicyCandidate(db,id)):json({error:"candidate cannot be approved"},{status:409});}
+            const policy=loadPolicy(options.policyPath,db);
+            const result=parts[4]==="disable"?disablePolicyRule(db,policy,id,"operator",typeof input.reason==="string"?input.reason:undefined):enablePolicyRule(db,policy,id,"operator");
+            return result.ok?json(result):json({error:result.reason},{status:409});
+          }finally{db.close();}
         }
+        const proposalRoute=url.pathname.match(/^\/api\/attention\/([^/]+)\/propose-rule$/);
+        if(request.method==="POST"&&proposalRoute){const db=openAnswersDb(controlPath);try{const input=await bodyObject(request);if(typeof input.answer!=="string")return json({error:"answer is required"},{status:400});const result=proposeRuleFromAttention(db,routeParameter(proposalRoute[1]),input.answer,"operator");return result.ok?json(result.candidate,{status:201}):json({error:result.reason},{status:409});}finally{db.close();}}
         if (request.method === "POST" && /^\/api\/decision-bot\/(disable|enable)$/.test(url.pathname)) {
           const db=openAnswersDb(controlPath);const disabled=url.pathname.endsWith("/disable");try{const body=await bodyObject(request);setBotDisabled(db,disabled,String(body.reason??(disabled?"disabled by operator":"enabled by operator")));return json({disabled});}finally{db.close();}
         }
@@ -193,6 +204,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (request.method === "POST" && promoteRoute) {
           const db=openControl(controlPath);try{const body=await bodyObject(request);return json(promoteWork(db,routeParameter(promoteRoute[1]),Number(body.expected_revision),body.contract as Contract,String(body.reason??"")));}catch(error){return controlError(error);}finally{db.close();}
         }
+        const previewRoute=url.pathname.match(/^\/api\/works\/([^/]+)\/contract-preview$/);
+        if(request.method==="POST"&&previewRoute){const db=openControl(controlPath);try{const input=await bodyObject(request);return json(previewContractRevision(db,routeParameter(previewRoute[1]),expectedRevision(input.expected_revision),input.contract as Contract));}catch(error){return controlError(error);}finally{db.close();}}
         const workRoute = url.pathname.match(/^\/api\/works\/([^/]+)(?:\/(contract|redirect|stop))?$/);
         if (workRoute) {
           const workId = routeParameter(workRoute[1]!); const operation = workRoute[2]; const control = openControl(controlPath);
@@ -209,8 +222,9 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
           const itemId = routeParameter(attentionRoute[1]!); const action = attentionRoute[2]!; const input = await bodyObject(request); const control = openControl(controlPath);
           try {
             const revision = expectedRevision(input.expected_revision);
+            if(action==="resolve"&&input.selected_option==="narrow"&&(!Number.isSafeInteger(input.expected_contract_revision)||!Array.isArray(input.affected_cards)))throw new ControlError("invalid","Review the contract and affected cards before applying narrow.");
             if (action === "feedback") { recordAttentionFeedback(control, itemId, revision, input.useful === true, typeof input.reason === "string" ? input.reason : undefined); return json(getAttention(control, itemId)); }
-            return json(actOnAttention(control, itemId, revision, action as "ack" | "defer" | "resolve", { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined, selected_option: typeof input.selected_option === "string" ? input.selected_option : undefined, replacement_contract: input.replacement_contract as Contract | undefined }));
+            return json(actOnAttention(control, itemId, revision, action as "ack" | "defer" | "resolve", { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined, selected_option: typeof input.selected_option === "string" ? input.selected_option : undefined, replacement_contract: input.replacement_contract as Contract | undefined, expected_contract_revision: input.expected_contract_revision as number | undefined, affected_cards: input.affected_cards as Array<{item_id:string;revision:number}> | undefined }));
           } catch (error) { return controlError(error); } finally { control.close(); }
         }
         if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive) }))));
@@ -271,7 +285,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
           if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({error:"forbidden"},{status:403});let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}if(body?.consumerOwner!=="extension"||typeof body.approvalId!=="string"||!Array.isArray(body.options))return json({error:"invalid target"},{status:400});const mailbox=openAnswersDb(controlPath);try{const effect=String(body.effect??"gated_tool"),binding=trustedTargetBinding(mailbox,body.approvalId,effect);const normalized={consumerOwner:"extension" as const,approvalId:body.approvalId,stableId:typeof body.stableId==="string"?body.stableId:undefined,requestUid:typeof body.requestUid==="string"?body.requestUid:undefined,question:String(body.question??""),options:body.options,effect,scope:body.scope??{},evidence:body.evidence??{},expiresAt:Number(body.expiresAt),workId:binding.workId,contractRevision:binding.contractRevision,decisionMode:"human_only" as "human_only"|"scoped_auto"};const policy=loadPolicy(options.policyPath,mailbox);if(!binding.humanOnly&&matchingRule(policy,normalized as any))normalized.decisionMode="scoped_auto";return json(registerTarget(mailbox,normalized));}finally{mailbox.close();}
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/orchestrator/answer/")) {
-          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}const approvalId=routeParameter(url.pathname.slice("/api/orchestrator/answer/".length));if(!approvalId||typeof body?.answer!=="string")return json({error:"missing answer"},{status:400});const mailbox=openAnswersDb(controlPath);try{const owner=body.consumer_owner==="extension"?"extension":"orchestrator";const result=writeHumanAnswer(mailbox,owner,approvalId,body.answer,"ui");return result.ok?json({ok:true}):json({error:result.reason},{status:result.reason==="already_consumed"?409:400});}finally{mailbox.close();}
+          try{await request.clone().json();}catch{return json({error:'invalid JSON'},{status:400});}
+          if (!request.headers.get('sec-fetch-site') && !request.headers.get('sec-fetch-mode')) return json({error:'forbidden'},{status:403});const body=await bodyObject(request);const approvalId=routeParameter(url.pathname.slice('/api/orchestrator/answer/'.length));if(!approvalId||typeof body.answer!=='string')return json({error:'missing answer'},{status:400});const mailbox=openAnswersDb(controlPath);try{const owner=body.consumer_owner==='extension'?'extension':'orchestrator';if(approvalId.startsWith('runtime:')){const item=getAttention(mailbox,approvalId);if(!item||item.revision!==body.expected_revision||item.state!=='open')return json({error:'stale_decision'},{status:409});}const result=writeHumanAnswer(mailbox,owner,approvalId,body.answer,'ui');return result.ok?json({ok:true}):json({error:result.reason},{status:result.reason==='already_consumed'?409:400});}finally{mailbox.close();}
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/decision/cancel/")) {
           if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });

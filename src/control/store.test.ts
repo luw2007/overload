@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { actOnAttention, promoteWork, ControlError, createWork, ensureControlSchema, getAttention, getWork, recordStopCondition, resolveAttentionDecision, reviseContract, upsertAttention } from "./store";
+import { actOnAttention, previewContractRevision, promoteWork, ControlError, createWork, ensureControlSchema, getAttention, getWork, recordStopCondition, resolveAttentionDecision, reviseContract, upsertAttention } from "./store";
 import type { Contract } from "./types";
 
 const contract: Contract = { objective:"ship",acceptance:[{id:"human",kind:"human",description:"owner accepts"}],non_goals:[],scope:{allowed_effects:["write"]},budget:{retry_limit:1},stop_conditions:[{id:"risk",kind:"hard",description:"unexpected destructive effect"}],decision_owner:"owner" };
@@ -50,4 +50,29 @@ test("promotion requires candidate and current revision and emits a new contract
  expect(()=>promoteWork(db,candidate.work_id,2,contract,"stale",4)).toThrow();
  expect(()=>promoteWork(db,candidate.work_id,1,{...contract,acceptance:[]},"invalid",4)).toThrow();
  expect(getWork(db,candidate.work_id)?.state).toBe("candidate");db.close();
+});
+
+test("continue supersedes stale sibling attention and preserves the selected receipt",()=>{
+  const db=fixture();const work=createWork(db,{title:"x",source:"test",contract},1);const selected=recordStopCondition(db,work.work_id,"risk",{},2,1);
+  const sibling=upsertAttention(db,{item_id:"sibling",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"sibling decision",trigger:"risk",impact:"blocked",recommendation:"stop",options:["stop"],owner:"owner",expires_at:null,source_link:null,approval_id:null,consumer_owner:null,contract_revision:1,decision_mode:"human_only",evidence:{}},2);
+  const resolved=resolveAttentionDecision(db,selected.item_id,selected.revision,{selected_option:"continue"},3);
+  expect(resolved).toMatchObject({state:"resolved",effect_state:"succeeded",contract_revision:2});expect(getAttention(db,sibling.item_id)).toMatchObject({state:"superseded",revision:2,effect_state:"not_started"});expect(()=>actOnAttention(db,sibling.item_id,sibling.revision,"ack",{},4)).toThrow(ControlError);db.close();
+});
+
+test("narrow applies the previewed card snapshot transactionally",()=>{
+  const db=fixture();const work=createWork(db,{title:"x",source:"test",contract},1);const selected=recordStopCondition(db,work.work_id,"risk",{},2,1);const sibling=upsertAttention(db,{item_id:"sibling",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"sibling decision",trigger:"risk",impact:"blocked",recommendation:"stop",options:["stop"],owner:"owner",expires_at:null,source_link:null,approval_id:null,consumer_owner:null,contract_revision:1,decision_mode:"human_only",evidence:{}},2);
+  const replacement={...contract,objective:"narrowed"};const preview=previewContractRevision(db,work.work_id,1,replacement);expect(preview).toMatchObject({current_revision:1,current_contract:contract});expect(preview.affected_cards.map(card=>card.item_id).sort()).toEqual([selected.item_id,sibling.item_id].sort());
+  const resolved=resolveAttentionDecision(db,selected.item_id,selected.revision,{selected_option:"narrow",replacement_contract:replacement,reason:"reduce scope",expected_contract_revision:preview.current_revision,affected_cards:preview.affected_cards.map(({item_id,revision})=>({item_id,revision}))},3);
+  expect(resolved).toMatchObject({state:"resolved",effect_state:"succeeded",contract_revision:2});expect(getAttention(db,sibling.item_id)).toMatchObject({state:"superseded",revision:2});db.close();
+});
+
+test("narrow preview cannot overwrite a sibling arriving after preview",()=>{
+  const db=fixture();const work=createWork(db,{title:"x",source:"test",contract},1);const selected=recordStopCondition(db,work.work_id,"risk",{},2,1);const replacement={...contract,objective:"narrowed"};const preview=previewContractRevision(db,work.work_id,1,replacement);
+  upsertAttention(db,{item_id:"late",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"late decision",trigger:"risk",impact:"blocked",recommendation:"stop",options:["stop"],owner:"owner",expires_at:null,source_link:null,approval_id:null,consumer_owner:null,contract_revision:1,decision_mode:"human_only",evidence:{}},2);
+  expect(()=>resolveAttentionDecision(db,selected.item_id,selected.revision,{selected_option:"narrow",replacement_contract:replacement,reason:"reduce scope",expected_contract_revision:preview.current_revision,affected_cards:preview.affected_cards.map(({item_id,revision})=>({item_id,revision}))},3)).toThrow(ControlError);expect(getAttention(db,selected.item_id)).toMatchObject({state:"open",revision:selected.revision});expect(getAttention(db,"late")?.state).toBe("open");db.close();
+});
+
+test("stop refuses to change work while a sibling effect is applying",()=>{
+  const db=fixture();const work=createWork(db,{title:"x",source:"test",contract},1);const selected=recordStopCondition(db,work.work_id,"risk",{},2,1);upsertAttention(db,{item_id:"applying",work_id:work.work_id,state:"applying",effect_state:"applying",urgency:"now",conclusion:"effect",trigger:"risk",impact:"held",recommendation:null,options:[],owner:"owner",expires_at:null,source_link:null,approval_id:null,consumer_owner:"orchestrator",contract_revision:1,decision_mode:"human_only",evidence:{}},2);
+  expect(()=>resolveAttentionDecision(db,selected.item_id,selected.revision,{selected_option:"stop"},3)).toThrow(ControlError);expect(getWork(db,work.work_id)).toMatchObject({state:"active",revision:1});expect(getAttention(db,selected.item_id)).toMatchObject({state:"open",revision:selected.revision});db.close();
 });

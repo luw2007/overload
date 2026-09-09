@@ -63,3 +63,20 @@ export type AttentionItem = {
   created_at: number;
   updated_at: number;
 };
+export type AttentionCardSnapshot = { item_id: string; revision: number };
+
+export type AffectedAttentionCard = { item_id: string; conclusion: string; revision: number };
+
+export type ContractRevisionPreview = {
+  current_contract: Contract | null;
+  current_revision: number;
+  affected_cards: AffectedAttentionCard[];
+};
+
+export type AttentionDecisionInput = {
+  selected_option: string;
+  replacement_contract?: Contract;
+  reason?: string;
+  expected_contract_revision?: number;
+  affected_cards?: AttentionCardSnapshot[];
+};
