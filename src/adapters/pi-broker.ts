@@ -254,7 +254,7 @@ class PiBroker {
     }
     if (type === "message_update") {
       const update = isObject(record.assistantMessageEvent) ? record.assistantMessageEvent : undefined;
-      const delta = update ? stringValue(update.delta) : undefined;
+      const delta = update?.type === "text_delta" ? stringValue(update.delta) : undefined;
       if (delta && this.activeTurn) this.publish({ eventId: randomUUID(), sessionId: this.config.sessionId, turnId: this.activeTurn.turnId, kind: "output", text: delta });
     }
   }
