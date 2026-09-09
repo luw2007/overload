@@ -2,9 +2,9 @@
   const $ = id => document.getElementById(id);
   const escapeHtml = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const e = escapeHtml;
-  const pages = ['decide','ledger','works','candidates','rules','agents'];
+  const pages = ['decide','conversations','ledger','works','candidates','rules','agents'];
   const LEGACY_ZONE = {now:'decide',inbox:'decide',done:'decide',q1:'agents',hung:'agents',q2:'agents',zombie:'agents',archive:'agents',sessions:'agents',health:'agents'};
-  const state = {page:'decide',attention:{now:[],inbox:[],done:[]},rules:null,ledger:null,works:[],selected:new Set(),session:null,detail:null,q1:[],q2:[],archive:[],hung:[],zombie:{groups:[],orphaned_requests:[]},sessions:[],health:null,range:'week'};
+  const state = {page:'decide',attention:{now:[],inbox:[],done:[]},rules:null,ledger:null,works:[],selected:new Set(),session:null,detail:null,q1:[],q2:[],archive:[],hung:[],zombie:{groups:[],orphaned_requests:[]},sessions:[],health:null,range:'week',conversationId:null,conversations:[],conversationDraft:'',conversationDrafts:{},conversationPosting:false,conversationPending:null};
   let generation = 0;
   const formatTime = value => value == null ? '—' : new Date(value).toLocaleString();
   const humanDuration = ms => ms == null ? '—' : ms < 60000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`;
@@ -135,12 +135,85 @@
 
   }
 
+  function conversationValue(value) {
+    if (value == null) return '—';
+    if (typeof value === 'string') return value;
+    try { return JSON.stringify(value); } catch { return String(value); }
+  }
+  function conversationState(value) {
+    const raw = value == null ? 'unknown' : String(value).toLowerCase();
+    if (raw === 'submitting') return {label:'submitting',raw};
+    if (['queued','pending','accepted','waiting'].includes(raw)) return {label:'queued',raw};
+    if (['running','started','executing','in_progress','in-progress'].includes(raw)) return {label:'running',raw};
+    if (['completed','complete','done','succeeded','success'].includes(raw)) return {label:'completed',raw};
+    if (!value || raw === 'unknown') return {label:'unknown',raw};
+    return {label:raw,raw};
+  }
+  function conversationStatus(value) {
+    const stateValue = conversationState(value);
+    const className = stateValue.label.replace(/[^a-z0-9_-]/g,'-');
+    return `<span class="conversation-status status-${className}" data-state="${e(stateValue.raw)}">${e(stateValue.label)}</span>`;
+  }
+  function conversationAddress(conversation) {
+    const address = conversation.address;
+    if (typeof address === 'string') return address;
+    if (address && typeof address === 'object') {
+      const short = address.chatId;
+      if (short != null) return `${address.instanceId} · ${short}${address.threadId ? ' · '+address.threadId : ''}`;
+    }
+    return conversationValue(address);
+  }
+  function conversationRelated(conversation) {
+    const links = [];
+    if (conversation.work_id) links.push(`<a href="/works" data-nav="works">Work ${e(conversation.work_id)}</a>`);
+    const reference = conversation.session_reference;
+    const sessionId = typeof reference === 'string' ? reference : reference?.sessionId;
+    if (sessionId) links.push(`<span>Runtime session <code>${e(sessionId)}</code></span>`);
+    const attentionId = conversation.attention_id ?? conversation.attention?.item_id ?? conversation.attention?.id ?? (typeof reference === 'object' ? reference?.attention_id : null);
+    if (attentionId) links.push(`<a href="/decide" data-nav="decide">Attention ${e(attentionId)}</a>`);
+    return links.length ? `<div class="conversation-related">${links.join('<span aria-hidden="true">·</span>')}</div>` : '';
+  }
+  function conversationChoice(conversation) {
+    const selected = String(conversation.id) === String(state.conversationId);
+    const turns = Array.isArray(conversation.turns) ? conversation.turns.length : 0;
+    return `<button type="button" class="conversation-choice${selected ? ' selected' : ''}" data-action="select-conversation" data-id="${e(conversation.id)}" aria-current="${selected ? 'true' : 'false'}"><span class="conversation-choice-title">${e(conversationAddress(conversation))}</span><span class="conversation-choice-meta">${e(conversation.owner_id ?? 'unknown owner')} · ${turns} turn${turns === 1 ? '' : 's'} · ${e(formatTime(conversation.created_at))}</span></button>`;
+  }
+  function conversationTurn(turn) {
+    const sequence = turn.sequence == null ? turn.id : `#${turn.sequence}`;
+    const output = turn.output == null ? '' : `<div class="conversation-output"><span class="conversation-label">Output</span><pre>${e(conversationValue(turn.output))}</pre></div>`;
+    const reason = turn.reason == null ? '' : `<p class="conversation-reason">${e(turn.reason)}</p>`;
+    return `<article class="conversation-turn"><header><strong>Turn ${e(sequence)}</strong>${conversationStatus(turn.state)}<time datetime="${e(turn.created_at ?? '')}">${e(formatTime(turn.created_at))}</time></header><div class="conversation-message"><span class="conversation-label">Message</span><p>${e(turn.text ?? '')}</p></div>${output}${reason}</article>`;
+  }
+  function conversationPendingMarkup() {
+    const pending = state.conversationPending;
+    if (!pending || String(pending.conversationId) !== String(state.conversationId)) return '';
+    return `<article class="conversation-turn conversation-turn-pending"><header><strong>New turn</strong>${conversationStatus(pending.state)}<time>now</time></header><div class="conversation-message"><span class="conversation-label">Message</span><p>${e(pending.text)}</p></div><p class="conversation-reason">No output has been fabricated; waiting for the server turn state.</p></article>`;
+  }
+  function conversationComposerMarkup() {
+    const disabled = state.conversationPosting || !state.conversationId;
+    const canSend = !disabled && Boolean(state.conversationDraft.trim());
+    return `<form id="conversation-message" class="conversation-composer"><label for="conversation-text">Message</label><textarea id="conversation-text" name="text" rows="4" placeholder="Send a message to this conversation" ${state.conversationPosting ? 'disabled' : ''}>${e(state.conversationDraft)}</textarea><div class="conversation-composer-actions"><span class="conversation-compose-status" aria-live="polite">${state.conversationPosting ? 'submitting…' : 'Messages queue a turn; they do not approve or steer execution.'}</span><button type="submit" class="primary" ${canSend ? '' : 'disabled'}>${state.conversationPosting ? 'Submitting…' : 'Queue message'}</button></div></form>`;
+  }
+  function renderConversations() {
+    const selected = state.conversations.find(conversation => String(conversation.id) === String(state.conversationId));
+    const list = state.conversations.length ? state.conversations.map(conversationChoice).join('') : empty('No conversations yet. Receive an authorized channel message first; this page cannot create one.');
+    if (!selected) return `${head('Conversations','Read-only conversation context and explicit queued messages.') }<section class="conversations-page"><section class="conversation-list" aria-label="Conversations"><h2>Choose a conversation</h2>${list}</section>${state.conversationId ? `<p class="conversation-unavailable" role="status">Conversation ${e(state.conversationId)} is not available in the authorized response.</p>` : `<p class="conversation-empty-hint">Choose a conversation above. New conversations arrive from an authorized channel.</p>`}</section>`;
+    const turns = Array.isArray(selected.turns) ? [...selected.turns].sort((a,b) => Number(a.sequence ?? 0) - Number(b.sequence ?? 0)) : [];
+    const binding = `<dl class="conversation-binding"><dt>Owner</dt><dd>${e(selected.owner_id ?? 'unknown')}</dd><dt>Address</dt><dd>${e(conversationAddress(selected))}</dd><dt>Session reference</dt><dd>${e(conversationValue(selected.session_reference))}</dd><dt>Created</dt><dd>${e(formatTime(selected.created_at))}</dd></dl>`;
+    return `${head('Conversations','Read-only conversation context and explicit queued messages.') }<section class="conversations-page"><section class="conversation-list" aria-label="Conversations"><h2>Choose a conversation</h2>${list}</section><article class="conversation-panel"><div class="conversation-panel-head"><h2>${e(conversationAddress(selected))}</h2><p class="conversation-id mono">${e(selected.id)}</p></div>${binding}${conversationRelated(selected)}<section class="conversation-turns" aria-label="Conversation messages">${turns.map(conversationTurn).join('') || empty('No turns received yet.')}<div id="conversation-pending">${conversationPendingMarkup()}</div></section>${conversationComposerMarkup()}</article></section>`;
+  }
+  function conversationPayload(data) {
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.conversations)) return data.conversations;
+    throw new Error('Conversation response was not a list.');
+  }
   function renderAgents() {
     return head('Agents','Session diagnostics and legacy recovery actions.')+`<div id="agent-summary" class="meta">${e(state.health?.open_incidents?.length||0)} open incidents · ${e(state.health?.coverage_gaps||0)} coverage gaps · ${e(state.health?.telemetry_gaps||0)} telemetry gaps</div><div id="agent-status" role="status"></div><section id="detail"></section><section id="content"><h2>Decision requests</h2>${button('Acknowledge selected','bulk-ack')}${state.q1.map(decisionCard).join('')||empty('No decision requests.')}<h2>Hung sessions</h2>${state.hung.map(hungCard).join('')||empty('No hung sessions.')}<h2>Closeout</h2>${button('Close out selected','bulk-closeout')}${button('Clear selection','clear-selection')}${state.q2.map(closeoutCard).join('')||empty('No closeout requests.')}<h2>Zombie / handoff</h2>${state.zombie.groups.map(zombieCard).join('')||empty('No zombie groups.')}<h3>Orphaned requests</h3>${state.zombie.orphaned_requests.map(r=>`<article class="card">${e(r.summary || r.request_uid)}${button('Acknowledge','orphan-ack',r.request_uid)}</article>`).join('')||empty('No orphaned requests.')}<h2>Sessions</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Agent</th><th>Host</th><th>State / queue</th><th>Last event</th></tr></thead><tbody>${state.sessions.map(r=>`<tr><td>${sessionLink(r.stable_id)} ${resumeCapability(r)} ${jumpActions(r, "stable_id", "jump-session")}</td><td>${e(r.agent)}</td><td>${e(r.host)}</td><td>${e(r.run_state)} · ${e(r.queue)}</td><td>${e(formatTime(r.last_event_at))}</td></tr>`).join('')}</tbody></table></div><h2>Archive</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Kind</th><th>Status</th><th>Time</th><th>Summary</th></tr></thead><tbody>${state.archive.map(r=>`<tr><td>${sessionLink(r.stable_id)}</td><td>${e(r.origin)}</td><td>${r.closed_out?'Closed out':'Archived'}</td><td>${e(formatTime(r.last_event_at))}</td><td>${e(r.state || r.run_state)}</td></tr>`).join('')}</tbody></table></div><h2>Health</h2>${json(state.health)}</section>`;
   }
-  function render() { document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.page)); $('main').innerHTML=({decide:renderDecide,ledger:renderLedger,works:renderWorks,candidates:renderCandidates,rules:renderRules,agents:renderAgents})[state.page](); if(state.page==='agents' && state.session) { $('content').hidden=true; renderDetail(); } }
+  function render() {document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.page));$('main').innerHTML=({decide:renderDecide,conversations:renderConversations,ledger:renderLedger,works:renderWorks,candidates:renderCandidates,rules:renderRules,agents:renderAgents})[state.page]();if(state.page==='agents'&&state.session){$('content').hidden=true;renderDetail();}}
   async function refresh() {
     const current=++generation, page=state.page;
+    if(page==='conversations'&&!state.conversationPosting){const text=$('conversation-text');if(text){state.conversationDraft=text.value;state.conversationDrafts[state.conversationId]=text.value;}}
     const since=state.range==='all'?0:Date.now()-(state.range==='week'?7:1)*86400000;
     try {
       let data={};
@@ -149,16 +222,37 @@
         if(page==='decide') { const [now,inbox,done,today,ledger]=await Promise.all(['now','inbox','done'].map(z=>fetchJson(`/api/attention/${z}`)).concat(fetchJson(`/api/ledger?since=${Date.now()-86400000}`),fetchJson(`/api/ledger?since=${Date.now()-7*86400000}`))); return {attention:{now,inbox,done},today,ledger}; }
         if(page==='ledger') return {ledger:await fetchJson(`/api/ledger?since=${since}`)};
         if(page==='works'||page==='candidates') return {works:await fetchJson('/api/works')};
+        if(page==='conversations') return {conversations:conversationPayload(await fetchJson('/api/conversations'))};
         if(page==='agents') { const keys=['q1','q2','hung','zombie','sessions','health','archive']; const rows=await Promise.all(keys.map(k=>fetchJson(`/api/${k}`))); const result=Object.fromEntries(keys.map((k,i)=>[k,rows[i]])); if(state.session)result.detail=await fetchJson(`/api/sessions/${encodeURIComponent(state.session)}`); return result; }
         return {};
       })();
       const [rules,result]=await Promise.all([rulesPromise,pagePromise]); data={...result,rules};
       if(current!==generation || page!==state.page)return;
-      Object.assign(state,data); $('bot-toggle').textContent=`bot · ${rules.bot_disabled?'off':'on'}`; $('bot-toggle').setAttribute('aria-pressed',String(!rules.bot_disabled)); render();
+      Object.assign(state,data);
+      if(page==='conversations'&&state.conversationPending){const selected=state.conversations.find(row=>String(row.id)===String(state.conversationPending.conversationId));if(selected?.turns?.some(turn=>String(turn.id)===String(state.conversationPending.turnId)))state.conversationPending=null;}
+      $('bot-toggle').textContent=`bot · ${rules.bot_disabled?'off':'on'}`; $('bot-toggle').setAttribute('aria-pressed',String(!rules.bot_disabled));
+      if(page==='conversations'&&(state.conversationPosting||document.activeElement?.id==='conversation-text'))return;
+      render();
     } catch(error) { if(current===generation)showError(error); }
   }
-  async function restoreRoute() { const parts=location.pathname.split('/').filter(Boolean), original=parts[0]; state.page=LEGACY_ZONE[original]||original||'decide'; if(!pages.includes(state.page))state.page='decide'; state.session=state.page==='agents' && (original==='sessions'||original==='agents') && parts[1]?decodeURIComponent(parts[1]):null; history.replaceState(null,'',`/${state.page}${state.session?'/'+encodeURIComponent(state.session):''}`); $('main').innerHTML=empty('Loading…'); await refresh(); if(original==='done')showDone(); }
-  async function navigate(page,session=null) { $('drawer').close(); $('modal').close(); state.selected.clear(); history.pushState(null,'',`/${page}${session?'/'+encodeURIComponent(session):''}`); await restoreRoute(); }
+  async function submitConversationMessage(form) {
+    if(state.conversationPosting) return;
+    const text=(form.elements.text?.value ?? '').trim();
+    if(!text){showError(new Error('Message cannot be blank.'));return;}
+    const conversationId=state.conversationId;
+    if(!conversationId){showError(new Error('Choose a conversation before sending a message.'));return;}
+    state.conversationDraft=text;state.conversationDrafts[conversationId]=text;state.conversationPosting=true;state.conversationPending={conversationId,text,state:'submitting',turnId:null};render();
+    try {
+      const result=await post(`/api/conversations/${encodeURIComponent(conversationId)}/messages`,{text});
+      const turnId=result?.turn_id;
+      if(turnId==null) throw new Error('Message accepted without a turn_id.');
+      state.conversationPending={conversationId,text,turnId,state:'queued'};state.conversationDraft='';state.conversationDrafts[conversationId]='';
+      await refresh();
+    } catch(error) { state.conversationPending=null;showError(error);render(); }
+    finally { state.conversationPosting=false;render(); }
+  }
+  async function restoreRoute() { const parts=location.pathname.split('/').filter(Boolean), original=parts[0]; state.page=LEGACY_ZONE[original]||original||'decide'; if(!pages.includes(state.page))state.page='decide'; state.session=state.page==='agents' && (original==='sessions'||original==='agents') && parts[1]?decodeURIComponent(parts[1]):null; state.conversationId=state.page==='conversations'&&parts[1]?decodeURIComponent(parts[1]):null; state.conversationDraft=state.conversationId?state.conversationDrafts[state.conversationId]||'':''; history.replaceState(null,'',`/${state.page}${state.page==='conversations'&&state.conversationId?'/'+encodeURIComponent(state.conversationId):state.session?'/'+encodeURIComponent(state.session):''}`); $('main').innerHTML=empty('Loading…'); await refresh(); if(original==='done')showDone(); }
+  async function navigate(page,session=null) {$('drawer').close();$('modal').close();state.selected.clear();history.pushState(null,'',`/${page}${session?'/'+encodeURIComponent(session):''}`);await restoreRoute();}
   function findAttention(id) { return [...state.attention.now,...state.attention.inbox,...state.attention.done].find(x=>x.item_id===id); }
   function showDone() { dialog('drawer','Done',state.attention.done.map(x=>`<article class="receipt"><h3>${e(x.conclusion)}</h3><p>${e(x.state)} · ${e(x.effect_state)}</p>${sourceLink(x.source_link)}${json(x.evidence)}</article>`).join('')||empty('Nothing done yet.')); }
   async function openWork(id) {const w=await fetchJson(`/api/works/${encodeURIComponent(id)}`);dialog('drawer',w.title,`<p class="mono">r${w.revision}</p>${contractFacts(w)}`);}
@@ -187,6 +281,9 @@
     if(action==='done'||target.dataset.done)return showDone();
     if(action==='expand'){if(expanded.has(id))expanded.delete(id);else expanded.add(id);render();return;}
     if(action==='export')return exportCsv();
+    if(action==='select-conversation') {state.conversationDraft=state.conversationDrafts[id]||'';return navigate('conversations',id);}
+    if(action==='refresh-conversations') return refresh();
+    if(action==='conversation-message') return submitConversationMessage(target);
     if(action==='clear-selection') {state.selected.clear();render();return;}
     if(action==='range') {state.range=id;return refresh();}
     if(action==='resolve')return resolveItem(id,target.dataset.option);
@@ -212,6 +309,8 @@
     if(target.id==='bot-toggle') {if(!state.rules)throw new Error('Rules have not loaded.');await post(`/api/decision-bot/${state.rules.bot_disabled?'enable':'disable'}`);return refresh();}
   }
   function exportCsv() {const rows=[['Work','Asked','Decided','Waited','Chose','Effect'],...state.ledger.slowest.map(r=>[r.title,r.asked_at,r.decided_at??'—',r.waited_ms,r.chose??'—',r.effect_state??'—'])];const csv=rows.map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='overload-ledger.csv';a.click();URL.revokeObjectURL(url);}
+  document.addEventListener('submit',event=>{if(event.target.id==='conversation-message'){event.preventDefault();void submitConversationMessage(event.target);}});
+  document.addEventListener('input',event=>{if(event.target.id==='conversation-text'){state.conversationDraft=event.target.value;state.conversationDrafts[state.conversationId]=event.target.value;event.target.form.querySelector('button[type="submit"]').disabled=state.conversationPosting||!event.target.value.trim();}});
   document.addEventListener('submit',async event=>{const form=event.target;if(form.id!=='capture'&&!form.matches('form.promote'))return;event.preventDefault();const submit=form.querySelector('button');submit.disabled=true;try {if(form.id==='capture')await post('/api/works',{title:form.elements.idea.value.trim(),source:'operator',candidate:true});else {const work=state.works.find(w=>w.work_id===form.dataset.id);await post(`/api/works/${encodeURIComponent(work.work_id)}/promote`,{expected_revision:work.revision,reason:'promoted from candidates',contract:{objective:form.elements.objective.value.trim(),acceptance:[{id:'a1',kind:'human',description:form.elements.acceptance.value.trim()}],non_goals:[],scope:{cwd:'.'},budget:{},stop_conditions:[{id:'s1',kind:'judgment',description:'operator review'}],decision_owner:'operator'}});}await refresh();}catch(error){showError(error);}finally{submit.disabled=false;}});
   document.addEventListener('click',async event=>{const target=event.target.closest('button,a[data-nav],a.drill');if(!target)return;if(target.closest('form'))return;event.preventDefault();if(target.dataset.nav)return navigate(target.dataset.nav);target.disabled=true;try {await handleAction(target);}catch(error){showError(error);}finally{target.disabled=false;if(target.dataset.action==='apply-editor')validateEditor();}});
   document.addEventListener('input',event=>{if(event.target.closest('#drawer'))validateEditor();const form=event.target.closest('form.promote');if(form)form.querySelector('button').disabled=!(form.elements.objective.value.trim()&&form.elements.acceptance.value.trim());});
