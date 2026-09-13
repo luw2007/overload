@@ -149,7 +149,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         }
         const originError = checkOrigin(request, port === 0 ? server.port : port);
         if (originError) return originError;
-        const management = await mgmtRoute(request, url, { controlPath, ledgerPath, overloadHome: homedir() });
+        const management = await mgmtRoute(request, url, { controlPath, ledgerPath, overloadHome: join(homedir(), ".overload") });
         if (management) return management;
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
