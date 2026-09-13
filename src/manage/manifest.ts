@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { ControlError, getWork, upsertAttention } from "../control/store";
 import { ensureMgmtSchema } from "./schema";
+import { canonicalWorkId, workScope } from "./relations";
 import type { SourceFs } from "./source";
 import { all, id, one } from "./store";
 
@@ -77,6 +78,13 @@ async function git(
   const result = await fs.exec(cwd, ["git", ...args], 5000);
   return result.code === 0 ? result.stdout.trim() || null : null;
 }
+function validateManifestHosts(db:Database,entries:{version_id:string}[]):void{
+  if(!entries.length)return;
+  const marks=entries.map(()=>"?").join(","),hosts=new Set<string>();
+  const executions=all<{stable_id:string;ledger_evidence:string|null}>(db,`SELECT DISTINCT e.stable_id,e.ledger_evidence FROM mgmt_artifact_versions v JOIN mgmt_executions e ON e.execution_id=v.producer OR EXISTS(SELECT 1 FROM mgmt_links l WHERE l.object=v.version_id AND l.subject=e.execution_id AND l.superseded_at IS NULL) WHERE v.version_id IN (${marks})`,...entries.map(x=>x.version_id));
+  for(const execution of executions){let host=execution.stable_id.split(":")[0]!;try{const evidence=JSON.parse(execution.ledger_evidence??"{}");if(typeof evidence.host==="string")host=evidence.host;}catch{ /* Stable identity remains authoritative when optional evidence is malformed. */ }hosts.add(host);}
+  if(hosts.size>1)throw new ControlError("conflict",`manifest_multiple_sources:${[...hosts].sort().join(",")}`);
+}
 export async function computeManifest(
   db: Database,
   fs: SourceFs,
@@ -84,21 +92,23 @@ export async function computeManifest(
   opts: { verification: Verification[]; now?: number },
 ): Promise<ManifestInput> {
   ensureMgmtSchema(db);
+  const canonicalWork = canonicalWorkId(db, workId), scope = workScope(db, canonicalWork), marks = scope.map(() => "?").join(",");
   const latest = one<{ cwd: string | null; ledger_evidence: string | null }>(
     db,
-    "SELECT cwd,ledger_evidence FROM mgmt_executions WHERE work_id=? ORDER BY last_observed_at DESC,started_at DESC LIMIT 1",
-    workId,
+    `SELECT cwd,ledger_evidence FROM mgmt_executions WHERE work_id IN (${marks}) ORDER BY last_observed_at DESC,started_at DESC,execution_id DESC LIMIT 1`,
+    ...scope,
   );
   const facts = evidenceFacts(latest?.ledger_evidence ?? null),
     repoRoot = facts.repo_root ?? latest?.cwd ?? null,
     baseRef = facts.base_ref ?? null;
   const entries = all<{ artifact_id: string; version_id: string }>(
     db,
-    `SELECT a.artifact_id,v.version_id FROM mgmt_artifacts a JOIN mgmt_artifact_versions v ON v.version_id=(SELECT v2.version_id FROM mgmt_artifact_versions v2 WHERE v2.artifact_id=a.artifact_id ORDER BY v2.observed_at DESC,v2.version_id DESC LIMIT 1) WHERE a.work_id=? AND a.kind IN ('file','git_dirty') ORDER BY a.artifact_id`,
-    workId,
+    `SELECT a.artifact_id,v.version_id FROM mgmt_artifacts a JOIN mgmt_artifact_versions v ON v.version_id=(SELECT v2.version_id FROM mgmt_artifact_versions v2 WHERE v2.artifact_id=a.artifact_id ORDER BY v2.observed_at DESC,v2.version_id DESC LIMIT 1) WHERE a.work_id IN (${marks}) AND a.kind IN ('file','git_dirty') AND (a.work_id=? OR NOT EXISTS(SELECT 1 FROM mgmt_artifacts canonical WHERE canonical.work_id=? AND canonical.kind=a.kind AND canonical.canonical_key=a.canonical_key)) ORDER BY a.artifact_id`,
+    ...scope, canonicalWork, canonicalWork,
   );
+  validateManifestHosts(db,entries);
   return {
-    work_id: workId,
+    work_id: canonicalWork,
     repo_root: repoRoot,
     git_head: repoRoot ? await git(fs, repoRoot, ["rev-parse", "HEAD"]) : null,
     git_tree_sha: repoRoot
@@ -121,6 +131,10 @@ export function insertManifest(
   now: number,
 ): { manifest_id: string; created: boolean } {
   ensureMgmtSchema(db);
+  const canonicalWork=canonicalWorkId(db,input.work_id);
+  if(canonicalWork!==input.work_id)throw new ControlError("invalid","manifest work_id must be canonical");
+  const scope=workScope(db,canonicalWork);
+  validateManifestHosts(db,input.entries);
   for (const entry of input.entries) {
     const row = one<{ work_id: string; artifact_id: string }>(
       db,
@@ -130,7 +144,7 @@ export function insertManifest(
     if (
       !row ||
       row.artifact_id !== entry.artifact_id ||
-      row.work_id !== input.work_id
+      !scope.includes(row.work_id)
     )
       throw new ControlError(
         "invalid",
@@ -291,11 +305,12 @@ export function invalidateAcceptances(
   now: number,
 ): number {
   ensureMgmtSchema(db);
+  const canonicalWork=canonicalWorkId(db,workId);
   const apply = () => {
     const stale = all<{ manifest_id: string }>(
       db,
-      `SELECT DISTINCT m.manifest_id FROM mgmt_manifests m JOIN mgmt_manifest_entries e ON e.manifest_id=m.manifest_id JOIN mgmt_artifact_versions old ON old.version_id=e.version_id WHERE m.work_id=? AND EXISTS(SELECT 1 FROM mgmt_artifact_versions newer WHERE newer.artifact_id=e.artifact_id AND (newer.observed_at>old.observed_at OR newer.observed_at=old.observed_at AND newer.version_id>old.version_id))`,
-      workId,
+      `SELECT DISTINCT m.manifest_id FROM mgmt_manifests m JOIN mgmt_manifest_entries e ON e.manifest_id=m.manifest_id JOIN mgmt_artifact_versions old ON old.version_id=e.version_id JOIN mgmt_artifacts old_artifact ON old_artifact.artifact_id=old.artifact_id WHERE m.work_id=? AND EXISTS(SELECT 1 FROM mgmt_artifacts current_artifact JOIN mgmt_artifact_versions newer ON newer.artifact_id=current_artifact.artifact_id WHERE current_artifact.work_id IN (${workScope(db, canonicalWork).map(() => "?").join(",")}) AND current_artifact.kind=old_artifact.kind AND current_artifact.canonical_key=old_artifact.canonical_key AND (newer.observed_at>old.observed_at OR newer.observed_at=old.observed_at AND newer.version_id>old.version_id))`,
+      canonicalWork, ...workScope(db, canonicalWork),
     );
     let count = 0;
     for (const { manifest_id } of stale) {
@@ -306,7 +321,7 @@ export function invalidateAcceptances(
         .run(now, reason, manifest_id).changes;
       db.query(
         "UPDATE control_attention SET state='superseded',revision=revision+1,updated_at=? WHERE item_id=? AND state='open'",
-      ).run(now, `mgmt:accept:${workId}:${manifest_id}`);
+      ).run(now, `mgmt:accept:${canonicalWork}:${manifest_id}`);
     }
     return count;
   };

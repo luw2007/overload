@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { ensureControlSchema, ControlError } from "../src/control/store";
-import { createDiscoveredWork } from "../src/manage/store";
+import { bindExecution, createDiscoveredWork } from "../src/manage/store";
 import { ensureMgmtSchema } from "../src/manage/schema";
+import { aliasWork } from "../src/manage/relations";
+import type { SourceFs } from "../src/manage/source";
 import {
+ computeManifest,
  insertManifest,
  invalidateAcceptances,
  manifestDigest,
@@ -25,15 +28,16 @@ function version(
  artifact: string,
  vid: string,
  at: number,
+ producer="x",
 ) {
  db
   .query("INSERT OR IGNORE INTO mgmt_artifacts VALUES(?,?, 'file',?,?,?)")
   .run(artifact, work, artifact, artifact, at);
  db
   .query(
-   "INSERT INTO mgmt_artifact_versions(version_id,artifact_id,content_kind,content_sha256,snapshot_state,producer,observed_at) VALUES(?,?,'content',?,'reference_only','x',?)",
+   "INSERT INTO mgmt_artifact_versions(version_id,artifact_id,content_kind,content_sha256,snapshot_state,producer,observed_at) VALUES(?,?,'content',?,'reference_only',?,?)",
   )
-  .run(vid, artifact, vid, at);
+  .run(vid, artifact, vid, producer, at);
 }
 const input = (
  work: string,
@@ -97,6 +101,24 @@ describe("management manifests", () => {
     2,
    ),
   ).toThrow(ControlError);
+ });
+
+ test("canonical manifest includes direct aliases and rejects alias or outsiders", async () => {
+  const db=fixture(),canonical=createDiscoveredWork(db,"canonical","canonical",1),alias=createDiscoveredWork(db,"alias","alias",1),outsider=createDiscoveredWork(db,"outsider","outsider",1);
+  bindExecution(db,{workId:canonical,stableId:"s",writerId:"w",agent:"pi",cwd:"/r",coverage:"ledger_full",state:"done",startedAt:1,observedAt:1,evidence:{repo_root:"/r"}});
+  version(db,canonical,"a","v1",1);version(db,alias,"b","v2",1);version(db,outsider,"x","v3",1);
+  aliasWork(db,alias,canonical,{actor:"owner",reason:"duplicate",now:2});
+  const fs={exec:async(_cwd:string,argv:string[])=>({code:0,stdout:argv.at(-1)==="HEAD^{tree}"?"tree\n":"head\n",stderr:""})} as SourceFs;
+  const computed=await computeManifest(db,fs,alias,{verification:[]});
+  expect(computed.work_id).toBe(canonical);expect(computed.entries).toEqual([{artifact_id:"a",version_id:"v1"},{artifact_id:"b",version_id:"v2"}]);
+  expect(insertManifest(db,computed,"owner",3).created).toBe(true);
+  const accepted=recordAcceptance(db,insertManifest(db,computed,"owner",3).manifest_id,"accepted","owner",{},3);
+  version(db,canonical,"canonical-b","v4",4);db.query("UPDATE mgmt_artifacts SET canonical_key='b' WHERE artifact_id='canonical-b'").run();
+  const shadowed=await computeManifest(db,fs,canonical,{verification:[]});expect(shadowed.entries).toEqual([{artifact_id:"a",version_id:"v1"},{artifact_id:"canonical-b",version_id:"v4"}]);expect(invalidateAcceptances(db,canonical,"scope_drift",4)).toBe(1);expect(db.query("SELECT invalidated_reason FROM mgmt_acceptances WHERE acceptance_id=?").get(accepted.acceptance_id)).toEqual({invalidated_reason:"scope_drift"});
+  expect(()=>insertManifest(db,input(alias,[{artifact_id:"b",version_id:"v2"}]),"owner",3)).toThrow("manifest work_id must be canonical");
+  expect(()=>insertManifest(db,input(canonical,[{artifact_id:"x",version_id:"v3"}]),"owner",3)).toThrow("manifest entry does not belong to work artifact");
+ });
+ test("canonical manifest rejects artifacts produced on multiple hosts", async()=>{const db=fixture(),canonical=createDiscoveredWork(db,"multi-canonical","canonical",1),alias=createDiscoveredWork(db,"multi-alias","alias",1);const local=bindExecution(db,{workId:canonical,stableId:"local:pi:c",writerId:"w",agent:"pi",cwd:"/r",coverage:"ledger_full",state:"ended_ok",startedAt:1,observedAt:1,evidence:{repo_root:"/r",host:"local"}}),remote=bindExecution(db,{workId:alias,stableId:"ssh:pi:a",writerId:"w",agent:"pi",cwd:"/r",coverage:"ledger_full",state:"ended_ok",startedAt:1,observedAt:1,evidence:{repo_root:"/r",host:"ssh"}});version(db,canonical,"local-artifact","local-version",1,local);version(db,alias,"remote-artifact","remote-version",1,remote);aliasWork(db,alias,canonical,{actor:"owner",reason:"duplicate",now:2});const fs={exec:async()=>({code:0,stdout:"head\n",stderr:""})} as SourceFs;expect(computeManifest(db,fs,canonical,{verification:[]})).rejects.toThrow("manifest_multiple_sources:local,ssh");
  });
  test("acceptance card resolves atomically for both verdicts", () => {
   for (const verdict of ["accepted", "rejected"] as const) {

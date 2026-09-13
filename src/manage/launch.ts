@@ -1,106 +1,69 @@
 import { Database } from "bun:sqlite";
-import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { ControlError } from "../control/store";
 import { setParentHandoff } from "./schema";
+import { buildSshArgv, localSourceFs, shellQuote, writeSourceFile, type SourceFs, type SourceHost } from "./source";
 
-export type LaunchResult = { pid?: number; receipt?: string };
-export type LaunchExecutor = (request: { handoffId: string; agent: string; cwd: string; host: string; argv: string[]; env: Record<string,string>; idempotencyKey: string }) => Promise<LaunchResult>;
-export type LaunchError = Error & { no_effect?: boolean; noEffect?: boolean };
+export type LaunchResult={pid?:number;receipt?:string};
+export type LaunchRequest={handoffId:string;agent:string;cwd:string;host:SourceHost;argv:string[];env:Record<string,string>;idempotencyKey:string};
+export type LaunchExecutor=(request:LaunchRequest)=>Promise<LaunchResult>;
+export type LaunchError=Error&{no_effect?:boolean;noEffect?:boolean};
+const row=<T>(db:Database,sql:string,...args:unknown[])=>db.query(sql).get(...args as any[]) as T|null;
+const noEffect=(message:string)=>Object.assign(new Error(message),{no_effect:true});
 
-const row = <T>(db: Database, sql: string, ...args: unknown[]) => db.query(sql).get(...args as any[]) as T | null;
-const commandFor = (agent: string, cwd: string) => agent === "pi" ? ["pi", "--session-dir", cwd] : agent === "omp" ? ["omp", "--cwd", cwd] : ["claude", "--cwd", cwd];
-
-export const localLaunchExecutor: LaunchExecutor = async request => {
-  try {
-    const proc = Bun.spawn(request.argv, { cwd: request.cwd, env: { ...process.env, ...request.env }, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-    proc.unref();
-    return { pid: proc.pid, receipt: `pid:${proc.pid}` };
-  } catch (error) {
-    if (["ENOENT", "EACCES", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) (error as LaunchError).no_effect = true;
-    throw error;
-  }
+export function handoffCommand(agent:string,cwd:string,packetPath:string,workId:string,packetText?:string){
+  const system=`Continue Overload work ${workId}. Read the handoff packet at ${packetPath}. Preserve its constraints and inspect gaps before changing files.`,prompt=`Overload-Work: ${workId}\nHandoff-Packet: ${packetPath}`;
+  if(agent==="pi")return ["pi","-p","--append-system-prompt",system,`@${packetPath}`,prompt];
+  if(agent==="omp")return ["omp","-p","--cwd",cwd,"--append-system-prompt",system,`@${packetPath}`,prompt];
+  if(agent==="claude")return ["claude","-p","--append-system-prompt",system,packetText?`${prompt}\nSealed handoff packet (also persisted at the path above):\n${packetText}`:prompt];
+  throw new ControlError("invalid","unsupported target agent");
+}
+export const localLaunchExecutor:LaunchExecutor=async request=>{try{const proc=Bun.spawn(request.argv,{cwd:request.cwd,env:{...process.env,...request.env},stdin:"ignore",stdout:"ignore",stderr:"ignore"});proc.unref();return {pid:proc.pid,receipt:`pid:${proc.pid}`};}catch(error){if(["ENOENT","EACCES","ENOTDIR"].includes((error as NodeJS.ErrnoException).code??""))(error as LaunchError).no_effect=true;throw error;}};
+export const sshLaunchExecutor:LaunchExecutor=async request=>{
+  if(request.host.kind!=="ssh")throw noEffect("ssh source host required");
+  const argv=request.argv.map(shellQuote).join(" "),receiptPath=join(request.cwd,".overload",`handoff-${request.handoffId}.log`),inner=`cd -- ${shellQuote(request.cwd)} && OVERLOAD_PARENT=${shellQuote(request.env.OVERLOAD_PARENT)} exec ${argv}`,login=`if [ -x /bin/zsh ]; then exec /bin/zsh -lic ${shellQuote(inner)}; else exec /bin/sh -lc ${shellQuote(inner)}; fi`;
+  const start=`nohup /bin/sh -c ${shellQuote(login)} >${shellQuote(receiptPath)} 2>&1 </dev/null & child=$!; kill -0 "$child" 2>/dev/null || exit 70; printf '%s\n' "$child"`;
+  let proc:ReturnType<typeof Bun.spawn>;try{proc=Bun.spawn(buildSshArgv(request.host,`/bin/sh -c ${shellQuote(start)}`),{stdin:"ignore",stdout:"pipe",stderr:"pipe"});}catch(error){(error as LaunchError).no_effect=true;throw error;}
+  const [code,stdout,stderr]=await Promise.all([proc.exited,new Response(proc.stdout).text(),new Response(proc.stderr).text()]);
+  if(code!==0){const error=new Error(stderr.trim()||`ssh spawn exited ${code}`) as LaunchError;if(code!==255)error.no_effect=true;throw error;}
+  const pid=Number(stdout.trim());if(!Number.isSafeInteger(pid)||pid<=0)throw new Error("ssh spawn receipt missing pid");
+  return {pid,receipt:`ssh:${request.host.host}:${pid}:${receiptPath}`};
 };
 
-export const sshLaunchExecutor: LaunchExecutor = async request => {
-  const remote = request.host.replace(/^ssh:/, "");
-  const quoted = request.argv.map(v => `'${v.replaceAll("'", `'\\''`)}'`).join(" ");
-  const env = `OVERLOAD_PARENT='${request.env.OVERLOAD_PARENT}'`;
-  const proc = Bun.spawn(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", remote, `cd '${request.cwd.replaceAll("'", `'\\''`)}' && ${env} nohup ${quoted} >/dev/null 2>&1 &`], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const code = await proc.exited;
-  if (code !== 0) { const error = new Error(await new Response(proc.stderr).text()) as LaunchError; error.no_effect = true; throw error; }
-  return { receipt: `ssh:${remote}` };
-};
-
-async function isolatedCwd(handoff: any, packet: any) {
-  const source = packet.workspace?.cwd;
-  if (!packet.isolate || !source) return source;
-  const target = join(source, ".overload-worktrees", handoff.handoff_id);
-  await mkdir(join(source, ".overload-worktrees"), { recursive: true });
-  const proc = Bun.spawn(["git", "worktree", "add", "--detach", target], { cwd: source, stdout: "pipe", stderr: "pipe" });
-  if (await proc.exited !== 0) { const error = new Error(await new Response(proc.stderr).text()) as LaunchError; error.no_effect = true; throw error; }
+async function git(source:SourceFs,cwd:string,argv:string[],timeout=30_000){const result=await source.exec(cwd,["git",...argv],timeout);if(result.code!==0)throw noEffect(result.stderr.trim()||`git ${argv[0]} failed`);return result.stdout.trim();}
+export async function prepareHandoffWorkspace(db:Database,handoffId:string,source:SourceFs){
+  const handoff=row<any>(db,"SELECT * FROM mgmt_handoffs WHERE handoff_id=?",handoffId);if(!handoff)throw new ControlError("not_found","handoff not found");if(handoff.state!=="ready_to_launch")throw new ControlError("conflict","handoff is not ready");
+  const packet=JSON.parse(handoff.packet||"{}"),cwd=packet.workspace?.cwd;if(!cwd)throw noEffect("source cwd unavailable");if(source.host.host!==packet.target_host)throw noEffect("configured source host does not match target_host");
+  const root=await git(source,cwd,["rev-parse","--show-toplevel"]),head=await git(source,root,["rev-parse","HEAD"]),status=await git(source,root,["status","--porcelain=v1","-z"]),patch=await source.exec(root,["git","diff","--binary","HEAD"],30_000);if(patch.code!==0)throw noEffect(patch.stderr.trim()||"dirty patch capture failed");
+  const untracked=status.split("\0").filter(Boolean).filter(line=>line.startsWith("?? ")).map(line=>line.slice(3));if(untracked.length)throw noEffect(`dirty snapshot cannot preserve untracked paths: ${untracked.join(", ")}`);
+  const gitPatchPath=await git(source,root,["rev-parse","--git-path",`overload/handoffs/${handoffId}.patch`]),patchPath=gitPatchPath.startsWith("/")?gitPatchPath:join(root,gitPatchPath);await writeSourceFile(source,patchPath,new TextEncoder().encode(patch.stdout));
+  packet.workspace={...packet.workspace,root,head,status_sha256:Bun.SHA256.hash(status,"hex"),patch_sha256:Bun.SHA256.hash(patch.stdout,"hex"),patch_path:patchPath};const text=JSON.stringify(packet),fp=JSON.stringify({root,head,status_sha256:packet.workspace.status_sha256,patch_sha256:packet.workspace.patch_sha256});db.query("UPDATE mgmt_handoffs SET packet=?,packet_sha256=?,workspace_fp=? WHERE handoff_id=? AND state='ready_to_launch'").run(text,Bun.SHA256.hash(text,"hex"),fp,handoffId);return packet.workspace;
+}
+async function isolatedCwd(source:SourceFs,handoff:any,packet:any){
+  const sourceCwd=packet.workspace?.cwd;if(!sourceCwd)throw noEffect("source cwd unavailable");
+  let workspace=packet.workspace;if(!workspace.head)workspace=await prepareHandoffWorkspace((handoff as any).__db,handoff.handoff_id,source);
+  const head=await git(source,workspace.root,["rev-parse","HEAD"]),status=await git(source,workspace.root,["status","--porcelain=v1","-z"]),patch=await source.exec(workspace.root,["git","diff","--binary","HEAD"],30_000);if(patch.code!==0)throw noEffect(patch.stderr.trim()||"dirty patch capture failed");
+  if(head!==workspace.head||Bun.SHA256.hash(status,"hex")!==workspace.status_sha256||Bun.SHA256.hash(patch.stdout,"hex")!==workspace.patch_sha256)throw noEffect("handoff workspace changed");
+  if(!handoff.isolate)return sourceCwd;
+  const commonPath=await git(source,workspace.root,["rev-parse","--git-common-dir"]),common=commonPath.startsWith("/")?commonPath:join(workspace.root,commonPath),target=join(common,"overload","worktrees",handoff.handoff_id),listed=await source.exec(workspace.root,["git","worktree","list","--porcelain"],30_000);if(listed.code!==0)throw noEffect(listed.stderr.trim()||"worktree list failed");
+  if(!listed.stdout.split("\n\n").some(block=>block.split("\n").includes(`worktree ${target}`))){const added=await source.exec(workspace.root,["git","worktree","add","--detach",target,workspace.head],60_000);if(added.code!==0)throw noEffect(added.stderr.trim()||"worktree add failed");}
+  if(workspace.patch_sha256!==Bun.SHA256.hash("","hex")){const applied=await source.exec(target,["git","apply","--index",workspace.patch_path],30_000);if(applied.code!==0)throw noEffect(`dirty patch apply failed: ${applied.stderr.trim()}`);}
   return target;
 }
+function unknownAttention(db:Database,handoff:any,now:number){const id=`mgmt:handoff:${handoff.handoff_id}:unknown`,options=JSON.stringify(["jump","attach","abandon"]);db.query(`INSERT INTO control_attention(item_id,work_id,revision,state,effect_state,urgency,conclusion,trigger,impact,recommendation,options,owner,contract_revision,decision_mode,evidence,created_at,updated_at) VALUES (?,?,1,'open','unknown','now','交接启动结果未知','handoff_launch_unknown','不得自动重试','检查并绑定或放弃',?,?,0,'human_only',?,?,?) ON CONFLICT(item_id) DO UPDATE SET updated_at=excluded.updated_at`).run(id,handoff.work_id,options,"decision_owner",JSON.stringify({handoff_id:handoff.handoff_id}),now,now);}
 
-function unknownAttention(db: Database, handoff: any, now: number) {
-  const id = `mgmt:handoff:${handoff.handoff_id}:unknown`, options = JSON.stringify(["jump", "attach", "abandon"]);
-  db.query(`INSERT INTO control_attention(item_id,work_id,revision,state,effect_state,urgency,conclusion,trigger,impact,recommendation,options,owner,contract_revision,decision_mode,evidence,created_at,updated_at)
-    VALUES (?,?,1,'open','unknown','now','交接启动结果未知','handoff_launch_unknown','不得自动重试','检查并绑定或放弃',?,? ,0,'human_only',?, ?,?)
-    ON CONFLICT(item_id) DO UPDATE SET updated_at=excluded.updated_at`).run(id, handoff.work_id, options, "decision_owner", JSON.stringify({ handoff_id: handoff.handoff_id }), now, now);
+export async function launchHandoff(db:Database,handoffId:string,opts:{confirmed?:boolean;executor?:LaunchExecutor;timeoutMs?:number;source?:SourceFs}={}){
+  if(opts.confirmed!==true)throw new ControlError("invalid","launch confirmation required");
+  const handoff=row<any>(db,"SELECT * FROM mgmt_handoffs WHERE handoff_id=?",handoffId);if(!handoff)throw new ControlError("not_found","handoff not found");if(handoff.state==="launch_unknown")throw new ControlError("conflict","launch outcome unknown");if(handoff.state!=="ready_to_launch")throw new ControlError("conflict","handoff is not ready");
+  const attemptNo=row<any>(db,"SELECT COALESCE(MAX(attempt_no),0)+1 n FROM mgmt_handoff_launch_attempts WHERE handoff_id=?",handoffId)?.n??1,now=Date.now(),key=createKey(handoff,attemptNo),packet=JSON.parse(handoff.packet||"{}"),initialCwd=packet.workspace?.cwd??".",initial=[handoff.target_agent];
+  db.transaction(()=>db.query("INSERT INTO mgmt_handoff_launch_attempts(attempt_id,handoff_id,idempotency_key,attempt_no,state,command,command_args,target_cwd,requested_at) VALUES (?,?,?,?, 'requested',?,?,?,?)").run(key,handoffId,key,attemptNo,initial[0],"[]",initialCwd,now)).immediate();
+  const source=opts.source??(packet.target_host==="local"?localSourceFs("local"):null);if(!source)return failNoEffect(db,handoff,attemptNo,noEffect("configured source host required"));if(source.host.host!==packet.target_host)return failNoEffect(db,handoff,attemptNo,noEffect("configured source host does not match target_host"));
+  const legacyExecutorOnly=!!opts.executor&&!opts.source;
+  let cwd:string,packetPath:string,argv:string;try{(handoff as any).__db=db;if(!legacyExecutorOnly&& !packet.workspace?.head){await prepareHandoffWorkspace(db,handoffId,source);handoff.packet=row<any>(db,"SELECT packet FROM mgmt_handoffs WHERE handoff_id=?",handoffId)!.packet;Object.assign(packet,JSON.parse(handoff.packet));}cwd=legacyExecutorOnly?packet.workspace?.cwd:await isolatedCwd(source,handoff,packet);packetPath=join(cwd,".overload",`handoff-${handoffId}.json`);if(!legacyExecutorOnly)await writeSourceFile(source,packetPath,new TextEncoder().encode(handoff.packet));argv=JSON.stringify(handoffCommand(handoff.target_agent,cwd,packetPath,handoff.work_id,handoff.packet));db.query("UPDATE mgmt_handoff_launch_attempts SET command=?,command_args=?,target_cwd=? WHERE handoff_id=? AND attempt_no=?").run(JSON.parse(argv)[0],JSON.stringify(JSON.parse(argv).slice(1)),cwd,handoffId,attemptNo);}catch(error){return failNoEffect(db,handoff,attemptNo,error);}
+  const request:LaunchRequest={handoffId,agent:handoff.target_agent,cwd,host:source.host,argv:JSON.parse(argv),env:{OVERLOAD_PARENT:`mgmt:handoff:${handoffId}`},idempotencyKey:key},executor=opts.executor??(source.host.kind==="local"?localLaunchExecutor:sshLaunchExecutor);
+  try{const timeout=new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error("launch timeout")),opts.timeoutMs??10_000)),result=await Promise.race([executor(request),timeout]);db.transaction(()=>{db.query("UPDATE mgmt_handoff_launch_attempts SET state='started',receipt=?,observed_pid=?,resolved_at=? WHERE handoff_id=? AND attempt_no=?").run(result.receipt??(result.pid?`pid:${result.pid}`:"started"),result.pid??null,Date.now(),handoffId,attemptNo);db.query("UPDATE mgmt_handoffs SET state='launching' WHERE handoff_id=?").run(handoffId);}).immediate();return {attempt_no:attemptNo,state:"launching",...result};}catch(error){if((error as LaunchError).no_effect||(error as LaunchError).noEffect)return failNoEffect(db,handoff,attemptNo,error);db.transaction(()=>{db.query("UPDATE mgmt_handoff_launch_attempts SET state='unknown',reconcile_result=?,resolved_at=? WHERE handoff_id=? AND attempt_no=?").run(String(error),Date.now(),handoffId,attemptNo);db.query("UPDATE mgmt_handoffs SET state='launch_unknown' WHERE handoff_id=?").run(handoffId);unknownAttention(db,handoff,Date.now());}).immediate();return {attempt_no:attemptNo,state:"launch_unknown"};}
 }
+function createKey(handoff:any,attemptNo:number){return Bun.SHA256.hash(`${handoff.handoff_id}${handoff.workspace_fp}${handoff.target_agent}${attemptNo}`,"hex");}
+function failNoEffect(db:Database,handoff:any,attemptNo:number,error:unknown){db.transaction(()=>{db.query("UPDATE mgmt_handoff_launch_attempts SET state='failed_no_effect',reconcile_result=?,resolved_at=? WHERE handoff_id=? AND attempt_no=?").run(String(error),Date.now(),handoff.handoff_id,attemptNo);db.query("UPDATE mgmt_handoffs SET state='ready_to_launch' WHERE handoff_id=?").run(handoff.handoff_id);}).immediate();return {attempt_no:attemptNo,state:"ready_to_launch",outcome:"failed_no_effect"};}
 
-export async function launchHandoff(db: Database, handoffId: string, opts: { confirmed?: boolean; executor?: LaunchExecutor; timeoutMs?: number } = {}) {
-  if (opts.confirmed !== true) throw new ControlError("invalid", "launch confirmation required");
-  const handoff = row<any>(db, "SELECT * FROM mgmt_handoffs WHERE handoff_id=?", handoffId);
-  if (!handoff) throw new ControlError("not_found", "handoff not found");
-  if (handoff.state === "launch_unknown") throw new ControlError("conflict", "launch outcome unknown");
-  if (handoff.state !== "ready_to_launch") throw new ControlError("conflict", "handoff is not ready");
-  const attemptNo = (row<any>(db, "SELECT COALESCE(MAX(attempt_no),0)+1 n FROM mgmt_handoff_launch_attempts WHERE handoff_id=?", handoffId)?.n ?? 1);
-  const now = Date.now(), key = `${handoffId}:${attemptNo}`;
-  const packet = JSON.parse(handoff.packet || "{}");
-  const initialCwd = packet.workspace?.cwd ?? ".";
-  const initialCommand = commandFor(handoff.target_agent, initialCwd);
-  db.transaction(() => db.query("INSERT INTO mgmt_handoff_launch_attempts(attempt_id,handoff_id,idempotency_key,attempt_no,state,command,command_args,target_cwd,requested_at) VALUES (?,?,?,?, 'requested',?,?,?,?)").run(key, handoffId, key, attemptNo, initialCommand[0], JSON.stringify(initialCommand.slice(1)), initialCwd, now)).immediate();
-  let cwd: string;
-  try { cwd = await isolatedCwd(handoff, packet); } catch (error) { return failNoEffect(db, handoff, attemptNo, error); }
-  const host = packet.target_host ?? packet.workspace?.host ?? "local";
-  const executor = opts.executor ?? (host === "local" ? localLaunchExecutor : sshLaunchExecutor);
-  const request = { handoffId, agent: handoff.target_agent, cwd, host, argv: commandFor(handoff.target_agent, cwd), env: { OVERLOAD_PARENT: `mgmt:handoff:${handoffId}` }, idempotencyKey: key };
-  try {
-    const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("launch timeout")), opts.timeoutMs ?? 10_000));
-    const result = await Promise.race([executor(request), timeout]);
-    db.transaction(() => { db.query("UPDATE mgmt_handoff_launch_attempts SET state='started',receipt=?,observed_pid=?,resolved_at=? WHERE handoff_id=? AND attempt_no=?").run(result.receipt ?? (result.pid ? `pid:${result.pid}` : "started"), result.pid ?? null, Date.now(), handoffId, attemptNo); db.query("UPDATE mgmt_handoffs SET state='launching' WHERE handoff_id=?").run(handoffId); }).immediate();
-    return { attempt_no: attemptNo, state: "launching", ...result };
-  } catch (error) {
-    if ((error as LaunchError).no_effect || (error as LaunchError).noEffect) return failNoEffect(db, handoff, attemptNo, error);
-    db.transaction(() => { db.query("UPDATE mgmt_handoff_launch_attempts SET state='unknown',reconcile_result=?,resolved_at=? WHERE handoff_id=? AND attempt_no=?").run(String(error), Date.now(), handoffId, attemptNo); db.query("UPDATE mgmt_handoffs SET state='launch_unknown' WHERE handoff_id=?").run(handoffId); unknownAttention(db, handoff, Date.now()); }).immediate();
-    return { attempt_no: attemptNo, state: "launch_unknown" };
-  }
-}
-
-function failNoEffect(db: Database, handoff: any, attemptNo: number, error: unknown) {
-  db.transaction(() => { db.query("UPDATE mgmt_handoff_launch_attempts SET state='failed_no_effect',reconcile_result=?,resolved_at=? WHERE handoff_id=? AND attempt_no=?").run(String(error), Date.now(), handoff.handoff_id, attemptNo); db.query("UPDATE mgmt_handoffs SET state='ready_to_launch' WHERE handoff_id=?").run(handoff.handoff_id); }).immediate();
-  return { attempt_no: attemptNo, state: "ready_to_launch", outcome: "failed_no_effect" };
-}
-
-export function reconcileLaunches(db: Database, ledger: Database) {
-  const handoffs = db.query("SELECT * FROM mgmt_handoffs WHERE state IN ('launching','launch_unknown')").all() as any[];
-  let bound = 0;
-  for (const handoff of handoffs) {
-    const session = row<any>(ledger, "SELECT stable_id,runtime,cwd FROM sessions WHERE origin=? ORDER BY first_seen_at DESC LIMIT 1", `mgmt:handoff:${handoff.handoff_id}`);
-    if (!session) continue;
-    const now = Date.now(), executionId = `${handoff.handoff_id}:${session.stable_id}`;
-    db.transaction(() => {
-      db.query("INSERT OR IGNORE INTO mgmt_session_binding(stable_id,work_id,role,evidence_ref,bound_at) VALUES (?,?, 'successor',?,?)").run(session.stable_id, handoff.work_id, `origin:mgmt:handoff:${handoff.handoff_id}`, now);
-      const attempt = row<any>(db, "SELECT COALESCE(MAX(attempt_no),0) n FROM mgmt_executions WHERE work_id=?", handoff.work_id)?.n ?? 0;
-      const packet = JSON.parse(handoff.packet || "{}");
-      db.query(`INSERT OR IGNORE INTO mgmt_executions(execution_id,work_id,stable_id,writer_id,attempt_no,exec_state,source_coverage,input_head_at_start,ledger_evidence,agent,cwd,started_at,last_observed_at) VALUES (?,?,?,'successor',?,'running','ledger_full',?,?,?, ?,?,?)`).run(executionId, handoff.work_id, session.stable_id, attempt + 1, packet.input_head ?? null, JSON.stringify({ origin: `mgmt:handoff:${handoff.handoff_id}` }), session.runtime, session.cwd, now, now);
-      setParentHandoff(db, executionId, handoff.handoff_id);
-      db.query("UPDATE mgmt_handoffs SET state='bound',new_stable_id=? WHERE handoff_id=?").run(session.stable_id, handoff.handoff_id);
-      db.query("UPDATE mgmt_handoff_launch_attempts SET state='bound',bound_stable_id=?,resolved_at=? WHERE handoff_id=? AND attempt_no=(SELECT MAX(attempt_no) FROM mgmt_handoff_launch_attempts WHERE handoff_id=?)").run(session.stable_id, now, handoff.handoff_id, handoff.handoff_id);
-      db.query("UPDATE control_attention SET state='resolved',effect_state='succeeded',updated_at=? WHERE item_id=?").run(now, `mgmt:handoff:${handoff.handoff_id}:unknown`);
-    }).immediate();
-    bound++;
-  }
-  return { bound };
-}
+export function reconcileLaunches(db:Database,ledger:Database){const handoffs=db.query("SELECT * FROM mgmt_handoffs WHERE state IN ('launching','launch_unknown') AND target_agent<>'claude'").all() as any[];let bound=0;for(const handoff of handoffs){const session=row<any>(ledger,"SELECT stable_id,runtime,cwd FROM sessions WHERE origin=? ORDER BY first_seen_at DESC LIMIT 1",`mgmt:handoff:${handoff.handoff_id}`);if(!session)continue;const now=Date.now(),executionId=`${handoff.handoff_id}:${session.stable_id}`;db.transaction(()=>{db.query("INSERT OR IGNORE INTO mgmt_session_binding(stable_id,work_id,role,evidence_ref,bound_at) VALUES (?,?,'successor',?,?)").run(session.stable_id,handoff.work_id,`origin:mgmt:handoff:${handoff.handoff_id}`,now);const attempt=row<any>(db,"SELECT COALESCE(MAX(attempt_no),0) n FROM mgmt_executions WHERE work_id=?",handoff.work_id)?.n??0,packet=JSON.parse(handoff.packet||"{}");db.query(`INSERT OR IGNORE INTO mgmt_executions(execution_id,work_id,stable_id,writer_id,attempt_no,exec_state,source_coverage,input_head_at_start,ledger_evidence,agent,cwd,started_at,last_observed_at) VALUES (?,?,?,'successor',?,'running','ledger_full',?,?,?, ?,?,?)`).run(executionId,handoff.work_id,session.stable_id,attempt+1,packet.input_head??null,JSON.stringify({origin:`mgmt:handoff:${handoff.handoff_id}`}),session.runtime,session.cwd,now,now);setParentHandoff(db,executionId,handoff.handoff_id);db.query("UPDATE mgmt_handoffs SET state='bound',new_stable_id=? WHERE handoff_id=?").run(session.stable_id,handoff.handoff_id);db.query("UPDATE mgmt_handoff_launch_attempts SET state='bound',bound_stable_id=?,resolved_at=? WHERE handoff_id=? AND attempt_no=(SELECT MAX(attempt_no) FROM mgmt_handoff_launch_attempts WHERE handoff_id=?)").run(session.stable_id,now,handoff.handoff_id,handoff.handoff_id);db.query("UPDATE control_attention SET state='resolved',effect_state='succeeded',updated_at=? WHERE item_id=?").run(now,`mgmt:handoff:${handoff.handoff_id}:unknown`);}).immediate();bound++;}return {bound};}

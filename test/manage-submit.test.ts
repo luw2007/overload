@@ -200,3 +200,20 @@ describe("management submission gates", () => {
   ).toBe(1);
  });
 });
+
+
+test("remote submission keeps git push on configured source",async()=>{
+ const {db,input,fs}=setup(true),commands:string[][]=[];
+ const remote:SourceFs={...fs,host:{host:"dev-id",kind:"ssh",remote:"dev-alias"},exec:async(_cwd,args)=>{
+  commands.push(args);
+  if(args[0]==="git"&&args[1]==="rev-parse")return {code:0,stdout:args.includes("--absolute-git-dir")?"/repo/.git":args.includes("--abbrev-ref")?"feature":"head",stderr:""};
+  if(args[0]==="git"&&args[1]==="ls-remote")return {code:0,stdout:"head refs/heads/feature",stderr:""};
+  if(args[0]==="which")return {code:1,stdout:"",stderr:"gh unavailable"};
+  return {code:0,stdout:"",stderr:""};
+ }};
+ const result=await submitAcceptance(db,remote,"accept",{target_kind:"github_pr",target:"main"},{recompute:async()=>input});
+ expect(result.state).toBe("pushed");
+ expect(commands.some(args=>args[0]==="git"&&args[1]==="ls-remote")).toBe(true);
+ expect(commands.some(args=>args[0]==="which"&&args[1]==="gh")).toBe(true);
+ expect(result.external_ref).toBeNull();db.close();
+});

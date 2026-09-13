@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureControlSchema } from "../src/control/store";
@@ -53,7 +53,9 @@ function fixture(coverage = "ledger_full", state = "done") {
   .run(state, Date.now());
  db.close();
  ledger.close();
- return { controlPath, ledgerPath };
+ writeFileSync(join(root,"host"),"local");
+ writeFileSync(join(root,"config.json"),JSON.stringify({manage:{hosts:[{host:"local",kind:"local"}]}}));
+ return { controlPath, ledgerPath, overloadHome:root };
 }
 const call = (
  f: ReturnType<typeof fixture>,
@@ -167,4 +169,28 @@ describe("management web routes", () => {
   ).toEqual({ state: "abandoned" });
   verify.close();
  });
+});
+
+
+test("alias projection preserves history, rejects revival, and correction supersedes evidence", async () => {
+ const f=fixture(), db=new Database(f.controlPath);
+ db.query("INSERT INTO control_works VALUES (?,?,?,?,?,?,?,?,?)").run("canonical","canonical","test","canonical","candidate",0,null,1,1);
+ db.query("INSERT INTO mgmt_work_profile(work_id,origin_mode,closeout_owner,track_state,decision_owner,discovered_title,updated_at) VALUES ('canonical','discovered','mgmt','tracking','owner','canonical',1)").run();
+ db.query("INSERT INTO mgmt_artifacts VALUES ('artifact','w','file','/tmp/a','/tmp/a',1)").run();
+ db.query("INSERT INTO mgmt_links(link_id,work_id,subject,relation,object,confidence,evidence_ref,observed_at) VALUES ('link','w','e','modified','artifact','strong','jsonl:session#1',1)").run();
+ const postBody=(value:unknown)=>({method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(value)});
+ let response=await call(f,"/api/mgmt/links/link/correct",postBody({relation:"read",actor:"owner",reason:"Only read this file"}));
+ expect(response.status).toBe(200);
+ expect(db.query("SELECT relation,superseded_at FROM mgmt_links WHERE link_id='link'").get()).toMatchObject({relation:"modified",superseded_at:expect.any(Number)});
+ expect(db.query("SELECT relation FROM mgmt_links WHERE supersedes='link'").get()).toMatchObject({relation:"read"});
+ expect(db.query("SELECT actor FROM mgmt_corrections WHERE evidence_ref='jsonl:session#1'").get()).toMatchObject({actor:"owner"});
+ response=await call(f,"/api/mgmt/works/w/alias",postBody({canonical_work_id:"canonical",actor:"owner",reason:"Same task"}));
+ expect(response.status).toBe(200);
+ const detail=await (await call(f,"/api/mgmt/works/canonical")).json();
+ expect(detail.artifacts).toEqual(expect.arrayContaining([expect.objectContaining({artifact_id:"artifact",work_id:"w"})]));
+ expect(db.query("SELECT work_id FROM mgmt_artifacts WHERE artifact_id='artifact'").get()).toEqual({work_id:"w"});
+ response=await call(f,"/api/mgmt/works/w/track",postBody({on:true}));
+ expect(response.status).toBe(409);
+ expect(db.query("SELECT track_state FROM mgmt_work_profile WHERE work_id='w'").get()).toEqual({track_state:"archived"});
+ db.close();
 });

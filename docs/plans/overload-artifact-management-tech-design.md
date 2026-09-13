@@ -1024,6 +1024,8 @@ HOME=$(mktemp -d) bun test/harness/e2e-mgmt.ts --scenario file-only-isolated-han
 
 **阶段 3：Claude 部分接入 + 纠错 + 并发归属 + alias（1–2 周）** · 模块 claude reader 接入发现；`present_in_workspace`/`multiple` 与 §7.2.1 交接一致性；`/links/*/correct`；`mgmt_work_hints`；`mgmt_work_alias`；**远程 ssh 主机的全量接入（多主机、远端 git、远端隔离 worktree、§6.4.6 启动路径进入强制 e2e）**。验收 Claude Session 以 `file_only` 纳管，且交接门禁按 §9.1.1 行事：`isolate=false` 如实拒绝（409 `liveness_unknown`）、`isolate=true` + 完整 override 时可启动且落在隔离 worktree；并发场景不伪造来源。本期不做 Claude 自动 successor 绑定与 Work 拆分。
 
+**阶段 3 实施验收（2026-09-14）**：已实现 Claude 显式工具结果与跨扫描 pending-call、并发/dirty 归属、纠错 fence、同主机相关提示、不可变 alias 与来源标注、配置 host ID/SSH alias 分离、远端 git/隔离 worktree/packet 传输及默认非交互启动。真实 `koda-dev` 发现 118 Session，重扫零新增；不可达主机零写入。默认远端 Claude 在隔离 worktree 消费密封 packet 并输出 `OVERLOAD_REMOTE_PHASE3_OK`，源树干净。本机 accept-and-submit 六步通过；全工作区 509 pass/1 skip/0 fail，隔离提交树 488 pass/1 skip/0 fail。原未知启动未重放。Claude 不自动绑定 successor；Work 不拆分；alias 只聚合展示，不迁移历史。单份 manifest 仍属单一来源；跨主机 alias 可展示，混合来源 manifest 明确拒绝 `manifest_multiple_sources`，不以单个 SourceFs 错读他机路径。未 push、未部署。
+
 **阶段 4（D1 已决定后的残余）：云端 Agent 手动导入** · D1 已在 2026-09-12 决定为「本机 + ssh 远程主机」，ssh 远程接入已下沉到阶段 1（发现+快照）与阶段 3（全量），故**本阶段只剩「云端 Agent 手动导入」**：无 ssh 可达性的托管 Agent（如浏览器端 / 受管云环境）仅支持人工粘贴会话导出或上传产物，以 `source_coverage='file_only'` 纳管，启动判定永远 `unknown`，只能走 §9.1.1 的隔离 worktree + 人工确认路径。**不做**云端轮询、**不做**反向隧道、**不做**分布式调度。
 
 ---

@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { ControlError } from "../control/store";
 import { checkPr } from "../orchestrator/pr";
 import {
@@ -11,7 +11,7 @@ import {
 } from "../orchestrator/worktree";
 import { submitBranch } from "../orchestrator/submit";
 import { manifestDigest, type ManifestInput } from "./manifest";
-import type { SourceFs } from "./source";
+import { writeSourceFile, type SourceFs } from "./source";
 
 export type SubmitTarget =
  | { target_kind: "github_pr"; target: string }
@@ -89,7 +89,10 @@ export async function submitAcceptance(
  },
 ): Promise<Result> {
  const now = opts.now ?? Date.now(),
-  executor = opts.executor ?? defaultCommandExecutor;
+  executor = opts.executor ?? (fs.host.kind==="ssh" ? async (command:string,args:string[],options?:{cwd?:string}) => {
+   const result=await fs.exec(options?.cwd??"/",[command,...args],30_000);
+   return {ok:result.code===0,stdout:result.stdout,stderr:result.stderr};
+  } : defaultCommandExecutor);
  db.exec("BEGIN IMMEDIATE");
  let snapshot: Snapshot;
  try {
@@ -161,10 +164,7 @@ export async function submitAcceptance(
     ],
    });
   if (entry.snapshot_state === "stored" && entry.snapshot_path) {
-   const stored = await fs.readFile(
-    entry.snapshot_path,
-    Number.MAX_SAFE_INTEGER,
-   );
+   const stored = await readFile(entry.snapshot_path).then(bytes=>({sha256:createHash("sha256").update(bytes).digest("hex")})).catch(()=>null);
    if (!stored || stored.sha256 !== entry.content_sha256)
     drift({
      expected: snapshot.manifest_id,
@@ -281,15 +281,22 @@ export async function submitAcceptance(
    snapshot.work_id,
   ),
   bodyFile = join(artifactsDir, "pr-body.md");
+ let targetBodyFile=bodyFile;
  await mkdir(artifactsDir, { recursive: true, mode: 0o700 });
  await writeFile(bodyFile, snapshot.evidence, { mode: 0o600 });
+ if(fs.host.kind==="ssh"){
+  const gitDir=await fs.exec(snapshot.repo_root,["git","rev-parse","--absolute-git-dir"],5000);
+  if(gitDir.code!==0)conflict("source_unavailable");
+  targetBodyFile=join(gitDir.stdout.trim(),"overload",`${submissionId}-pr-body.md`);
+  await writeSourceFile(fs,targetBodyFile,new TextEncoder().encode(snapshot.evidence));
+ }
  insertSubmission(db, submissionId, snapshot, target, key, "pending", [], null);
  const submitted = await submitBranch({
   cwd: snapshot.repo_root,
   branch: branchResult.stdout.trim(),
   base_ref: target.target,
   title: opts.title ?? `Submit ${snapshot.work_id}`,
-  bodyFile,
+  bodyFile:targetBodyFile,
   artifactsDir,
   executor,
  });
@@ -397,13 +404,14 @@ async function reconcileUnknown(
 ) {
  const rows = db
   .query(
-   `SELECT e.effect_id,e.kind,e.target,m.git_head FROM mgmt_external_effects e LEFT JOIN mgmt_submissions s ON s.submission_id=e.evidence_ref LEFT JOIN mgmt_manifests m ON m.manifest_id=s.manifest_id WHERE e.work_id=? AND e.state='unknown'`,
+   `SELECT e.effect_id,e.kind,e.target,m.git_head,m.repo_root FROM mgmt_external_effects e LEFT JOIN mgmt_submissions s ON s.submission_id=e.evidence_ref LEFT JOIN mgmt_manifests m ON m.manifest_id=s.manifest_id WHERE e.work_id=? AND e.state='unknown'`,
   )
   .all(workId) as Array<{
   effect_id: string;
   kind: string;
   target: string;
   git_head: string | null;
+  repo_root: string | null;
  }>;
  for (const row of rows) {
   let state = "unknown";
@@ -413,7 +421,7 @@ async function reconcileUnknown(
     "--heads",
     "origin",
     row.target,
-   ]);
+   ], {cwd:row.repo_root??undefined});
    if (r.ok)
     state =
      r.stdout.trim().split(/\s+/)[0] === row.git_head
@@ -429,7 +437,7 @@ async function reconcileUnknown(
     "url",
     "--limit",
     "1",
-   ]);
+   ], {cwd:row.repo_root??undefined});
    if (r.ok) state = json(r.stdout)[0]?.url ? "confirmed" : "observed";
   }
   db

@@ -1,7 +1,7 @@
-import { readFile as fsReadFile, readdir, stat } from "node:fs/promises";
+import { mkdir, readFile as fsReadFile, readdir, stat, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 
 export type SourceHost = { host: string; kind: "local" } | { host: string; kind: "ssh"; remote: string; ssh_cmd?: string };
@@ -110,14 +110,14 @@ export function sshSourceFs(host: SourceHost & { kind: "ssh" }): SourceFs {
     async listFiles(dir, opts) {
       if (!Number.isFinite(opts.sinceMs) || typeof opts.suffix !== "string") throw new TypeError("invalid list options");
       let kind: "bsd" | "gnu";
-      try { kind = await flavor(); } catch (error) { if (remoteUnavailable(String(error))) return []; throw error; }
+      kind = await flavor();
       const ref = `${"${TMPDIR:-/tmp}"}/overload-source-$$-${Math.random().toString(36).slice(2)}`;
       const find = `find ${shellQuote(dir)} -type f -name ${shellQuote(`*${opts.suffix}`)}`;
       const stat = await statFormat(kind, "list");
       const filtered = `ref=${ref}; if TZ=UTC touch -t ${shellQuote(touchTime(opts.sinceMs))} "$ref"; then ${find} -newer "$ref" -print0; rm -f "$ref"; else ${find} -print0; fi`;
       const statArgs = shellQuote(`test "$#" -eq 0 || ${stat} -- "$@"`);
       const result = await remote(`${filtered} | xargs -0 sh -c ${statArgs} sh`);
-      if (result.code !== 0) { if (remoteUnavailable(result.stderr)) return []; throw new Error(`remote find failed: ${result.stderr.trim()}`); }
+      if (result.code !== 0) { if (result.code !== 255 && remoteUnavailable(result.stderr)) return []; throw new Error(`remote find failed: ${result.stderr.trim()}`); }
       return result.stdout.split("\n").filter(Boolean).map((line) => {
         const match = /^(\d+) (\d+) (.*)$/.exec(line);
         if (!match) throw new Error(`invalid remote stat output: ${line}`);
@@ -149,4 +149,12 @@ export function sshSourceFs(host: SourceHost & { kind: "ssh" }): SourceFs {
       return remote(command, timeoutMs);
     },
   };
+}
+
+export async function writeSourceFile(source:SourceFs,path:string,bytes:Uint8Array):Promise<void>{
+  if(source.host.kind==="local"){await mkdir(dirname(path),{recursive:true});await writeFile(path,bytes);return;}
+  const parent=dirname(path),encoded=Buffer.from(bytes).toString("base64"),decode=(await source.exec("/",["uname","-s"],5_000)).stdout.trim()==="Darwin"?"-D":"-d";
+  let result=await source.exec("/",["mkdir","-p",parent],10_000);if(result.code!==0)throw new Error(`source mkdir failed: ${result.stderr.trim()}`);
+  result=await source.exec("/",["sh","-c",`: > "$1"`,"sh",path],10_000);if(result.code!==0)throw new Error(`source write failed: ${result.stderr.trim()}`);
+  for(let offset=0;offset<encoded.length;offset+=48_000){const chunk=encoded.slice(offset,offset+48_000);result=await source.exec("/",["sh","-c",`printf %s "$1" | base64 ${decode} >> "$2"`,"sh",chunk,path],10_000);if(result.code!==0)throw new Error(`source write failed: ${result.stderr.trim()}`);}
 }

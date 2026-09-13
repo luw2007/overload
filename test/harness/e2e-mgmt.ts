@@ -211,7 +211,7 @@ async function main() {
    join(home, ".pi/agent/sessions"),
    "-p",
    scenario === "accept-and-submit"
-    ? "Create exactly two files a.txt and b.txt, each containing its own filename. Commit both files to git, then stop."
+    ? "Use the write tool (not bash) to create exactly two files a.txt and b.txt, each containing its own filename. Then use bash only to commit both files to git, then stop."
     : "Create exactly two files a.txt and b.txt, each containing its own filename, then stop.",
   ],
   env,
@@ -413,7 +413,7 @@ async function main() {
     join(home, ".pi/agent/sessions"),
     "--continue",
     "-p",
-    "Change only a.txt to contain changed-a, commit it to git, then stop.",
+    "Use the write or edit tool (not bash) to change only a.txt to contain changed-a. Then use bash only to commit it to git, then stop.",
    ],
    env,
    repo,
