@@ -12,6 +12,7 @@ import { DecisionBotService } from "../decision-bot/service";
 import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
+import { mgmtRoute } from "./mgmt-routes";
 import { actOnAttention, ControlError, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract, promoteWork } from "../control/store";
 import { previewContractRevision } from "../control/store";
 import type { Contract } from "../control/types";
@@ -147,6 +148,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         }
         const originError = checkOrigin(request, port === 0 ? server.port : port);
         if (originError) return originError;
+        const management = await mgmtRoute(request, url, { controlPath, ledgerPath, overloadHome: homedir() });
+        if (management) return management;
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
           const control = openControl(controlPath);
@@ -331,7 +334,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
 }
 
 function dashboardRoute(path: string): boolean {
-  return /^\/(conversations|decide|ledger|works|candidates|rules|agents|now|inbox|done|sessions|health|q1|q2|archive|hung|zombie)(?:\/.*)?$/.test(path);
+  return /^\/(conversations|decide|ledger|works|tasks|candidates|rules|agents|now|inbox|done|sessions|health|q1|q2|archive|hung|zombie)(?:\/.*)?$/.test(path);
 }
 
 if (import.meta.main) {

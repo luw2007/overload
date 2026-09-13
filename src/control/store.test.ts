@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { actOnAttention, previewContractRevision, promoteWork, ControlError, createWork, ensureControlSchema, getAttention, getWork, recordStopCondition, resolveAttentionDecision, reviseContract, upsertAttention } from "./store";
+import { CONTROL_SCHEMA_VERSION, actOnAttention, previewContractRevision, promoteWork, ControlError, createWork, ensureControlSchema, getAttention, getWork, recordStopCondition, resolveAttentionDecision, reviseContract, upsertAttention } from "./store";
 import type { Contract } from "./types";
 
 const contract: Contract = { objective:"ship",acceptance:[{id:"human",kind:"human",description:"owner accepts"}],non_goals:[],scope:{allowed_effects:["write"]},budget:{retry_limit:1},stop_conditions:[{id:"risk",kind:"hard",description:"unexpected destructive effect"}],decision_owner:"owner" };
@@ -15,7 +15,7 @@ describe("control store CAS and attention semantics",()=>{
     expect((db.query("SELECT COUNT(*) n FROM control_outbox").get() as {n:number}).n).toBe(4);db.close();
   });
   test("schema version refuses newer databases and initialization records version",()=>{
-    const db=fixture();expect(db.query("SELECT version FROM control_schema_meta WHERE id=1").get()).toEqual({version:1});db.query("UPDATE control_schema_meta SET version=99 WHERE id=1").run();expect(()=>ensureControlSchema(db)).toThrow(ControlError);db.close();
+    const db=fixture();expect(db.query("SELECT version FROM control_schema_meta WHERE id=1").get()).toEqual({version:CONTROL_SCHEMA_VERSION});db.query("UPDATE control_schema_meta SET version=99 WHERE id=1").run();expect(()=>ensureControlSchema(db)).toThrow(ControlError);db.close();
   });
   test("malformed contract does not default missing scope, acceptance, or hard cost",()=>{
     const db=fixture();for(const malformed of [{...contract,acceptance:[]},{...contract,scope:{}},{...contract,budget:{cost_mode:"hard"}}])expect(()=>createWork(db,{title:"x",source:"test",contract:malformed as Contract})).toThrow(ControlError);db.close();

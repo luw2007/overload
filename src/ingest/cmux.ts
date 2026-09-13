@@ -3,6 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { reduceJournal } from "./reducer";
+import { scrubText } from "../shared/redact";
 
 type Generation = {
   generation_uuid: string;
@@ -179,11 +180,7 @@ function summaryFor(kind: string, body: Record<string, unknown>, row: Record<str
   return truncateUtf8(redact(candidate), 500);
 }
 
-function redact(value: string): string {
-  return value
-    .replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs])-?[A-Za-z0-9_-]{12,}\b/gi, "[REDACTED]")
-    .replace(/\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]");
-}
+const redact = (value: string): string => scrubText(value)
 
 function truncateUtf8(value: string, limit: number): string {
   const bytes = Buffer.from(value);

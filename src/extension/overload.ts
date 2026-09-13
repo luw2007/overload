@@ -6,6 +6,7 @@
 import { constants, readFileSync, statSync } from "node:fs"
 import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
+import { scrubText } from "../shared/redact"
 import { join } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { execFile, execFileSync } from "node:child_process"
@@ -86,11 +87,7 @@ function textFrom(value: unknown): string {
     .join("")
 }
 
-function scrub(text: string): string {
-  return text
-    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{12,}\b/gi, "[REDACTED]")
-    .replace(/\b(authorization|api[_-]?key|token|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
-}
+const scrub = (text: string): string => scrubText(text)
 
 function truncateUtf8(value: unknown, limit = 500): string {
   const source = scrub(typeof value === "string" ? value : String(value ?? ""))

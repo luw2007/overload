@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { enqueueControlEvent, ensureOutbox } from "./outbox";
+import { ensureMgmtSchema } from "../manage/schema";
 import type { AffectedAttentionCard, AttentionCardSnapshot, AttentionDecisionInput, AttentionItem, Contract, ContractRevisionPreview, Work } from "./types";
 
 export { type AffectedAttentionCard, type AttentionCardSnapshot, type AttentionDecisionInput, type AttentionItem, type Contract, type ContractRevisionPreview, type Work } from "./types";
@@ -14,7 +15,7 @@ export class ControlError extends Error {
   constructor(public readonly code: "not_found" | "conflict" | "invalid" | "blocked", message: string) { super(message); this.name = "ControlError"; }
 }
 
-export const CONTROL_SCHEMA_VERSION = 1;
+export const CONTROL_SCHEMA_VERSION = 2;
 const CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS control_schema_meta(
   id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, migrated_at INTEGER NOT NULL
@@ -69,7 +70,10 @@ function backupForDestructiveMigration(db:Database,from:number,to:number):string
   const backup=`${path}.control-v${from}-to-v${to}-${Date.now()}.bak`;db.query("VACUUM INTO ?").run(backup);chmodSync(backup,0o600);return backup;
 }
 type ControlMigration={to:number;destructive:boolean;apply(db:Database):void};
-const CONTROL_MIGRATIONS:ControlMigration[]=[{to:1,destructive:false,apply(db){db.exec(CONTROL_SCHEMA);ensureOutbox(db);db.query("INSERT INTO control_schema_meta(id,version,migrated_at) VALUES (1,?,?)").run(1,Date.now());}}];
+const CONTROL_MIGRATIONS:ControlMigration[]=[
+  {to:1,destructive:false,apply(db){db.exec(CONTROL_SCHEMA);ensureOutbox(db);db.query("INSERT INTO control_schema_meta(id,version,migrated_at) VALUES (1,?,?)").run(1,Date.now());}},
+  {to:2,destructive:false,apply(db){ensureMgmtSchema(db);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(2,Date.now());}},
+];
 export function ensureControlSchema(db: Database): void {
   const version=controlSchemaVersion(db);
   if(version>CONTROL_SCHEMA_VERSION)throw new ControlError("blocked",`control schema version ${version} is newer than supported ${CONTROL_SCHEMA_VERSION}`);
@@ -83,7 +87,7 @@ export function ensureControlSchema(db: Database): void {
 export function openControl(path = process.env.OVERLOAD_ANSWERS_PATH ?? join(homedir(), ".overload", "orchestrator-answers.db")): Database {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const db = new Database(path, { create: true });
-  db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL");
+  db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON");
   ensureControlSchema(db);
   try { chmodSync(path, 0o600); } catch { db.close(); throw new ControlError("blocked", `cannot secure control database: ${path}`); }
   return db;
