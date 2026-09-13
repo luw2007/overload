@@ -2,18 +2,61 @@ import { Database } from "bun:sqlite";
 import { ControlError, openControl } from "../control/store";
 import { loadManageConfig, scanOnce, listWorks, showWork, setTracking } from "../manage/manage";
 import { checkHandoffPreconditions, createHandoff, launchHandoff, abandonHandoff, buildHandoffPacket } from "../manage/handoff";
-import type { SourceHost } from "../manage/source";
+import {
+  computeManifest,
+  insertManifest,
+  listManifests,
+  requestAcceptance,
+  recordAcceptance,
+  type Verification,
+} from "../manage/manifest";
+import { pollSubmissions, submitAcceptance } from "../manage/submit";
+import {
+  localSourceFs,
+  sshSourceFs,
+  type SourceFs,
+  type SourceHost,
+} from "../manage/source";
 
 const json = (value: unknown, init?: ResponseInit) => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" }, ...init });
 const body = async (r: Request) => { const x = await r.json(); if (!x || typeof x !== "object" || Array.isArray(x)) throw new ControlError("invalid", "JSON object required"); return x as Record<string, unknown>; };
 const idOf = (s: string) => decodeURIComponent(s);
+function sourceFor(
+  control: Database,
+  ledgerPath: string,
+  workId: string,
+): SourceFs {
+  const execution = control
+    .query(
+      "SELECT stable_id FROM mgmt_executions WHERE work_id=? ORDER BY started_at DESC LIMIT 1",
+    )
+    .get(workId) as { stable_id: string } | null;
+  if (!execution) return localSourceFs();
+  const ledger = new Database(ledgerPath, { readonly: true });
+  try {
+    const row = ledger
+      .query("SELECT host FROM sessions WHERE stable_id=?")
+      .get(execution.stable_id) as { host: string } | null;
+    return row?.host && row.host !== "local"
+      ? sshSourceFs({ host: row.host, kind: "ssh", remote: row.host })
+      : localSourceFs(row?.host);
+  } finally {
+    ledger.close();
+  }
+}
 
 export type MgmtRouteOptions = { controlPath: string; ledgerPath: string; overloadHome?: string };
 export async function mgmtRoute(request: Request, url: URL, options: MgmtRouteOptions): Promise<Response | null> {
   if (!url.pathname.startsWith("/api/mgmt/")) return null;
   const path = url.pathname;
   const m = path.match(/^\/api\/mgmt\/works\/([^/]+)(?:\/(track|handoff\/preconditions|handoffs))?$/);
-  const handoff = path.match(/^\/api\/mgmt\/handoffs\/([^/]+)\/(launch|abandon|packet)$/);
+  const handoff = path.match(/^\/api\/mgmt\/handoffs\/([^/]+)\/(launch|abandon|packet)$/,
+  );
+  const manifests = path.match(/^\/api\/mgmt\/works\/([^/]+)\/manifests$/);
+  const acceptance = path.match(
+    /^\/api\/mgmt\/manifests\/([^/]+)\/acceptance$/,
+  );
+  const submit = path.match(/^\/api\/mgmt\/acceptances\/([^/]+)\/submit$/);
   const control = openControl(options.controlPath);
   try {
     if (request.method === "GET" && path === "/api/mgmt/works") {
@@ -21,6 +64,86 @@ export async function mgmtRoute(request: Request, url: URL, options: MgmtRouteOp
       if (!["tracking", "paused", "archived"].includes(track)) return json({ error: "invalid track" }, { status: 400 });
       return json(listWorks(control, { track: track as "tracking"|"paused"|"archived" }));
     }
+    if (manifests && request.method === "GET") {
+      const workId = idOf(manifests[1]!);
+      if (!showWork(control, workId))
+        return json({ error: "not found" }, { status: 404 });
+      return json(listManifests(control, workId));
+    }
+    if (manifests && request.method === "POST") {
+      const workId = idOf(manifests[1]!),
+        x = await body(request),
+        work = showWork(control, workId);
+      if (!work) return json({ error: "not found" }, { status: 404 });
+      const verification = (x.verification ?? []) as Verification[];
+      if (!Array.isArray(verification))
+        throw new ControlError("invalid", "verification must be an array");
+      const fs = sourceFor(control, options.ledgerPath, workId),
+        input = await computeManifest(control, fs, workId, { verification }),
+        inserted = insertManifest(
+          control,
+          input,
+          String(work.decision_owner),
+          Date.now(),
+        ),
+        requested = requestAcceptance(
+          control,
+          inserted.manifest_id,
+          Date.now(),
+        );
+      return json({ ...inserted, ...requested });
+    }
+    if (acceptance && request.method === "POST") {
+      const manifestId = idOf(acceptance[1]!),
+        x = await body(request);
+      if (x.verdict !== "accepted" && x.verdict !== "rejected")
+        throw new ControlError("invalid", "invalid verdict");
+      const owner = control
+        .query(
+          "SELECT p.decision_owner FROM mgmt_manifests m JOIN mgmt_work_profile p USING(work_id) WHERE m.manifest_id=?",
+        )
+        .get(manifestId) as { decision_owner: string } | null;
+      if (!owner) throw new ControlError("not_found", "manifest not found");
+      return json(
+        recordAcceptance(
+          control,
+          manifestId,
+          x.verdict,
+          owner.decision_owner,
+          (x.evidence ?? {}) as Record<string, unknown>,
+          Date.now(),
+        ),
+      );
+    }
+    if (submit && request.method === "POST") {
+      const acceptanceId = idOf(submit[1]!),
+        x = await body(request),
+        row = control
+          .query("SELECT work_id FROM mgmt_acceptances WHERE acceptance_id=?")
+          .get(acceptanceId) as { work_id: string } | null;
+      if (!row) throw new ControlError("not_found", "acceptance not found");
+      const fs = sourceFor(control, options.ledgerPath, row.work_id),
+        result = await submitAcceptance(
+          control,
+          fs,
+          acceptanceId,
+          {
+            target_kind: String(x.target_kind || ""),
+            target: String(x.target || ""),
+          },
+          {
+            recompute: (db, source, workId) =>
+              computeManifest(db, source, workId, { verification: [] }),
+          },
+        );
+      return json({
+        submission_id: result.submission_id,
+        state: result.state,
+        external_ref: result.external_ref,
+      });
+    }
+    if (request.method === "POST" && path === "/api/mgmt/submissions/poll")
+      return json(await pollSubmissions(control, {}));
     if (m && request.method === "GET" && !m[2]) { const result = showWork(control, idOf(m[1]!)); return result ? json(result) : json({ error: "not found" }, { status: 404 }); }
     if (m && m[2] === "track" && request.method === "POST") { const x = await body(request); setTracking(control, idOf(m[1]!), x.on === true); return json({ ok: true }); }
     if (m && m[2] === "handoff/preconditions" && request.method === "GET") return json(checkHandoffPreconditions(control, null, idOf(m[1]!)));
@@ -41,7 +164,11 @@ export async function mgmtRoute(request: Request, url: URL, options: MgmtRouteOp
     if (request.method === "POST" && path === "/api/mgmt/scan") { const cfg = loadManageConfig(options.overloadHome); const result = await scanOnce(control, null, cfg); return json(result); }
     return json({ error: "not found" }, { status: 404 });
   } catch (error) {
-    if (error instanceof ControlError) { const cause = (error as any).cause || error.message; const status = error.code === "conflict" ? 409 : error.code === "invalid" ? 400 : error.code === "not_found" ? 404 : 500; return json({ error: cause, allowed: (error as any).allowed, evidence: (error as any).evidence }, { status }); }
+    if (error instanceof ControlError) { const cause = (error as any).cause || error.message; const status = error.code === "conflict" ? 409 : error.code === "invalid" ? 400 : error.code === "not_found" ? 404 : 500; return json({ error: cause,
+          ...((error as any).data && typeof (error as any).data === "object"
+            ? (error as any).data
+            : {}),
+          allowed: (error as any).allowed, evidence: (error as any).evidence }, { status }); }
     return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
   } finally { control.close(); }
 }

@@ -13,6 +13,7 @@ import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, quer
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
 import { mgmtRoute } from "./mgmt-routes";
+import { recordAcceptance } from "../manage/manifest";
 import { actOnAttention, ControlError, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract, promoteWork } from "../control/store";
 import { previewContractRevision } from "../control/store";
 import type { Contract } from "../control/types";
@@ -227,7 +228,32 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
             const revision = expectedRevision(input.expected_revision);
             if(action==="resolve"&&input.selected_option==="narrow"&&(!Number.isSafeInteger(input.expected_contract_revision)||!Array.isArray(input.affected_cards)))throw new ControlError("invalid","Review the contract and affected cards before applying narrow.");
             if (action === "feedback") { recordAttentionFeedback(control, itemId, revision, input.useful === true, typeof input.reason === "string" ? input.reason : undefined); return json(getAttention(control, itemId)); }
-            return json(actOnAttention(control, itemId, revision, action as "ack" | "defer" | "resolve", { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined, selected_option: typeof input.selected_option === "string" ? input.selected_option : undefined, replacement_contract: input.replacement_contract as Contract | undefined, expected_contract_revision: input.expected_contract_revision as number | undefined, affected_cards: input.affected_cards as Array<{item_id:string;revision:number}> | undefined }));
+            const attention = getAttention(control, itemId);
+            if (itemId.startsWith("mgmt:accept:") && action === "resolve") {
+              if (input.selected_option === "defer") return json(attention);
+              if (
+                input.selected_option !== "accept" &&
+                input.selected_option !== "reject"
+              )
+                throw new ControlError(
+                  "invalid",
+                  "invalid acceptance decision",
+                );
+              const manifestId = itemId.slice(itemId.lastIndexOf(":") + 1);
+              return json(
+                recordAcceptance(
+                  control,
+                  manifestId,
+                  input.selected_option === "accept" ? "accepted" : "rejected",
+                  attention?.owner || "operator",
+                  typeof input.reason === "string"
+                    ? { reason: input.reason }
+                    : {},
+                  Date.now(),
+                ),
+              );
+            }
+return json(actOnAttention(control, itemId, revision, action as "ack" | "defer" | "resolve", { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined, selected_option: typeof input.selected_option === "string" ? input.selected_option : undefined, replacement_contract: input.replacement_contract as Contract | undefined, expected_contract_revision: input.expected_contract_revision as number | undefined, affected_cards: input.affected_cards as Array<{item_id:string;revision:number}> | undefined }));
           } catch (error) { return controlError(error); } finally { control.close(); }
         }
         if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive) }))));

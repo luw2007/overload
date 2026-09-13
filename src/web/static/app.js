@@ -4,7 +4,34 @@
   const e = escapeHtml;
   const pages = ['decide','conversations','ledger','works','tasks','candidates','rules','agents'];
   const LEGACY_ZONE = {now:'decide',inbox:'decide',done:'decide',q1:'agents',hung:'agents',q2:'agents',zombie:'agents',archive:'agents',sessions:'agents',health:'agents'};
-  const state = {page:'decide',mgmtWorks:[],mgmtHtml:'',attention:{now:[],inbox:[],done:[]},rules:null,ledger:null,works:[],selected:new Set(),session:null,detail:null,q1:[],q2:[],archive:[],hung:[],zombie:{groups:[],orphaned_requests:[]},sessions:[],health:null,range:'week',conversationId:null,conversations:[],conversationDraft:'',conversationDrafts:{},conversationPosting:false,conversationPending:null};
+  const state = {
+    page: "decide",
+    mgmtWorks: [],
+    mgmtHtml: "",
+    taskManifests: [],
+    taskDrift: null,
+    attention: { now: [], inbox: [], done: [] },
+    rules: null,
+    ledger: null,
+    works: [],
+    selected: new Set(),
+    session: null,
+    detail: null,
+    q1: [],
+    q2: [],
+    archive: [],
+    hung: [],
+    zombie: { groups: [], orphaned_requests: [] },
+    sessions: [],
+    health: null,
+    range: "week",
+    conversationId: null,
+    conversations: [],
+    conversationDraft: "",
+    conversationDrafts: {},
+    conversationPosting: false,
+    conversationPending: null,
+  };
   let generation = 0;
   const formatTime = value => value == null ? '—' : new Date(value).toLocaleString();
   const humanDuration = ms => ms == null ? '—' : ms < 60000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`;
@@ -37,9 +64,92 @@
   function renderDecide() {const items=[...state.attention.now,...state.attention.inbox],automatic=state.attention.done.filter(x=>x.decision_mode==='scoped_auto'&&x.state==='resolved'&&x.updated_at>=Date.now()-86400000);return `<h1>Decide</h1><div class="summary">${decideTopLine(items,automatic.length)}</div>${items.length||receipts.size?`<div class="section-heading"><h2>Owed to the system</h2><small>Now · ${items.length} decisions · expand for evidence</small></div><div class="list">${items.map(x=>receipts.get(x.item_id)||decisionRow(x)).join('')}${[...receipts].filter(([id])=>!items.some(x=>x.item_id===id)).map(([,html])=>html).join('')}</div>`:empty(`Nothing owed. Agents self-resolved ${automatic.length} decisions today.`)}<div class="section-heading"><h2>Within contract</h2><small>Automatic · no decision required</small></div><div class="list auto">${dot('blue')}<span><strong class="mono">${automatic.length}</strong> handled without you</span><button class="text-button" data-done="automatic">Inspect Done ↗</button></div><div class="section-heading"><h2>Done <span class="muted mono">${state.attention.done.length}</span></h2><button data-done="all">Show receipts</button></div>`;}
   function taskBadge(v, fallback='—') { return `<span class="badge">${e(v||fallback)}</span>`; }
   function taskTable(headers, rows) { return `<div class="table-wrap"><table><thead><tr>${headers.map(h=>`<th>${e(h)}</th>`).join('')}</tr></thead><tbody>${rows||`<tr><td colspan="${headers.length}">暂无</td></tr>`}</tbody></table></div>`; }
-  function acceptanceBadge(value) { return taskBadge(({draft:'草稿',pending:'待验收',accepted:'已接受',invalidated:'已失效'})[value]||'草稿'); }
+  function acceptanceBadge(value) {
+    return taskBadge(
+      {
+        draft: "草稿",
+        pending: "待验收",
+        accepted: "已接受",
+        rejected: "已拒绝",
+        invalidated: "已失效",
+      }[value] || "草稿",
+    );
+  }
+  function submissionBadge(submission) {
+    const state = submission?.state || submission,
+      label =
+        {
+          pending: "未提交",
+          pushed: "已推送",
+          pr_created: "PR 已创建",
+          merged: "已合并",
+          failed: "提交失败",
+          unsupported: "需要人工发布",
+        }[state] || "未提交";
+    if (state === "pr_created" && submission?.external_ref) {
+      const match = submission.external_ref.match(/\/pull\/(\d+)(?:\/)?$/);
+      return `<a class="badge" href="${e(submission.external_ref)}" target="_blank" rel="noopener noreferrer">${e(match ? `PR #${match[1]}` : label)}</a>`;
+    }
+    return taskBadge(label);
+  }
+  function manifestAcceptance(manifest) {
+    return manifest?.acceptance
+      ? manifest.acceptance.invalidated_at
+        ? "invalidated"
+        : manifest.acceptance.verdict
+      : "draft";
+  }
+  function manifestSection(d) {
+    const rows = state.taskManifests || [],
+      accepted = rows.find(
+        (x) =>
+          x.acceptance?.verdict === "accepted" &&
+          !x.acceptance.invalidated_at &&
+          (!x.submission || x.submission.state === "failed"),
+      ),
+      acceptedAny = rows.find(
+        (x) =>
+          x.acceptance?.verdict === "accepted" && !x.acceptance.invalidated_at,
+      ),
+      submitTitle = accepted
+        ? "提交已接受的清单"
+        : acceptedAny
+          ? "该清单已有进行中或完成的提交"
+          : "须先有未失效且已接受的清单",
+      base =
+        d.executions
+          ?.map((x) => {
+            try {
+              return JSON.parse(x.ledger_evidence || "{}").base_ref;
+            } catch {
+              return null;
+            }
+          })
+          .find(Boolean) || "main";
+    return `<section class="card"><h2>交付物清单</h2>${taskTable(["built_at", "entries", "验收", "提交", "manifest_id"], rows.map((x) => `<tr><td>${e(formatTime(x.built_at))}</td><td>${e(x.entries)}</td><td>${acceptanceBadge(manifestAcceptance(x))}</td><td>${submissionBadge(x.submission)}</td><td><code>${e(String(x.manifest_id).slice(0, 8))}</code></td></tr>`).join(""))}<div class="task-manifest-actions"><label>验证证据 JSON<textarea id="manifest-verification" placeholder='[{"kind":"test","at":0}]'></textarea></label><button data-action="task-manifest">生成清单并请求验收</button><label>Base ref <input id="submission-target" value="${e(base)}"></label><button data-action="task-submit"${accepted ? ` data-id="${e(accepted.acceptance.acceptance_id)}"` : " disabled"} title="${e(submitTitle)}">提交为 PR</button><button data-action="task-poll">刷新提交状态</button></div>${state.taskDrift ? `<div class="error"><b>manifest_drift</b>${json(state.taskDrift)}</div>` : ""}</section>`;
+  }
   function taskList() { const track=state.taskTrack||'tracking', works=state.mgmtWorks||[]; return `<h1>Tasks</h1><p class="summary">治理工作项</p><div class="tabs">${['tracking','paused','archived'].map(t=>`<a href="/tasks?track=${t}" class="${track===t?'active':''}" data-task-track="${t}">${t==='tracking'?'跟踪中':t==='paused'?'已暂停':'已归档'}</a>`).join('')} <button data-action="task-scan">扫描</button></div>${track==='archived'?'<p class="meta">未作为正式 Work 完成（可升级后走验收）</p>':''}<div class="list">${works.length?works.map(w=>`<a class="card drill" href="/tasks/${encodeURIComponent(w.work_id)}" data-task-id="${e(w.work_id)}"><h2>${e(w.discovered_title||w.title||w.work_id)}</h2>${taskBadge(w.origin_mode==='discovered'?'未契约治理':null,'未契约治理')}${taskBadge(w.track_state==='archived'?'已归档':w.track_state,'tracking')}${taskBadge(w.coverage,'coverage 未知')}<p class="meta">${w.track_state==='archived'?'未作为正式 Work 完成（可升级后走验收）':`${e(w.state||'')} · ${e(w.executions||0)} executions · ${e(formatTime(w.updated_at))}`}</p></a>`).join(''):empty('暂无工作项')}</div>`; }
-  function taskDetail(d) { const input=(d.inputs||[]).find(x=>x.input_id===d.input_head)||(d.inputs||[])[0]||{}; const host=(d.executions||[])[0]?.host||'local'; const artifacts=d.artifacts||[], versions=new Map(artifacts.map(a=>[a.artifact_id,artifacts.filter(x=>x.artifact_id===a.artifact_id).length])), exec=d.executions||[], att=(d.attention||[]).filter(x=>x.state==='open'||x.status==='open'), hs=d.handoffs||[]; return `<p><a href="/tasks">← Tasks</a></p><h1>${e(d.discovered_title||d.title||d.work_id)}</h1><p>${e(d.state||'')} ${taskBadge(d.track_state==='archived'?'已归档':d.track_state)} ${taskBadge(d.origin_mode==='discovered'?'未契约治理':null,'未契约治理')}</p>${d.track_state==='archived'?'<p class="meta">未作为正式 Work 完成（可升级后走验收）</p>':''}<section class="card"><h2>一句话结论</h2><p>${e(d.summary||d.conclusion||d.title||'待治理工作项')}</p><h3>当前输入头版本摘录</h3><p>${e(String(input.content||input.text||input.body||'').slice(0,200))}</p></section><section class="card"><h2>产物列表</h2>${taskTable(['path','version','版本数','验收','提交','共享'],artifacts.map(a=>`<tr><td>${e(a.display_path||a.path)}</td><td><code>${e(String(a.content_sha256||a.version_id||'').slice(0,8))}</code></td><td>${e(a.version_count||a.versions||versions.get(a.artifact_id)||1)}</td><td>${acceptanceBadge(a.acceptance_state)}</td><td>${taskBadge(a.submission_state,'未提交')}</td><td>${taskBadge(a.shareable===1?'可分享':null,'不可分享')}</td></tr>`).join(''))}</section><section class="card"><h2>执行列表</h2>${taskTable(['agent','host','exec_state','coverage','started'],exec.map(x=>`<tr><td>${e(x.agent)}</td><td>${e(x.host)}</td><td>${e(x.exec_state||x.state)}</td><td>${e(x.source_coverage||x.coverage)}</td><td>${e(formatTime(x.started_at||x.started))}${x.stable_id?`<br><a href="/ledger?session=${encodeURIComponent(x.stable_id)}">返回原现场</a>`:''}</td></tr>`).join(''))}</section><section class="card"><h2>待决策</h2>${att.map(x=>`<p>${e(x.summary||x.title||x.item_id)}</p>`).join('')||empty('暂无待决策')}</section><section class="card"><h2>Agent 接力记录</h2>${taskTable(['id','target','host','state'],hs.map(x=>`<tr><td>${e(x.handoff_id||x.id)}</td><td>${e(x.target_agent)}</td><td>${e(x.target_host)}</td><td>${e(x.state)}</td></tr>`).join(''))}</section><section class="card"><h2>交给另一个 Agent</h2><form id="task-handoff" data-work-id="${e(d.work_id)}"><label>Agent <select name="target_agent"><option>pi</option><option>omp</option><option>claude</option></select></label><label>Host <input name="target_host" value="${e(host)}"></label><label><input type="checkbox" name="isolate"> isolate</label><label id="override-wrap" hidden>理由 <input name="override_reason"></label><button type="button" data-action="task-preconditions">检查前置条件</button><button type="submit" class="primary">生成交接点</button><div id="task-preconditions"></div><div id="task-handoff-error" role="alert"></div></form></section>`; }
+  function taskDetail(d) {
+    const input =
+      (d.inputs || []).find((x) => x.input_id === d.input_head) ||
+      (d.inputs || [])[0] ||
+      {};
+    const host = (d.executions || [])[0]?.host || "local";
+    const artifacts = d.artifacts || [],
+      versions = new Map(
+        artifacts.map((a) => [
+          a.artifact_id,
+          artifacts.filter((x) => x.artifact_id === a.artifact_id).length,
+        ]),
+      ),
+      exec = d.executions || [],
+      att = (d.attention || []).filter(
+        (x) => x.state === "open" || x.status === "open",
+      ),
+      hs = d.handoffs || [];
+    const latestManifest = (state.taskManifests || [])[0];
+    return `<div class="task-detail"><p><a href="/tasks">← Tasks</a></p><h1>${e(d.discovered_title || d.title || d.work_id)}</h1><p>${e(d.state || "")} ${taskBadge(d.track_state === "archived" ? "已归档" : d.track_state)} ${taskBadge(d.origin_mode === "discovered" ? "未契约治理" : null, "未契约治理")}</p>${d.track_state === "archived" ? '<p class="meta">未作为正式 Work 完成（可升级后走验收）</p>' : ""}<section class="card"><h2>一句话结论</h2><p>${e(d.summary || d.conclusion || d.title || "待治理工作项")}</p><h3>当前输入头版本摘录</h3><p>${e(String(input.content || input.text || input.body || "").slice(0, 200))}</p></section><section class="card"><h2>产物列表</h2>${taskTable(["path", "version", "版本数", "验收", "提交", "共享"], artifacts.map((a) => `<tr><td>${e(a.display_path || a.path)}</td><td><code>${e(String(a.content_sha256 || a.version_id || "").slice(0, 8))}</code></td><td>${e(a.version_count || a.versions || versions.get(a.artifact_id) || 1)}</td><td>${acceptanceBadge(a.acceptance_state || manifestAcceptance(latestManifest))}</td><td>${a.submission_state ? submissionBadge(a.submission_state) : submissionBadge(latestManifest?.submission)}</td><td>${taskBadge(a.shareable === 1 ? "可分享" : null, "不可分享")}</td></tr>`).join(""))}</section><section class="card"><h2>执行列表</h2>${taskTable(["agent", "host", "exec_state", "coverage", "started"], exec.map((x) => `<tr><td>${e(x.agent)}</td><td>${e(x.host)}</td><td>${e(x.exec_state || x.state)}</td><td>${e(x.source_coverage || x.coverage)}</td><td>${e(formatTime(x.started_at || x.started))}${x.stable_id ? `<br><a href="/ledger?session=${encodeURIComponent(x.stable_id)}">返回原现场</a>` : ""}</td></tr>`).join(""))}</section><section class="card"><h2>待决策</h2>${att.map((x) => `<p>${e(x.summary || x.title || x.item_id)}</p>`).join("") || empty("暂无待决策")}</section>${manifestSection(d)}<section class="card"><h2>Agent 接力记录</h2>${taskTable(["id", "target", "host", "state"], hs.map((x) => `<tr><td>${e(x.handoff_id || x.id)}</td><td>${e(x.target_agent)}</td><td>${e(x.target_host)}</td><td>${e(x.state)}</td></tr>`).join(""))}</section><section class="card"><h2>交给另一个 Agent</h2><form id="task-handoff" data-work-id="${e(d.work_id)}"><label>Agent <select name="target_agent"><option>pi</option><option>omp</option><option>claude</option></select></label><label>Host <input name="target_host" value="${e(host)}"></label><label><input type="checkbox" name="isolate"> isolate</label><label id="override-wrap" hidden>理由 <input name="override_reason"></label><button type="button" data-action="task-preconditions">检查前置条件</button><button type="submit" class="primary">生成交接点</button><div id="task-preconditions"></div><div id="task-handoff-error" role="alert"></div></form></section></div>`;
+  }
   function renderTasks() { return state.taskDetail ? taskDetail(state.taskDetail) : taskList(); }
   function renderLedger() {const m=state.ledger,pct=m.rework.total?Math.round(m.rework.caused/m.rework.total*100):0;return `<div class="toolbar"><h1>Ledger</h1><select id="period" aria-label="Ledger period"><option value="week" ${state.range==='week'?'selected':''}>This week</option><option value="day" ${state.range==='day'?'selected':''}>Today</option></select><button data-action="export">Export CSV</button></div><p class="summary">${state.range==='week'?'This week':'Today'} you were the bottleneck for ${duration(m.bottleneck.total_ms)} across ${m.bottleneck.work_count} works.${m.coverage<1?` · coverage ${Math.round(m.coverage*100)}%`:''}</p><div class="metrics">${metric('Waiting',duration(m.waiting.total_ms),`median ${duration(m.waiting.median_ms)}`,m.waiting.series)}${metric('Rework you caused',`${m.rework.caused} / ${m.rework.total}`,`${pct}%`,m.rework.series)}${metric('Redirects',`${m.redirects.count} (${m.redirects.unplanned} unplanned)`,`lost ${duration(m.redirects.lost_ms)}`,m.redirects.series)}${metric('Sunk to rules',`${m.rules.hits} ${m.rules.delta>=0?'↑':'↓'}${Math.abs(m.rules.delta)}`,`${m.rules.share.toFixed(0)}% of decisions`,m.rules.series)}${metric('Death delay',duration(m.death.median_ms),`oldest: &quot;${e(m.death.oldest?.title??'—')}&quot;`,m.death.series)}</div><h2>Slowest decisions</h2><p class="muted">Waiting = asked → decided, or now while still owed. Raw rows behind the median.</p><table><thead><tr><th>Work</th><th>Asked</th><th>Decided</th><th>Waited</th><th>Chose</th><th>Effect</th></tr></thead><tbody>${m.slowest.map(r=>`<tr><td>${e(r.title)}</td><td class="mono">${stamp(r.asked_at)}</td><td class="mono">${stamp(r.decided_at)}</td><td class="mono">${duration(r.waited_ms)}</td><td>${e(r.chose??'—')}</td><td>${e(r.effect_state??'—')}</td></tr>`).join('')}</tbody></table>`;}
   function contractFacts(w) {const c=w.contract;return `<div class="facts"><b>Objective</b><span>${e(c?.objective??'—')}</span><b>Acceptance</b><span>${(c?.acceptance||[]).map(x=>e(x.description)).join('<br>')||'—'}</span><b>Scope</b><span class="mono">${e(JSON.stringify(c?.scope??null))}</span><b>Budget</b><span class="mono">${e(JSON.stringify(c?.budget??null))}</span><b>Stop conditions</b><span>${(c?.stop_conditions||[]).map(x=>e(x.description)).join('<br>')||'—'}</span><b>Decision owner</b><span>${e(c?.decision_owner??'—')}</span></div><p class="mono muted">updated ${stamp(w.updated_at)}</p>`;}
@@ -270,7 +380,68 @@
     } catch(error) { state.conversationPending=null;showError(error);render(); }
     finally { state.conversationPosting=false;render(); }
   }
-  async function restoreRoute() { const parts=location.pathname.split('/').filter(Boolean), original=parts[0], query=new URLSearchParams(location.search); state.taskDetail=null; state.taskTrack=query.get('track')||'tracking'; if(original==='tasks'){try{if(parts[1]) state.taskDetail=await fetchJson(`/api/mgmt/works/${encodeURIComponent(decodeURIComponent(parts[1]))}`); else state.mgmtWorks=await fetchJson(`/api/mgmt/works?track=${encodeURIComponent(state.taskTrack)}`);state.mgmtHtml=renderTasks();}catch(error){showError(error);state.mgmtHtml=empty(error.message);}} state.page=LEGACY_ZONE[original]||original||'decide'; if(!pages.includes(state.page))state.page='decide'; state.session=state.page==='agents' && (original==='sessions'||original==='agents') && parts[1]?decodeURIComponent(parts[1]):null; state.conversationId=state.page==='conversations'&&parts[1]?decodeURIComponent(parts[1]):null; state.conversationDraft=state.conversationId?state.conversationDrafts[state.conversationId]||'':''; if(original!=='tasks')history.replaceState(null,'',`/${state.page}${state.page==='conversations'&&state.conversationId?'/'+encodeURIComponent(state.conversationId):state.session?'/'+encodeURIComponent(state.session):''}`); $('main').innerHTML=empty('Loading…'); await refresh(); if(original==='done')showDone(); if(original==='tasks'&&query.get('demo')==='confirm')showHandoffConfirm({handoff_id:'demo',target_agent:'pi',target_host:state.taskDetail?.executions?.[0]?.host||'local',isolate:true},true); }
+  async function restoreRoute() {
+    const parts = location.pathname.split("/").filter(Boolean),
+      original = parts[0],
+      query = new URLSearchParams(location.search);
+    state.taskDetail = null;
+    state.taskTrack = query.get("track") || "tracking";
+    if (original === "tasks") {
+      try {
+        if (parts[1])
+          [state.taskDetail, state.taskManifests] = await Promise.all([
+            fetchJson(
+              `/api/mgmt/works/${encodeURIComponent(decodeURIComponent(parts[1]))}`,
+            ),
+            fetchJson(
+              `/api/mgmt/works/${encodeURIComponent(decodeURIComponent(parts[1]))}/manifests`,
+            ),
+          ]);
+        else
+          state.mgmtWorks = await fetchJson(
+            `/api/mgmt/works?track=${encodeURIComponent(state.taskTrack)}`,
+          );
+        state.mgmtHtml = renderTasks();
+      } catch (error) {
+        showError(error);
+        state.mgmtHtml = empty(error.message);
+      }
+    }
+    state.page = LEGACY_ZONE[original] || original || "decide";
+    if (!pages.includes(state.page)) state.page = "decide";
+    state.session =
+      state.page === "agents" &&
+      (original === "sessions" || original === "agents") &&
+      parts[1]
+        ? decodeURIComponent(parts[1])
+        : null;
+    state.conversationId =
+      state.page === "conversations" && parts[1]
+        ? decodeURIComponent(parts[1])
+        : null;
+    state.conversationDraft = state.conversationId
+      ? state.conversationDrafts[state.conversationId] || ""
+      : "";
+    if (original !== "tasks")
+      history.replaceState(
+        null,
+        "",
+        `/${state.page}${state.page === "conversations" && state.conversationId ? "/" + encodeURIComponent(state.conversationId) : state.session ? "/" + encodeURIComponent(state.session) : ""}`,
+      );
+    $("main").innerHTML = empty("Loading…");
+    await refresh();
+    if (original === "done") showDone();
+    if (original === "tasks" && query.get("demo") === "confirm")
+      showHandoffConfirm(
+        {
+          handoff_id: "demo",
+          target_agent: "pi",
+          target_host: state.taskDetail?.executions?.[0]?.host || "local",
+          isolate: true,
+        },
+        true,
+      );
+  }
   async function navigate(page,session=null) {editor=null;$('drawer').close();$('modal').close();state.selected.clear();history.pushState(null,'',`/${page}${session?'/'+encodeURIComponent(session):''}`);await restoreRoute();}
   function findAttention(id) { return [...state.attention.now,...state.attention.inbox,...state.attention.done].find(x=>x.item_id===id); }
   function showDone() { dialog('drawer','Done',state.attention.done.map(x=>`<article class="receipt"><h3>${e(x.conclusion)}</h3><p>${e(x.state)} · ${e(x.effect_state)}</p>${sourceLink(x.source_link)}${json(x.evidence)}</article>`).join('')||empty('Nothing done yet.')); }
@@ -325,7 +496,16 @@
   function showHandoffConfirm(handoff,demo=false) { const id=handoff.handoff_id||handoff.id; state.pendingHandoff=handoff; dialog('modal','确认启动',`<p><b>Agent</b> ${e(handoff.target_agent)} · <b>Host</b> ${e(handoff.target_host)} · <b>isolate</b> ${e(handoff.isolate)}</p><p>将在目标工作区启动新 Agent；原执行已终止；不会重复外部副作用</p>`,`${demo?'<button class="primary" disabled>确认启动</button>':button('确认启动','task-launch',id,'class="primary"')}${windowCancel()}`); }
   async function submitTaskHandoff(form) { const error=$('task-handoff-error'); error.textContent=''; try { const values=handoffValues(form), handoff=await post(`/api/mgmt/works/${encodeURIComponent(form.dataset.workId)}/handoffs`,values); showHandoffConfirm({...handoff,...values}); } catch(ex) { error.textContent=`${ex.message}${ex.data?.allowed?` · allowed: ${ex.data.allowed.join(', ')}`:''}`; } }
   async function launchTaskHandoff(id) { const result=await post(`/api/mgmt/handoffs/${encodeURIComponent(id)}/launch`,{confirmed:true}); $('modal').close(); await refreshTaskDetail(); const raw=result.attempt_state||result.state||'unknown', attempt=raw==='launching'?'started':raw; const box=$('task-handoff-error'); if(box)box.innerHTML=`启动结果：${e(attempt)}${attempt==='unknown'?` <a href="/ledger?session=${encodeURIComponent(result.stable_id||'')}">jump</a> ${button('attach','task-attach',id)} ${button('abandon','task-abandon',id)}`:''}`; }
-  async function refreshTaskDetail() { if(!state.taskDetail)return; state.taskDetail=await fetchJson(`/api/mgmt/works/${encodeURIComponent(state.taskDetail.work_id)}`); state.mgmtHtml=renderTasks(); render(); }
+  async function refreshTaskDetail() {
+    if (!state.taskDetail) return;
+    const id = state.taskDetail.work_id;
+    [state.taskDetail, state.taskManifests] = await Promise.all([
+      fetchJson(`/api/mgmt/works/${encodeURIComponent(id)}`),
+      fetchJson(`/api/mgmt/works/${encodeURIComponent(id)}/manifests`),
+    ]);
+    state.mgmtHtml = renderTasks();
+    render();
+  }
   async function jump(target) {
     const status=target.parentElement.querySelector('.jump-status');
     try { const result=await post(`/api/${target.dataset.route || 'jump'}/${encodeURIComponent(target.dataset.id)}`); if(result.opened) {if(status)status.textContent='已打开并聚焦目标终端';return;} if(result.error)showError(new Error(result.error)); }
@@ -333,49 +513,212 @@
     try {await navigator.clipboard.writeText(target.dataset.binding);if(status)status.textContent='打开失败，已复制跳转标识';} catch(error) {showError(error);if(status)status.textContent='打开失败，复制跳转标识失败';}
   }
   async function handleAction(target) {
-    const action=target.dataset.action,id=target.dataset.id;
-    if(action==='dismiss')return $(id).close();
-    if(action==='task-scan'){await post('/api/mgmt/scan');state.mgmtWorks=await fetchJson(`/api/mgmt/works?track=${encodeURIComponent(state.taskTrack)}`);state.mgmtHtml=renderTasks();return render();}
-    if(action==='task-preconditions')return checkTaskPreconditions();
-    if(action==='task-launch')return launchTaskHandoff(id);
-    if(action==='task-abandon'){await post(`/api/mgmt/handoffs/${encodeURIComponent(id)}/abandon`,{reason:'operator abandoned unknown launch'});return refreshTaskDetail();}
-    if(action==='task-attach')return showError(new Error('attach 需在原现场绑定现有 Agent'));
-    if(action==='done'||target.dataset.done)return showDone();
-    if(action==='expand'){if(expanded.has(id))expanded.delete(id);else expanded.add(id);render();return;}
-    if(action==='export')return exportCsv();
-    if(action==='select-conversation') {state.conversationDraft=state.conversationDrafts[id]||'';return navigate('conversations',id);}
-    if(action==='refresh-conversations') return refresh();
-    if(action==='conversation-message') return submitConversationMessage(target);
-    if(action==='clear-selection') {state.selected.clear();render();return;}
-    if(action==='range') {state.range=id;return refresh();}
-    if(action==='resolve')return resolveItem(id,target.dataset.option);
-    if(action==='attention-evidence') {const item=findAttention(id);return dialog('drawer',item.conclusion,json(item.evidence)+sourceLink(item.source_link));}
-    if(action==='work')return openWork(id);
-    if(action==='preview-editor')return previewEditor();
-    if(action==='apply-editor')return applyEditor();
-    if(action==='exit-editor'){editor=null;return refresh();}
-    if(action==='edit-again'){editor.stage='edit';editor.preview=null;renderEditor();return;}
-    if(action==='propose-rule'){const item=findAttention(id);dialog('modal','Propose rule',`<p>The server derives exact scope from this approval. This does not answer or resolve the decision.</p><label>Suggested answer<select id="rule-answer">${item.options.map(o=>`<option value="${e(o)}">${e(o)}</option>`).join('')}</select></label>`,button('Create candidate','submit-rule',id));return;}
-    if(action==='submit-rule'){await post(`/api/attention/${encodeURIComponent(id)}/propose-rule`,{answer:$('rule-answer').value});$('modal').close();return navigate('rules');}
-    if(action==='disable-rule'){dialog('modal','Disable rule',`<p>Pending proposals from this rule will no longer authorize an answer. Already consumed decisions are not undone.</p><label>Reason<input id="disable-reason" required></label>`,button('Disable rule','confirm-disable-rule',id));return;}
-    if(action==='confirm-disable-rule'){const reason=$('disable-reason').value.trim();if(!reason)throw new Error('Reason is required.');await post(`/api/rules/${encodeURIComponent(id)}/disable`,{reason});$('modal').close();return refresh();}
-    if(action==='approve-rule') {await post(`/api/rules/${encodeURIComponent(id)}/approve`);return refresh();}
-    if(action==='enable-rule') {await post(`/api/rules/${encodeURIComponent(id)}/enable`,{});return refresh();}
-    if(action==='bulk-ack'||action==='bulk-closeout'||action==='orphan-ack') {
-      const closing=action==='bulk-closeout';
-      const ids=action==='orphan-ack'?[id]:[...state.selected].filter(uid=>(closing?state.q2:state.q1).some(r=>(closing?r.stable_id:r.request_uid)===uid));
-      for(const uid of ids) {await post(`/api/${closing?'closeout':'ack'}/${encodeURIComponent(uid)}`);state.selected.delete(uid);}
+    const action = target.dataset.action,
+      id = target.dataset.id;
+    if (action === "dismiss") return $(id).close();
+    if (action === "task-scan") {
+      await post("/api/mgmt/scan");
+      state.mgmtWorks = await fetchJson(
+        `/api/mgmt/works?track=${encodeURIComponent(state.taskTrack)}`,
+      );
+      state.mgmtHtml = renderTasks();
+      return render();
+    }
+    if (action === "task-manifest") {
+      let verification = [];
+      try {
+        verification = JSON.parse($("manifest-verification").value || "[]");
+      } catch {
+        return showError(new Error("验证证据必须为 JSON"));
+      }
+      await post(
+        `/api/mgmt/works/${encodeURIComponent(state.taskDetail.work_id)}/manifests`,
+        { verification },
+      );
+      return refreshTaskDetail();
+    }
+    if (action === "task-submit") {
+      if (
+        !confirm(
+          `提交为 PR？\n目标：${$("submission-target").value}\n将推送并创建外部 PR。`,
+        )
+      )
+        return;
+      state.taskDrift = null;
+      try {
+        await post(`/api/mgmt/acceptances/${encodeURIComponent(id)}/submit`, {
+          target_kind: "github_pr",
+          target: $("submission-target").value || "main",
+        });
+      } catch (error) {
+        if (error.status === 409 && error.data?.error === "manifest_drift") {
+          state.taskDrift = error.data.diff || [];
+          return render();
+        }
+        throw error;
+      }
+      return refreshTaskDetail();
+    }
+    if (action === "task-poll") {
+      await post("/api/mgmt/submissions/poll");
+      return refreshTaskDetail();
+    }
+    if (action === "task-preconditions") return checkTaskPreconditions();
+    if (action === "task-launch") return launchTaskHandoff(id);
+    if (action === "task-abandon") {
+      await post(`/api/mgmt/handoffs/${encodeURIComponent(id)}/abandon`, {
+        reason: "operator abandoned unknown launch",
+      });
+      return refreshTaskDetail();
+    }
+    if (action === "task-attach")
+      return showError(new Error("attach 需在原现场绑定现有 Agent"));
+    if (action === "done" || target.dataset.done) return showDone();
+    if (action === "expand") {
+      if (expanded.has(id)) expanded.delete(id);
+      else expanded.add(id);
+      render();
+      return;
+    }
+    if (action === "export") return exportCsv();
+    if (action === "select-conversation") {
+      state.conversationDraft = state.conversationDrafts[id] || "";
+      return navigate("conversations", id);
+    }
+    if (action === "refresh-conversations") return refresh();
+    if (action === "conversation-message")
+      return submitConversationMessage(target);
+    if (action === "clear-selection") {
+      state.selected.clear();
+      render();
+      return;
+    }
+    if (action === "range") {
+      state.range = id;
       return refresh();
     }
-    if(action==='confirm-resume')return performResume(id);
-    if(target.classList.contains('drill'))return navigate('agents',id);
-    if(target.classList.contains('resume'))return resume(target);
-    if(target.classList.contains('jump'))return jump(target);
-    if(target.classList.contains('copy-jump')) {await navigator.clipboard.writeText(target.dataset.binding);target.textContent='已复制';return;}
-    if(target.classList.contains('ack')||target.classList.contains('closeout')) {await post(`/api/${target.classList.contains('ack')?'ack':'closeout'}/${encodeURIComponent(id)}`);state.selected.delete(id);return refresh();}
-    if(target.classList.contains('approve')) {await post(`/api/orchestrator/answer/${encodeURIComponent(target.dataset.approvalId)}`,{answer:target.dataset.answer,consumer_owner:target.dataset.consumerOwner});return refresh();}
-    if(target.id==='detail-back')return navigate('agents');
-    if(target.id==='bot-toggle') {if(!state.rules)throw new Error('Rules have not loaded.');await post(`/api/decision-bot/${state.rules.bot_disabled?'enable':'disable'}`);return refresh();}
+    if (action === "resolve") return resolveItem(id, target.dataset.option);
+    if (action === "attention-evidence") {
+      const item = findAttention(id);
+      return dialog(
+        "drawer",
+        item.conclusion,
+        json(item.evidence) + sourceLink(item.source_link),
+      );
+    }
+    if (action === "work") return openWork(id);
+    if (action === "preview-editor") return previewEditor();
+    if (action === "apply-editor") return applyEditor();
+    if (action === "exit-editor") {
+      editor = null;
+      return refresh();
+    }
+    if (action === "edit-again") {
+      editor.stage = "edit";
+      editor.preview = null;
+      renderEditor();
+      return;
+    }
+    if (action === "propose-rule") {
+      const item = findAttention(id);
+      dialog(
+        "modal",
+        "Propose rule",
+        `<p>The server derives exact scope from this approval. This does not answer or resolve the decision.</p><label>Suggested answer<select id="rule-answer">${item.options.map((o) => `<option value="${e(o)}">${e(o)}</option>`).join("")}</select></label>`,
+        button("Create candidate", "submit-rule", id),
+      );
+      return;
+    }
+    if (action === "submit-rule") {
+      await post(`/api/attention/${encodeURIComponent(id)}/propose-rule`, {
+        answer: $("rule-answer").value,
+      });
+      $("modal").close();
+      return navigate("rules");
+    }
+    if (action === "disable-rule") {
+      dialog(
+        "modal",
+        "Disable rule",
+        `<p>Pending proposals from this rule will no longer authorize an answer. Already consumed decisions are not undone.</p><label>Reason<input id="disable-reason" required></label>`,
+        button("Disable rule", "confirm-disable-rule", id),
+      );
+      return;
+    }
+    if (action === "confirm-disable-rule") {
+      const reason = $("disable-reason").value.trim();
+      if (!reason) throw new Error("Reason is required.");
+      await post(`/api/rules/${encodeURIComponent(id)}/disable`, { reason });
+      $("modal").close();
+      return refresh();
+    }
+    if (action === "approve-rule") {
+      await post(`/api/rules/${encodeURIComponent(id)}/approve`);
+      return refresh();
+    }
+    if (action === "enable-rule") {
+      await post(`/api/rules/${encodeURIComponent(id)}/enable`, {});
+      return refresh();
+    }
+    if (
+      action === "bulk-ack" ||
+      action === "bulk-closeout" ||
+      action === "orphan-ack"
+    ) {
+      const closing = action === "bulk-closeout";
+      const ids =
+        action === "orphan-ack"
+          ? [id]
+          : [...state.selected].filter((uid) =>
+              (closing ? state.q2 : state.q1).some(
+                (r) => (closing ? r.stable_id : r.request_uid) === uid,
+              ),
+            );
+      for (const uid of ids) {
+        await post(
+          `/api/${closing ? "closeout" : "ack"}/${encodeURIComponent(uid)}`,
+        );
+        state.selected.delete(uid);
+      }
+      return refresh();
+    }
+    if (action === "confirm-resume") return performResume(id);
+    if (target.classList.contains("drill")) return navigate("agents", id);
+    if (target.classList.contains("resume")) return resume(target);
+    if (target.classList.contains("jump")) return jump(target);
+    if (target.classList.contains("copy-jump")) {
+      await navigator.clipboard.writeText(target.dataset.binding);
+      target.textContent = "已复制";
+      return;
+    }
+    if (
+      target.classList.contains("ack") ||
+      target.classList.contains("closeout")
+    ) {
+      await post(
+        `/api/${target.classList.contains("ack") ? "ack" : "closeout"}/${encodeURIComponent(id)}`,
+      );
+      state.selected.delete(id);
+      return refresh();
+    }
+    if (target.classList.contains("approve")) {
+      await post(
+        `/api/orchestrator/answer/${encodeURIComponent(target.dataset.approvalId)}`,
+        {
+          answer: target.dataset.answer,
+          consumer_owner: target.dataset.consumerOwner,
+        },
+      );
+      return refresh();
+    }
+    if (target.id === "detail-back") return navigate("agents");
+    if (target.id === "bot-toggle") {
+      if (!state.rules) throw new Error("Rules have not loaded.");
+      await post(
+        `/api/decision-bot/${state.rules.bot_disabled ? "enable" : "disable"}`,
+      );
+      return refresh();
+    }
   }
   function exportCsv() {const rows=[['Work','Asked','Decided','Waited','Chose','Effect'],...state.ledger.slowest.map(r=>[r.title,r.asked_at,r.decided_at??'—',r.waited_ms,r.chose??'—',r.effect_state??'—'])];const csv=rows.map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='overload-ledger.csv';a.click();URL.revokeObjectURL(url);}
   document.addEventListener('submit',event=>{if(event.target.id==='conversation-message'){event.preventDefault();void submitConversationMessage(event.target);}if(event.target.id==='task-handoff'){event.preventDefault();void submitTaskHandoff(event.target);}});
