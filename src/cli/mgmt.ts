@@ -2,11 +2,11 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { listWorks, loadManageConfig, scanOnce, setTracking, showWork } from "../manage/manage";
-import { ensureControlSchema } from "../control/store";
+import { ensureControlSchema, openControl } from "../control/store";
 
 export async function runMgmtCli(args:string[]):Promise<void>{
   const home=process.env.OVERLOAD_HOME??join(homedir(),".overload");
-  const db=new Database(process.env.OVERLOAD_ANSWERS_PATH??join(home,"orchestrator-answers.db"),{create:true});
+  const db=openControl(process.env.OVERLOAD_ANSWERS_PATH??join(home,"orchestrator-answers.db"));
   const ledgerPath=process.env.OVERLOAD_LEDGER_PATH??join(home,"ledger.db");let ledger:Database|null=null;
   try{try{ledger=new Database(ledgerPath,{readonly:true});}catch{}
     ensureControlSchema(db);const [command,...rest]=args;

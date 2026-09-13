@@ -41,8 +41,8 @@ async function spawn(argv: string[], cwd: string | undefined, timeoutMs: number)
   return { ...result, stdout: new TextDecoder().decode(result.stdout) };
 }
 
-export function localSourceFs(host?: string): SourceFs {
-  const sourceHost: SourceHost = { host: host ?? defaultHost(), kind: "local" };
+export function localSourceFs(host?: string | (SourceHost & {kind:"local"})): SourceFs {
+  const sourceHost: SourceHost = typeof host==="object"?host:{ host: host ?? defaultHost(), kind: "local" };
   return {
     host: sourceHost,
     async listFiles(dir, opts) {
@@ -77,7 +77,7 @@ export function localSourceFs(host?: string): SourceFs {
       try { const all = await fsReadFile(path); const bytes = all.subarray(0, maxBytes); return { bytes, truncated: all.length > maxBytes, sha256: digest(bytes) }; }
       catch (error) { if (unavailable(error)) return null; throw error; }
     },
-    exec(cwd, argv, timeoutMs) { return spawn(argv, cwd, timeoutMs); },
+    async exec(cwd, argv, timeoutMs) { try{return await spawn(argv, cwd, timeoutMs);}catch(error){if(unavailable(error))return {code:127,stdout:"",stderr:String(error)};throw error;} },
   };
 }
 
