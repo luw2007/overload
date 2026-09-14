@@ -4,6 +4,7 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import { addTask, bindTaskContract, getTask, listTasks, transition, type Task, type TaskState } from "./store";
 import { artifactsDir } from "./runner";
+import { taskRunnerPrompt } from "./prompt";
 import { getAttention, getWork, enqueueControlEvent, ensureControlSchema, upsertAttention, type AttentionItem, type Work } from "../control/store";
 import type { Contract } from "../control/types";
 
@@ -467,9 +468,9 @@ function workRetryLimit(controlDb: Database, workId: string): number {
 export function coordinatorChildPrompt(orchestratorDb: Database, controlDb: Database, task: Task): string {
   ensureCoordinatorSchema(orchestratorDb);
   const row = orchestratorDb.query("SELECT * FROM coordinator_children WHERE task_id=?").get(task.task_id) as Record<string, unknown> | null;
-  if (!row) return task.title;
+  if (!row) return taskRunnerPrompt(controlDb, task);
   const work = getWork(controlDb, row.work_id as string);
-  if (!work?.contract) return task.title;
+  if (!work?.contract) return taskRunnerPrompt(controlDb, task);
   const scope = parseJson<ChildScope>(row.scope as string, { repo: task.repo, allowed_effects: [] });
   const acceptance = parseJson<string[]>(row.acceptance as string, []);
   const report = task.attempt_id ? join(artifactsDir(task.task_id), `report-${task.attempt_id}.txt`) : join(artifactsDir(task.task_id), "report-attempt.txt");
