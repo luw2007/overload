@@ -10,6 +10,7 @@ import { join } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { execFile, execFileSync } from "node:child_process"
 import { scrubText } from "../shared/redact"
+import { parseHostId } from "../shared/types"
 
 const SEGMENT_MAX_AGE_MS = 30_000
 const SEGMENT_MAX_BYTES = 1_048_576
@@ -30,7 +31,7 @@ type Kind =
 type Envelope = {
   v: 1
   at: number
-  host: "local" | "devbox"
+  host: string
   runtime: Runtime
   session: string
   emitter_id: string
@@ -191,7 +192,7 @@ function execGit(cwd: string, args: string[]): Promise<string | null> {
 class SpoolWriter {
   readonly ready: Promise<void>
   private runtime: Runtime
-  host: "local" | "devbox" = "local"
+  host = "local"
   emitterId = ""
   writerId = ""
   private dir = ""
@@ -219,10 +220,9 @@ class SpoolWriter {
     try {
       const root = join(homedir(), ".overload")
       try {
-        const configured = (await readFile(join(root, "host"), "utf8")).trim()
-        if (configured === "devbox") this.host = "devbox"
+        this.host = parseHostId(await readFile(join(root, "host"), "utf8"))
       } catch {
-        // Missing/unreadable host configuration deliberately falls back to local.
+        // Missing, unreadable or malformed host configuration falls back to local.
       }
       const spoolRoot = join(root, "spool")
       const hostDir = join(spoolRoot, this.host)

@@ -10,6 +10,7 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 | `prune_interval_ms` | ingest | How often consumed spool bytes are swept; default `3600000`. |
 | `spool_retention_ms` | ingest | How long a fully consumed spool file is kept before the sweep removes it; default `86400000`. Only this host's tree is swept — a pulled tree is a mirror and rsync would refetch it. |
 | `web_port` | web | Loopback dashboard port; default `4870`. |
+| `runner_instructions` | orchestrator | Standing project rules appended to every runner brief, as a string or array of strings; default none. They are placed after the contract and the evidence gate and are explicitly subordinate to both, so they cannot license a child to skip committing or to push. Bounded at 20 entries and 4000 characters total; the excess is dropped with a log line. |
 | `approval_gate.enabled` | extension | Enables action gate; default `false`. Missing or disabled gate is inert. |
 | `approval_gate.block_bash_patterns` | extension | Regex patterns that always deny bash; optional, and win over approval rules. |
 | `approval_gate.block_write_paths` | extension | Path prefixes that always deny write/edit; optional, and win over approval rules. |

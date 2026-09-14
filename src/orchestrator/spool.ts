@@ -2,14 +2,14 @@ import { Database } from "bun:sqlite";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { EventEnvelope, EventKind, HostId } from "../shared/types";
+import { parseHostId, type EventEnvelope, type EventKind, type HostId } from "../shared/types";
 import { SEGMENT_MAX_AGE_MS, SEGMENT_MAX_BYTES } from "../shared/types";
 
 export type Clock = { now():number };
 export class SpoolWriter {
   readonly host:HostId; readonly dir:string; private openedAt:number|null=null;
   constructor(private db:Database, root=join(homedir(),".overload"), private clock:Clock={now:Date.now}) {
-    const host=readFileSync(join(root,"host"),"utf8").trim(); if(host!=="local"&&host!=="devbox")throw new Error(`Invalid host: ${host}`); this.host=host;
+    const host=parseHostId(readFileSync(join(root,"host"),"utf8")); this.host=host;
     this.dir=join(root,"spool",host,"orchestrator"); mkdirSync(this.dir,{recursive:true,mode:0o700}); chmodSync(this.dir,0o700);
   }
   private row():{seq:number;segment:number}{return this.db.query("SELECT seq,segment FROM spool_seq WHERE id=1").get() as {seq:number;segment:number};}

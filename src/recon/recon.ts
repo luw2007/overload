@@ -14,6 +14,7 @@ import {
   TURN_HANG_MS,
   type EventEnvelope,
   type EventKind,
+  parseHostId,
   type HostId,
 } from "../shared/types";
 
@@ -647,7 +648,7 @@ async function loadConfig(args: string[]): Promise<{ config: ReconConfig; once: 
   const hostPath = join(home, "host");
   let host = "local";
   try { host = (await readFile(hostPath, "utf8")).trim(); } catch { /* local */ }
-  if (host !== "local" && host !== "devbox") throw new Error(`invalid host id: ${host}`);
+  host = parseHostId(host);
   const numberValue = (flag: string, key: string, fallback: number) => {
     const raw = values.get(flag);
     return raw === undefined ? positive(file[key], fallback) : positive(Number(raw), fallback);
@@ -658,7 +659,7 @@ async function loadConfig(args: string[]): Promise<{ config: ReconConfig; once: 
     stall_profile_ms: numberValue("stall-profile-ms", "stall_profile_ms", STALL_PROFILE_MS.narrow),
     turn_hang_ms: numberValue("turn-hang-ms", "turn_hang_ms", TURN_HANG_MS),
     command_timeout_ms: numberValue("command-timeout-ms", "command_timeout_ms", DEFAULT_COMMAND_TIMEOUT_MS),
-    host: host as HostId,
+    host,
     ledger: values.get("ledger") ?? join(home, "ledger.db"),
     spool: values.get("spool") ?? join(home, "spool"),
     // herdr prints JSON by default and rejects a --json flag (loop-1 E4).

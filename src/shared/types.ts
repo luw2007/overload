@@ -6,8 +6,18 @@
 
 export const ENVELOPE_VERSION = 1;
 
-/** From ~/.overload/host config file; never hostname. */
-export type HostId = "local" | "devbox";
+/**
+ * From ~/.overload/host config file; never hostname. Any orchestration peer
+ * names itself here, so the value is a free identifier — but it also becomes a
+ * spool directory segment, hence the conservative character set.
+ */
+export type HostId = string;
+export const HOST_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
+export function parseHostId(value: string): HostId {
+  const host = value.trim();
+  if (!HOST_ID_PATTERN.test(host)) throw new Error(`invalid host id: ${value}`);
+  return host;
+}
 
 export type Runtime = "pi" | "omp" | "prime" | "claude" | "cmux" | "overload"; // "overload" = admin/recon self-events
 
