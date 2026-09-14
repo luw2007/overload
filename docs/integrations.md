@@ -1,5 +1,15 @@
 # Integrations
 
+## Contract-bound multi-agent coordinator
+
+Add `workId` only to the authorized conversation entry that shall coordinate an existing active, operator-approved Work. The contract must identify the runtime repository, explicit allowed effects (`read` for scout, `write` for ship), a retry limit, and acceptance criteria. `OVERLOAD_COORDINATOR_PORT` defaults to loopback `4891`. Entries without `workId` remain ordinary private tasks in the same conversation database; an existing conversation cannot be rebound to a different Work. Run one channel daemon/websocket consumer for the app, routing the dedicated test group and production private conversations through their explicit `appId`/`instanceId`/`tenantId`/`userId`/`chatId` entries.
+
+The root pi session receives only read/search tools and four bound tools: `coordinator_dispatch`, `coordinator_status`, `coordinator_review`, `coordinator_deliver`. The daemon drives the existing orchestrator with owned pi workers in isolated worktrees; no cmux installation is required for coordinator workers. Scout workers have read-only tools and persist their final text as a report. Ship workers make local committed changes and supply `orchestrator.check`; push and merge are not automatic.
+
+Actionable worker transitions durably enqueue a root-session wakeup exactly once; ordinary progress does not invoke a model. Successful supervisor wakeups are not forwarded as chat noise. Reviews pin the child attempt, current contract, artifact paths and content hashes. Local reviewed children release repository occupancy, but only final operator acceptance completes the root Work. Final acceptance/rejection is available through the original channel card and Web decision route. Evidence is rechecked before delivery; worker self-report alone is insufficient.
+
+Broker metadata now records broker and child process identities. Automatic recovery requires both recorded identities to be dead; missing legacy evidence or a surviving child fails closed. Terminated owned sessions restore the same session file; unknown turns are never automatically resubmitted. This mode does not upgrade existing live brokers in place.
+
 ## Feishu channel and owned pi runtime
 
 Run `bun install` once, then `bun src/adapters/daemon.ts`. The daemon uses the official `@larksuiteoapi/node-sdk` WebSocket long connection; no public inbound port or webhook reverse proxy is required. Set `FEISHU_APP_FILE` to a mode-0600 JSON file containing exactly `{ "app_id": "cli_…", "app_secret": "…" }`, or set `FEISHU_APP_ID` and `FEISHU_APP_SECRET` directly. Set `FEISHU_INSTANCE_ID`, `OVERLOAD_RUNTIME_CWD`, and `OVERLOAD_CHANNEL_AUTH_FILE`. The authorization file is a JSON array of `{ "instanceId": "…", "tenantId": "…", "userId": "…", "ownerId": "…" }` mappings. Keep credentials outside the repository.
