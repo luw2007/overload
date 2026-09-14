@@ -77,7 +77,7 @@ export class Orchestrator {
   }
   private async collectAndResolve(task:Task,now:number):Promise<void>{
     if(!task.worktree)return;
-    const control=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);let child;try{child=coordinatorChild(this.db,control,task.task_id);}finally{control.close();}
+    const child=coordinatorChild(this.db,task.task_id);
     if(child?.kind==='scout'){const report=join(this.artifactsDir,task.task_id,'report-'+task.attempt_id+'.txt');if(!existsSync(report)||!readFileSync(report,'utf8').trim()){this.casTransition(task.task_id,'check_absent',{reason:'scout_report_missing'},now);return;}this.casTransition(task.task_id,'runner_exit',{evidence_complete:true,report},now);return;}
     try {
       const evidence=await collectEvidence(task.worktree,task.task_id,task.base_ref,this.worktreeExec,this.artifactsDir),ready=evidenceReady(evidence);
@@ -192,7 +192,8 @@ export class Orchestrator {
     try { ({dir}=await ensureWorktree(task.repo,task.task_id,branch,task.base_ref,this.worktreesDir,this.worktreeExec)); }
     catch(error){ this.casTransition(task.task_id,"worktree_fail",{reason:"repo_gone",detail:String((error as Error).message??error)},Date.now()); return; }
     setRecovery(this.db,task.task_id,attemptId,"intent");
-    const control=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);let prompt:string;try{prompt=coordinatorChildPrompt(this.db,control,task);}finally{control.close();}
+    // The worktree exists by now, so the brief can name the real branch instead of "(pending)".
+    const control=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);let prompt:string;try{prompt=coordinatorChildPrompt(this.db,control,{...task,worktree:dir,branch});}finally{control.close();}
     const spawned=this.managedRunner?.owns(task)?await this.managedRunner.start(task,dir,attemptId,prompt):await spawnRunner(task,dir,attemptId,prompt,this.runnerExec,this.artifactsDir);setRecovery(this.db,task.task_id,attemptId,spawned.ok?"spawned":"failed");
     if(!spawned.ok){ this.casTransition(task.task_id,"spawn_fail",{worktree:dir,branch,reason:"tool_missing",detail:spawned.error},Date.now()); return; }
     this.casTransition(task.task_id,"spawn_ok",{worktree:dir,branch},Date.now());

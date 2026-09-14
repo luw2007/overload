@@ -93,7 +93,6 @@ export type CoordinatorDelivery = {
 };
 export type CoordinatorAcceptance = { work: Work; attention: AttentionItem };
 
-const ACTIONABLE_STATES = new Set<TaskState>(["awaiting_human", "blocked", "failed", "submitted", "done"]);
 const TASK_STATES = new Set<TaskState>(["queued", "starting", "running", "awaiting_human", "submitted", "blocked", "done", "failed", "abandoned"]);
 const EMPTY_SCOPE_EFFECTS: string[] = [];
 
@@ -287,7 +286,7 @@ function verifyEvidence(task: Task, child: CoordinatorChild, evidence: Coordinat
   }
   if (child.kind === "scout" && !report) throw new Error("scout_report_required");
 }
-function readiness(db: Database, controlDb: Database, root: CoordinatorRoot, work: Work): { children: CoordinatorChild[]; pending: string[] } {
+function readiness(db: Database, root: CoordinatorRoot): { children: CoordinatorChild[]; pending: string[] } {
   const children = childrenFor(db, root.work_id, root.contract_revision);
   const pending: string[] = [];
   if (children.length === 0) pending.push("no_children");
@@ -351,7 +350,7 @@ export class Coordinator {
 
   status(workId: string): CoordinatorStatus {
     const { root, work } = requireRoot(this.orchestratorDb, this.controlDb, safeId(workId, "work_id"),true);
-    const result = readiness(this.orchestratorDb, this.controlDb, root, work);
+    const result = readiness(this.orchestratorDb, root);
     return { root, work, children: result.children, ready: result.pending.length === 0, pending: result.pending, evidence:result.children.map(child=>{const paths=child.kind==='scout'?[child.report_path]:['diff.patch','commits.txt','status.txt','checks.txt'].map(name=>join(artifactsDir(child.task_id),name));return {task_id:child.task_id,files:paths.filter((path):path is string=>!!path&&existsSync(path)).map(path=>({path,sha256:createHash('sha256').update(readFileSync(path)).digest('hex')}))};}) };
   }
 
@@ -407,7 +406,7 @@ export class Coordinator {
   deliver(value: unknown): CoordinatorDelivery {
     const input = parseDeliver(value);
     const { root, work } = requireRoot(this.orchestratorDb, this.controlDb, input.work_id);
-    const result = readiness(this.orchestratorDb, this.controlDb, root, work);
+    const result = readiness(this.orchestratorDb, root);
     if (result.pending.length) throw new Error(`final_not_ready:${result.pending.join(",")}`);
     const itemId = `coordinator:delivery:${input.work_id}:${root.contract_revision}`;
     const existing = getAttention(this.controlDb, itemId);
@@ -431,7 +430,7 @@ export class Coordinator {
     const { root, work } = requireRoot(this.orchestratorDb, this.controlDb, id);
     if (owner !== work.contract!.decision_owner) throw new Error("decision_owner_required");
     if (target !== `coordinator:delivery:${id}:${root.contract_revision}`) throw new Error("delivery_item_mismatch");
-    const result = readiness(this.orchestratorDb, this.controlDb, root, work);
+    const result = readiness(this.orchestratorDb, root);
     if (result.pending.length) throw new Error(`final_not_ready:${result.pending.join(",")}`);
     const now = Date.now();
     const tx = this.controlDb.transaction(() => {
@@ -488,7 +487,7 @@ export function coordinatorChildPrompt(orchestratorDb: Database, controlDb: Data
   ].join("\n");
 }
 
-export function coordinatorChild(taskDb: Database, controlDb: Database, taskId: string): CoordinatorChild | null {
+export function coordinatorChild(taskDb: Database, taskId: string): CoordinatorChild | null {
   ensureCoordinatorSchema(taskDb);
   const task = getTask(taskDb, taskId);
   const row = taskDb.query("SELECT * FROM coordinator_children WHERE task_id=?").get(taskId) as Record<string, unknown> | null;
