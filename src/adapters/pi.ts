@@ -4,14 +4,24 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentRuntime, CommandReceipt, RuntimeEvent, SessionHandle, SessionReference, StartRequest, TurnRequest } from "./types";
 import { brokerMetadataPath, brokerSocketPath, connectPiBroker, readBrokerMetadata, runPiBroker, stopPiBroker, type PiBrokerClient, type PiBrokerConfig } from "./pi-broker";
+import {processLiveness} from './pi-broker';
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
 export type PiRunnerInvocation = { command: string; args: string[] };
 
-export function buildPiRunnerInvocation(taskId: string, attemptId: string, worktreeDir: string, promptFile: string): PiRunnerInvocation {
+export function buildPiRunnerInvocation(taskId: string, attemptId: string, worktreeDir: string, promptFile: string, options?: { readOnly?: boolean; reportPath?: string }): PiRunnerInvocation {
   const origin = `orch:task:${taskId}:${attemptId}`;
-  const piCommand = `OVERLOAD_PARENT=${shellQuote(origin)} OVERLOAD_ORCH_TASK=${shellQuote(taskId)} pi -p ${shellQuote(`@${promptFile}`)}`;
+  // Read-only (scout) children never get write-capable tools on the unmanaged
+  // cmux spawn path either; this mirrors pi-broker.ts's managed --tools gate
+  // so the capability boundary is the same regardless of which runtime owns
+  // the child.
+  const toolsFlag = options?.readOnly ? ` --tools ${shellQuote("read,grep,find,ls")}` : "";
+  const base = `OVERLOAD_PARENT=${shellQuote(origin)} OVERLOAD_ORCH_TASK=${shellQuote(taskId)} pi -p ${shellQuote(`@${promptFile}`)}${toolsFlag}`;
+  // The unmanaged cmux path has no broker observing turn events, so a scout
+  // report has nowhere to land unless the child's own stdout is captured;
+  // tee it to the report path the orchestrator will read as evidence.
+  const piCommand = options?.reportPath ? `${base} | tee ${shellQuote(options.reportPath)}` : base;
   return { command: "cmux", args: ["new-workspace", "--cwd", worktreeDir, "--command", piCommand, "--focus", "false"] };
 }
 
@@ -147,6 +157,7 @@ export class PiRuntime implements AgentRuntime {
       cwd: request.cwd,
       command: this.command,
       stderrLimit: this.stderrLimit,
+      coordinator:request.coordinator,readOnly:request.readOnly,configPath:request.configPath??process.env.OVERLOAD_CONFIG_PATH,
       ...(request.provider ? { provider: request.provider } : {}),
       ...(request.model ? { model: request.model } : {}),
     };
@@ -159,6 +170,8 @@ export class PiRuntime implements AgentRuntime {
     const metadata = metadataFor(this.runtimeRoot, reference.sessionId);
     if (!metadata) throw new Error("runtime_metadata_missing");
     if (metadata.ownerId !== reference.ownerId || metadata.cwd !== reference.cwd) throw new Error("runtime_ownership_mismatch");
+    const broker=metadata.brokerIdentity,child=metadata.childIdentity;
+    if(broker&&child&&processLiveness(broker.pid,broker.startIdentity,broker.bootIdentity)==='dead'&&processLiveness(child.pid,child.startIdentity,child.bootIdentity)==='dead')return this.restore(reference);
     if (metadata.state !== "running" && metadata.state !== "starting") throw new Error("runtime_not_live");
     return this.connectFromMetadata(metadata, reference.sessionId, reference);
   }
@@ -168,10 +181,11 @@ export class PiRuntime implements AgentRuntime {
     const metadata = metadataFor(this.runtimeRoot, reference.sessionId);
     if (metadata?.state === "running" || metadata?.state === "starting") {
       if (metadata.ownerId !== reference.ownerId || metadata.cwd !== reference.cwd) throw new Error("runtime_ownership_mismatch");
-      if (existsSync(metadata.socketPath)) return this.connectFromMetadata(metadata, reference.sessionId, reference);
-      if (metadata.state === "running") throw new Error("runtime_live_ambiguous");
+      const broker=metadata.brokerIdentity,child=metadata.childIdentity;
+      if(!broker||!child||processLiveness(broker.pid,broker.startIdentity,broker.bootIdentity)!=='dead'||processLiveness(child.pid,child.startIdentity,child.bootIdentity)!=='dead'){if(existsSync(metadata.socketPath))return this.connectFromMetadata(metadata,reference.sessionId,reference);throw new Error('runtime_live_ambiguous');}
     }
     const sessionFile = reference.sessionFile ?? metadata?.sessionFile;
+    if(!metadata||metadata.ownerId!==reference.ownerId||metadata.cwd!==reference.cwd||sessionFile!==metadata.sessionFile)throw new Error('runtime_restore_ownership_mismatch');
     if (!sessionFile) throw new Error("runtime_session_file_missing");
     const config: PiBrokerConfig = {
       runtimeRoot: this.runtimeRoot,
@@ -184,6 +198,7 @@ export class PiRuntime implements AgentRuntime {
       command: this.command,
       stderrLimit: this.stderrLimit,
       sessionFile,
+      coordinator:metadata.coordinator,readOnly:metadata.readOnly,provider:metadata.provider,model:metadata.model,configPath:metadata.configPath,
     };
     await this.spawnBroker(config);
     return this.connectFromMetadata({ ...config }, reference.sessionId, reference);
@@ -206,7 +221,7 @@ export class PiRuntime implements AgentRuntime {
     return receipt;
   }
 
-  private async connectFromMetadata(metadata: { socketPath: string; ownerToken: string }, sessionId: string, expected?: SessionReference): Promise<SessionHandle> {
+  private async connectFromMetadata(metadata: { socketPath: string; ownerToken: string } & Record<string, unknown>, sessionId: string, expected?: SessionReference): Promise<SessionHandle> {
     const deadline = Date.now() + this.connectTimeoutMs;
     let lastError: unknown = new Error("runtime_connect_timeout");
     while (Date.now() < deadline) {
@@ -228,8 +243,15 @@ export class PiRuntime implements AgentRuntime {
   }
 
   private async spawnDefaultBroker(config: PiBrokerConfig): Promise<void> {
-    const encoded = JSON.stringify(config);
-    const proc = Bun.spawn([process.execPath, "run", defaultBrokerScript, "--pi-broker", encoded], { cwd: config.cwd, stdin: "ignore", stdout: "ignore", stderr: "ignore", detached: true }) as unknown as BrokerProcess;
+    // config carries ownerToken (and, when bound, the coordinator bridge token);
+    // both must never appear in argv (world-readable via /proc/<pid>/cmdline and
+    // ps) or in any log line. Hand the broker a private config file instead of
+    // an inline --pi-broker <json> argument.
+    const configDir = join(this.runtimeRoot, "config");
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    const configPath = join(configDir, `${config.sessionId}-${randomUUID()}.json`);
+    await Bun.write(configPath, JSON.stringify(config), { mode: 0o600 });
+    const proc = Bun.spawn([process.execPath, "run", defaultBrokerScript, "--pi-broker-file", configPath], { cwd: config.cwd, stdin: "ignore", stdout: "ignore", stderr: "ignore", detached: true }) as unknown as BrokerProcess;
     proc.unref?.();
   }
 }

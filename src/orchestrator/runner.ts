@@ -33,12 +33,12 @@ export function artifactsDir(taskId: string, root = join(homedir(), ".overload",
  * is written to the artifacts dir, not the worktree, so it never shows up in
  * `git status --porcelain` (the worktree's cleanliness gate, plan §3.6/§3.8).
  */
-export async function spawnRunner(task: Task, worktreeDir: string, attemptId: string, promptText: string, executor: RunnerExecutor = defaultRunnerExecutor, artifactsRoot = join(homedir(), ".overload", "artifacts")): Promise<{ ok: boolean; error?: string }> {
+export async function spawnRunner(task: Task, worktreeDir: string, attemptId: string, promptText: string, executor: RunnerExecutor = defaultRunnerExecutor, artifactsRoot = join(homedir(), ".overload", "artifacts"), options?:{readOnly?:boolean;reportPath?:string}): Promise<{ ok: boolean; error?: string }> {
   const dir = artifactsDir(task.task_id, artifactsRoot);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const promptFile = join(dir, `prompt-${attemptId}.txt`);
   writeFileSync(promptFile, promptText, { mode: 0o600 });
-  const invocation=buildPiRunnerInvocation(task.task_id,attemptId,worktreeDir,promptFile);
+  const invocation=buildPiRunnerInvocation(task.task_id,attemptId,worktreeDir,promptFile,options);
   const result=await executor(invocation.command,invocation.args);
   // Executor output is attempt-scoped evidence; never overwrite another retry.
   appendFileSync(join(dir,`runner-${attemptId}.log`),`[${new Date().toISOString()}] spawn ${result.ok?"ok":"failed"}\nstdout: ${result.stdout??""}\nstderr: ${result.stderr??""}\nerror: ${result.error??""}\n`,{mode:0o600});

@@ -8,3 +8,5 @@ node_modules/
 .dispatch/
 .done/
 .dispatch-ledger/
+# Local code-intelligence cache: per-machine tooling state, not project history.
+.pi-lens.json

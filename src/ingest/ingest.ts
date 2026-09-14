@@ -99,8 +99,16 @@ export function initializeLedger(db: Database): void {
   const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
   db.exec(requireText(schemaPath));
   migrateProgressColumn(db);
+  migrateAttentionEffectDetail(db);
   dropRetiredColumns(db);
   db.query("INSERT OR IGNORE INTO reducer_cursor(id, journal_seq) VALUES (1, 0)").run();
+}
+
+/** Ledgers projected before effect_detail existed carry the column-less card table;
+ *  the projection writes the reason column, so add it before any event is applied. */
+function migrateAttentionEffectDetail(db: Database): void {
+  const columns = db.query("PRAGMA table_info(control_attention)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "effect_detail")) db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");
 }
 
 /** Retire unreachable notification and incident-projection state while
@@ -274,6 +282,8 @@ function parseEnvelope(line: string, key: string): Envelope | null {
       if (typeof control.event_id !== "string" || typeof control.payload_hash !== "string" ||
         !control.payload || typeof control.payload !== "object" || Array.isArray(control.payload)) return null;
     }
+    // SAFETY: every Envelope field was checked above (v, at, seq, writer_id, kind, and the
+    // control_event detail shape); the parsed JSON is structurally an Envelope by this point.
     return value as unknown as Envelope;
   } catch {
     return null;

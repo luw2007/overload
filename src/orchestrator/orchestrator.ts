@@ -12,6 +12,9 @@ import { submitTask } from "./submit";
 import { checkPr } from "./pr";
 import { consumeAnswers, expireApprovals, openAnswersDb, requestApproval, repairApprovalIntents, reconcileApprovalEffects } from "./approval";
 import type { Database } from "bun:sqlite";
+import {coordinatorChild,coordinatorChildPrompt} from './coordinator';
+import {existsSync,readFileSync} from 'node:fs';
+export type ManagedRunner={owns(task:Task):boolean;start(task:Task,worktree:string,attempt:string,prompt:string):Promise<{ok:boolean;error?:string}>;probe(task:Task):Promise<'running'|'ended'|'unknown'>};
 
 const BIND_TIMEOUT_TICKS = 12; // ~60s at the 5s tick interval, plan §3.3 bind_timeout.
 
@@ -23,7 +26,7 @@ export class Orchestrator {
   constructor(readonly db:Database,readonly spool:SpoolWriter,readonly concurrency=2,
     readonly ledgerPath=process.env.OVERLOAD_LEDGER_PATH??join(homedir(),".overload","ledger.db"),
     readonly worktreeExec:CommandExecutor=defaultCommandExecutor,readonly runnerExec:RunnerExecutor=defaultRunnerExecutor,
-    readonly worktreesDir=worktreesRoot(),readonly artifactsDir=join(homedir(),".overload","artifacts")) {
+    readonly worktreesDir=worktreesRoot(),readonly artifactsDir=join(homedir(),".overload","artifacts"),readonly managedRunner?:ManagedRunner) {
     if(concurrency<1||concurrency>4)throw new Error("concurrency must be between 1 and 4");
   }
   private mine(t:Task,now:number):boolean{return t.owner_instance==null||t.owner_instance===this.owner||t.lease_expires_at==null||t.lease_expires_at<=now}
@@ -74,9 +77,11 @@ export class Orchestrator {
   }
   private async collectAndResolve(task:Task,now:number):Promise<void>{
     if(!task.worktree)return;
+    const control=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);let child;try{child=coordinatorChild(this.db,control,task.task_id);}finally{control.close();}
+    if(child?.kind==='scout'){const report=join(this.artifactsDir,task.task_id,'report-'+task.attempt_id+'.txt');if(!existsSync(report)||!readFileSync(report,'utf8').trim()){this.casTransition(task.task_id,'check_absent',{reason:'scout_report_missing'},now);return;}this.casTransition(task.task_id,'runner_exit',{evidence_complete:true,report},now);return;}
     try {
       const evidence=await collectEvidence(task.worktree,task.task_id,task.base_ref,this.worktreeExec,this.artifactsDir),ready=evidenceReady(evidence);
-      if(ready.ready){this.casTransition(task.task_id,"runner_exit",{evidence_complete:true},now);requestApproval(this.db,this.spool,task.task_id,"ready","Approve these verified changes?",["approve","reject","abandon"]);}
+      if(ready.ready){this.casTransition(task.task_id,"runner_exit",{evidence_complete:true},now);if(!child)requestApproval(this.db,this.spool,task.task_id,"ready","Approve these verified changes?",["approve","reject","abandon"]);}
       else if(ready.reason==="no_check")this.casTransition(task.task_id,"check_absent",{reason:ready.reason},now);
       else this.casTransition(task.task_id,"runner_exit",{evidence_complete:false,reason:ready.reason},now);
     } catch(error) { this.casTransition(task.task_id,"runner_exit",{evidence_complete:false,reason:"evidence_collection_failed",error:String((error as Error).message??error)},now); }
@@ -84,6 +89,7 @@ export class Orchestrator {
   // §3.3 rows #1-#6: a "starting" task never seen by pollBinding yet. Anything but a genuinely
   // fresh row (no recovery, no pid, no stable_id) must be probed, never blind-spawned again.
   private async reconcileStarting(task:Task,now:number):Promise<void>{
+    if(this.managedRunner?.owns(task)&&getRecovery(this.db,task.task_id)){const state=await this.managedRunner.probe(task);if(state==='ended'){this.casTransition(task.task_id,'session_bound',{},now);await this.collectAndResolve(getTask(this.db,task.task_id)!,now);}else if(state==='running')this.casTransition(task.task_id,'session_bound',{},now);else this.bumpUnknownAndMaybeBlock(task,now,'spawn_unverified');return;}
     const recovery=getRecovery(this.db,task.task_id);
     if(!recovery){ if(task.runner_pid==null&&task.stable_id==null)return; /* row #1: fresh, leave it to startRunner */ }
     else if(recovery.spawn_state==="failed")return; // row #4: startRunner already routes this to spawn_fail
@@ -110,6 +116,7 @@ export class Orchestrator {
   // §3.3 rows #9/#11/#12/#13: bound tasks whose pid is alive per this process, which pollRunning
   // (defaultPidAlive only) can't tell apart on its own — reconcile owns pid-recycle/exited/unknown here.
   private async reconcileRunning(task:Task,now:number):Promise<void>{
+    if(this.managedRunner?.owns(task)){const state=await this.managedRunner.probe(task);if(state==='ended')await this.collectAndResolve(task,now);else if(state==='unknown')this.bumpUnknownAndMaybeBlock(task,now,'liveness_unknown');return;}
     if(task.runner_pid==null||!defaultPidAlive(task.runner_pid))return; // pollBinding/pollRunning already own these
     if(!task.attempt_id)return;
     const p=probeRunnerLiveness(this.ledgerPath,task.task_id,task.attempt_id);
@@ -185,12 +192,14 @@ export class Orchestrator {
     try { ({dir}=await ensureWorktree(task.repo,task.task_id,branch,task.base_ref,this.worktreesDir,this.worktreeExec)); }
     catch(error){ this.casTransition(task.task_id,"worktree_fail",{reason:"repo_gone",detail:String((error as Error).message??error)},Date.now()); return; }
     setRecovery(this.db,task.task_id,attemptId,"intent");
-    const spawned=await spawnRunner(task,dir,attemptId,task.title,this.runnerExec,this.artifactsDir);setRecovery(this.db,task.task_id,attemptId,spawned.ok?"spawned":"failed");
+    const control=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);let prompt:string;try{prompt=coordinatorChildPrompt(this.db,control,task);}finally{control.close();}
+    const spawned=this.managedRunner?.owns(task)?await this.managedRunner.start(task,dir,attemptId,prompt):await spawnRunner(task,dir,attemptId,prompt,this.runnerExec,this.artifactsDir);setRecovery(this.db,task.task_id,attemptId,spawned.ok?"spawned":"failed");
     if(!spawned.ok){ this.casTransition(task.task_id,"spawn_fail",{worktree:dir,branch,reason:"tool_missing",detail:spawned.error},Date.now()); return; }
     this.casTransition(task.task_id,"spawn_ok",{worktree:dir,branch},Date.now());
     this.bindAttempts.set(task.task_id,0);
   }
   private async pollRunning(task:Task,now:number):Promise<void> {
+    if(this.managedRunner?.owns(task)){await this.reconcileRunning(task,now);return;}
     if(task.runner_pid==null){await this.pollBinding(task,now);return;}
     if(defaultPidAlive(task.runner_pid))return;
     await this.collectAndResolve(task,now);

@@ -61,7 +61,7 @@ export class FeishuChannel implements ChannelAdapter{
   if(message.chatType==='group'&&!message.mentionedBot)return;
   const identity=rawIdentity(message.raw,message.messageId);
   const threadId=message.threadId??message.rootId??(message.chatType==='group'?message.messageId:undefined);
-  try{await this.accept({kind:'message',eventId:identity.eventId,identity:{instanceId:this.instanceId,tenantId:identity.tenantId,userId:requiredString(message.senderId,'sender')},address:{instanceId:this.instanceId,tenantId:identity.tenantId,chatId:requiredString(message.chatId,'chat'),...(threadId?{threadId}: {})},messageId:requiredString(message.messageId,'message'),text:requiredString(message.content,'content'),receivedAt:receivedAt(message.createTime)});}catch(error){if(error instanceof Error&&error.message==='unauthorized_channel_identity'){await this.channel.send(message.chatId,{markdown:'此会话尚未获得 Overload 执行授权，消息未提交给 Agent。请联系操作员配置访问权限。'},{replyTo:message.messageId});return;}throw error;}
+  try{await this.accept({kind:'message',eventId:identity.eventId,identity:{instanceId:this.instanceId,tenantId:identity.tenantId,userId:requiredString(message.senderId,'sender')},address:{instanceId:this.instanceId,tenantId:identity.tenantId,chatId:requiredString(message.chatId,'chat'),...(threadId?{threadId}: {}),replyTo:requiredString(message.messageId,'message')},messageId:requiredString(message.messageId,'message'),text:requiredString(message.content,'content'),receivedAt:receivedAt(message.createTime)});}catch(error){if(error instanceof Error&&error.message==='unauthorized_channel_identity'){await this.channel.send(message.chatId,{markdown:'此会话尚未获得 Overload 执行授权，消息未提交给 Agent。请联系操作员配置访问权限。'},{replyTo:message.messageId});return;}throw error;}
  }
  private async handleAction(action:FeishuSdkAction):Promise<void>{
   if(!this.accept)return;
@@ -77,13 +77,13 @@ export class FeishuChannel implements ChannelAdapter{
  private receiptFor(error:unknown):DeliveryReceipt{const code=errorCode(error);if(code==='rate_limited'||code==='not_connected')return {state:'retryable',reason:code};if(code==='permission_denied'||code==='target_revoked'||code==='format_error')return {state:'failed',reason:code};return {state:'unknown',reason:code||'feishu_send_failed'};}
  private card(message:ChannelMessage):object{
   const decision=message.decision;if(!decision)throw new Error('decision_required');
-  const actions=decision.options.map(answer=>({tag:'button',text:{tag:'plain_text',content:answer},type:'primary',value:{itemId:decision.itemId,revision:decision.revision,answer,threadId:message.address.threadId},confirm:{title:{tag:'plain_text',content:'确认此决定？'},text:{tag:'plain_text',content:answer+'；决定将交由原现场消费。'}}}));
+  const actions=decision.options.map(answer=>({tag:'button',text:{tag:'plain_text',content:answer},type:'primary',value:{itemId:decision.itemId,revision:decision.revision,answer,threadId:message.address.threadId}}));
   return {config:{wide_screen_mode:true,update_multi:true},header:{title:{tag:'plain_text',content:decision.title}},elements:[{tag:'markdown',content:decision.state+'\\nOwner: '+decision.owner},...(actions.length?[{tag:'action',actions}]:[])]};
  }
  async send(message:ChannelMessage):Promise<DeliveryReceipt>{
   try{
    if(message.replaceMessageId){if(message.decision)await this.channel.updateCard(message.replaceMessageId,this.card(message));else await this.channel.editMessage(message.replaceMessageId,message.text);return {state:'sent',messageId:message.replaceMessageId};}
-   const replyTo=message.replyTo??message.address.threadId;const options=replyTo?{replyTo,replyInThread:true}:undefined;
+   const replyTo=message.replyTo??message.address.replyTo;const options=replyTo?{replyTo,replyInThread:true}:undefined;
    const result=message.decision?await this.channel.send(message.address.chatId,{card:this.card(message)},options):await this.channel.send(message.address.chatId,{markdown:message.text},options);
    return {state:'sent',messageId:requiredString(result.messageId,'message_id')};
   }catch(error){return this.receiptFor(error);}

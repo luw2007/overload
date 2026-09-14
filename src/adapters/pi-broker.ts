@@ -1,8 +1,9 @@
 import { createServer, createConnection, type Server, type Socket } from "node:net";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, appendFileSync, renameSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, appendFileSync, renameSync, chmodSync, openSync, closeSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { CommandReceipt, RuntimeEvent, SessionReference } from "./types";
+
 
 type JsonObject = Record<string, unknown>;
 type PiStdin = { write(data: string): number | Promise<number>; flush?: () => void | Promise<void> };
@@ -43,6 +44,99 @@ function sendSocket(socket: Socket, value: JsonObject): void { if (!socket.destr
 function safeUnlink(path: string): void { try { unlinkSync(path); } catch { /* stale socket is optional */ } }
 function atomicWrite(path: string, content: string): void { const temp = `${path}.${process.pid}.${randomUUID()}.tmp`; writeFileSync(temp, content, { mode: 0o600 }); renameSync(temp, path); }
 
+export type ProcessIdentity = { pid: number; startIdentity: string; bootIdentity: string };
+export type ProcessLiveness = "alive" | "dead" | "unknown";
+
+function procStartIdentity(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const end = stat.lastIndexOf(")");
+    if (end < 0) return undefined;
+    const fields = stat.slice(end + 2).trim().split(/\s+/);
+    return fields[19];
+  } catch { return undefined; }
+}
+
+function procBootIdentity(): string | undefined {
+  try { return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || undefined; } catch { return undefined; }
+}
+
+export function captureProcessIdentity(pid: number): ProcessIdentity | null {
+  const startIdentity = procStartIdentity(pid);
+  const bootIdentity = procBootIdentity();
+  if (!startIdentity || !bootIdentity) return null;
+  return { pid, startIdentity, bootIdentity };
+}
+
+export function processLiveness(pid: number | undefined, startIdentity: string | undefined, bootIdentity: string | undefined): ProcessLiveness {
+  if (pid === undefined || !Number.isInteger(pid) || !startIdentity || !bootIdentity) return "unknown";
+  const current = captureProcessIdentity(pid);
+  if (current) {
+    return current.startIdentity === startIdentity && current.bootIdentity === bootIdentity ? "alive" : "dead";
+  }
+  try {
+    process.kill(pid!, 0);
+    return "unknown";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "unknown";
+  }
+}
+
+type LockRecord = { pid: number; startIdentity: string; bootIdentity: string; acquiredAt: number; token: string };
+export type OwnershipLease = { release(): void };
+export const ownershipLockPath = (metadataPath: string): string => `${metadataPath}.lock`;
+export const brokerLockPath = (metadataPath: string): string => `${metadataPath}.broker.lock`;
+
+function readLock(path: string): LockRecord | null {
+  try {
+    const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!isObject(value) || typeof value.pid !== "number" || typeof value.startIdentity !== "string" || typeof value.bootIdentity !== "string" || typeof value.acquiredAt !== "number" || typeof value.token !== "string") return null;
+    return value as unknown as LockRecord;
+  } catch { return null; }
+}
+
+export async function acquireOwnershipLock(path: string, timeoutMs = 1_000): Promise<OwnershipLease> {
+  const identity = captureProcessIdentity(process.pid);
+  if (!identity) throw new Error("runtime_owner_identity_unavailable");
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + Math.max(1, timeoutMs);
+  while (Date.now() <= deadline) {
+    const token = randomUUID();
+    let fd: number | undefined;
+    try {
+      fd = openSync(path, "wx", 0o600);
+      const record: LockRecord = { ...identity, acquiredAt: Date.now(), token };
+      writeSync(fd, Buffer.from(JSON.stringify(record)));
+      let released = false;
+      return {
+        release() {
+          if (released) return;
+          released = true;
+          try { closeSync(fd!); } catch { /* already closed */ }
+          const current = readLock(path);
+          if (current?.token === token) safeUnlink(path);
+        },
+      };
+    } catch (error) {
+      if (fd !== undefined) { try { closeSync(fd); } catch { /* best effort */ } }
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+      const current = readLock(path);
+      if (!current) throw new Error("runtime_ownership_lock_unknown");
+      const state = processLiveness(current.pid, current.startIdentity, current.bootIdentity);
+      if (state === "alive") {
+        await new Promise(resolve => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+        continue;
+      }
+      if (state === "unknown") throw new Error("runtime_ownership_lock_unknown");
+      try { unlinkSync(path); } catch (unlinkError) {
+        if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") throw unlinkError;
+      }
+    }
+  }
+  throw new Error("runtime_ownership_contended");
+}
+
 export type PiBrokerConfig = {
   runtimeRoot: string;
   metadataPath: string;
@@ -56,9 +150,12 @@ export type PiBrokerConfig = {
   sessionFile?: string;
   command: string;
   stderrLimit: number;
+  coordinator?:{endpoint:string;token:string;workId:string};
+  readOnly?:boolean;
+  configPath?:string;
 };
 
-type BrokerMetadata = PiBrokerConfig & { pid: number; state: "starting" | "running" | "stopped"; stderrTail?: string; exitCode?: number; updatedAt: number };
+type BrokerMetadata = PiBrokerConfig & { pid: number; brokerIdentity?:ProcessIdentity;childIdentity?:ProcessIdentity;state: "starting" | "running" | "stopped"; stderrTail?: string; exitCode?: number; updatedAt: number };
 type ClientState = { socket: Socket; framer: JsonlFramer; hello: boolean };
 type PendingCommand = { socket: Socket; commandId: string; turnId?: string; type: string };
 type JournalRow = { seq: number; event: RuntimeEvent };
@@ -70,6 +167,8 @@ const makeReference = (config: PiBrokerConfig, sessionFile?: string): SessionRef
 class PiBroker {
   private server: Server | undefined;
   private child: PiProcess | undefined;
+  private childIdentity:ProcessIdentity|undefined;
+  private ownershipLease:OwnershipLease|undefined;
   private readonly clients = new Set<ClientState>();
   private readonly pending = new Map<string, PendingCommand>();
   private readonly pendingHello = new Set<ClientState>();
@@ -96,6 +195,7 @@ class PiBroker {
     mkdirSync(dirname(this.config.metadataPath), { recursive: true, mode: 0o700 });
     mkdirSync(dirname(this.config.socketPath), { recursive: true, mode: 0o700 });
     mkdirSync(dirname(this.journalPath), { recursive: true, mode: 0o700 });
+    this.ownershipLease=await acquireOwnershipLock(brokerLockPath(this.config.metadataPath),1000);
     safeUnlink(this.config.socketPath);
     this.loadJournalSequence();
     const commandsPath=this.journalPath+'.commands';if(existsSync(commandsPath))for(const key of readFileSync(commandsPath,'utf8').split('\n'))if(key)this.issued.add(key);
@@ -128,6 +228,7 @@ class PiBroker {
   private writeMetadata(state: BrokerMetadata["state"], exitCode?: number): void {
     const value: BrokerMetadata = {
       ...this.config, pid: process.pid, state, updatedAt: Date.now(),
+      brokerIdentity:captureProcessIdentity(process.pid)??undefined,childIdentity:this.childIdentity,
       ...(this.sessionFile ? { sessionFile: this.sessionFile } : {}),
       ...(this.stderrTail ? { stderrTail: this.stderrTail } : {}), ...(exitCode === undefined ? {} : { exitCode }),
     };
@@ -135,11 +236,15 @@ class PiBroker {
   }
 
   private spawnChild(): void {
-    const argv = [this.config.command, "--mode", "rpc", "--session-dir", join(this.config.runtimeRoot, "sessions")];
+    const argv = [this.config.command, "--mode", "rpc", "--session-dir", join(this.config.runtimeRoot, "sessions"),"--extension",join(import.meta.dir,"../extension/overload.ts")];
     if (this.config.provider) argv.push("--provider", this.config.provider);
     if (this.config.model) argv.push("--model", this.config.model);
     if (this.config.sessionFile) argv.push("--session", this.config.sessionFile);
-    const proc = Bun.spawn(argv, { cwd: this.config.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" }) as unknown as PiProcess;
+    if(this.config.coordinator||this.config.readOnly)argv.push('--tools',this.config.coordinator?'read,grep,find,ls,coordinator_dispatch,coordinator_status,coordinator_review,coordinator_deliver':'read,grep,find,ls');
+    if(this.config.coordinator)argv.push('-e',join(import.meta.dir,'../extension/coordinator.ts'));
+    const coordinator=this.config.coordinator;
+    const proc = Bun.spawn(argv, { cwd: this.config.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe",env:{...process.env,OVERLOAD_RUNTIME_SESSION_ID:this.config.sessionId,...(this.config.configPath?{OVERLOAD_CONFIG_PATH:this.config.configPath}:{}),...(coordinator?{OVERLOAD_COORDINATOR_ENDPOINT:coordinator.endpoint,OVERLOAD_COORDINATOR_TOKEN:coordinator.token,OVERLOAD_COORDINATOR_WORK_ID:coordinator.workId}:{})} }) as unknown as PiProcess & { pid: number };
+    this.childIdentity=captureProcessIdentity(proc.pid)??undefined;
     this.child = proc;
     this.writeMetadata("running");
     void this.readStdout(proc.stdout as AsyncBytes);
@@ -370,6 +475,7 @@ class PiBroker {
     for (const client of this.clients) client.socket.destroy();
     await new Promise<void>(resolve => this.server?.close(() => resolve()) ?? resolve());
     safeUnlink(this.config.socketPath);
+    this.ownershipLease?.release();
   }
 }
 
@@ -455,10 +561,15 @@ export function readBrokerMetadata(path: string): BrokerMetadata | null {
   try { const value: unknown = JSON.parse(readFileSync(path, "utf8")); return isObject(value) && typeof value.sessionId === "string" && typeof value.ownerId === "string" && typeof value.ownerToken === "string" && typeof value.socketPath === "string" ? value as unknown as BrokerMetadata : null; } catch { return null; }
 }
 
-if (Bun.argv[2] === "--pi-broker") {
-  const raw = Bun.argv[3];
-  if (!raw) process.exit(2);
-  const parsed: unknown = JSON.parse(raw);
+// The token-bearing config is handed off via a private (mode-0600) file, never
+// inline argv/log: argv is world-readable through /proc/<pid>/cmdline and ps,
+// and both ownerToken and any bound coordinator token would otherwise leak.
+if (Bun.argv[2] === "--pi-broker-file") {
+  const configPath = Bun.argv[3];
+  if (!configPath) process.exit(2);
+  let parsed: unknown;
+  try { parsed = JSON.parse(readFileSync(configPath, "utf8")); } catch { process.exit(2); }
   if (!isObject(parsed)) process.exit(2);
+  safeUnlink(configPath); // one-shot handoff; the broker holds the config in memory from here.
   void runPiBroker(parsed as unknown as PiBrokerConfig).catch(() => process.exit(1));
 }

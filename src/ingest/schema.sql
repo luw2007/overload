@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS applied_control_events(
 );
 CREATE TABLE IF NOT EXISTS control_attention(
   item_id TEXT PRIMARY KEY, work_id TEXT NOT NULL, revision INTEGER NOT NULL,
-  state TEXT NOT NULL, effect_state TEXT NOT NULL, urgency TEXT NOT NULL, owner TEXT NOT NULL,
+  state TEXT NOT NULL, effect_state TEXT NOT NULL, effect_detail TEXT, urgency TEXT NOT NULL, owner TEXT NOT NULL,
   conclusion TEXT NOT NULL, trigger TEXT NOT NULL, impact TEXT NOT NULL, recommendation TEXT,
   options TEXT NOT NULL, expires_at INTEGER, defer_until INTEGER, acknowledged_at INTEGER,
   source_link TEXT, approval_id TEXT, consumer_owner TEXT, contract_revision INTEGER NOT NULL,

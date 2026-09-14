@@ -44,6 +44,8 @@ export type AttentionItem = {
   revision: number;
   state: "open" | "applying" | "resolved" | "superseded";
   effect_state: "not_started" | "applying" | "succeeded" | "failed" | "unknown";
+  /** Why the effect ended in this state (e.g. "push_failed"); null while unexplained. */
+  effect_detail: string | null;
   urgency: "now" | "inbox";
   conclusion: string;
   trigger: string;

@@ -6,10 +6,10 @@
 import { constants, readFileSync, statSync } from "node:fs"
 import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
-import { scrubText } from "../shared/redact"
 import { join } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { execFile, execFileSync } from "node:child_process"
+import { scrubText } from "../shared/redact"
 
 const SEGMENT_MAX_AGE_MS = 30_000
 const SEGMENT_MAX_BYTES = 1_048_576
@@ -392,7 +392,7 @@ export default function overload(pi: ExtensionApi): void {
     try {
       let raw: string
       try {
-        raw = await readFile(join(homedir(), ".overload", "config.json"), "utf8")
+        raw = await readFile(process.env.OVERLOAD_CONFIG_PATH??join(homedir(), ".overload", "config.json"), "utf8")
       } catch (error: any) {
         if (error?.code === "ENOENT") return
         throw error
@@ -506,7 +506,7 @@ export default function overload(pi: ExtensionApi): void {
     const detail = approvalDetail(event, rule.rule, expiresAt)
     const approvalId = String(detail.approval_id)
     const base = `http://127.0.0.1:${gate.webPort}`
-    const evidence = { tool: detail.tool, command: typeof event?.input?.command === "string" ? event.input.command : undefined, path: typeof event?.input?.path === "string" ? event.input.path : undefined, input: event?.input, cwd: sessionCwd, rule: rule.rule, class: detail.class, toolCallId: event.toolCallId }
+    const evidence = { tool: detail.tool, command: typeof event?.input?.command === "string" ? event.input.command : undefined, path: typeof event?.input?.path === "string" ? event.input.path : undefined, input: event?.input, cwd: sessionCwd, rule: rule.rule, class: detail.class, toolCallId: event.toolCallId,session_id:process.env.OVERLOAD_RUNTIME_SESSION_ID }
     let targetVersion = ""
     const cancelApproval = async (): Promise<{ block: true; reason: string }> => {
       let closed = false
@@ -798,7 +798,8 @@ export default function overload(pi: ExtensionApi): void {
       const tool=String(event?.toolName||"unknown").toLowerCase()
       const state:"succeeded"|"failed"|"unknown" = tool==="write"||tool==="edit"?(isError?"failed":"succeeded"):"unknown"
       const evidence={tool,isError,output:truncateUtf8(textFrom(event),2000)}
-      emitEffect({receipt_id:pending.receiptId,toolCallId,attempt_id:pending.attemptId,effect:pending.effect,effect_state:state,evidence})
+      const observation={receipt_id:pending.receiptId,toolCallId,attempt_id:pending.attemptId,effect:pending.effect,effect_state:state,evidence};emitEffect(observation)
+      void globalThis.fetch(`http://127.0.0.1:${approvalGate?.webPort??DEFAULT_WEB_PORT}/api/decision/effect`,{method:"POST",headers:{"Content-Type":"application/json","Origin":`http://127.0.0.1:${approvalGate?.webPort??DEFAULT_WEB_PORT}`},body:JSON.stringify(observation)}).catch(()=>{})
     }
   })
 

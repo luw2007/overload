@@ -1,0 +1,11 @@
+import {test,expect} from 'bun:test';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {openMailbox} from '../decision-bot/mailbox';
+import {openStore} from '../orchestrator/store';
+import {createWork} from '../control/store';
+import {ensureAdapterSchema,acceptMessage} from './store';
+import type {Conversation} from './store';
+import {CoordinatorBridge} from './coordinator';
+test('coordinator HTTP tools require bound capability and current contract',async()=>{const dir=mkdtempSync(join(tmpdir(),'coordinator-bridge-'));const db=openMailbox(join(dir,'control.db')),orch=openStore(join(dir,'orch.db'));ensureAdapterSchema(db);const work=createWork(db,{title:'Bound task',source:'operator',contract:{objective:'inspect',acceptance:[{id:'report',kind:'artifact',description:'report'}],non_goals:[],scope:{repo:dir,allowed_effects:['read']},budget:{retry_limit:1},stop_conditions:[],decision_owner:'owner'}});const event={kind:'message' as const,eventId:'one',identity:{instanceId:'test',tenantId:'tenant',userId:'user'},address:{instanceId:'test',tenantId:'tenant',chatId:'chat'},messageId:'one',text:'inspect',receivedAt:Date.now()};const accepted=acceptMessage(db,event,'owner');const c=db.query('SELECT * FROM conversations WHERE id=?').get(accepted.conversationId) as import('./store').Conversation;const bridge=new CoordinatorBridge(db,orch);try{bridge.start(0);const binding=bridge.bind(c,{runtimeKind:'pi',sessionId:'session',ownerId:c.id,cwd:dir},work.work_id);const body=JSON.stringify({work_id:work.work_id});expect((await bridge.handle(new Request(binding.endpoint+'/coordinator_status',{method:'POST',body}))).status).toBe(403);const response=await bridge.handle(new Request(binding.endpoint+'/coordinator_status',{method:'POST',headers:{authorization:'Bearer '+binding.token},body}));expect(response.status).toBe(200);db.run('UPDATE control_works SET revision=revision+1 WHERE work_id=?',[work.work_id]);expect((await bridge.handle(new Request(binding.endpoint+'/coordinator_status',{method:'POST',headers:{authorization:'Bearer '+binding.token},body}))).status).toBe(409);}finally{bridge.stop();db.close();orch.close();rmSync(dir,{recursive:true,force:true});}});

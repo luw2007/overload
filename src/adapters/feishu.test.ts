@@ -53,7 +53,7 @@ test('normalizes authenticated direct and mentioned group messages with thread i
  await fake.emit('message',{messageId:'m1',chatId:'chat',chatType:'group',senderId:'user',content:'hello',mentionedBot:true,rootId:'root',threadId:'thread',createTime:1_700_000_000,raw:raw('e1','tenant')});
  await fake.emit('message',{messageId:'m2',chatId:'dm',chatType:'p2p',senderId:'user-2',content:'direct',mentionedBot:false,createTime:1_700_000_001,raw:raw('e2','tenant')});
  expect(events).toHaveLength(2);
- expect(events[0]).toMatchObject({kind:'message',eventId:'e1',identity:{instanceId:'feishu-main',tenantId:'tenant',userId:'user'},address:{chatId:'chat',threadId:'thread'},messageId:'m1',text:'hello',receivedAt:1_700_000_000_000});
+ expect(events[0]).toMatchObject({kind:'message',eventId:'e1',identity:{instanceId:'feishu-main',tenantId:'tenant',userId:'user'},address:{chatId:'chat',threadId:'thread',replyTo:'m1'},messageId:'m1',text:'hello',receivedAt:1_700_000_000_000});
  expect(events[1]).toMatchObject({kind:'message',eventId:'e2',address:{chatId:'dm'},text:'direct'});
  await instance.stop();
 });
@@ -61,20 +61,26 @@ test('normalizes authenticated direct and mentioned group messages with thread i
 test('normalizes card callbacks without unauthenticated tenant bypass',async()=>{
  const instance=channel();const events:ChannelEvent[]=[];await instance.start(async event=>{events.push(event);});
  await fake.emit('cardAction',{messageId:'card-1',chatId:'chat',operator:{openId:'user'},action:{tag:'button',value:JSON.stringify({itemId:'item-1',revision:3,answer:'approve',threadId:'root'})},raw:raw('action-1','tenant')});
+ await fake.emit('cardAction',{messageId:'card-2',chatId:'chat',operator:{openId:'user'},action:{tag:'button',value:JSON.stringify({itemId:'item-2',revision:1,answer:'approve'})},raw:raw('action-2','tenant')});
  expect(events[0]).toMatchObject({kind:'decision',eventId:'action-1',identity:{tenantId:'tenant',userId:'user'},address:{chatId:'chat',threadId:'root'},messageId:'card-1',itemId:'item-1',revision:3,answer:'approve'});
+ expect(events[1]).toMatchObject({kind:'decision',eventId:'action-2',address:{chatId:'chat'},messageId:'card-2',itemId:'item-2'});
  await expect(fake.emit('cardAction',{messageId:'card-2',chatId:'chat',operator:{openId:'user'},action:{tag:'button',value:{itemId:'item-2',revision:1,answer:'approve'}},raw:{event_id:'action-2'}})).rejects.toThrow('invalid_feishu_tenant_key');
- expect(events).toHaveLength(1);
+ expect(events).toHaveLength(2);
  await instance.stop();
 });
 
-test('sends threaded text and decision cards, and updates existing cards',async()=>{
+test('sends threaded text and decision cards without a second client confirmation, and updates existing cards',async()=>{
  const instance=channel();await instance.start(async()=>{});
  const text:ChannelMessage={deliveryId:'d1',address:{instanceId:'feishu-main',tenantId:'tenant',chatId:'chat',threadId:'root'},text:'hello'};
  expect(await instance.send(text)).toEqual({state:'sent',messageId:'sent-1'});
- expect(fake.sent[0]).toMatchObject({to:'chat',input:{markdown:'hello'},options:{replyTo:'root',replyInThread:true}});
+ expect(fake.sent[0]).toMatchObject({to:'chat',input:{markdown:'hello'},options:undefined});
+ const topicText:ChannelMessage={...text,address:{...text.address,threadId:'omt-topic',replyTo:'om-anchor'},replyTo:undefined};
+ expect(await instance.send(topicText)).toEqual({state:'sent',messageId:'sent-1'});
+ expect(fake.sent[1]).toMatchObject({options:{replyTo:'om-anchor',replyInThread:true}});
  const decision:ChannelMessage={deliveryId:'d2',address:text.address,text:'review',decision:{itemId:'item',revision:2,title:'Review',owner:'owner',options:['approve'],state:'open'}};
  expect(await instance.send(decision)).toEqual({state:'sent',messageId:'sent-1'});
- expect(fake.sent[1].input).toMatchObject({card:{header:{title:{content:'Review'}}}});
+ expect(fake.sent[2].input).toMatchObject({card:{header:{title:{content:'Review'}}}});
+ expect(JSON.stringify(fake.sent[2].input)).not.toContain('confirm');
  const update={...decision,replaceMessageId:'card-1'};
  expect(await instance.send(update)).toEqual({state:'sent',messageId:'card-1'});
  expect(fake.updates).toHaveLength(1);
