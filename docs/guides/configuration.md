@@ -28,6 +28,16 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 - `--orca-cmd <path>`：覆盖 orca 可执行文件路径
 - `--cmux-sessions-file <path>`：覆盖 cmux sessions 文件路径
 
+## Session view window (env var)
+
+`sessions`, the Inbox (`q2`), the Done/archive surface, and the `zombie` view show only sessions whose last event falls within the last 30 days. History is filtered, never deleted: old sessions stay in the journal and are reachable through `show <stable_id>`, `jump`, and the closeout workflow.
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `OVERLOAD_SESSION_WINDOW_DAYS` | `30` | Session-view lookback in days. Any non-positive or unparseable value falls back to 30. |
+
+Not windowed, by design: Q1 pending requests (decisions waiting on you), `hung` turns (currently stuck), open incidents, explicit single-session lookups (`show`), and write operations.
+
 Remote pull settings are command-line flags to `src/pull/pull.ts`: `--remote`, `--remote-spool`, `--dest`, `--ssh-cmd`, `--rsync-cmd`, `--fail-threshold`, and `--timeout-ms`. Run `bun src/pull/pull.ts --once` with invalid input to print the accepted contract.
 
 The host identity is a separate file: `~/.overload/host`, containing exactly `local` or `devbox`. It is an operator topology label, not a hostname. Most public single-machine installations need no host file.

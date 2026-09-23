@@ -2,10 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ackRequest, queryHealth, queryHung, queryJumpTarget, querySession, querySessions, queryQ1, requestSession, queryQ2, queryArchive, queryZombie } from "./queries";
+import { ackRequest, queryHealth, queryHung, queryJumpTarget, querySession, querySessions, queryQ1, requestSession, queryQ2, queryArchive, queryZombie, sessionCutoff, SESSION_WINDOW_MS } from "./queries";
 
 const NOW = 1_755_000_000_000;
 const HOUR = 3_600_000;
+const DAY = 24 * HOUR;
 
 function sessionFixture(): Database {
   const db = new Database(":memory:");
@@ -172,7 +173,7 @@ describe("session list / inbox / archive surfaces", () => {
     db.run("INSERT INTO current VALUES (?, 'idle', 'q3', NULL, ?, ?, ?)", ["local:pi:b", NOW + 1000, NOW + 1000, NOW + 1000]);
     db.run("INSERT INTO journal VALUES (1, 'local:pi:a', ?, 'pi', 'w', 'settled', ?)", [NOW, JSON.stringify({ handoff: { path: "/h", status: "complete", uncertainties: 0 } })]);
 
-    const rows = querySessions(db);
+    const rows = querySessions(db, -1, NOW);
     expect(rows.map((r) => r.stable_id)).toEqual(["local:pi:b", "local:pi:a"]);
     expect(rows.find((r) => r.stable_id === "local:pi:a")?.handoff).toEqual({ path: "/h", status: "complete", uncertainties: 0 });
     expect(rows.find((r) => r.stable_id === "local:pi:b")?.handoff).toBeNull();
@@ -210,8 +211,8 @@ describe("session list / inbox / archive surfaces", () => {
     db.run("INSERT INTO current VALUES ('local:pi:a', 'idle', 'q2', NULL, ?, ?, ?, 'agent')", [NOW, NOW, NOW]);
     db.run("INSERT INTO current VALUES ('local:pi:b', 'idle', 'q4', NULL, ?, ?, ?, 'agent')", [NOW, NOW, NOW]);
 
-    expect(queryQ2(db).map((r) => r.stable_id)).toEqual(["local:pi:a"]);
-    expect(queryArchive(db).map((r) => r.stable_id)).toEqual(["local:pi:b"]);
+    expect(queryQ2(db, NOW).map((r) => r.stable_id)).toEqual(["local:pi:a"]);
+    expect(queryArchive(db, NOW).map((r) => r.stable_id)).toEqual(["local:pi:b"]);
     db.close();
   });
 
@@ -223,10 +224,48 @@ describe("session list / inbox / archive surfaces", () => {
     db.run("INSERT INTO current VALUES (?, 'working', 'q5', 'turn_hung', ?, ?, ?)", ["local:pi:b", NOW, NOW, NOW]);
     db.run("INSERT INTO requests(request_uid, stable_id, kind, created_at, detail, state, resolved_at) VALUES ('o1', 'local:pi:a', 'ask', ?, '{}', 'orphaned', ?)", [NOW, NOW]);
 
-    const view = queryZombie(db);
+    const view = queryZombie(db, NOW);
     expect(view.groups.map((g) => g.q5_reason)).toEqual(["stalled"]);
     expect(view.groups[0].rows.map((r) => r.stable_id)).toEqual(["local:pi:a"]);
     expect(view.orphaned_requests.map((r) => r.request_uid)).toEqual(["o1"]);
+    db.close();
+  });
+});
+
+describe("30-day session window", () => {
+  test("querySessions keeps rows at or inside the cutoff, including exactly 30 days old", () => {
+    const db = sessionFixture();
+    const edge = NOW - 30 * DAY;
+    expect(sessionCutoff(NOW)).toBe(edge);
+    for (const [stableId, lastEvent] of [
+      ["fresh", NOW],
+      ["inside", NOW - 29 * DAY],
+      ["edge", edge],
+      ["ancient", NOW - 31 * DAY],
+    ] as Array<[string, number]>) {
+      db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", [stableId, lastEvent, lastEvent]);
+      db.run("INSERT INTO current VALUES (?, 'idle', 'q3', NULL, ?, ?, ?)", [stableId, lastEvent, lastEvent, lastEvent]);
+    }
+    // No current row: first_seen_at is the decision time, same rule applies.
+    db.run("INSERT INTO sessions VALUES ('ghost-old', 'local', 'pi', ?, '/repo', 'main', ?)", [NOW - 40 * DAY, NOW - 40 * DAY]);
+    db.run("INSERT INTO sessions VALUES ('ghost-fresh', 'local', 'pi', ?, '/repo', 'main', ?)", [NOW - 5 * DAY, NOW - 5 * DAY]);
+
+    const rows = querySessions(db, -1, NOW);
+    expect(rows.map((r) => r.stable_id)).toEqual(["fresh", "ghost-fresh", "inside", "edge"]);
+    db.close();
+  });
+
+  test("Q1 pending requests and hung turns ignore the window", () => {
+    const db = sessionFixture();
+    db.run("ALTER TABLE sessions ADD COLUMN host TEXT");
+    db.run("ALTER TABLE attachments ADD COLUMN platform TEXT");
+    const old = NOW - 60 * DAY;
+    db.run("INSERT INTO sessions VALUES ('ancient', 'local', 'pi', ?, '/repo', 'main', ?, 'local')", [old, old]);
+    db.run("INSERT INTO requests(request_uid, stable_id, kind, created_at, detail, state) VALUES ('r-old', 'ancient', 'ask', ?, '{}', 'pending')", [old]);
+    db.run("INSERT INTO current VALUES ('ancient', 'working', 'q5', 'turn_hung', ?, ?, ?)", [old, old, old]);
+
+    expect(queryQ1(db).map((r) => r.request_uid)).toEqual(["r-old"]);
+    expect(queryHung(db, NOW).map((r) => r.stable_id)).toEqual(["ancient"]);
     db.close();
   });
 });
