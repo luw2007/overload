@@ -8,13 +8,13 @@ import type { Work } from "../control/types";
 const schema = readFileSync(join(import.meta.dir, "schema.sql"), "utf8");
 export const STATES = ["queued", "starting", "running", "awaiting_human", "submitted", "blocked", "done", "failed", "abandoned"] as const;
 export type TaskState = typeof STATES[number];
-export type Task = { task_id:string; title:string; repo:string; base_ref:string; worktree:string|null; branch:string|null; state:TaskState; attempt_id:string|null; owner_instance:string|null; lease_expires_at:number|null; heartbeat_at:number|null; runner_pid:number|null; runner_boot_id:string|null; retry_budget:number; stable_id:string|null; pr_url:string|null; blocked_reason:string|null; terminal_reason:string|null; work_id:string|null; contract_revision:number|null; budget_deadline_at:number|null; ci_observation_failures:number; created_at:number; updated_at:number };
+export type Task = { task_id:string; title:string; repo:string; base_ref:string; worktree:string|null; branch:string|null; state:TaskState; attempt_id:string|null; owner_instance:string|null; lease_expires_at:number|null; heartbeat_at:number|null; runner_pid:number|null; runner_boot_id:string|null; retry_budget:number; stable_id:string|null; pr_url:string|null; blocked_reason:string|null; terminal_reason:string|null; work_id:string|null; contract_revision:number|null; budget_deadline_at:number|null; ci_observation_failures:number; stop_state:"stop_requested"|"stopped_confirmed"|"stop_unconfirmed"|null; stop_requested_at:number|null; stop_deadline_at:number|null; stop_reason:string|null; created_at:number; updated_at:number };
 export type TransitionDetail = Record<string, unknown>;
 export type Recovery={task_id:string;attempt_id:string;spawn_state:"intent"|"spawned"|"failed";spawn_at:number;unknown_ticks:number};
 const rules: Record<TaskState, Record<string, TaskState>> = {
   queued:{claim:"starting",human_abandon:"abandoned"},
   starting:{worktree_ok:"running",spawn_ok:"running",spawn_fail:"blocked",worktree_fail:"failed",bind_timeout:"running",session_bound:"running",runner_dead:"starting",spawn_unverified:"blocked",no_attempt:"blocked",human_abandon:"abandoned"},
-  running:{session_bound:"running",bind_timeout:"running",runner_exit:"awaiting_human",runner_dead:"starting",check_absent:"blocked",liveness_unknown:"blocked",no_attempt:"blocked",human_abandon:"abandoned"},
+  running:{session_bound:"running",bind_timeout:"running",runner_exit:"awaiting_human",runner_dead:"starting",check_absent:"blocked",liveness_unknown:"blocked",no_attempt:"blocked",human_abandon:"abandoned","answer=confirm-stopped":"running","answer=keep-held":"running"},
   awaiting_human:{"answer=approve":"submitted","answer=reject":"blocked","answer=abandon":"abandoned","answer=recheck":"submitted","answer=manual-followup":"blocked",gate_expire:"blocked",human_abandon:"abandoned"},
   submitted:{push_pr_ok:"submitted",tool_missing:"blocked",push_fail:"blocked",ci_merged:"done",ci_anomaly:"awaiting_human",human_abandon:"abandoned"},
   blocked:{human_reopen:"starting",human_abandon:"abandoned"}, done:{}, failed:{}, abandoned:{}
@@ -31,7 +31,7 @@ export function openStore(path?: string | null): Database {
   // Existing M0 databases predate contract/budget observability. SQLite does
   // not support ADD COLUMN IF NOT EXISTS, so make this migration idempotent.
   const columns=db.query("PRAGMA table_info(tasks)").all() as {name:string}[];
-  for(const [name,sql] of [["work_id","TEXT"],["contract_revision","INTEGER"],["budget_deadline_at","INTEGER"],["ci_observation_failures","INTEGER NOT NULL DEFAULT 0"]] as const)
+  for(const [name,sql] of [["work_id","TEXT"],["contract_revision","INTEGER"],["budget_deadline_at","INTEGER"],["ci_observation_failures","INTEGER NOT NULL DEFAULT 0"],["stop_state","TEXT"],["stop_requested_at","INTEGER"],["stop_deadline_at","INTEGER"],["stop_reason","TEXT"]] as const)
     if(!columns.some(column=>column.name===name))db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
   chmodSync(resolved, 0o600);
   db.run("INSERT OR IGNORE INTO spool_seq(id,seq,segment) VALUES(1,0,0)"); return db;

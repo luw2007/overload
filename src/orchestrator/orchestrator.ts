@@ -14,6 +14,8 @@ import { consumeAnswers, expireApprovals, openAnswersDb, requestApproval, repair
 import { buildAgentTaskContext } from "./agent-task-context";
 import { collectAndSpool, spoolContextEnvelope } from "./context-collector";
 import { determineRecoveryOutcome } from "./recovery-context";
+import { AnomalyMonitor, repairAnomalyIntents } from "./anomaly-monitor";
+import { getAnomalyBudget } from "./anomaly-store";
 import type { Database } from "bun:sqlite";
 
 const BIND_TIMEOUT_TICKS = 12; // ~60s at the 5s tick interval, plan §3.3 bind_timeout.
@@ -23,11 +25,13 @@ export class Orchestrator {
   private static readonly CI_CHECK_INTERVAL=5*60*1000; // 5 minutes
   private static readonly GC_INTERVAL=5*60*1000; // §3.6: sweep worktrees at most this often, not on every 5s tick.
   private static readonly GC_MIN_AGE=60*60*1000; // Leave a finished worktree alone for an hour so a human can still look.
+  readonly anomalyMonitor:AnomalyMonitor;
   constructor(readonly db:Database,readonly spool:SpoolWriter,readonly concurrency=2,
     readonly ledgerPath=process.env.OVERLOAD_LEDGER_PATH??join(homedir(),".overload","ledger.db"),
     readonly worktreeExec:CommandExecutor=defaultCommandExecutor,readonly runnerExec:RunnerExecutor=defaultRunnerExecutor,
     readonly worktreesDir=worktreesRoot(),readonly artifactsDir=join(homedir(),".overload","artifacts")) {
     if(concurrency<1||concurrency>4)throw new Error("concurrency must be between 1 and 4");
+    this.anomalyMonitor=new AnomalyMonitor(db,spool,ledgerPath,worktreeExec,worktreesDir,artifactsDir);
   }
   private mine(t:Task,now:number):boolean{return t.owner_instance==null||t.owner_instance===this.owner||t.lease_expires_at==null||t.lease_expires_at<=now}
   // §1.3: every post-await write from this class is CAS'd against this.owner; a loser leaves a
@@ -150,10 +154,11 @@ export class Orchestrator {
       }
       try {
         const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{
-          repairApprovalIntents(this.db,answers,now);consumeAnswers(this.db,answers,this.spool,now);expireApprovals(this.db,this.spool,now,answers);reconcileApprovalEffects(this.db,answers,now);
+          repairApprovalIntents(this.db,answers,now);repairAnomalyIntents(this.db,answers,now);consumeAnswers(this.db,answers,this.spool,now);expireApprovals(this.db,this.spool,now,answers);reconcileApprovalEffects(this.db,answers,now);
           publishControlEvents(answers,this.ledgerPath,detail=>this.spool.emit("control", "control_event", detail),now);
           this.collectContextFacts();
         }finally{answers.close();}
+        await this.anomalyMonitor.consumeDecisions(now);
         renewLeases(this.db,this.owner,now);
         await this.collectWorktrees(now);
       } catch(error) { console.error(error); }
@@ -222,6 +227,13 @@ export class Orchestrator {
       }
       finally{control?.close();}
     }
+    // §12.6：clean_restart 后新 attempt 携带失败指纹约束，避免重复同一路径。
+    if(task.work_id){
+      const budget=getAnomalyBudget(this.db,task.work_id);
+      if(budget?.fingerprint){
+        promptText+=`\n\n【异常止损约束】此前同一失败指纹 ${budget.fingerprint} 连续 ${budget.fix_rounds_consumed} 轮未通过。请勿重复同一路径，尝试不同的修复策略。`;
+      }
+    }
     setRecovery(this.db,task.task_id,attemptId,"intent");
     const spawned=await spawnRunner(task,dir,attemptId,promptText,this.runnerExec,this.artifactsDir);setRecovery(this.db,task.task_id,attemptId,spawned.ok?"spawned":"failed");
     if(!spawned.ok){ this.casTransition(task.task_id,"spawn_fail",{worktree:dir,branch,reason:"tool_missing",detail:spawned.error},Date.now()); return; }
@@ -230,7 +242,16 @@ export class Orchestrator {
   }
   private async pollRunning(task:Task,now:number):Promise<void> {
     if(task.runner_pid==null){await this.pollBinding(task,now);return;}
-    if(defaultPidAlive(task.runner_pid))return;
+    if(defaultPidAlive(task.runner_pid)){
+      // 异常信号采样与围栏：已围栏（stop_state 非空）的任务跳过采样，避免噪声。
+      if(!task.stop_state){
+        try{await this.anomalyMonitor.sampleTask(task,now);}
+        catch(e){this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,now,task.state,task.state,"anomaly_sample_failed",JSON.stringify({error:String(e)})]);}
+        try{await this.anomalyMonitor.evaluateAndFence(task,now);}
+        catch(e){this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,now,task.state,task.state,"anomaly_evaluate_failed",JSON.stringify({error:String(e)})]);}
+      }
+      return;
+    }
     await this.collectAndResolve(task,now);
   }
   // §3.7 会话绑定: poll ledger.db (readonly) each tick until bound, or give up after BIND_TIMEOUT_TICKS.

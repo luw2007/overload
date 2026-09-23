@@ -449,3 +449,18 @@ orchestrator 只写：`orchestrator.db`、`artifacts/`、`worktrees/`、自己�
 ## 附：一句话总结
 
 先用约 70 行修掉 orchestrator 真正依赖的三件事（CSRF 卫生、跨 host 的 `detail.stable_id` 覆盖、看不见的 Inbox），其余止血项各自独立提交；再用约 1015 行在 `src/orchestrator/` 里造一个**由 DB 唯一索引强制单写者、有租约与启动 reconciliation、只有一个 ready gate、终态之外一律用 blocked 接住人类、经 cmux 起 runner 因而真能跳回现场、push/PR/CI 写成幂等链**的最小编排器；并诚实承认：gate 是工作流边界不是安全边界，Overload 核心为此改了约 10 行（`resume.ts` 的 `orch:` guard），代价是 runner 自批最多换来一个 bot 分支和一个待人合并的 PR。
+
+---
+
+## 运行期异常止损（AnomalyMonitor，内部机制，无独立 CLI）
+
+`src/orchestrator/anomaly-monitor.ts` 是 orchestrator 在任务 `running` 期间的**内部止损机制**，随每个 5s tick 自动运行，**没有独立 CLI/Web 命令**，也不要求用户手动触发。设计依据见 `attention-anomaly-signals-design.md`。
+
+- **采样**：对进程存活的 running 任务按 `signal_sample_window_ms`（默认 60s）节流采样 git churn（`base...HEAD` numstat）与 `worktree/orchestrator.check` 的机器可读逐项检查。已围栏（`stop_state` 非空）的任务跳过采样，避免噪声。
+- **两类机器可验信号**：`fix_loop_exhausted`（同一归一化失败指纹连续 5 轮无 fail→pass 进展）与 `divergence_detected`（churn 升至近窗中位数 3 倍且连续 3 窗无检查项转通过、仍有失败项）。触发即围栏：请求停止 runner、把任务 `stop_state` 置位、投影一张决策卡到 Now。
+- **预算**：`work_anomaly_budget` 按 work_id 持久化，新 attempt / clean_restart 继承不重置。人工 `continue_with_budget` 只追加有限观察窗（默认 2），**按采样窗消耗、不按 tick**；预算耗尽后才重新围栏，禁止自动续杯。
+- **决策回流**：人工在卡上选择 `clean_restart` / `continue_with_budget` / `narrow_or_redirect` / `stop`，由 `consumeDecisions` 应用——旋转 attempt 或清围栏续跑，并把结果写回预算与 `task_events`。检查项恢复通过后自动清退机器卡。
+- **弱信号**（无机器可读检查）只投 Inbox 卡、不围栏。
+- **数据**：采样与检查结果按 work 保留最近 40 窗（`pruneSignalHistory`），防止长期运行 DB 无限膨胀。
+
+用户可见入口仅是决策卡本身（Now/Inbox），通过现有 `answer` 流程处置；不存在 `overload anomaly ...` 子命令。

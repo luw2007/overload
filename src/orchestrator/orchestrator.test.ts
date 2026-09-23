@@ -280,3 +280,67 @@ test("§3.6 tick collects abandoned worktrees on its own, throttled, and records
   expect(removed).toHaveLength(1);
   spool.close();db.close();
 });
+
+function seedControlWorkForTest(root:string, workId:string):void{
+  const { openAnswersDb } = require("./approval");
+  const answers = openAnswersDb(join(root,"answers.db"));
+  answers.run(
+    "INSERT INTO control_works(work_id,title,source,source_id,state,revision,contract,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+    [workId,"w","test",null,"active",1,JSON.stringify({objective:"fix",acceptance:[],non_goals:[],scope:{repo:"/r"},budget:{},stop_conditions:[],decision_owner:"alice"}),1,1],
+  );
+  answers.close();
+}
+
+test("§12.6 clean_restart budget fingerprint is injected into the new attempt prompt",async()=>{
+  const root=mkdtempSync(join(tmpdir(),"orch-fp-"));dirs.push(root);writeFileSync(join(root,"host"),"local\n");
+  const repo=mkdtempSync(join(tmpdir(),"orch-repo-fp-"));dirs.push(repo);
+  const run=(args:string[])=>Bun.spawnSync(["git",...args],{cwd:repo});
+  run(["init","-q"]);run(["config","user.email","a@a.com"]);run(["config","user.name","a"]);
+  Bun.spawnSync(["bash","-c","echo x > f"],{cwd:repo});run(["add","f"]);run(["commit","-q","-m","init"]);
+  const baseRef=run(["rev-parse","HEAD"]).stdout.toString().trim();
+  const answersPath=join(root,"answers.db");
+  process.env.OVERLOAD_ANSWERS_PATH=answersPath;
+  seedControlWorkForTest(root,"work-fp");
+  const db=openStore(join(root,"orchestrator.db"));const spool=new SpoolWriter(db,root);
+  const runnerExec=async()=>({ok:true});
+  const worktreeExec=async(cmd:string,args:string[])=>{const proc=Bun.spawnSync([cmd,...args]);return{ok:proc.exitCode===0,stdout:proc.stdout.toString(),stderr:proc.stderr.toString()};};
+  const orch=new Orchestrator(db,spool,4,join(root,"ledger.db"),worktreeExec as never,runnerExec,join(root,"worktrees"),join(root,"artifacts"));
+  const task=addTask(db,"fp inject",repo,baseRef,1);
+  db.run("UPDATE tasks SET work_id=?, contract_revision=1 WHERE task_id=?",["work-fp",task.task_id]);
+  db.run("INSERT INTO work_anomaly_budget(work_id,budget_version,fingerprint,fix_rounds_consumed,updated_at) VALUES(?,1,?,?,1)",["work-fp","fp-same",5]);
+  process.env.OVERLOAD_CONTEXT_ASSEMBLY_ENABLED="false";
+  await orch.tick(1);
+  delete process.env.OVERLOAD_CONTEXT_ASSEMBLY_ENABLED;
+  const after=getTask(db,task.task_id)!;expect(after.state).toBe("running");
+  const promptFile=join(root,"artifacts",task.task_id,`prompt-${after.attempt_id}.txt`);
+  const prompt=require("node:fs").readFileSync(promptFile,"utf8");
+  expect(prompt).toContain("异常止损约束");
+  expect(prompt).toContain("fp-same");
+  expect(prompt).toContain("连续 5 轮");
+  spool.close();db.close();delete process.env.OVERLOAD_ANSWERS_PATH;
+});
+
+test("§12.6 no fingerprint -> prompt is not decorated",async()=>{
+  const root=mkdtempSync(join(tmpdir(),"orch-nofp-"));dirs.push(root);writeFileSync(join(root,"host"),"local\n");
+  const repo=mkdtempSync(join(tmpdir(),"orch-repo-nofp-"));dirs.push(repo);
+  const run=(args:string[])=>Bun.spawnSync(["git",...args],{cwd:repo});
+  run(["init","-q"]);run(["config","user.email","a@a.com"]);run(["config","user.name","a"]);
+  Bun.spawnSync(["bash","-c","echo x > f"],{cwd:repo});run(["add","f"]);run(["commit","-q","-m","init"]);
+  const baseRef=run(["rev-parse","HEAD"]).stdout.toString().trim();
+  process.env.OVERLOAD_ANSWERS_PATH=join(root,"answers.db");
+  seedControlWorkForTest(root,"work-nofp");
+  const db=openStore(join(root,"orchestrator.db"));const spool=new SpoolWriter(db,root);
+  const runnerExec=async()=>({ok:true});
+  const worktreeExec=async(cmd:string,args:string[])=>{const proc=Bun.spawnSync([cmd,...args]);return{ok:proc.exitCode===0,stdout:proc.stdout.toString(),stderr:proc.stderr.toString()};};
+  const orch=new Orchestrator(db,spool,4,join(root,"ledger.db"),worktreeExec as never,runnerExec,join(root,"worktrees"),join(root,"artifacts"));
+  const task=addTask(db,"no fp",repo,baseRef,1);
+  db.run("UPDATE tasks SET work_id=?, contract_revision=1 WHERE task_id=?",["work-nofp",task.task_id]);
+  process.env.OVERLOAD_CONTEXT_ASSEMBLY_ENABLED="false";
+  await orch.tick(1);
+  delete process.env.OVERLOAD_CONTEXT_ASSEMBLY_ENABLED;
+  const after=getTask(db,task.task_id)!;expect(after.state).toBe("running");
+  const promptFile=join(root,"artifacts",task.task_id,`prompt-${after.attempt_id}.txt`);
+  const prompt=require("node:fs").readFileSync(promptFile,"utf8");
+  expect(prompt).not.toContain("异常止损约束");
+  spool.close();db.close();delete process.env.OVERLOAD_ANSWERS_PATH;
+});
