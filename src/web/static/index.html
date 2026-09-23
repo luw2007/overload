@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Overload</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header><a class="brand" href="/decide" data-nav="decide">Overload</a><nav aria-label="Main navigation"><a href="/decide" data-nav="decide">Decide</a><a href="/conversations" data-nav="conversations">Conversations</a><a href="/ledger" data-nav="ledger">Ledger</a><a href="/works" data-nav="works">Works</a><a href="/tasks" data-nav="tasks">Tasks</a><a href="/candidates" data-nav="candidates">Candidates</a><a href="/agents" data-nav="agents">Agents</a></nav><kbd title="Batch bounded decisions">⌘K / Ctrl K</kbd></header>
+  <p id="error" class="error-line" role="alert" hidden></p>
+  <main id="main"></main>
+  <footer id="workspace-actions" class="workspace-actions" aria-label="当前任务操作"></footer>
+  <dialog id="drawer" class="drawer" aria-labelledby="drawer-title"></dialog>
+  <dialog id="modal" aria-labelledby="modal-title"></dialog>
+  <div id="announcement" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>

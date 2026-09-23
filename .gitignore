@@ -1,0 +1,44 @@
+digests/
+ledger.db*
+*.ndjson
+*.db
+*.log
+.env*
+.DS_Store
+node_modules/
+feishu-app.json
+*-auth.json
+.superpowers/
+# Orchestration scratch: a dispatch projection is owner-written and read-only,
+# and a done marker names a candidate SHA. Neither is repository history.
+.dispatch/
+.done/
+.dispatch-ledger/
+
+# Local process artifacts and working notes
+REVIEW.md
+REVIEW-P2.md
+REVIEW-P3.md
+REVIEW-P4.md
+docs/feature-stories.csv.orig-backup
+docs/plans/_backup/
+docs/plans/_shots/
+docs/plans/verification/
+docs/plans/*.html
+docs/plans/overload-code-audit-20260922.md
+docs/plans/overload-context-interaction-review-20260923.md
+docs/plans/overload-context-plan-review-20260922.md
+docs/plans/overload-context-verification-20260922.md
+docs/plans/overload-plan-review-20260922.md
+docs/research/jev-reference/
+docs/superpowers/
+
+# Source copies of docs now tracked under architecture/ and history/plans/
+docs/plans/overload-context-management-plan-20260922.md
+docs/plans/overload-context-interaction-design-notes-20260923.md
+docs/plans/overload-development-plan-20260922.md
+docs/plans/overload-context-development-report-20260923.md
+docs/plans/overload-requirements-synthesis-20260922.md
+
+# Local design drafts (not for release)
+docs/architecture/attention-anomaly-signals-design.md

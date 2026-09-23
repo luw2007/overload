@@ -1,0 +1,69 @@
+import { Database } from "bun:sqlite";
+import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { Task } from "./store";
+import { buildPiRunnerInvocation } from "../adapters/pi";
+
+export type RunnerExecutor = (command: string, args: string[]) => Promise<{ ok: boolean; error?: string; stdout?:string; stderr?:string }>;
+export type RunnerProbe={kind:"absent"}|{kind:"unreadable"}|{kind:"found";stable_id:string;pid:number|null;boot_id:string|null;has_incarnation:boolean;ended:boolean};
+
+/** Same shape/behavior as src/shared/resume.ts's defaultResumeExecutor. */
+export const defaultRunnerExecutor: RunnerExecutor = async (command, args) => {
+  try {
+    const proc = Bun.spawn([command, ...args], { stdout: "pipe", stderr: "pipe" });
+    const stderr = new Response(proc.stderr).text();
+    const rc = await proc.exited;
+    return rc === 0 ? { ok: true } : { ok: false, error: (await stderr).trim().split("\n", 1)[0] || "launch_failed" };
+  } catch {
+    return { ok: false, error: "cmux_unavailable" };
+  }
+};
+
+
+export function taskOrigin(taskId: string, attemptId: string): string { return `orch:task:${taskId}:${attemptId}`; }
+
+export function artifactsDir(taskId: string, root = join(homedir(), ".overload", "artifacts")): string { return join(root, taskId); }
+
+/**
+ * §3.7 spawn. Chosen invocation shape: `pi -p @<prompt-file>` — `--print, -p` is pi's
+ * documented non-interactive mode (process prompt and exit, verified via `pi --help`,
+ * R1), and `@<file>` is pi's documented file-content-as-message syntax, so the prompt
+ * never has to be shell-embedded inline (fragile per the task brief). The prompt file
+ * is written to the artifacts dir, not the worktree, so it never shows up in
+ * `git status --porcelain` (the worktree's cleanliness gate, plan §3.6/§3.8).
+ */
+export async function spawnRunner(task: Task, worktreeDir: string, attemptId: string, promptText: string, executor: RunnerExecutor = defaultRunnerExecutor, artifactsRoot = join(homedir(), ".overload", "artifacts")): Promise<{ ok: boolean; error?: string }> {
+  const dir = artifactsDir(task.task_id, artifactsRoot);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const promptFile = join(dir, `prompt-${attemptId}.txt`);
+  writeFileSync(promptFile, promptText, { mode: 0o600 });
+  const invocation=buildPiRunnerInvocation(task.task_id,attemptId,worktreeDir,promptFile);
+  const result=await executor(invocation.command,invocation.args);
+  // Executor output is attempt-scoped evidence; never overwrite another retry.
+  appendFileSync(join(dir,`runner-${attemptId}.log`),`[${new Date().toISOString()}] spawn ${result.ok?"ok":"failed"}\nstdout: ${result.stdout??""}\nstderr: ${result.stderr??""}\nerror: ${result.error??""}\n`,{mode:0o600});
+  return result;
+}
+
+type SessionRow = { stable_id: string };
+type IncarnationRow = { pid: number | null; proc_boot_id: string | null };
+
+/**
+ * §3.7 会话绑定 / §4.2 boundary: opens ledger.db `{readonly:true}` exactly like
+ * src/web/server.ts:61, reads only sessions/session_incarnations, never writes.
+ */
+type ProbeRow={stable_id:string;pid:number|null;proc_boot_id:string|null;has_incarnation:number;ended:number};
+export function probeRunnerLiveness(ledgerPath:string,taskId:string,attemptId:string):RunnerProbe{let db:Database|null=null;try{db=new Database(ledgerPath,{readonly:true});const r=db.query(`SELECT s.stable_id,i.pid,i.proc_boot_id,(i.stable_id IS NOT NULL) AS has_incarnation,EXISTS(SELECT 1 FROM journal j WHERE j.stable_id=i.stable_id AND j.writer_id=i.writer_id AND j.kind='session_ended') AS ended FROM sessions s LEFT JOIN session_incarnations i ON i.stable_id=s.stable_id AND i.liveness_domain='process' WHERE s.origin=? ORDER BY s.created_at DESC,i.last_seen_at DESC LIMIT 1`).get(taskOrigin(taskId,attemptId)) as ProbeRow|null;return r?{kind:"found",stable_id:r.stable_id,pid:r.pid,boot_id:r.proc_boot_id,has_incarnation:!!r.has_incarnation,ended:!!r.ended}:{kind:"absent"}}catch{return{kind:"unreadable"}}finally{db?.close()}}
+
+export function bindRunnerSession(ledgerPath: string, task: Task, attemptId: string): { stable_id: string; pid: number | null; boot_id: string | null } | null {
+  let db: Database;
+  try { db = new Database(ledgerPath, { readonly: true }); } catch { return null; }
+  try {
+    const origin = taskOrigin(task.task_id, attemptId);
+    const session = db.query("SELECT stable_id FROM sessions WHERE origin=? ORDER BY created_at DESC LIMIT 1").get(origin) as SessionRow | null;
+    if (!session) return null;
+    const incarnation = db.query(`SELECT pid, proc_boot_id FROM session_incarnations WHERE stable_id=? AND liveness_domain='process'
+      ORDER BY last_seen_at DESC LIMIT 1`).get(session.stable_id) as IncarnationRow | null;
+    return { stable_id: session.stable_id, pid: incarnation?.pid ?? null, boot_id: incarnation?.proc_boot_id ?? null };
+  } finally { db.close(); }
+}

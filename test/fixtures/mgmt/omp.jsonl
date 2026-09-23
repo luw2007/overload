@@ -1,0 +1,4 @@
+{"type":"session","id":"omp-1","cwd":"/tmp/omp","timestamp":"2026-01-02T00:00:00Z"}
+{"type":"message","timestamp":"2026-01-02T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"write it"}]}}
+{"type":"message","timestamp":"2026-01-02T00:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"t1","name":"write","arguments":{"path":"new.ts","create":true}},{"type":"toolCall","id":"t2","name":"grep","arguments":{"path":"src"}}]}}
+{"truncated":

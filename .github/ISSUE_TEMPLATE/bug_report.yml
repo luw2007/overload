@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible Overload defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include ledger databases, spool files, logs, session transcripts, credentials, or unredacted local paths."
+  - type: input
+    id: version
+    attributes:
+      label: Overload version or commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: macOS and Bun versions
+      placeholder: "macOS 14.6, Bun 1.1.30"
+    validations:
+      required: true
+  - type: dropdown
+    id: integration
+    attributes:
+      label: Affected integration
+      options: [core ingest, web dashboard, launchd, pi/omp/prime extension, Claude hooks, cmux, herdr, orca, remote pull, other]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Redacted reproduction and observed result
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true

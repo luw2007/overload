@@ -1,0 +1,13 @@
+{
+  "name": "overload",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.73.3"
+  }
+}

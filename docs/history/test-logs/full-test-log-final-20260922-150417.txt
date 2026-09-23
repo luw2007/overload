@@ -1,0 +1,1012 @@
+bun test v1.4.2 (744846f84)
+
+test/p4-cmux.test.ts:
+(pass) P4 cmux entry inventory > cmux implementation is optional during parallel landing [0.01ms]
+(pass) cmux identity and generation contracts > exports a scanner/translator surface [8.17ms]
+(pass) cmux identity and generation contracts > frozen identity mapping is documented by implementation [0.26ms]
+(pass) cmux identity and generation contracts > generation retirement and rescan hooks exist [0.13ms]
+
+test/ext-host-identity-local.test.ts:
+(pass) EXT-16(b): no host file defaults to spool/local/ [0.03ms]
+
+test/manage-scan.test.ts:
+(pass) management scan > fresh unrelated sessions create separate candidate discovered Works and rescan is row-idempotent [10.98ms]
+(pass) management scan > same repo and near time are not weakly merged [5.73ms]
+(pass) management scan > handoff origin attaches successor to seeded Work [4.42ms]
+(pass) management scan > truncated then appended source does not duplicate content versions [4.04ms]
+(pass) management scan > unavailable host changes no rows and archives nothing [1.29ms]
+(pass) management scan > read-only tool creates an artifact link but no content version [1.69ms]
+(pass) rescanning an aliased session preserves binding and routes new artifacts canonically [5.26ms]
+(pass) write result in a later scan retains original call evidence [3.89ms]
+
+test/manage-write-source.test.ts:
+(pass) MAN-52: local writeSourceFile creates missing parent dirs and writes content [3.40ms]
+(pass) MAN-52: remote writeSourceFile mkdirs parent, truncates then appends 48KB base64 chunks (Darwin -D) [2.23ms]
+
+test/ext-behavior-extra.test.ts:
+(pass) EXT-04: one working run from before_agent_start/agent_start/turn_start [0.27ms]
+(pass) EXT-09: tool_activity collapses non-change-capable calls inside 5s [0.24ms]
+(pass) EXT-10: heartbeat fires every 60s while working, stops after settle [0.03ms]
+(pass) flush and assert [506.31ms]
+
+test/p2-recon.test.ts:
+(pass) contract: source_outage — one event per outage + recovery (protocol 6) > down → single event; still down → silence; up → recovered; down again → NEW outage [451.84ms]
+(pass) contract: source_outage — one event per outage + recovery (protocol 6) > unparseable CLI output (rc 0, garbage) is an OUTAGE, not an empty snapshot [72.73ms]
+(pass) contract: source_outage — one event per outage + recovery (protocol 6) > while herdr is out, ZERO herdr-derived per-session findings are emitted [289.38ms]
+(pass) contract: source_outage — one event per outage + recovery (protocol 6) > cmux: missing file = unused (silence); malformed file = outage [165.52ms]
+(pass) contract: telemetry_gap — live platform agent with no spool writer (rate-limited) > gap fires once per native_id per hour — no storm on repeated passes [323.97ms]
+(pass) contract: telemetry_gap — live platform agent with no spool writer (rate-limited) > a session WITH a live (recent) spool writer is not a gap [72.47ms]
+(pass) contract: telemetry_gap — live platform agent with no spool writer (rate-limited) > a cwd with no ledger session joins nothing (no fabricated subjects) [68.21ms]
+(pass) contract: emitter_dead / emitter_drained — the cursor==size gate (protocol 3) > dead by kill-0, cursor behind EOF → emitter_dead but NOT drained [81.45ms]
+(pass) contract: emitter_dead / emitter_drained — the cursor==size gate (protocol 3) > cursor reaches EOF → emitter_drained follows; emitted exactly once [178.17ms]
+(pass) contract: emitter_dead / emitter_drained — the cursor==size gate (protocol 3) > grace not elapsed (fresh death) → dead but NOT drained despite cursor at EOF [103.33ms]
+(pass) contract: emitter_dead / emitter_drained — the cursor==size gate (protocol 3) > comm mismatch also proves death (verified=comm_mismatch) [80.14ms]
+(pass) contract: emitter_dead / emitter_drained — the cursor==size gate (protocol 3) > alive emitter with heartbeat silence beyond the profile → emitter_stalled, never dead [72.85ms]
+(pass) contract: emitter_dead / emitter_drained — the cursor==size gate (protocol 3) > lifecycle-domain writers (claude) are never kill-0 probed [104.50ms]
+(pass) contract: emitter_dead / emitter_drained — the cursor==size gate (protocol 3) > allSpoolFilesDrained: any file without a cursor at size blocks the drain [17.02ms]
+(pass) contract: session_vanished — ONLY on a complete snapshot > complete snapshot lacking the bound session → session_vanished [70.20ms]
+(pass) contract: session_vanished — ONLY on a complete snapshot > failed snapshot (rc!=0) proves NOTHING — no vanished [66.75ms]
+(pass) contract: session_vanished — ONLY on a complete snapshot > garbage snapshot (parse failure) proves NOTHING — no vanished [68.34ms]
+(pass) contract: session_vanished — ONLY on a complete snapshot > session still present in the complete snapshot → no vanished [83.56ms]
+(pass) contract: session_vanished — ONLY on a complete snapshot > orca worktrees follow the same rule (binding = worktreeInstanceId) [130.02ms]
+(pass) contract: findings land in the admin spool as overload envelopes > writeFindingsToSpool produces newline-terminated monotonic-seq envelopes, never touching the ledger [75.31ms]
+[n8] real-layer entry: src/recon/recon.ts=true (real-layer tests ACTIVE)
+(pass) entry inventory: recon entry exists on this tree [0.87ms]
+(pass) real: N6 recon --once against fake CLIs > outage: single event per outage, recovery backfills, re-outage emits again [471.12ms]
+(pass) real: N6 recon --once against fake CLIs > telemetry_gap: rate limit across passes (journal count stays 1) [288.65ms]
+(pass) real: N6 recon --once against fake CLIs > drained gate: cursor behind EOF blocks; EOF + grace releases; emitted once [389.78ms]
+(pass) real: N6 recon --once against fake CLIs > vanished only on complete snapshots [250.66ms]
+(pass) real: N6 recon --once against fake CLIs > orca maps a non-empty parentWorktreeId and omits a null parent [123.85ms]
+(pass) real: orca attachment lineage reduction > parent upgrades unknown origins in sessions and current [7.83ms]
+(pass) real: orca attachment lineage reduction > parent never overwrites agent or another lineage [6.82ms]
+(pass) real: orca attachment lineage reduction > orca attachment without parent retains the unknown to agent fallback [7.43ms]
+(pass) real: orca attachment lineage reduction > a done orca-lineage session with change evidence still enters q2 [1.33ms]
+
+test/manage-launch-executor.test.ts:
+(pass) MAN-26: localLaunchExecutor spawns a tmp executable stub and returns pid + receipt [2.07ms]
+(pass) MAN-26: localLaunchExecutor maps ENOENT (missing binary) to a no_effect error [1.17ms]
+
+test/ext-commit-observed.test.ts:
+(pass) EXT-12: a new HEAD after a bash tool_result emits commit_observed{sha, repo} [580.80ms]
+
+test/manage-readers.test.ts:
+(pass) session readers > pi.jsonl [1.01ms]
+(pass) session readers > omp.jsonl [0.33ms]
+(pass) session readers > claude.jsonl [0.25ms]
+(pass) session readers > empty and paths [0.03ms]
+
+test/requests.test.ts:
+(pass) requests state machine: pending → resolved (normal path) > decision_requested creates pending; decision_resolved advances [6.11ms]
+(pass) requests state machine: pending → resolved (normal path) > pending → cancelled and pending → timed_out also allowed [4.50ms]
+(pass) requests state machine: duplicate resolve idempotent > applying resolved twice is a no-op (kind=noop_same_state, resolved_at sticky) [5.46ms]
+(pass) requests state machine: duplicate resolve idempotent > replay-safe: re-applying pending after terminal is no-op, keeps terminal [5.01ms]
+(pass) requests state machine: terminal-before-pending (out-of-order) > decision_resolved arriving before decision_requested creates a resolved row [3.94ms]
+(pass) requests state machine: orphaned override + source mutual exclusion > orphaned is the ONLY inferred terminal [12.69ms]
+(pass) requests state machine: orphaned override + source mutual exclusion > orphaned → resolved override ALLOWED (source overrides inferred, idempotent) [4.33ms]
+(pass) requests state machine: orphaned override + source mutual exclusion > orphaned → cancelled and orphaned → timed_out also allowed [3.95ms]
+(pass) requests state machine: orphaned override + source mutual exclusion > resolved → cancelled REJECTED (source terminals mutually exclusive) [3.79ms]
+(pass) requests state machine: orphaned override + source mutual exclusion > every source-vs-source pair is rejected [4.88ms]
+(pass) requests state machine: orphaned override + source mutual exclusion > source terminal is NOT demoted to orphaned (inferred cannot override source) [3.42ms]
+
+test/maintenance.test.ts:
+(pass) maintenance composition (OPS-04 / OPS-06) > recon=7 + watchdog=0 -> recon propagates rc=7, watchdog still invoked [69.18ms]
+(pass) maintenance composition (OPS-04 / OPS-06) > recon=7 + watchdog=1 -> watchdog nonzero wins rc=1 [70.08ms]
+
+test/p4-attrib.test.ts:
+(skip) P4 attribution grades > fixture commits cover all grades and trailer precedence
+(pass) attribution entry inventory
+
+test/install-launchd.test.ts:
+(pass) portable launchd installer > installs four jobs by default [542.95ms]
+(pass) portable launchd installer > installs orchestrator only with --with-orchestrator and uninstall removes all five [659.08ms]
+(pass) portable launchd installer > stops before bootstrap when plutil rejects plist [518.18ms]
+
+test/ingest-idempotency.test.ts:
+(pass) ingest idempotency: overlapping active + sealed (UNIQUE dedup) > journal rows == unique events; overlap deduped; stable_id correct [9.00ms]
+(pass) ingest idempotency: overlapping active + sealed (UNIQUE dedup) > run --once twice: 2nd pass inserts 0, cursors unchanged [9.33ms]
+(pass) ingest idempotency: overlapping active + sealed (UNIQUE dedup) > ingest across many passes keeps journal == unique events (replay-safe) [18.02ms]
+(pass) ingest idempotency: partial trailing line is NOT consumed, then IS > active file ending mid-line: partial bytes left for next pass [12.47ms]
+(pass) ingest idempotency: partial trailing line is NOT consumed, then IS > completing a partial line reveals it; a later complete line also flows [13.26ms]
+(pass) ingest idempotency: crash recovery (transaction atomicity) > after a simulated crash mid-batch, re-scan yields identical results [9.90ms]
+(pass) ingest idempotency: multiple emitters isolated > two emitters with the same seq ranges are distinct keys (host, emitter_id, seq) [7.38ms]
+
+test/ext-host-context.test.ts:
+(pass) extension cmux host probe [525.30ms]
+
+test/audit-pipeline-reducer.test.ts:
+(pass) RED-10 writer arbitration > foreign-writer non-start events are ignored; a new writer session_started adopts writer and resets to idle [13.55ms]
+(pass) RED-09 recon finding preserves the subject's writer_id > an admin-emitter recon finding does not overwrite current.writer_id [17.05ms]
+(pass) RED-16 session-end orphans that writer's pending requests > session_ended sets the writer's pending request to orphaned with resolved_at [10.62ms]
+
+test/audit.test.ts:
+(pass) audit > reports gate pass rate, repeated handoff failures, and missing consequential rule [1.37ms]
+(pass) audit > parses supported since values [0.06ms]
+
+test/queries-q1.test.ts:
+(pass) queryQ1 summary/options extraction > ask-sourced detail (summary + options array) surfaces both fields [0.67ms]
+(pass) queryQ1 summary/options extraction > cmux-sourced detail (summary only, no options field) surfaces summary with null options [0.44ms]
+(pass) queryQ1 summary/options extraction > gated (approval-gate) detail has neither field: both null [0.42ms]
+(pass) queryQ1 summary/options extraction > absent detail (NULL column) yields both fields null [0.38ms]
+(pass) queryQ1 summary/options extraction > malformed JSON detail parses to null detail and null summary/options [0.39ms]
+(pass) queryQ1 summary/options extraction > options containing non-string entries are dropped; empty result is null, not [] [0.43ms]
+
+test/ext-approval-gate.test.ts:
+(pass) approval gate > abort interrupts pending approval and blocks the tool [41.65ms]
+[overload] invalid approval_gate configuration; blocking all bash/write/edit until it is fixed: block_bash_patterns must be an array of strings
+(pass) approval gate > invalid enabled config fails closed and emits a cancelled pair [36.47ms]
+(pass) approval gate > require approval resolves approve and consumes mailbox [36.00ms]
+(pass) approval gate > deny answer blocks tool [38.90ms]
+(pass) approval gate > missing answer times out and blocks [35.85ms]
+(pass) approval gate > block rules win over require rules [35.42ms]
+(pass) approval gate > git push emits consequential tool activity [35.55ms]
+
+test/ext-host-identity-devbox.test.ts:
+(pass) EXT-16(a): host file 'devbox' yields spool/devbox/ [0.06ms]
+
+test/notify-nudge.test.ts:
+(pass) nudgeOnce > empty Now: no notification, no state churn [17.46ms]
+(pass) nudgeOnce > empty→non-empty notifies once with the aggregated count [23.64ms]
+(pass) nudgeOnce > non-empty→still non-empty notifies for new subjects [30.08ms]
+(pass) nudgeOnce > same subjects repeated: no re-notification [21.40ms]
+(pass) nudgeOnce > lingering item + new item still fires notification [20.85ms]
+(pass) nudgeOnce > lingering hung item + new pending request still fires [22.32ms]
+(pass) nudgeOnce > draining to empty and re-entering same subject re-notifies [26.56ms]
+(pass) nudgeOnce > corrupt state file reads as empty and does not crash [19.58ms]
+
+test/manage-audit-coverage.test.ts:
+(pass) MAN-12 bindExecution idempotency > same stableId+writerId returns the same execution_id without duplicating rows [1.31ms]
+(pass) MAN-18 detectRuntimeFromPath > recognizes pi, omp, claude roots and returns null elsewhere [0.02ms]
+(pass) MAN-19 sessionDirs > resolves pi, omp, and claude directories under home [0.02ms]
+(pass) MAN-34 showWork detail graph > returns null for unknown work and expands every relation bucket for a known work [1.52ms]
+(pass) MAN-35 setTracking guards > rejects an aliased work and an unknown work [1.68ms]
+(pass) MAN-09/MAN-10 one/all query helpers > one returns a single row or null, all returns every row [1.01ms]
+(pass) MAN-13 addInputs versioning and supersedes > increments version, chains supersedes, and returns added count [1.02ms]
+(pass) MAN-14 updateCursor idempotent upsert > inserts on first call and updates cursor/status on conflict [0.81ms]
+
+test/manage-poll-submissions.test.ts:
+(pass) MAN-54: pollSubmissions counts merged vs failed_observations and updates state/steps [0.69ms]
+
+test/recon-cmux-snapshot.test.ts:
+(pass) REC-07: glob merges hook-sessions files and binds native_id + visibility correctly [0.86ms]
+(pass) REC-07: collectCmux falls back to map key, and treats missing agentLifecycle as visible [0.03ms]
+
+test/p2-classifier.test.ts:
+(pass) contract: Q1 — requests.pending is the sole source > pending → q1; every other request state never lands in q1 [5.82ms]
+(pass) contract: Q1 — requests.pending is the sole source > orphaned requests are Q5 (orphaned_request), not q1 [4.80ms]
+(pass) contract: Q2 — done ∧ origin ∈ {agent, unknown} > done + agent origin → q2 [4.87ms]
+(pass) contract: Q2 — done ∧ origin ∈ {agent, unknown} > done + unknown origin → q2 (unknown is treated as agent, §2.4a) [5.43ms]
+(pass) contract: Q2 — done ∧ origin ∈ {agent, unknown} > done + human origin → NOT q2 (Q4 closed until P4) [6.25ms]
+(pass) contract: Q2 — done ∧ origin ∈ {agent, unknown} > non-done sessions never enter q2 [9.13ms]
+(pass) contract: Q2 — done ∧ origin ∈ {agent, unknown} > normalizeOrigin: parent lineage ⇒ agent; 'human' stays human; empty ⇒ unknown [6.45ms]
+(pass) contract: Q3 — working/idle ∧ heartbeat not expired > working with fresh heartbeat → q3 [5.90ms]
+(pass) contract: Q3 — working/idle ∧ heartbeat not expired > idle with fresh heartbeat → q3 [7.18ms]
+(pass) contract: Q3 — working/idle ∧ heartbeat not expired > heartbeat older than STALL_PROFILE_MS.narrow (1800000ms) → NOT q3 [5.74ms]
+(pass) contract: Q3 — working/idle ∧ heartbeat not expired > fresh heartbeat exactly at the boundary is still fresh [6.83ms]
+(pass) contract: Q3 — working/idle ∧ heartbeat not expired > terminal states never enter q3 regardless of heartbeat [6.03ms]
+(pass) contract: Q5 — four mutually exclusive reasons > the frozen Q5Reason vocabulary is exactly the four reasons [5.51ms]
+(pass) contract: Q5 — four mutually exclusive reasons > each single evidence source maps to its own reason [6.34ms]
+(pass) contract: Q5 — four mutually exclusive reasons > simultaneous evidence still yields EXACTLY ONE reason (dead > gap > stalled) [6.39ms]
+(pass) contract: Q5 — four mutually exclusive reasons > telemetry_gap is authoritative even while the heartbeat looks fresh (§2.3) [6.99ms]
+(pass) contract: Q5 — four mutually exclusive reasons > terminal states are sticky — recon evidence never moves done/vanished [7.26ms]
+(pass) contract: Q5 — four mutually exclusive reasons > an unconfirmed heartbeat expiry records NOTHING (no guess without recon) [6.04ms]
+(pass) contract: transitions idempotent on re-reduce (UNIQUE 5-tuple) > re-running the same journal range inserts ZERO new transitions [7.90ms]
+(pass) contract: transitions idempotent on re-reduce (UNIQUE 5-tuple) > recordTransition directly: identical 5-tuple inserts once, differs in any component insert again [7.62ms]
+(pass) contract: classifier_activations watermark respected > activation is idempotent — repeated runs keep exactly one row per version [7.87ms]
+(pass) contract: classifier_activations watermark respected > activeVersionAt: rows at/below the watermark belong to the earlier version [6.83ms]
+(pass) contract: classifier_activations watermark respected > reduce pass classifies only journal rows AFTER the activation watermark [6.65ms]
+(pass) contract: emitter_drained orphaning (protocol 3) > drained orphans ONLY that emitter's pending requests + writes the coverage gap tail [6.64ms]
+[n8] real-layer entries: src/ingest/classifier.ts=true src/ingest/ingest.ts=true src/cli/overload.ts=true (real-layer tests ACTIVE)
+(pass) entry inventory: which P2 implementation entries exist on this tree [5.23ms]
+(pass) real: N5 classifier via ingest --once + CLI surface > q1 from a pending request; q2 for done+unknown; initial row same-txn; idempotent re-reduce [258.18ms]
+(pass) real: frozen P2 DDL drift check on src/ingest/schema.sql > every frozen P2 table/column/UNIQUE key is present verbatim [6.56ms]
+
+test/manage-handoff.test.ts:
+(pass) management handoff > running and blocked sources are rejected [4.34ms]
+(pass) management handoff > file-only requires isolation and confirmation reason [3.02ms]
+(pass) management handoff > no-effect launch retries same handoff and persists requested before executor [3.42ms]
+(pass) management handoff > launch confirmation, unknown idempotency, and reconcile [3.61ms]
+
+test/orchestrator-main-signal.test.ts:
+(pass) ORC-50: main SIGTERM seals spool, closes DB, exits 0 [64.95ms]
+
+test/web-mgmt-audit.test.ts:
+(pass) WEB-36 list works by track filter and toggles tracking [28.14ms]
+(pass) WEB-37 acceptance verdict accepted records owner verdict [19.59ms]
+(pass) WEB-38 handoff preconditions report gate state [20.98ms]
+
+test/p3-pull.test.ts:
+(pass) P3 pull acceptance contracts > outage threshold is four failures and recovery is one transition [0.03ms]
+(pass) P3 pull acceptance contracts > overlapping active and segment files deduplicate end-to-end [11.87ms]
+
+test/ext-handoff.test.ts:
+(pass) HANDOFF.md capture > captures current handoff status and uncertainty count [49.06ms]
+(pass) HANDOFF.md capture > ignores handoff older than run start [56.82ms]
+
+test/ext-seal-overflow.test.ts:
+(pass) EXT-14(b): inline seal fires at 1MB and advances segment without path reuse [570.53ms]
+
+test/manage-submit.test.ts:
+(pass) management submission gates > unsupported targets create one idempotent manual submission [2.29ms]
+(pass) management submission gates > invalidated acceptance returns manifest drift with its reason [1.21ms]
+(pass) management submission gates > push failure records a failed submission with unknown push effect [2.63ms]
+(pass) management submission gates > unknown effects remain blocked and create one no-option attention card [1.59ms]
+(pass) remote submission keeps git push on configured source [1.99ms]
+
+test/pull-singleflight.test.ts:
+pull files=0 bytes=0 failures=0
+(pass) PUL-06: concurrent second call hits mkdir EEXIST, returns 0 without pulling [6042.45ms]
+
+test/install-extension.test.ts:
+(pass) install-extension.sh (INS-04) > installs to pi+omp with 0700 dirs / 0600 files, byte-identical; prime untouched [75.04ms]
+(pass) install-extension.sh (INS-04) > uninstall removes both extension files [143.51ms]
+(pass) install-extension.sh (INS-04) > unknown flag prints usage and exits 2 [20.32ms]
+
+test/manage-identity.test.ts:
+(pass) identity pure functions > stableId composes host:runtime:session [0.01ms]
+(pass) identity pure functions > artifactId and versionId are stable 32-hea digests [0.07ms]
+(pass) identity pure functions > canonicalFileKey relativizes under root and escapes outside [0.02ms]
+(pass) identity pure functions > store.id joins parts with colon and digests [0.01ms]
+(pass) abandonHandoff > abandons a non-terminal handoff and rejects empty reason [1.39ms]
+(pass) listManifests > lists manifests with entry count and null acceptance/submission [1.22ms]
+(pass) works listing and tracking > listWorks returns the tracked work row [1.20ms]
+(pass) works listing and tracking > showWork returns detail graph for a known work [1.32ms]
+(pass) works listing and tracking > setTracking pauses and resumes a work [1.16ms]
+
+test/ext-host-identity-unreadable.test.ts:
+(pass) EXT-16(c): unreadable host file falls back to spool/local/ [0.07ms]
+
+test/manage-source.test.ts:
+(pass) local source [10.63ms]
+(pass) ssh command builder quotes without a shell locally [0.08ms]
+(pass) ssh source preserves odd paths and caches platform detection [164.60ms]
+(pass) ssh list builds GNU and BSD stat commands [64.09ms]
+(pass) identity helpers follow stable and content identity contracts [0.22ms]
+
+test/audit-pipeline-ingest.test.ts:
+(pass) ING-01 loadConfig variants > missing file → defaults 2000/500 [0.42ms]
+overload ingest: ignoring invalid config /var/folders/cm/7sydc7ps31j8l_m6twsrkscw0000gp/T/ov-ing01b-KbiFGP/config.json
+(pass) ING-01 loadConfig variants > invalid JSON → defaults (warns, does not throw) [0.53ms]
+(pass) ING-01 loadConfig variants > explicit values honored; non-positive falls back [0.60ms]
+(pass) ING-02 openLedger hardening > ledger dir is 0700 and db file is 0600 [11.44ms]
+(pass) ING-02 openLedger hardening > refuses a symlinked ledger path [0.84ms]
+(pass) ING-02 openLedger hardening > schema is idempotent across a second open [9.40ms]
+(pass) ING-04 spool discovery rejects hostile names and symlinks > foreign dir names, foreign files, and file symlinks are skipped [9.17ms]
+(pass) ING-06 truncation recovery restarts from 0 without double-insert > cursor beyond new size restarts at 0 and dedups by (host,emitter,seq) [10.40ms]
+(pass) ING-07 envelope host/emitter must match its spool directory > line whose host or emitter_id mismatches the dir is dropped [8.98ms]
+(pass) ING-09 sessions projection: origin upgrades only from unknown, cwd/branch coalesce > second session_started does not overwrite origin or null cwd [9.59ms]
+(pass) ING-09 sessions projection: origin upgrades only from unknown, cwd/branch coalesce > a non-unknown origin is never downgraded [11.07ms]
+(pass) ING-10 liveness_domain is lifecycle for claude, process otherwise > claude runtime → lifecycle; pi runtime → process [9.64ms]
+(pass) ING-11 non-start events bump session_incarnations.last_seen_at > heartbeat advances last_seen_at monotonically [11.48ms]
+(pass) ING-12 reduceJournal drains in batches until a short batch > more than one batch is applied fully [1.02ms]
+(pass) ING-03 classifier activation appends once and records watermark > activateClassifier twice keeps one row and records the journal watermark [1.54ms]
+(pass) ING-13/14 ingest CLI --once contract + watchdog heartbeat > ingest --once prints the ingested summary and writes a numeric heartbeat [40.46ms]
+(pass) ING-13/14 ingest CLI --once contract + watchdog heartbeat > unknown CLI arg exits 2 with usage [22.54ms]
+
+test/prune-host-guard.test.ts:
+(pass) PRN-04 pruneSpool host-guard > illegal host '../etc' returns empty summary and deletes nothing [3.99ms]
+(pass) PRN-04 pruneSpool host-guard > illegal host empty string returns empty summary and deletes nothing [2.56ms]
+(pass) PRN-04 pruneSpool host-guard > illegal host with slash returns empty summary and deletes nothing [2.52ms]
+(pass) PRN-04 pruneSpool host-guard > legal host 'local' still prunes consumed aged segments [3.50ms]
+
+test/web-mgmt.test.ts:
+(pass) management web routes > manifest routes expose list, 404, acceptance validation, and poll shapes [28.64ms]
+(pass) management web routes > unknown work is 404 and blocked handoff is 409 with allowed [20.13ms]
+(pass) management web routes > launch requires confirmation, abandon transitions, packet contains refs not content [25.72ms]
+(pass) alias projection preserves history, rejects revival, and correction supersedes evidence [28.44ms]
+
+test/mgmt-track-scan.test.ts:
+(pass) MGMT-03 track > track on an existing work exits 0 and sets tracking [43.88ms]
+(pass) MGMT-03 track > track off an existing work exits 0 and sets paused [39.38ms]
+(pass) MGMT-03 track > track a nonexistent work exits non-zero [32.40ms]
+(pass) MGMT-03 track > track without on|off exits non-zero with usage error [37.73ms]
+(pass) MGMT-04 scan > scan prints a JSON report and exits 0 [2057.66ms]
+
+test/ext-answer.test.ts:
+(pass) ATT-3 answer round-trip > web answer consumes the target once, unblocks the tool, and resolves once [41.34ms]
+(pass) ATT-3 answer round-trip > a plain ask tool_call surfaces a decision_requested (observational Q1 row) [40.63ms]
+(pass) ATT-3 answer round-trip > ask resolution via tool_execution_end emits a single decision_resolved [37.62ms]
+
+test/ext-lineage.test.ts:
+(pass) EXT-20 env parent export > session_start exports this session's stable id for descendants [0.07ms]
+(pass) EXT-19 spawn lineage injection > agent CLI spawns gain OVERLOAD_PARENT with this session's stable id [0.10ms]
+(pass) EXT-19 spawn lineage injection > compound commands with metachars are never rewritten [0.01ms]
+(pass) EXT-19 spawn lineage injection > commands already carrying OVERLOAD_PARENT are untouched [0.01ms]
+(pass) EXT-19 spawn lineage injection > non-agent commands are untouched
+(pass) EXT-19 spawn lineage injection > git commit trailer injection (EXT-11) still works after the refactor [0.02ms]
+(pass) EXT-20 spool record > the session's OWN parent (pre-start env value) reached the spool [6.46ms]
+
+test/cli-output.test.ts:
+(pass) overload sessions (CLI-01) > prints stable_id/runtime/origin/state/queue/last_event and empty-state note [43.38ms]
+(pass) overload sessions (CLI-01) > empty ledger notes 'No known sessions.' on stderr and exits 0 [41.21ms]
+(pass) overload show (CLI-02) > prints the session header for a known id [59.93ms]
+(pass) overload show (CLI-02) > unknown id prints 'Session not found' on stderr and exits 1 [65.08ms]
+(pass) overload q1 (CLI-03) > lists pending requests with jump= binding (ssh remote, local binding) [43.00ms]
+(pass) overload q1 (CLI-03) > empty q1 notes no pending requests [54.38ms]
+(pass) overload health (CLI-06) > prints the counts line and one line per open incident [46.72ms]
+(pass) CLI contract (CLI-07) > unknown command prints usage to stderr and exits 2 [57.73ms]
+(pass) CLI contract (CLI-07) > extra args on a no-arg command print usage and exit 2 [61.28ms]
+(pass) CLI contract (CLI-07) > unopenable ledger prints an error and exits 1 [40.21ms]
+(pass) CLI contract (CLI-07) > OVERLOAD_LEDGER_PATH selects the isolated ledger (override) [49.41ms]
+
+test/watchdog.test.ts:
+(pass) watchdog healthy path (OPS-01) > loaded job + fresh heartbeat -> silent exit 0 [87.48ms]
+(pass) watchdog alarms (OPS-02) > unloaded job -> 'not loaded' message, exit 1 [94.54ms]
+(pass) watchdog alarms (OPS-02) > loaded + missing heartbeat -> 'heartbeat is missing', exit 1 [88.88ms]
+(pass) watchdog alarms (OPS-02) > loaded + stale heartbeat -> 'heartbeat is stale (Ns)', exit 1 [116.97ms]
+(pass) watchdog sleep-skew suppression (OPS-03) > wall-vs-uptime skew > 60s -> state reset, exit 2, no alarm [73.59ms]
+
+test/audit-pipeline-pull.test.ts:
+(pass) PUL-02 ssh preflight passes BatchMode + ConnectTimeout > ssh is invoked with -o BatchMode=yes -o ConnectTimeout=5 [41.36ms]
+(pass) PUL-04 heartbeat is touched only on success > a failing run leaves pull.heartbeat absent [31.01ms]
+(pass) PUL-05 pull-state.json is atomic + 0600 > after one failure it records {failures:1,outage_reported:false} at 0600 [15.68ms]
+(pass) PUL-07 loadConfig rejects invalid flags (exit 2 contract) > --fail-threshold 0 and unknown flag throw [0.32ms]
+(pass) PUL-08 a hung child is reaped within the time budget > ssh sleeping 60s is killed by the deadline; run fails well under the wall clock [1514.70ms]
+
+test/audit-pipeline-recon.test.ts:
+(pass) REC-14 a hung snapshot command is treated as an outage > herdr snapshot killed at command_timeout_ms emits source_outage [349.16ms]
+(pass) REC-13 invalid host id exits 2 > recon --once refuses a non-local/devbox host file [25.18ms]
+
+test/ext-decision-payload.test.ts:
+(pass) ask tool_call decision_requested payload capture > structured questions carry redacted summary and option labels [0.06ms]
+(pass) ask tool_call decision_requested payload capture > multiple questions in one ask join into a single summary and pool options [0.01ms]
+(pass) ask tool_call decision_requested payload capture > a question without options omits the options field entirely [0.01ms]
+(pass) ask tool_call decision_requested payload capture > unrecognized input shape omits summary/options (request_id-only) [0.01ms]
+(pass) ask tool_call decision_requested payload capture > missing input omits summary/options
+(pass) ask tool_call decision_requested payload capture > bundled ask_user emits paired requested and resolved events [0.03ms]
+(pass) ask tool_call decision_requested payload capture > non-ask tool_call never produces a decision_requested with summary/options [0.01ms]
+(pass) EXT-20 spool seal > session_shutdown flushed and sealed a session_ended record
+
+test/p4-q4.test.ts:
+(pass) P4 Q4 predicate matrix > entry is present only when classifier v2 is available
+(pass) classifier v2 Q4 matrix > read-only agent session enters q4 [0.07ms]
+(pass) classifier v2 Q4 matrix > commit_observed keeps an otherwise identical session in q2 [0.04ms]
+(pass) classifier v2 Q4 matrix > unknown origin never enters q4 [0.03ms]
+(pass) classifier v2 Q4 matrix > v1 transitions remain versioned and historical [0.03ms]
+
+test/manage-schema.test.ts:
+(pass) management schema > fresh control DB is v2 with the exact management tables [1.27ms]
+(pass) management schema > v1 migrates without touching control works [2.40ms]
+(pass) management schema > openControl enables foreign keys [9.03ms]
+(pass) management schema > foreign keys reject invalid direct inserts [1.43ms]
+(pass) management schema > de-cycled pointers accept same-work and reject cross-work targets [1.12ms]
+(pass) management schema > full chain passes foreign_key_check [1.10ms]
+
+test/setup-deploy.test.ts:
+(pass) setup.sh composition (INS-05) > --dry-run runs launchd installer then extension installer, in order, rc=0 [71.83ms]
+(pass) setup.sh composition (INS-05) > unknown arg prints usage and exits 2 [26.29ms]
+(pass) deploy-devbox.sh dry-run (DEP-01 / DEP-02) > --dry-run previews pi+omp scp, mkdir/chmod 700, host=devbox 0600; no prime [17.81ms]
+(pass) deploy-devbox.sh dry-run (DEP-01 / DEP-02) > unknown arg and extra arg both usage exit 2 [29.27ms]
+
+test/ext-seal-30s-real.test.ts:
+(pass) EXT-14(a): real 31s clock seals active -> seg- and opens a higher-segment active [32613.83ms]
+
+test/manage-manifest.test.ts:
+(pass) management manifests > digest canonicalizes sets and covers facts [1.04ms]
+(pass) management manifests > insert validates ownership and is idempotent [2.69ms]
+(pass) management manifests > canonical manifest includes direct aliases and rejects alias or outsiders [4.32ms]
+(pass) management manifests > canonical manifest rejects artifacts produced on multiple hosts [1.87ms]
+(pass) management manifests > acceptance card resolves atomically for both verdicts [3.79ms]
+(pass) management manifests > new artifact version invalidates only related acceptance [2.19ms]
+
+test/envelope.test.ts:
+(pass) envelope: frozen field names/types (types.ts exact match) > a well-formed envelope validates with zero errors [0.14ms]
+(pass) envelope: frozen field names/types (types.ts exact match) > every required field from types.ts is checked for presence [0.09ms]
+(pass) envelope: frozen field names/types (types.ts exact match) > unknown top-level field is rejected (contract is narrow) [0.02ms]
+(pass) envelope: frozen field names/types (types.ts exact match) > the ONLY optional field is `detail`; it is an object when present [0.05ms]
+(pass) envelope: frozen field names/types (types.ts exact match) > field types match types.ts exactly [0.09ms]
+(pass) envelope: frozen field names/types (types.ts exact match) > host ∈ {local, devbox} exactly; runtime/kind in frozen unions [0.05ms]
+(pass) envelope: frozen field names/types (types.ts exact match) > v === ENVELOPE_VERSION (currently 1) — the version gate
+(pass) envelope: seq monotonicity (per-emitter, starts at 1) > a stream of envelopes has strictly increasing integer seq from 1 [0.01ms]
+(pass) envelope: seq monotonicity (per-emitter, starts at 1) > validation rejects non-integer and negative seq [0.07ms]
+(pass) envelope: monotonic counters present on EVERY event (R5-B2) > dropped_total and write_error_total are required on every envelope
+(pass) envelope: monotonic counters present on EVERY event (R5-B2) > a gap in dropped_total is detectable across consecutive events [0.05ms]
+(pass) envelope: UTF-8-safe truncation boundary (§2.7) > ASCII string truncates to exact byte budget [0.12ms]
+(pass) envelope: UTF-8-safe truncation boundary (§2.7) > multi-byte codepoints are NEVER split (2-byte, 3-byte, 4-byte) [0.03ms]
+(pass) envelope: UTF-8-safe truncation boundary (§2.7) > resulting bytes never exceed the budget [0.07ms]
+(pass) envelope: UTF-8-safe truncation boundary (§2.7) > detail string leaves truncated before serialization (≤500B rule) [10.69ms]
+(pass) envelope: UTF-8-safe truncation boundary (§2.7) > truncating a valid envelope's serialized form keeps it parseable [8.44ms]
+
+test/manage-remote-handoff.test.ts:
+(pass) remote management handoff > configured host identity routes executor independently of ssh alias and transfers packet [3.93ms]
+(pass) remote management handoff > file_only rejects same workspace and requires matching human actor for isolation [2.88ms]
+(pass) remote management handoff > contention enumerates paths and executions and requires isolation [2.94ms]
+(pass) remote management handoff > failed remote dirty patch never spawns or falls back to source cwd [3.98ms]
+(pass) remote management handoff > unknown launch is durable and cannot duplicate [3.14ms]
+(pass) remote management handoff > ssh executor uses configured alias, login shell cwd, and parent without Claude cwd flag [0.28ms]
+(pass) remote management handoff > supported commands carry real packet without invalid Claude cwd flag [0.02ms]
+
+test/manage-config-load.test.ts:
+(pass) MAN-31: loadManageConfig returns built-in defaults for an empty tmp HOME [1.33ms]
+(pass) MAN-31: loadManageConfig reads host from ~/.overload/host [1.46ms]
+
+test/manage-export-boundary.test.ts:
+(pass) redaction and management export boundary > scrubs the union of caller patterns and truncates [0.08ms]
+(pass) redaction and management export boundary > classifies denylisted, secret, plain, and binary content [0.15ms]
+(pass) redaction and management export boundary > share package contains references only [0.03ms]
+
+test/manage-attribution.test.ts:
+(pass) artifact attribution > concurrent successful writers preserve both links and mark every observed version contended [11.17ms]
+(pass) artifact attribution > failed and result-less writes plus reads never become modified evidence [1.82ms]
+(pass) artifact attribution > dirty-only file belongs to canonical Work without execution producer [3.06ms]
+(pass) artifact attribution > capture lag uses tool time and marks stale after sixty seconds [3.21ms]
+(pass) artifact attribution > corrected evidence is fenced from later collection [2.88ms]
+(pass) Claude evidence parsing > pending Claude call is emitted once when a later range supplies its result [0.15ms]
+(pass) Claude evidence parsing > only an explicitly successful Claude write is attributable [0.07ms]
+(pass) captured replacement invalidates acceptance and stores private real bytes [7.22ms]
+
+test/ext-overflow-drop.test.ts:
+(pass) EXT-15: queue at WRITE_QUEUE_LIMIT drops overflow entries and increments dropped_total [506.67ms]
+
+test/manage-handoff-workspace.test.ts:
+(pass) MAN-28: prepareHandoffWorkspace captures root/head/status/patch and writes patch to git-dir [124.48ms]
+(pass) MAN-28: prepareHandoffWorkspace rejects a dirty tree with untracked files [90.92ms]
+
+test/manage-relations.test.ts:
+(pass) management relations > immutable aliases archive profile only and preserve history [2.76ms]
+(pass) management relations > alias rejects in-flight handoffs without changing either work [1.36ms]
+(pass) management relations > correction supersedes once and fences scanner evidence atomically [2.08ms]
+(pass) management relations > workspace correction permits non-execution subject but validates artifact scope [2.01ms]
+(pass) management relations > hints are deterministic same-repo facts without attention [1.85ms]
+
+test/launchd-contract.test.ts:
+(pass) plist parse + scheduling (OPS-05) > ingest.plist lints OK [7.51ms]
+(pass) plist parse + scheduling (OPS-05) > maintenance.plist lints OK [6.92ms]
+(pass) plist parse + scheduling (OPS-05) > pull.plist lints OK [7.24ms]
+(pass) plist parse + scheduling (OPS-05) > web.plist lints OK [7.54ms]
+(pass) plist parse + scheduling (OPS-05) > orchestrator.plist lints OK [6.59ms]
+(pass) plist parse + scheduling (OPS-05) > ingest and web are KeepAlive; maintenance and pull run every 60s [0.49ms]
+(pass) plist parse + scheduling (OPS-05) > retired notifier plist is gone [0.02ms]
+(pass) pull job contract (OPS-07) > pull.plist runs bun src/pull/pull.ts --once [0.30ms]
+(pass) pull job contract (OPS-07) > README documents pull in both install and uninstall sections [0.32ms]
+
+test/manage-archive.test.ts:
+(pass) management archive > session_ended ledger state derives closeout then archives after grace without rewriting control state [1.95ms]
+(pass) management archive > idle-only execution with dead writer derives ended_ok and archives after grace [1.40ms]
+(pass) management archive > open management attention blocks archive [1.80ms]
+(pass) management archive > grace retains recently ended work then archives later [1.73ms]
+
+src/notify/nudge.test.ts:
+(pass) notificationCapability > reports actual supported and unsupported platforms [0.04ms]
+
+src/decision-bot/mailbox-extra.test.ts:
+(pass) canonical sorts object keys and digest is stable sha256 [0.14ms]
+(pass) closeTarget marks an active target closed without touching consumed ones [53.08ms]
+
+src/decision-bot/mailbox-guard.test.ts:
+(pass) DBT-05 writeHumanAnswer rejects expired target and invalid option [21.51ms]
+(pass) DBT-08 observeReceiptEffect rejects conflicting state on same toolCallId [13.13ms]
+(pass) DBT-09 reconcileOutstandingReceipts marks overdue unknown receipts [11.71ms]
+
+src/decision-bot/policy.test.ts:
+(pass) bot consumed receipt increments matching rule weekly hits [13.34ms]
+(pass) candidate report exposes persisted approval and observations [14.16ms]
+
+src/decision-bot/service.test.ts:
+(pass) parseProposal requires evidence refs to be a subset of snapshot refs [18.82ms]
+(pass) tick recovers expired running attempt even while policy disabled [16.83ms]
+(pass) identity remains stable across service instances [13.02ms]
+
+src/decision-bot/policy-candidate.test.ts:
+(pass) candidate needs explicit approval and completed observation before enable [14.93ms]
+(pass) candidate samples aggregate only for identical exact scope [12.69ms]
+
+src/decision-bot/mailbox.test.ts:
+(pass) cancelled target rejects late answers and previously queued approval consumption [14.09ms]
+(pass) human answer is accepted before consume and conflicts after consume [12.34ms]
+(pass) human_only rejects bot proposal but consumes valid human answer [13.27ms]
+(pass) contract revision invalidation blocks stale consume [12.33ms]
+(pass) effect observation is idempotent and outstanding receipts become unknown [12.87ms]
+(pass) owner-scoped target rejects foreign human and preserves foreign row [12.08ms]
+(pass) disabled invalidates proposal while takeover remains available [13.13ms]
+(pass) identity data and receipt replay survive reopen [14.00ms]
+(pass) individual config rule disable revokes stale bot proposal at consume time [12.85ms]
+(pass) individual candidate rule disable revokes stale bot proposal at consume time [12.11ms]
+
+src/decision-bot/service-status.test.ts:
+(pass) DBT-30 DecisionBotService.status returns identity, targets and recent attempts [16.22ms]
+
+src/decision-bot/runner-parse.test.ts:
+(pass) DBT-26 runDecisionModel parseOutput > timeoutMs <= 0 returns invalid_limits without spawning pi [0.22ms]
+(pass) DBT-26 runDecisionModel parseOutput > maxOutputBytes <= 0 returns invalid_limits without spawning pi [0.03ms]
+(pass) DBT-26 runDecisionModel parseOutput > tool_execution_* event returns tool_call_rejected [24.70ms]
+(pass) DBT-26 runDecisionModel parseOutput > message_end with toolCall in content returns tool_call_rejected [35.86ms]
+(pass) DBT-26 runDecisionModel parseOutput > two message_end with different text returns conflicting_final_answers [46.98ms]
+(pass) DBT-26 runDecisionModel parseOutput > single clean message_end returns ok with the text [24.18ms]
+(pass) DBT-26 runDecisionModel parseOutput > malformed JSONL returns malformed_jsonl [33.10ms]
+(pass) DBT-26 runDecisionModel parseOutput > no message_end returns missing_final_answer [31.84ms]
+
+src/decision-bot/policy-extra.test.ts:
+(pass) loadPolicy disables the bot when config file is missing and reports error [0.07ms]
+(pass) loadPolicy parses an enabled config and filters disabled rules [1.28ms]
+(pass) matchingRule requires every rule answer to be a target option and scope match [0.18ms]
+(pass) policyAuthorizes binds answer to rule answers and policy hash [0.05ms]
+(pass) policyPrompt embeds permitted answers and snapshot evidence hash [0.04ms]
+(pass) candidateScopeHash is stable for identical scope and differs on command [0.03ms]
+(pass) disablePolicyRule flags a config rule and enable rejects unknown rules [17.01ms]
+
+src/decision-bot/reconcile.test.ts:
+(pass) DBT-10 reconcileEffectEvents advances cursor and applies an effect_observed row [16.32ms]
+
+src/decision-bot/propose-from-attention.test.ts:
+(pass) DBT-24 proposeRuleFromAttention derives a rule candidate for an eligible card [14.17ms]
+(pass) DBT-24 proposeRuleFromAttention rejects human-only and expired cards [12.75ms]
+
+src/web/audit-api-routes.test.ts:
+(pass) WEB-09 conversations API > GET /api/conversations returns empty array on fresh DB [57.64ms]
+(pass) WEB-09 conversations API > GET /api/conversations lists seeded conversations with turns [45.43ms]
+(pass) WEB-09 conversations API > POST /api/conversations/:id/messages enqueues a turn and returns 201 [58.54ms]
+(pass) WEB-09 conversations API > POST /api/conversations/:id/messages returns 404 for unknown conversation [44.21ms]
+(pass) WEB-09 conversations API > POST /api/conversations/:id/messages returns 400 for empty text [52.72ms]
+(pass) WEB-09 conversations API > POST /api/conversations/:id/messages without Origin returns 403 [40.71ms]
+(pass) WEB-12 propose-rule > POST /api/attention/:id/propose-rule returns 400 without answer [46.44ms]
+(pass) WEB-12 propose-rule > POST /api/attention/:id/propose-rule returns 409 for unknown attention [43.38ms]
+(pass) WEB-12 propose-rule > POST /api/attention/:id/propose-rule without Origin returns 403 [42.55ms]
+(pass) WEB-13 decision-bot status > GET /api/decision-bot/status returns identity, targets, and attempts arrays [40.68ms]
+(pass) WEB-15 candidates > GET /api/candidates returns empty array on fresh DB [39.66ms]
+(pass) WEB-15 candidates > GET /api/candidates lists seeded policy candidates [40.07ms]
+(pass) WEB-15 candidates > POST /api/candidates/:id/approve approves a candidate [40.26ms]
+(pass) WEB-15 candidates > POST /api/candidates/:id/approve returns 409 for unknown candidate [37.43ms]
+(pass) WEB-15 candidates > POST /api/candidates/:id/approve without Origin returns 403 [34.46ms]
+(pass) WEB-17 work-ops (contract/redirect/stop) > POST /api/works/:id/stop records a stop condition [52.04ms]
+(pass) WEB-17 work-ops (contract/redirect/stop) > POST /api/works/:id/stop returns 404 for unknown work [48.87ms]
+(pass) WEB-17 work-ops (contract/redirect/stop) > POST /api/works/:id/stop returns 400 without expected_revision [52.22ms]
+(pass) WEB-17 work-ops (contract/redirect/stop) > POST /api/works/:id/stop without Origin returns 403 [33.90ms]
+(pass) WEB-17 work-ops (contract/redirect/stop) > POST /api/works/:id/contract revises contract [40.85ms]
+(pass) WEB-32 decision-target > POST /api/decision/target registers a target and returns 200 [45.26ms]
+(pass) WEB-32 decision-target > POST /api/decision/target returns 400 for invalid body [35.91ms]
+(pass) WEB-32 decision-target > POST /api/decision/target returns 403 without sec-fetch headers [33.23ms]
+(pass) WEB-33 orchestrator-answer > POST /api/orchestrator/answer/:id writes human answer and returns 200 [38.95ms]
+(pass) WEB-33 orchestrator-answer > POST /api/orchestrator/answer/:id returns 400 for malformed JSON [37.45ms]
+(pass) WEB-33 orchestrator-answer > POST /api/orchestrator/answer/:id returns 400 without answer field [36.92ms]
+(pass) WEB-33 orchestrator-answer > POST /api/orchestrator/answer/:id returns 403 without sec-fetch headers [34.15ms]
+(pass) WEB-34 decision-consume > POST /api/decision/consume/:id returns 404 when no valid target exists [43.56ms]
+(pass) WEB-34 decision-consume > POST /api/decision/consume/:id returns 400 for invalid body [43.08ms]
+(pass) WEB-34 decision-consume > POST /api/decision/consume/:id returns 403 without sec-fetch headers [40.80ms]
+(pass) WEB-35 bot-status (disable/enable) > POST /api/decision-bot/disable sets disabled=true [43.52ms]
+(pass) WEB-35 bot-status (disable/enable) > POST /api/decision-bot/enable sets disabled=false [38.48ms]
+(pass) WEB-35 bot-status (disable/enable) > POST /api/decision-bot/disable without Origin returns 403 [34.08ms]
+
+src/web/contract-closure.test.ts:
+(pass) reviewed narrow refuses newly arrived cards; fresh review applies and archives siblings [43.56ms]
+
+src/web/ledger.test.ts:
+(pass) wait and stop death use resolution time; overlapping waits union and slowest cap [22.07ms]
+(pass) redirect never-candidate work is unplanned and revision counts supersession [12.53ms]
+
+src/web/audit-supplement.test.ts:
+overload web: ignoring invalid config /var/folders/cm/7sydc7ps31j8l_m6twsrkscw0000gp/T/overload-webcfg-26FxIr/bad.json
+(pass) WEB-01 loadWebConfig > custom positive web_port wins; missing/invalid fall back to 4870 [1.75ms]
+(pass) WEB-03/04 SPA shell + static > GET / returns the SPA shell as text/html [30.61ms]
+(pass) WEB-03/04 SPA shell + static > static assets serve with correct types and traversal is blocked [22.55ms]
+(pass) WEB-07/08/25 attention zones, capabilities, health > GET /api/attention/(now|inbox|done) delegate to listAttention [43.08ms]
+(pass) WEB-07/08/25 attention zones, capabilities, health > GET /api/capabilities reports notifications + web bind/port [23.69ms]
+(pass) WEB-07/08/25 attention zones, capabilities, health > GET /api/health returns incidents + gap counts [28.92ms]
+(pass) WEB-10 ledger window validation > invalid since/until window returns 400 [24.68ms]
+(pass) WEB-14 works list/create > GET /api/works lists and POST creates a 201 [49.06ms]
+(pass) WEB-16/18 promote + attention ack/defer/feedback > promote requires expected_revision [43.93ms]
+(pass) WEB-16/18 promote + attention ack/defer/feedback > attention ack/defer/feedback mutate via the route [69.00ms]
+(pass) WEB-28 jump-session > POST /api/jump-session/:stableId jumps or 404 [29.62ms]
+(pass) WEB-11 rules report over HTTP > GET /api/rules returns the rules report shape [36.74ms]
+(pass) WEB-30 closeout 409 for non-q2 > closeout rejects a q5 session with 409 [33.44ms]
+
+src/web/rule-closure.test.ts:
+(pass) HTTP per-rule disable persists and enables without disabling another signed rule [57.66ms]
+
+src/web/server.test.ts:
+(pass) web API > binds loopback and exposes summary counts [31.38ms]
+(pass) web API > queries fresh readonly ledgers without the optional closeouts table [12.01ms]
+(pass) web API > closeout moves q2 work to archive [39.31ms]
+(pass) web API > rejects an answer without a registered actionable target [39.03ms]
+(pass) web API > archive includes q4 and unproven q2 rows [34.90ms]
+(pass) web API > serves legacy archive route with the dashboard shell [28.15ms]
+(pass) web API > Q1 JSON preserves the CLI query semantics [29.59ms]
+(pass) web API > surfaces a pending decision [41.98ms]
+(pass) web API > prefers a structured host target over a reconciliation attachment [34.65ms]
+(pass) web API > exposes host context as the Q1 jump identifier [29.32ms]
+(pass) web API > omits a jump binding when the host lacks a precise session id [32.57ms]
+(pass) web API > ack moves a pending request to the acked terminal and is idempotent [33.29ms]
+(pass) web API > SEC-1: Origin/Host guard > correct headers: POST /api/ack/<uid> succeeds and mutates state [33.03ms]
+(pass) web API > SEC-1: Origin/Host guard > wrong Origin: 403 and no state change [44.46ms]
+(pass) web API > SEC-1: Origin/Host guard > wrong Host: 403 [39.23ms]
+(pass) web API > SEC-1: Origin/Host guard > missing Origin: 403 [31.87ms]
+(pass) web API > SEC-1: Origin/Host guard > GET /api/q1: correct Host succeeds, wrong Host 403 [34.21ms]
+(pass) web API > reports resume capability and launches pi and omp sessions through cmux [41.98ms]
+(pass) web API > serves session detail and returns 404 for missing resources [31.80ms]
+(pass) web API > returns pending decisions newest-first [34.06ms]
+(pass) web API > serves dashboard routes for zones, legacy tabs, and session deep links [32.07ms]
+(pass) web API > bounds the session list and carries queue state for drill-down [37.83ms]
+(pass) web API > extension target authority > enabled exact rule derives scoped_auto while spoof cannot lower contract human-only [216.04ms]
+(pass) web API > POST /api/orchestrator/answer/:approval_id > valid request inserts row and returns 200 [43.08ms]
+(pass) web API > POST /api/orchestrator/answer/:approval_id > missing Sec-Fetch-* headers returns 403 [34.86ms]
+(pass) web API > POST /api/orchestrator/answer/:approval_id > wrong Origin returns 403 (reuses checkOrigin) [37.94ms]
+(pass) web API > POST /api/orchestrator/answer/:approval_id > missing answers.db is created [39.26ms]
+(pass) web API > POST /api/orchestrator/answer/:approval_id > malformed JSON body returns 400 [38.37ms]
+(pass) web API > POST /api/orchestrator/answer/:approval_id > missing answer field returns 400 [38.66ms]
+(pass) generic stop changes work state and stale decision conflicts [47.10ms]
+(pass) generic narrow without replacement contract stays open [46.17ms]
+(pass) approval-linked option writes human answer and leaves attention open [43.77ms]
+(pass) hung and zombie API rows expose resume capability [31.68ms]
+
+src/ingest/ingest.test.ts:
+(pass) ledger schema migrations > sets a five-second busy timeout on opened writable ledgers [8.74ms]
+(pass) ledger schema migrations > fresh schema does not recreate the retired request reminder column [1.07ms]
+(pass) ledger schema migrations > drops the retired current frozen column from existing ledgers [0.99ms]
+(pass) atomic spool ingestion > reads a spool file larger than 4 MiB across scan passes without loss or duplication [53.82ms]
+(pass) atomic spool ingestion > drops lines longer than 64 KiB and records a coverage gap [10.77ms]
+(pass) atomic spool ingestion > consumes only newline-terminated valid envelopes and resumes by byte cursor [13.37ms]
+(pass) atomic spool ingestion > does not reopen a file whose cursor already covers it [14.89ms]
+(pass) atomic spool ingestion > deduplicates overlap from active and sealed files [12.21ms]
+(pass) atomic spool ingestion > tolerates a spool file that vanishes between discovery and read (seal race) [14.08ms]
+(pass) atomic spool ingestion > stores the incarnation pid from the nested session_started lease (loop-1 E1) [13.54ms]
+(pass) atomic spool ingestion > q2 accepts done sessions with lineage origins, not just the literal 'agent' (loop-1 E8) [0.25ms]
+(pass) P2 reducer and classifier > classifier is pure and emits deterministic queue changes [0.17ms]
+(pass) P2 reducer and classifier > tracks state, terminal stickiness, precedence, attachments, and idempotent transitions [12.94ms]
+(pass) P2 reducer and classifier > separates the progress clock from the heartbeat clock and keeps recon findings off last_event_at [13.53ms]
+(pass) P2 reducer and classifier > projects session-start host context without creating an external attachment [10.90ms]
+(pass) P2 reducer and classifier > projects attributable telemetry gaps and ignores unattributable gaps [11.64ms]
+(pass) P2 reducer and classifier > gates recon findings while their source incident is open [16.26ms]
+(pass) P2 reducer and classifier > labels a drained emitter only when it actually orphans a pending request [15.04ms]
+(pass) P2 reducer and classifier > does not label a drained emitter with no pending request as a zombie [19.58ms]
+(pass) request reducer > cmux settle orphans only cmux pending requests [14.03ms]
+(pass) request reducer > decision resolution returns an awaiting session to idle without losing request terminal state [12.39ms]
+(pass) request reducer > source resolution overrides a local acked terminal [15.61ms]
+(pass) request reducer > handles pending, terminal-first, idempotency, and source override of orphaned [19.92ms]
+(pass) request reducer > errored resolution without explicit state lands as cancelled, not resolved (review B1) [15.27ms]
+
+src/ingest/classifier.test.ts:
+(pass) settled handoff classification > routes blocked handoff to Inbox [0.04ms]
+(pass) settled handoff classification > keeps complete zero-uncertainty handoff on normal Q3 path [0.01ms]
+(pass) settled handoff classification > keeps settled event without handoff on normal Q3 path
+(pass) settled handoff classification > later working event clears handoff block
+(pass) settled handoff classification > keeps the Inbox entry when the session exits, unlike liveness reasons [0.01ms]
+
+src/ingest/reducer.test.ts:
+(pass) decision resolution outcomes > absent outcome stays pending and records an anomaly [1.05ms]
+(pass) decision resolution outcomes > unrecognized outcome stays pending and records an anomaly [1.64ms]
+(pass) decision resolution outcomes > preserves resolved mapping [0.69ms]
+(pass) decision resolution outcomes > preserves cancelled mapping [0.93ms]
+(pass) decision resolution outcomes > preserves timed_out mapping [0.82ms]
+(pass) decision resolution outcomes > preserves error mapping [0.81ms]
+(pass) decision resolution outcomes > re-reduction does not duplicate an unrecognized-outcome anomaly [0.80ms]
+(pass) detail stable_id host authority > session_vanished cannot target another host [0.75ms]
+(pass) detail stable_id host authority > session_vanished still targets another session on same host [0.75ms]
+(pass) detail stable_id host authority > attachment_observed cannot target another host [0.90ms]
+(pass) detail stable_id host authority > local recon (overload admin emitter) still marks a devbox session vanished [0.67ms]
+(pass) detail stable_id host authority > a devbox emitter claiming to be admin cannot target local [0.74ms]
+
+src/ingest/cmux.test.ts:
+(pass) cmux workstream ingestion > reads only bounded verification bytes plus the appended tail in steady state [55.64ms]
+(pass) cmux workstream ingestion > turns a real-shape pending question into a Q1 request and terminal status resolves it [17.05ms]
+(pass) cmux workstream ingestion > detects rotation even when the replacement has the same head line [11.22ms]
+(pass) cmux workstream ingestion > detects truncate-and-regrow ABA with the same first line using cursor tail fingerprint [12.95ms]
+(pass) cmux workstream ingestion > is idempotent and silently skips a missing configured file through scanOnce [32.88ms]
+
+src/ingest/prune.test.ts:
+(pass) pruneSpool > sweeps consumed sealed segments and leaves unconsumed or recent ones [6.73ms]
+(pass) pruneSpool > keeps a live emitter's unsealed file and removes a dead one's, then drops the empty directory [4.58ms]
+(pass) pruneSpool > reconciles missing cursors only for the local host tree [8.77ms]
+
+src/pull/pull.test.ts:
+(pass) Puller > limits rsync transfers to 8 MiB files [40.30ms]
+(pass) Puller > emits one outage at the consecutive failure threshold and journal-deduplicates later attempts [149.75ms]
+(pass) Puller > emits recovered after a successful pull when the journal has an open outage [63.70ms]
+(pass) Puller > pulls seg and active files with local rsync, preserves unrelated files, and touches heartbeat [89.95ms]
+
+src/shared/queries.test.ts:
+(pass) ackRequest > uses a distinct acked terminal without rewriting source cancellation [0.32ms]
+(pass) queryJumpTarget > surfaces only the latest session-start probe failure when no binding exists [0.46ms]
+(pass) queryJumpTarget > leaves an existing binding unaffected [0.50ms]
+(pass) querySession > merges addressed events with recon findings that point at the session [0.46ms]
+(pass) querySession > exposes latest settled handoff fields [0.33ms]
+(pass) queryHealth > counts only recent gaps while keeping old open incidents [0.16ms]
+(pass) queryHung > reports hung age and the finding evidence, ignoring other q5 reasons [0.68ms]
+(pass) HungRow declares the complete hung payload including resume capability [13.11ms]
+(pass) session list / inbox / archive surfaces > querySessions orders by last event and attaches the latest settled handoff [0.56ms]
+(pass) session list / inbox / archive surfaces > queryQ1 returns pending requests with parsed summary/options and jump binding [0.48ms]
+(pass) session list / inbox / archive surfaces > requestSession resolves a request uid to its stable id and null when absent [0.19ms]
+(pass) session list / inbox / archive surfaces > queryQ2 lists ended inbox rows and queryArchive lists terminal rows without closeouts table [0.26ms]
+(pass) session list / inbox / archive surfaces > queryZombie groups q5 rows, drops hung from groups, and lists orphaned requests [0.19ms]
+
+src/shared/jump.test.ts:
+(pass) performJump > focuses a Ghostty terminal by its session id [0.32ms]
+(pass) performJump > focuses a cmux host terminal by its surface id [0.05ms]
+(pass) performJump > reports a stale binding when the target terminal is gone [0.03ms]
+(pass) performJump > focuses a herdr terminal by binding [0.03ms]
+(pass) performJump > opens a cmux workspace deeplink [0.03ms]
+(pass) performJump > resolves an orca worktree to its first terminal handle [0.10ms]
+(pass) performJump > aborts the orca chain after a mid-chain failure [0.03ms]
+(pass) performJump > returns a short error for malformed orca output [0.08ms]
+(pass) performJump > does not execute for unknown platforms or missing bindings [0.03ms]
+(pass) performJump > aborts before any lookup when the orca worktree-list command itself fails [0.02ms]
+(pass) performJump > stops after step 2 on malformed terminal-list JSON [0.03ms]
+(pass) performJump > stops after step 2 when no terminal entry carries a usable handle field [0.04ms]
+(pass) performJump > surfaces the underlying error when the final orca switch call fails [0.04ms]
+(pass) defaultExecutor > kills a hung process and returns a failure within the timeout bound, not the process's own duration [154.26ms]
+(pass) defaultExecutor > reports a non-zero exit as a failure with the first stderr line [17.13ms]
+(pass) defaultExecutor > returns a graceful failure for a nonexistent command instead of throwing [1.93ms]
+
+src/shared/resume.test.ts:
+(pass) inspectResume orchestrator_owned guard (plan §3.10) > orch: origin is never resumable, even with a dead process [0.29ms]
+(pass) inspectResume orchestrator_owned guard (plan §3.10) > orch: origin wins over process_alive check ordering but process_alive still short-circuits first [0.28ms]
+(pass) inspectResume orchestrator_owned guard (plan §3.10) > null origin is unaffected: falls through to normal resumable result [0.18ms]
+(pass) inspectResume orchestrator_owned guard (plan §3.10) > non-orch origin is unaffected: falls through to normal resumable result [0.23ms]
+(pass) inspectResume orchestrator_owned guard (plan §3.10) > no regression on remote_host_unsupported for non-orch origin [0.16ms]
+(pass) resumeSession launch > launches cmux new-workspace with the quoted session and returns resumed [0.21ms]
+(pass) resumeSession launch > refuses to launch when the process is still alive [0.13ms]
+(pass) resumeSession launch > returns null for an unknown stable id [0.10ms]
+
+src/cli/audit.test.ts:
+(pass) ledger-only control audit > reports explicit effect and interruption observations without inventing unmeasured outcomes [1.08ms]
+
+src/cli/mgmt.test.ts:
+[]
+(pass) runMgmtCli > works on an empty control db prints an empty list and resolves [13.19ms]
+(pass) runMgmtCli > an unknown command rejects with a usage error [7.76ms]
+(pass) runMgmtCli > show on a missing work id rejects as work not found [7.07ms]
+(pass) runMgmtCli > works prints a JSON array of listWorks [6.13ms]
+
+src/cli/doctor.test.ts:
+(pass) runDoctor > reports OK across the board on a healthy install and exits 0 [4.18ms]
+(pass) runDoctor > fails when the ledger cannot be opened, but still runs independent checks [0.19ms]
+(pass) runDoctor > warns (not fails) when an extension file is missing [2.48ms]
+(pass) runDoctor > fails when a required keepalive job is not running [3.70ms]
+(pass) runDoctor > treats interval-job idle state as healthy but flags a nonzero last exit [9.59ms]
+(pass) runDoctor > downgrades a stale pull job to WARN, since remote sync is optional infrastructure [4.36ms]
+(pass) runDoctor > does not require the retired notifier LaunchAgent [3.97ms]
+(pass) runDoctor > fails a stale ingest heartbeat but only warns on a stale pull heartbeat [8.92ms]
+(pass) runDoctor > fails telemetry liveness when a stale session gap has corroborating telemetry_gap evidence [15.26ms]
+(pass) runDoctor > only warns telemetry liveness for a stale gap with no corroborating evidence [3.85ms]
+(pass) runDoctor > warns on unexpected ledger directory/file permissions [2.87ms]
+
+src/cli/overload.test.ts:
+(pass) classifier v2 Q4 > auto-verifies only done agent sessions with zero change evidence [0.07ms]
+(pass) classifier v2 Q4 > never auto-verifies unknown, human, or unfinished sessions [0.03ms]
+(pass) classifier handoff routing > settled blocked handoff enters Inbox q5 [0.03ms]
+(pass) classifier handoff routing > settled complete or missing handoff stays q3 and clears prior handoff reason [0.02ms]
+(pass) reducer Q4 projection > projects read-only agent completion to q4 and a bash session to q2 [0.62ms]
+(pass) overload q4 > keeps rows on the data sink and the heading off it [2.97ms]
+acked local:pi:one#e#r1
+acked local:pi:one#e#r2
+(pass) overload ack > acks every uid it is given, matching the web bulk selection [17.79ms]
+acked local:pi:one#e#r1
+no pending request matches no-such-request
+(pass) overload ack > a uid that matched nothing does not exit 0 and read as done [14.56ms]
+opened cmux surface-uuid
+(pass) overload jump > resolves a request uid to its session and jumps to the recorded binding [10.92ms]
+opened cmux surface-uuid
+(pass) overload jump > accepts a stable id directly because a hung turn has no request to jump from [12.16ms]
+jump failed: target terminal not found (may have closed)
+(pass) overload jump > a target that did not respond fails loudly instead of reporting success [8.43ms]
+Session not found: local:pi:missing
+(pass) overload jump > an unknown id never reaches the jump executor [9.72ms]
+No jump target recorded for local:pi:unbound
+(pass) overload jump > a session with no recorded binding is nothing-to-try, not a failed attempt [10.83ms]
+
+src/adapters/pi.test.ts:
+(pass) buildPiRunnerInvocation wraps pi prompt in cmux new-workspace with parent origin [0.06ms]
+
+src/adapters/daemon-factory.test.ts:
+(pass) ADP-01 startAdapterDaemon factory injection > injects fake channel + runtime, starts service, returns stop() [13.82ms]
+(pass) ADP-01 startAdapterDaemon factory injection > missing FEISHU_APP_ID throws before connecting to network [1.27ms]
+(pass) ADP-01 startAdapterDaemon factory injection > missing OVERLOAD_CHANNEL_AUTH_FILE throws [1.75ms]
+(pass) ADP-01 startAdapterDaemon factory injection > unsupported channel name throws [1.87ms]
+(pass) ADP-01 startAdapterDaemon factory injection > service.start failure triggers service.stop() and rethrows [13.58ms]
+
+src/adapters/service.test.ts:
+(pass) commands reply through delivery queue and do not create turns [24.12ms]
+(pass) new closes owned runtime and preserves turns [18.80ms]
+(pass) new rejects unresolved runtime states [19.11ms]
+(pass) requester authorization may submit text but cannot decide cards [16.93ms]
+(pass) delivery uuid is stable across retry and terminal results reply to their source [19.15ms]
+(pass) terminal completion before reaction acknowledgement converges to DONE [18.50ms]
+(pass) duplicate messages execute once and same conversation serializes turns [19.15ms]
+(pass) unknown fences queued work and owner rejection does not persist event [16.46ms]
+(pass) native approval consumes once and updates original decision card with effect [27.23ms]
+(pass) restart retains binding and does not re-submit unknown work [24.88ms]
+(pass) two conversations have distinct sessions and reject cross-session events [25.68ms]
+(pass) temporary delivery retries but unknown send never automatically repeats [39.62ms]
+(pass) channel cancellation never becomes an LLM prompt and fences queued work [20.58ms]
+
+src/adapters/pi-broker.test.ts:
+(pass) JsonlFramer splits newline-delimited records across chunks and strips CR [3.33ms]
+(pass) JsonlFramer rejects non-object JSON records [0.07ms]
+(pass) broker path helpers embed sessionId under runtimeRoot [0.02ms]
+(pass) readBrokerMetadata accepts a valid metadata file and rejects malformed ones [2.83ms]
+
+src/adapters/pi-broker-server.test.ts:
+(pass) ADP-15 PiBroker listens, enforces ownerToken on hello and commands, persists journal [1522.57ms]
+
+src/adapters/pi-client.test.ts:
+(pass) ADP-16 connectPiBroker resolves a reference on a valid hello [5.30ms]
+(pass) ADP-16 connectPiBroker rejects an ownership-rejected hello [508.74ms]
+(pass) ADP-17 stopPiBroker sends a shutdown command and closes the client [4.34ms]
+(pass) ADP-19 PiSessionHandle rejects submit after close and serializes turns [1.14ms]
+(pass) ADP-19 PiSessionHandle confirms only yes/no and validates select options [0.64ms]
+(pass) ADP-19 PiSessionHandle treats an unknown submit receipt as prior_turn_unknown [0.22ms]
+
+src/adapters/feishu.test.ts:
+(pass) uses the official websocket transport and does not report start before connect [0.55ms]
+(pass) normalizes authenticated direct and mentioned group messages with thread identity [0.54ms]
+(pass) exposes SDK reaction methods [0.13ms]
+(pass) replies when a requester invokes an owner-only slash command [0.24ms]
+(pass) replies when a non-owner submits a card decision [0.41ms]
+(pass) normalizes card callbacks without unauthenticated tenant bypass [0.24ms]
+(pass) sends threaded text and decision cards, and updates existing cards [0.51ms]
+(pass) passes a stable delivery uuid and only falls back for important terminal revoked updates [0.40ms]
+(pass) retries a missing reply anchor once with the same delivery uuid [0.12ms]
+(pass) does not retry a reply send for generic errors [0.10ms]
+(pass) classifies official SDK delivery errors without pretending success [0.19ms]
+
+src/adapters/pi-runtime-guard.test.ts:
+(pass) ADP-20 start rejects an owner/cwd mismatch before spawning the broker [2.49ms]
+(pass) ADP-20 start rejects an existing stopped session before spawning the broker [1.31ms]
+
+src/adapters/service-guard.test.ts:
+(pass) ADP-21 AdapterService rejects duplicate channel instanceId [27.22ms]
+
+src/recon/recon.test.ts:
+(pass) ReconDaemon > emits dead then drained only after every emitter spool cursor reaches EOF [79.70ms]
+(pass) ReconDaemon > treats a vanished spool file as consumed when prune wins the lstat race [74.36ms]
+(pass) ReconDaemon > keeps a remote incarnation live when its injected host probe finds the process [66.66ms]
+(pass) ReconDaemon > declares a remote incarnation dead only when its injected host probe proves absence [75.17ms]
+(pass) ReconDaemon > treats a failed remote host probe as unknown and aggregates outage and recovery [189.57ms]
+(pass) ReconDaemon > checks a dead remote emitter against spool/<incarnation host>/<emitter> [72.89ms]
+(pass) ReconDaemon > joins visible native sessions by cwd and includes stable_id in a rate-limited telemetry gap [131.60ms]
+(pass) ReconDaemon > aggregates a source outage and emits recovery without source-derived findings [187.56ms]
+(pass) ReconDaemon > ignores idle silence and reports a working stall once per silence episode [239.96ms]
+(pass) ReconDaemon > reports a heartbeating turn with frozen progress as turn_hung [73.52ms]
+(pass) ReconDaemon > outranks turn_hung with dead_connection when a socket is stranded on a lost address [70.33ms]
+(pass) ReconDaemon > ignores a future remote clock when the local ingest pipeline is stale [74.58ms]
+(pass) ReconDaemon > holds back hang findings while the ingest clock is stale [74.34ms]
+
+src/control/store.test.ts:
+(pass) control store CAS and attention semantics > contract revision supersedes only unconsumed open attention and emits in same transaction [1.57ms]
+(pass) control store CAS and attention semantics > schema version refuses newer databases and initialization records version [0.90ms]
+(pass) control store CAS and attention semantics > malformed contract does not default missing scope, acceptance, or hard cost [0.84ms]
+(pass) control store CAS and attention semantics > stop-condition expected revision is checked atomically [1.49ms]
+(pass) control store CAS and attention semantics > generic stop decision applies work effect before resolving [1.28ms]
+(pass) control store CAS and attention semantics > generic continue decision applies work effect before resolving [1.09ms]
+(pass) control store CAS and attention semantics > narrow rejects missing contract without changing card and atomically revises with valid replacement [1.11ms]
+(pass) control store CAS and attention semantics > generic decision stale CAS and approval-linked route fail without mutation [0.98ms]
+(pass) control store CAS and attention semantics > stale mutation conflicts, ack does not resolve, unresolved external effect blocks resolve [0.93ms]
+(pass) promotion requires candidate and current revision and emits a new contract [0.95ms]
+(pass) continue supersedes stale sibling attention and preserves the selected receipt [1.62ms]
+(pass) narrow applies the previewed card snapshot transactionally [1.64ms]
+(pass) narrow preview cannot overwrite a sibling arriving after preview [1.09ms]
+(pass) stop refuses to change work while a sibling effect is applying [0.95ms]
+
+src/control/store-extra.test.ts:
+(pass) listWorks returns works newest-updated first [1.23ms]
+(pass) listAttention zones filter open vs done and defer [1.14ms]
+(pass) redirectWork stops a work and records a redirect row [1.18ms]
+(pass) recordAttentionFeedback writes a feedback row and emits an outbox event [1.17ms]
+(pass) publishControlEvents claims pending events once and skips lease-held retries [1.07ms]
+
+src/control/projection.test.ts:
+(pass) control projection durable dedup > same event is idempotent and newer revision wins [1.03ms]
+(pass) control projection durable dedup > same identity with another payload fails safe [0.70ms]
+
+src/control/store-guard.test.ts:
+(pass) CTRL-10 redirectWork activate reopens a stopped work [1.11ms]
+(pass) CTRL-13 listAttention done zone returns resolved/superseded only [1.36ms]
+
+src/control/outbox.test.ts:
+(pass) control outbox identity > retries retain stable event id and reject changed payload [0.25ms]
+
+src/control/open-control.test.ts:
+(pass) CTRL-06 openControl creates a secured WAL db and boots the control schema [40.09ms]
+(pass) CTRL-06 openControl is idempotent across reopen [8.37ms]
+
+src/orchestrator/store.test.ts:
+(pass) orchestrator store > claim enforces repo lock while skipping to independent repo [6.68ms]
+(pass) orchestrator store > cap counts only starting and running [6.43ms]
+(pass) orchestrator store > illegal event rejected and budgets only documented retries [6.80ms]
+(pass) orchestrator store > attempt survives close and reopen [8.27ms]
+
+src/orchestrator/spool.test.ts:
+(pass) rotates at one MiB [13.13ms]
+(pass) rotates at 30 seconds [8.58ms]
+(pass) seq persists across restart [11.01ms]
+
+src/orchestrator/expire.test.ts:
+(pass) expireApprovals transitions awaiting_human task to blocked and closes target [23.06ms]
+
+src/orchestrator/submit.test.ts:
+(pass) submit compares remote SHA rather than branch existence [0.49ms]
+(pass) push confirmation stays unknown when remote verification fails [0.46ms]
+
+src/orchestrator/pr.test.ts:
+(pass) checkPr > observation failure is never treated as clean [0.06ms]
+(pass) checkPr > invalid observation payload is explicit [0.05ms]
+(pass) checkPr > merged PR [0.06ms]
+(pass) checkPr > closed without merge [0.03ms]
+(pass) checkPr > CI check failure [0.04ms]
+(pass) checkPr > changes requested [0.02ms]
+(pass) checkPr > 24h stale [0.03ms]
+(pass) checkPr > clean: all checks pass, no issues [0.02ms]
+(pass) checkPr > anomaly dedup: requestApproval called at most once across multiple ticks [0.03ms]
+
+src/orchestrator/evidence.test.ts:
+(pass) evidenceReady rejects no changes [0.04ms]
+(pass) evidenceReady rejects no commits
+(pass) evidenceReady rejects dirty worktree
+(pass) evidenceReady distinguishes missing check
+(pass) evidenceReady rejects failed check
+(pass) evidenceReady accepts complete evidence collected from real git [155.64ms]
+(pass) collectEvidence reports a present but non-executable check as failed, not absent [137.68ms]
+
+src/orchestrator/orchestrator.test.ts:
+(pass) tick emits ingestible overload session and leaves same repo queued [50.47ms]
+(pass) tick wires ensureWorktree -> spawnRunner -> session_bound to running with a real scratch repo [193.69ms]
+(pass) tick isolates runner errors across tasks [17.54ms]
+(pass) overlapping tick is single-flight [15.65ms]
+(pass) §3 spawn intent is committed before the spawn is attempted [14.39ms]
+(pass) runner exit with no check blocks as no_check without spending retry budget [150.10ms]
+(pass) §7-1 crash-before-spawn task is redriven without spending retry budget [14.94ms]
+(pass) §7-2 intent state never spawns while the ingest window catches up [66.49ms]
+(pass) §7-3 a still-alive runner recovers without a double spawn [25.93ms]
+(pass) §7-4 exited is distinguishable from absent [54.64ms]
+(pass) §7-5 owner CAS blocks a stale post-await write once the lease has been taken over [16.68ms]
+(pass) §7-6 an external instance's tick never touches this instance's task [14.58ms]
+(pass) §7-7 a pid recycled by an unrelated process is judged dead, not stuck [33.36ms]
+(pass) §7-8 liveness_unknown's bound survives an orchestrator restart [40.86ms]
+(pass) §7-9 budget exhaustion lands on blocked, not failed, and doesn't loop [28.81ms]
+(pass) §7-10 a starting task with no attempt_id gets blocked, not silently stuck [15.23ms]
+(pass) §7-11 a legacy pre-upgrade row with a pid but no recovery row never gets re-spawned [14.66ms]
+(pass) §3.6 tick collects abandoned worktrees on its own, throttled, and records each deletion [15.58ms]
+
+src/orchestrator/runner.test.ts:
+(pass) runner spawn records attempt-scoped executor evidence [2.28ms]
+
+src/orchestrator/worktree.test.ts:
+(pass) ensureWorktree (mocked executor) > reuses an existing worktree listed by `git worktree list --porcelain` [0.14ms]
+(pass) ensureWorktree (mocked executor) > reuses an existing branch when the worktree dir is absent [0.08ms]
+(pass) ensureWorktree (mocked executor) > creates a new branch + worktree when neither exists [0.13ms]
+(pass) ensureWorktree (mocked executor) > throws with git's stderr when worktree add fails [0.07ms]
+(pass) gcWorktree (mocked executor) > only reports (never deletes) a dirty worktree [7.86ms]
+(pass) gcWorktree (mocked executor) > dryRun never deletes even when clean and terminal [10.79ms]
+(pass) gcWorktree (mocked executor) > refuses to delete a non-terminal task's worktree [10.94ms]
+(pass) gcWorktree (mocked executor) > refuses to delete while a live pid holds the worktree [17.68ms]
+(pass) gcWorktree (mocked executor) > deletes a clean, terminal, no-live-pid worktree with --apply (dryRun=false) [16.48ms]
+(pass) gcWorktree (mocked executor) > gcCandidates only considers terminal tasks [25.79ms]
+(pass) gcWorktree (mocked executor) > a grace window spares a worktree whose task only just went terminal [9.17ms]
+(pass) ensureWorktree (real git, scratch repo) > is idempotent across two calls against a real repo [172.88ms]
+(pass) ensureWorktree (real git, scratch repo) > reuses an existing branch across two different task ids (real repo) [211.33ms]
+(pass) ensureWorktree (real git, scratch repo) > gcWorktree deletes a real clean terminal worktree and leaves a dirty one [283.42ms]
+
+src/orchestrator/audit-coverage.test.ts:
+(pass) ORC-01 repairApprovalIntents projects a human_only target and stamps repaired_at [28.42ms]
+(pass) ORC-02 requestApproval throws on unknown task and reuses an unconsumed approval [22.07ms]
+(pass) ORC-03 updateAttention no-ops on matching state and upserts with revision [21.34ms]
+(pass) ORC-04 reconcileApprovalEffects maps done to resolved/succeeded and blocked to open/failed [25.63ms]
+(pass) ORC-05 replayAppliedReceipts marks a null outcome as unknown [22.54ms]
+(pass) ORC-38 defaultPidAlive reports the live process and rejects a non-existent pid [0.07ms]
+(pass) ORC-11 defaultRunnerExecutor returns ok on exit 0 and error on a missing binary [22.56ms]
+(pass) ORC-12 taskOrigin composes the expected string [0.04ms]
+(pass) ORC-13 artifactsDir joins root with task id [0.01ms]
+(pass) ORC-27 events returns chronological task_events rows [13.27ms]
+(pass) ORC-35 worktreesRoot defaults and respects an override [0.03ms]
+(pass) ORC-43 runCli answer inserts an answer row and prints confirmation [19.04ms]
+
+src/orchestrator/approval.test.ts:
+(pass) approval intent is durable before mailbox repair [26.31ms]
+(pass) human_only target cannot be bot-consumed [22.45ms]
+(pass) terminal mailbox outcome survives receipt replay [20.27ms]
+(pass) receipt projection recovers from durable applied receipt [27.11ms]
+
+src/orchestrator/cli.test.ts:
+(pass) add resolves default HEAD to commit SHA [129.26ms]
+(pass) add resolves branch base ref to branch SHA [165.28ms]
+(pass) unresolvable base ref inserts no task [130.07ms]
+(pass) add ls show advance abandon reopen round trip [133.80ms]
+(pass) gc lists terminal worktrees and only deletes with --apply [16.92ms]
+(pass) gc --older-than spares a task that only just went terminal [11.75ms]
+
+1 tests skipped:
+(skip) P4 attribution grades > fixture commits cover all grades and trailer precedence
+
+ 741 pass
+ 1 skip
+ 0 fail
+ 2268 expect() calls
+Ran 742 tests across 122 files. [68.29s]

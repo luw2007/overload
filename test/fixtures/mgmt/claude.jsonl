@@ -1,0 +1,4 @@
+{"type":"user","sessionId":"claude-1","cwd":"/tmp/claude","gitBranch":"main","timestamp":"2026-01-03T00:00:00Z","message":{"role":"user","content":"please edit"}}
+{"type":"assistant","sessionId":"claude-1","cwd":"/tmp/claude","gitBranch":"main","timestamp":"2026-01-03T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"u1","name":"Write","input":{"file_path":"lib/a.ts"}},{"type":"tool_use","id":"u2","name":"Read","input":{"file_path":"README.md"}}]}}
+{"type":"user","sessionId":"claude-1","cwd":"/tmp/claude","gitBranch":"main","timestamp":"2026-01-03T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"u1","is_error":false,"content":"ok"}]}}
+not-json

@@ -1,0 +1,341 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { ReconDaemon, type ReconConfig } from "./recon";
+
+const roots: string[] = [];
+afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), "overload-recon-"));
+  roots.push(root);
+  const spool = join(root, "spool");
+  await mkdir(spool, { recursive: true });
+  const ledger = join(root, "ledger.db");
+  const db = new Database(ledger);
+  db.exec(`
+    CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, host TEXT, emitter_id TEXT, seq INTEGER, at INTEGER, stable_id TEXT, writer_id TEXT, kind TEXT, detail TEXT);
+    CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, host TEXT, runtime TEXT, session TEXT, cwd TEXT);
+    CREATE TABLE session_incarnations(stable_id TEXT, writer_id TEXT, liveness_domain TEXT, pid INTEGER, proc_boot_id TEXT, started_at INTEGER, last_seen_at INTEGER);
+    CREATE TABLE cursors(file_name TEXT PRIMARY KEY, bytes INTEGER);
+    CREATE TABLE attachments(stable_id TEXT, platform TEXT, binding TEXT, observed_at INTEGER, valid INTEGER);
+    CREATE TABLE current(stable_id TEXT PRIMARY KEY, state TEXT, last_progress_at INTEGER, last_event_at INTEGER);
+  `);
+  db.close();
+  const herdr = join(root, "herdr.sh");
+  const orca = join(root, "orca.sh");
+  const cmux = join(root, "cmux-hook-sessions.json");
+  await writeFile(herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[]}}'\n", { mode: 0o700 });
+  await writeFile(orca, "#!/bin/sh\nprintf '%s\\n' '[]'\n", { mode: 0o700 });
+  await writeFile(cmux, "{}\n");
+  const config: ReconConfig = {
+    recon_interval_ms: 60_000,
+    drain_grace_ms: 0,
+    stall_profile_ms: 1_000,
+    turn_hang_ms: 1_000,
+    command_timeout_ms: 10_000,
+    host: "local",
+    ledger,
+    spool,
+    herdr_cmd: herdr,
+    orca_cmd: orca,
+    remote_probe_cmd: "unused {host} {pid}",
+    cmux_sessions_file: cmux,
+  };
+  return { root, spool, ledger, herdr, orca, cmux, config };
+}
+
+async function events(spool: string) {
+  const host = join(spool, "local");
+  const emitters = await Array.fromAsync(new Bun.Glob("*/active-*.ndjson").scan({ cwd: host, absolute: true }));
+  const lines = (await Promise.all(emitters.map((path) => readFile(path, "utf8"))))
+    .flatMap((text) => text.trim().split("\n").filter((line) => line.startsWith("{")));
+  return lines.map((line) => JSON.parse(line));
+}
+
+/** A live pi incarnation (this process) with a controllable progress clock. */
+function seedLive(ledger: string, emitter: string, options: { at: number; state: string; progressAt: number }) {
+  const db = new Database(ledger);
+  db.query("INSERT INTO sessions VALUES (?, 'local', 'pi', 's1', '/repo')").run("local:pi:s1");
+  db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', ?, 'feedface00', 1, ?)")
+    .run("local:pi:s1", emitter, process.pid, options.at);
+  db.query("INSERT INTO journal VALUES (1, 'local', ?, 1, ?, ?, ?, 'heartbeat', '{}')")
+    .run(emitter, options.at, "local:pi:s1", emitter);
+  db.query("INSERT INTO current VALUES (?, ?, ?, ?)").run("local:pi:s1", options.state, options.progressAt, options.at);
+  db.close();
+}
+
+function ingestFinding(ledger: string, kind: string, emitter: string, at: number) {
+  const db = new Database(ledger);
+  db.query("INSERT INTO journal VALUES (99, 'local', 'overload-x', 1, ?, 'local:pi:s1', 'overload-x', ?, ?)")
+    .run(at, kind, JSON.stringify({ emitter_id: emitter, stable_id: "local:pi:s1" }));
+  db.close();
+}
+
+const probes = (addresses: string[], sockets: Array<{ local: string; peer: string }> = []) => ({
+  localAddresses: () => new Set(addresses),
+  establishedSockets: async () => sockets,
+});
+
+function seedRemote(ledger: string, emitter: string, pid = 999999) {
+  const db = new Database(ledger);
+  db.query("INSERT INTO sessions VALUES (?, 'devbox', 'pi', 'remote', '/devbox/repo')").run("devbox:pi:remote");
+  db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', ?, 'devbox0000', 1, ?)")
+    .run("devbox:pi:remote", emitter, pid, Date.now() - 5_000);
+  db.query("INSERT INTO journal VALUES (1, 'devbox', ?, 1, ?, ?, ?, 'heartbeat', '{}')")
+    .run(emitter, Date.now() - 5_000, "devbox:pi:remote", emitter);
+  db.close();
+}
+
+describe("ReconDaemon", () => {
+  test("emits dead then drained only after every emitter spool cursor reaches EOF", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-deadbeef";
+    const sourceDir = join(f.spool, "local", emitter);
+    await mkdir(sourceDir, { recursive: true });
+    const sourceFile = join(sourceDir, `active-${emitter}-0.ndjson`);
+    await writeFile(sourceFile, "source-event\n");
+    const size = (await stat(sourceFile)).size;
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO sessions VALUES (?, 'local', 'pi', 's1', '/repo')").run("local:pi:s1");
+    db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', 999999, 'deadbeef00', 1, ?)").run("local:pi:s1", emitter, Date.now() - 5_000);
+    db.query("INSERT INTO journal VALUES (1, 'local', ?, 1, ?, ?, ?, 'heartbeat', '{}')").run(emitter, Date.now() - 5_000, "local:pi:s1", emitter);
+    db.query("INSERT INTO cursors VALUES (?, ?)").run(`local/${emitter}/active-${emitter}-0.ndjson`, size);
+    db.close();
+
+    const summary = await new ReconDaemon(f.config).runOnce();
+    expect(summary.byKind.emitter_dead).toBe(1);
+    expect(summary.byKind.emitter_drained).toBe(1);
+    const output = await events(f.spool);
+    expect(output.map((event) => event.kind)).toEqual(expect.arrayContaining(["emitter_dead", "emitter_drained"]));
+    expect(output.every((event) => event.runtime === "overload" && event.dropped_total === 0 && event.write_error_total === 0)).toBe(true);
+  });
+
+  test("treats a vanished spool file as consumed when prune wins the lstat race", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-pruned00";
+    const sourceDir = join(f.spool, "local", emitter);
+    await mkdir(sourceDir, { recursive: true });
+    const sourceFile = join(sourceDir, `active-${emitter}-0.ndjson`);
+    await writeFile(sourceFile, "source-event\n");
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO sessions VALUES (?, 'local', 'pi', 's1', '/repo')").run("local:pi:s1");
+    db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', 999999, 'pruned0000', 1, ?)")
+      .run("local:pi:s1", emitter, Date.now() - 5_000);
+    db.query("INSERT INTO journal VALUES (1, 'local', ?, 1, ?, ?, ?, 'heartbeat', '{}')")
+      .run(emitter, Date.now() - 5_000, "local:pi:s1", emitter);
+    db.close();
+
+    let raced = false;
+    const raceProbes = {
+      ...probes(["10.0.0.1"]),
+      spoolLstat: async (path: string) => {
+        if (path === sourceFile && !raced) {
+          raced = true;
+          await rm(path);
+          const error = new Error("pruned") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        return stat(path);
+      },
+    };
+    const summary = await new ReconDaemon(f.config, raceProbes).runOnce();
+    expect(raced).toBe(true);
+    expect(summary.byKind.emitter_drained).toBe(1);
+  });
+
+  test("keeps a remote incarnation live when its injected host probe finds the process", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-devbox00";
+    seedRemote(f.ledger, emitter);
+    let calledWith: [string, number] | undefined;
+
+    const summary = await new ReconDaemon(f.config, {
+      ...probes([]),
+      remoteProcess: async (host, pid) => { calledWith = [host, pid]; return "alive"; },
+    }).runOnce();
+
+    expect(calledWith).toEqual(["devbox", 999999]);
+    expect(summary.byKind.emitter_dead ?? 0).toBe(0);
+  });
+
+  test("declares a remote incarnation dead only when its injected host probe proves absence", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-devbox01";
+    seedRemote(f.ledger, emitter);
+
+    const summary = await new ReconDaemon(f.config, {
+      ...probes([]), remoteProcess: async () => "dead",
+    }).runOnce();
+
+    expect(summary.byKind.emitter_dead).toBe(1);
+  });
+
+  test("treats a failed remote host probe as unknown and aggregates outage and recovery", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-devbox02";
+    seedRemote(f.ledger, emitter);
+    let reachable = false;
+    const daemon = new ReconDaemon(f.config, {
+      ...probes([]),
+      remoteProcess: async () => {
+        if (!reachable) throw new Error("ssh timeout");
+        return "alive";
+      },
+    });
+
+    const failed = await daemon.runOnce();
+    const repeated = await daemon.runOnce();
+    reachable = true;
+    const recovered = await daemon.runOnce();
+
+    expect(failed.byKind.emitter_dead ?? 0).toBe(0);
+    expect(failed.byKind.source_outage).toBe(1);
+    expect(repeated.total).toBe(0);
+    expect(recovered.byKind.source_recovered).toBe(1);
+    const output = await events(f.spool);
+    expect(output.filter((event) => event.detail?.source === "host_probe:devbox").map((event) => event.kind))
+      .toEqual(["source_outage", "source_recovered"]);
+  });
+
+  test("checks a dead remote emitter against spool/<incarnation host>/<emitter>", async () => {
+    const f = await fixture();
+    const emitter = "pi-999999-devbox03";
+    seedRemote(f.ledger, emitter);
+    const sourceDir = join(f.spool, "devbox", emitter);
+    await mkdir(sourceDir, { recursive: true });
+    await writeFile(join(sourceDir, `active-${emitter}-0.ndjson`), "not-consumed\n");
+
+    const summary = await new ReconDaemon(f.config, {
+      ...probes([]), remoteProcess: async () => "dead",
+    }).runOnce();
+
+    expect(summary.byKind.emitter_dead).toBe(1);
+    expect(summary.byKind.emitter_drained ?? 0).toBe(0);
+  });
+
+  test("joins visible native sessions by cwd and includes stable_id in a rate-limited telemetry gap", async () => {
+    const f = await fixture();
+    await writeFile(f.herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[{\"terminal_id\":\"term-1\",\"agent_status\":\"working\",\"cwd\":\"/repo\"},{\"terminal_id\":\"term-gap\",\"agent_status\":\"working\",\"cwd\":\"/missing\"}]}}'\n", { mode: 0o700 });
+    const emitter = `pi-${process.pid}-feedface`;
+    const sourceDir = join(f.spool, "local", emitter);
+    await mkdir(sourceDir, { recursive: true });
+    await writeFile(join(sourceDir, `active-${emitter}-0.ndjson`), "\n");
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO sessions VALUES (?, 'local', 'pi', 's1', '/repo')").run("local:pi:s1");
+    db.query("INSERT INTO sessions VALUES (?, 'local', 'claude', 'gap', '/missing')").run("local:claude:gap");
+    db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', ?, 'feedface00', 1, ?)").run("local:pi:s1", emitter, process.pid, Date.now());
+    db.query("INSERT INTO journal VALUES (1, 'local', ?, 1, ?, ?, ?, 'heartbeat', '{}')").run(emitter, Date.now(), "local:pi:s1", emitter);
+    db.close();
+
+    const daemon = new ReconDaemon(f.config);
+    const first = await daemon.runOnce();
+    const second = await daemon.runOnce();
+    expect(first.byKind.attachment_observed).toBe(2);
+    expect(first.byKind.telemetry_gap).toBe(1);
+    expect(second.byKind.telemetry_gap ?? 0).toBe(0);
+    const output = await events(f.spool);
+    expect(output.find((event) => event.kind === "attachment_observed")?.detail.binding).toBe("term-1");
+    expect(output.find((event) => event.kind === "telemetry_gap")?.detail).toMatchObject({
+      platform: "herdr", native_id: "term-gap", cwd: "/missing", stable_id: "local:claude:gap",
+    });
+  });
+
+  test("aggregates a source outage and emits recovery without source-derived findings", async () => {
+    const f = await fixture();
+    await writeFile(f.herdr, "#!/bin/sh\nexit 7\n", { mode: 0o700 });
+    const daemon = new ReconDaemon(f.config);
+    const first = await daemon.runOnce();
+    const second = await daemon.runOnce();
+    expect(first.byKind.source_outage).toBe(1);
+    expect(second.total).toBe(0);
+
+    await writeFile(f.herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[]}}'\n", { mode: 0o700 });
+    const recovered = await daemon.runOnce();
+    expect(recovered.byKind.source_recovered).toBe(1);
+    const output = await events(f.spool);
+    expect(output.filter((event) => event.detail?.source === "herdr").map((event) => event.kind)).toEqual(["source_outage", "source_recovered"]);
+  });
+
+  test("ignores idle silence and reports a working stall once per silence episode", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-idlecafe`;
+    const now = Date.now();
+    seedLive(f.ledger, emitter, { at: now - 5_000, state: "idle", progressAt: now - 5_000 });
+
+    const idle = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(idle.byKind.emitter_stalled ?? 0).toBe(0);
+
+    const db = new Database(f.ledger);
+    db.query("UPDATE current SET state='working'").run();
+    db.close();
+    const working = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(working.byKind.emitter_stalled).toBe(1);
+
+    ingestFinding(f.ledger, "emitter_stalled", emitter, now);
+    const repeat = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(repeat.byKind.emitter_stalled ?? 0).toBe(0);
+  });
+
+  test("reports a heartbeating turn with frozen progress as turn_hung", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-hungbeef`;
+    const now = Date.now();
+    seedLive(f.ledger, emitter, { at: now - 100, state: "working", progressAt: now - 60_000 });
+
+    const summary = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(summary.byKind.turn_hung).toBe(1);
+    expect(summary.byKind.emitter_stalled ?? 0).toBe(0);
+    const finding = (await events(f.spool)).find((event) => event.kind === "turn_hung");
+    expect(finding?.detail).toMatchObject({ emitter_id: emitter, stable_id: "local:pi:s1" });
+    expect(finding?.detail.hung_ms).toBeGreaterThanOrEqual(60_000);
+  });
+
+  test("outranks turn_hung with dead_connection when a socket is stranded on a lost address", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-deadconn`;
+    const now = Date.now();
+    // Only a lost address shortens the grace, so the hang is younger than turn_hang_ms.
+    const config = { ...f.config, turn_hang_ms: 3_600_000 };
+    seedLive(f.ledger, emitter, { at: now - 100, state: "working", progressAt: now - 120_000 });
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO journal VALUES (50, 'local', 'overload-x', 1, ?, 'admin', 'overload-x', 'network_changed', ?)")
+      .run(now - 200, JSON.stringify({ previous: [], current: ["10.0.0.1", "192.168.1.5"] }));
+    db.close();
+
+    const socket = { local: "192.168.1.5:55373", peer: "192.168.1.20:20128" };
+    const summary = await new ReconDaemon(config, probes(["10.0.0.1"], [socket])).runOnce(now);
+    expect(summary.byKind.dead_connection).toBe(1);
+    expect(summary.byKind.turn_hung ?? 0).toBe(0);
+    expect(summary.byKind.network_changed).toBe(1);
+    const finding = (await events(f.spool)).find((event) => event.kind === "dead_connection");
+    expect(finding?.detail).toMatchObject({ local: socket.local, peer: socket.peer });
+  });
+
+  test("ignores a future remote clock when the local ingest pipeline is stale", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-remoteclock`;
+    const now = Date.now();
+    seedLive(f.ledger, emitter, { at: now - 600_000, state: "working", progressAt: now - 600_000 });
+    const db = new Database(f.ledger);
+    db.query("INSERT INTO journal VALUES (2, 'devbox', 'pi-remote', 1, ?, 'devbox:pi:s2', 'pi-remote', 'heartbeat', '{}')")
+      .run(now + 60_000);
+    db.close();
+
+    const summary = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(summary.byKind.turn_hung ?? 0).toBe(0);
+  });
+
+  test("holds back hang findings while the ingest clock is stale", async () => {
+    const f = await fixture();
+    const emitter = `pi-${process.pid}-stalepipe`;
+    const now = Date.now();
+    seedLive(f.ledger, emitter, { at: now - 600_000, state: "working", progressAt: now - 600_000 });
+
+    const summary = await new ReconDaemon(f.config, probes(["10.0.0.1"])).runOnce(now);
+    expect(summary.byKind.turn_hung ?? 0).toBe(0);
+  });
+});
