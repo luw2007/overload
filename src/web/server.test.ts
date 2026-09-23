@@ -23,29 +23,32 @@ afterEach(() => {
 
 function seedLedger(): string {
   const now = Date.now();
+  // All seeded session activity sits 25 hours in the past: inside the default 30d session window.
+  const HOUR = 3_600_000;
+  const t = (offset: number) => now - 25 * HOUR + offset;
   const root = mkdtempSync(join(tmpdir(), "overload-web-"));
   roots.push(root);
   const path = join(root, "ledger.db");
   const db = new Database(path);
   db.exec(SCHEMA_SQL);
-  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["remote:pi:alpha", "buildbox", "pi", "alpha", "agent", "/repo", "main", 1_700_000_000_000, 1_700_000_000_000]);
-  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:pi:dead", "local", "pi", "pi-session", "agent", "/repo/pi", "main", 1_700_000_000_100, 1_700_000_000_100]);
-  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:omp:dead", "local", "omp", "omp-session", "agent", "/repo/omp", "main", 1_700_000_000_200, 1_700_000_000_200]);
-  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:pi:live", "local", "pi", "live-session", "agent", "/repo/live", "main", 1_700_000_000_300, 1_700_000_000_300]);
-  db.run("INSERT INTO session_incarnations VALUES (?, ?, ?, ?, ?, ?, ?)", ["local:pi:live", "writer-live", "process", 4242, "boot", 1_700_000_000_300, 1_700_000_000_300]);
-  db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)", ["req-1", "remote:pi:alpha", "writer", "emitter", "one", "decision", 1_700_000_001_000, JSON.stringify({ question: "ship?" })]);
-  db.run("INSERT INTO attachments VALUES ('remote:pi:alpha', 'cmux', 'workspace-42', 1700000002000, 1)");
-  db.run("INSERT INTO session_hosts VALUES ('remote:pi:alpha', 'cmux', 'terminal-7', '/dev/ttys007', 1700000003000)");
-  db.run("INSERT INTO current VALUES ('done:pi:beta', 'writer', 'done', 'q2', NULL, 'agent', 2, 1700000003000, NULL, NULL)");
-  db.run("INSERT INTO incidents VALUES (1, 'recon', 1700000004000, NULL, ?)", [JSON.stringify({ reason: "adapter unavailable" })]);
-  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["remote:pi:new", "remote", "pi", "new", "agent", "/repo", "main", 1_700_000_000_500, 1_700_000_000_500]);
-  db.run("INSERT INTO current VALUES ('remote:pi:new', 'writer-new', 'working', 'q3', NULL, 'agent', 5, 1700000010000, 1700000010000, 1700000010000)");
-  db.run("INSERT INTO session_hosts VALUES ('remote:pi:new', 'cmux', 'terminal-7', '/dev/ttys007', 1700000006000)");
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["remote:pi:alpha", "buildbox", "pi", "alpha", "agent", "/repo", "main", t(0), t(0)]);
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:pi:dead", "local", "pi", "pi-session", "agent", "/repo/pi", "main", t(100), t(100)]);
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:omp:dead", "local", "omp", "omp-session", "agent", "/repo/omp", "main", t(200), t(200)]);
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["local:pi:live", "local", "pi", "live-session", "agent", "/repo/live", "main", t(300), t(300)]);
+  db.run("INSERT INTO session_incarnations VALUES (?, ?, ?, ?, ?, ?, ?)", ["local:pi:live", "writer-live", "process", 4242, "boot", t(300), t(300)]);
+  db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)", ["req-1", "remote:pi:alpha", "writer", "emitter", "one", "decision", t(1000), JSON.stringify({ question: "ship?" })]);
+  db.run("INSERT INTO attachments VALUES ('remote:pi:alpha', 'cmux', 'workspace-42', ?, 1)", [t(2000)]);
+  db.run("INSERT INTO session_hosts VALUES ('remote:pi:alpha', 'cmux', 'terminal-7', '/dev/ttys007', ?)", [t(3000)]);
+  db.run("INSERT INTO current VALUES ('done:pi:beta', 'writer', 'done', 'q2', NULL, 'agent', 2, ?, NULL, NULL)", [t(3000)]);
+  db.run("INSERT INTO incidents VALUES (1, 'recon', ?, NULL, ?)", [t(4000), JSON.stringify({ reason: "adapter unavailable" })]);
+  db.run("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ["remote:pi:new", "remote", "pi", "new", "agent", "/repo", "main", t(500), t(500)]);
+  db.run("INSERT INTO current VALUES ('remote:pi:new', 'writer-new', 'working', 'q3', NULL, 'agent', 5, ?, ?, ?)", [t(10000), t(10000), t(10000)]);
+  db.run("INSERT INTO session_hosts VALUES ('remote:pi:new', 'cmux', 'terminal-7', '/dev/ttys007', ?)", [t(6000)]);
   db.run("INSERT INTO coverage_gaps VALUES (1, 'remote:pi:alpha', 'emitter', 1, ?, ?, 'missing_seq')", [now - 60_000, now]);
   db.run("INSERT INTO journal(ingest_seq, host, emitter_id, seq, at, stable_id, writer_id, kind, detail) VALUES (1, 'local', 'emitter', 1, ?, 'remote:pi:alpha', 'writer', 'telemetry_gap', ?)", [now - 60_000, JSON.stringify({ platform: "cmux", native_id: "term-9" })]);
-  db.run("INSERT INTO current VALUES ('remote:pi:alpha', 'writer', 'working', 'q5', 'turn_hung', 'agent', 9, 1700000009000, 1700000009000, 1700000005000)");
-  db.run("INSERT INTO journal(ingest_seq, host, emitter_id, seq, at, stable_id, writer_id, kind, detail) VALUES (2, 'local', 'emitter', 2, 1700000005000, 'remote:pi:alpha', 'writer', 'tool_activity', ?)", [JSON.stringify({ tool: "bash" })]);
-  db.run("INSERT INTO journal(ingest_seq, host, emitter_id, seq, at, stable_id, writer_id, kind, detail) VALUES (3, 'local', 'emitter', 3, 1700000009000, 'remote:pi:alpha', 'writer', 'heartbeat', '{}')");
+  db.run("INSERT INTO current VALUES ('remote:pi:alpha', 'writer', 'working', 'q5', 'turn_hung', 'agent', 9, ?, ?, ?)", [t(9000), t(9000), t(5000)]);
+  db.run("INSERT INTO journal(ingest_seq, host, emitter_id, seq, at, stable_id, writer_id, kind, detail) VALUES (2, 'local', 'emitter', 2, ?, 'remote:pi:alpha', 'writer', 'tool_activity', ?)", [t(5000), JSON.stringify({ tool: "bash" })]);
+  db.run("INSERT INTO journal(ingest_seq, host, emitter_id, seq, at, stable_id, writer_id, kind, detail) VALUES (3, 'local', 'emitter', 3, ?, 'remote:pi:alpha', 'writer', 'heartbeat', '{}')", [t(9000)]);
   db.close();
   return path;
 }
@@ -76,8 +79,8 @@ describe("web API", () => {
     writable.run("INSERT INTO current(stable_id, writer_id, state, queue, origin, last_event_at) VALUES ('known', 'w', 'done', 'q2', 'agent', 2), ('unknown', 'w', 'done', 'q2', 'unknown', 1)");
     writable.close();
     const readonly = new Database(path, { readonly: true });
-    expect(queryQ2(readonly)).toEqual([{ stable_id: "known", origin: "agent", last_event_at: 2 }]);
-    expect(queryArchive(readonly)).toEqual([{ stable_id: "unknown", origin: "unknown", last_event_at: 1 }]);
+    expect(queryQ2(readonly, 0)).toEqual([{ stable_id: "known", origin: "agent", last_event_at: 2 }]);
+    expect(queryArchive(readonly, 0)).toEqual([{ stable_id: "unknown", origin: "unknown", last_event_at: 1 }]);
     readonly.close();
   });
 
@@ -87,7 +90,7 @@ describe("web API", () => {
     const headers = { origin: base };
     expect(await (await fetch(`${base}/api/closeout/done:pi:beta`, { method: "POST", headers })).json()).toEqual({ closed: true });
     expect(await (await fetch(`${base}/api/q2`)).json()).toEqual([]);
-    expect(await (await fetch(`${base}/api/archive`)).json()).toContainEqual({ stable_id: "done:pi:beta", origin: "agent", last_event_at: 1_700_000_003_000, closed_out: true });
+    expect(await (await fetch(`${base}/api/archive`)).json()).toContainEqual(expect.objectContaining({ stable_id: "done:pi:beta", origin: "agent", closed_out: true }));
     expect((await fetch(`${base}/api/closeout/missing`, { method: "POST", headers })).status).toBe(404);
   });
 
@@ -105,14 +108,15 @@ describe("web API", () => {
   test("archive includes q4 and unproven q2 rows", async () => {
     const path = seedLedger();
     const db = new Database(path);
-    db.run("INSERT INTO current VALUES ('done:pi:unknown', 'writer', 'done', 'q2', NULL, 'unknown', 3, 1700000004000, NULL, NULL)");
-    db.run("INSERT INTO current VALUES ('done:pi:autoverified', 'writer', 'done', 'q4', NULL, 'agent', 4, 1700000005000, NULL, NULL)");
+    const recent = Date.now() - 2 * 3_600_000;
+    db.run("INSERT INTO current VALUES ('done:pi:unknown', 'writer', 'done', 'q2', NULL, 'unknown', 3, ?, NULL, NULL)", [recent]);
+    db.run("INSERT INTO current VALUES ('done:pi:autoverified', 'writer', 'done', 'q4', NULL, 'agent', 4, ?, NULL, NULL)", [recent + 1000]);
     db.close();
     const { base } = await runningServer(path);
 
     expect(await (await fetch(`${base}/api/archive`)).json()).toEqual([
-      { stable_id: "done:pi:autoverified", origin: "agent", last_event_at: 1_700_000_005_000 },
-      { stable_id: "done:pi:unknown", origin: "unknown", last_event_at: 1_700_000_004_000 },
+      { stable_id: "done:pi:autoverified", origin: "agent", last_event_at: recent + 1000 },
+      { stable_id: "done:pi:unknown", origin: "unknown", last_event_at: recent },
     ]);
   });
 
@@ -136,7 +140,7 @@ describe("web API", () => {
       stable_id: "remote:pi:alpha",
       host: "buildbox",
       kind: "decision",
-      created_at: 1_700_000_001_000,
+      created_at: expect.any(Number),
       detail: { question: "ship?" },
       binding: "terminal-7",
       summary: null,
@@ -265,12 +269,12 @@ describe("web API", () => {
     const view = await detail.json();
     expect(view.session).toMatchObject({
       stable_id: "remote:pi:alpha", state: "working", queue: "q5", q5_reason: "turn_hung",
-      last_progress_at: 1_700_000_005_000, app: "cmux", binding: "terminal-7",
+      last_progress_at: expect.any(Number), app: "cmux", binding: "terminal-7",
     });
     // Newest first, heartbeat-free: the top row must be what the turn last did.
     expect(view.events.map((row: { kind: string }) => row.kind)).toEqual(["tool_activity", "telemetry_gap"]);
     expect(view.pending_requests).toHaveLength(1);
-    expect(view.latest_surface_session).toMatchObject({ stable_id: "remote:pi:new", state: "working", last_event_at: 1_700_000_010_000 });
+    expect(view.latest_surface_session).toMatchObject({ stable_id: "remote:pi:new", state: "working", last_event_at: expect.any(Number) });
     const latest = await (await fetch(`${base}/api/sessions/${encodeURIComponent("remote:pi:new")}`)).json();
     expect(latest.latest_surface_session).toBeNull();
     expect((await fetch(`${base}/api/sessions/missing`)).status).toBe(404);
@@ -280,7 +284,7 @@ describe("web API", () => {
   test("returns pending decisions newest-first", async () => {
     const path = seedLedger();
     const db = new Database(path);
-    db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["req-2", "remote:pi:alpha", "writer", "emitter", "request-2", "decision", "pending", 1_700_000_002_000, null, "{}"]);
+    db.run("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["req-2", "remote:pi:alpha", "writer", "emitter", "request-2", "decision", "pending", Date.now() + 1000, null, "{}"]);
     db.close();
     const { base } = await runningServer(path);
     expect((await (await fetch(`${base}/api/q1`)).json()).map((row: { request_uid: string }) => row.request_uid)).toEqual(["req-2", "req-1"]);
@@ -461,7 +465,7 @@ test("approval-linked option writes human answer and leaves attention open", asy
 test("hung and zombie API rows expose resume capability", async () => {
   const path = seedLedger();
   const db = new Database(path);
-  db.run("INSERT INTO current VALUES ('local:pi:dead', 'writer-dead', 'idle', 'q5', 'stalled', 'agent', 10, 1700000011000, 1700000011000, 1700000011000)");
+  db.run("INSERT INTO current VALUES ('local:pi:dead', 'writer-dead', 'idle', 'q5', 'stalled', 'agent', 10, ?, ?, ?)", [Date.now(), Date.now(), Date.now()]);
   db.close();
   const { base } = await runningServer(path);
 

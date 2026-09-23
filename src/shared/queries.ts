@@ -39,6 +39,15 @@ type JsonRow = { detail: string | null };
 // Health reflects currently active collection problems; stale gap history must age out.
 const HEALTH_GAP_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+// Session views default to the last 30 days: old history stays in the journal but
+// stops crowding the attention surfaces. OVERLOAD_SESSION_WINDOW_DAYS overrides;
+// invalid or missing values fall back to 30.
+const parsedWindowDays = Number.parseInt(process.env.OVERLOAD_SESSION_WINDOW_DAYS ?? "", 10);
+export const SESSION_WINDOW_MS = (Number.isFinite(parsedWindowDays) && parsedWindowDays > 0 ? parsedWindowDays : 30) * 24 * 60 * 60 * 1000;
+export function sessionCutoff(now: number = Date.now()): number {
+  return now - SESSION_WINDOW_MS;
+}
+
 function parseDetail(value: string | null): Record<string, unknown> | null {
   if (!value) return null;
   try {
@@ -89,11 +98,13 @@ function latestSettledHandoff(db: Database, stableId: string): Handoff | null {
   return row ? detailHandoff(parseDetail(row.detail)) : null;
 }
 
-export function querySessions(db: Database, limit = -1): SessionSummary[] {
+export function querySessions(db: Database, limit = -1, now = Date.now()): SessionSummary[] {
+  const cutoff = sessionCutoff(now);
   const rows = db.query(`SELECT s.stable_id, s.runtime, s.origin, s.created_at,
     c.state, c.queue, c.q5_reason, COALESCE(c.last_event_at, s.first_seen_at) last_event_at
     FROM sessions s LEFT JOIN current c ON c.stable_id=s.stable_id
-    ORDER BY last_event_at DESC, s.stable_id LIMIT ?`).all(limit) as SessionSummary[];
+    WHERE COALESCE(c.last_event_at, s.first_seen_at) >= ?
+    ORDER BY last_event_at DESC, s.stable_id LIMIT ?`).all(cutoff, limit) as SessionSummary[];
   return rows.map((row) => ({ ...row, handoff: latestSettledHandoff(db, row.stable_id) }));
 }
 
@@ -196,22 +207,25 @@ export function queryHung(db: Database, now = Date.now()): HungRow[] {
 }
 
 /** Inbox: ended sessions that have not been explicitly closed out by an operator. */
-export function queryQ2(db: Database): Q2Row[] {
-  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin!='unknown' ORDER BY last_event_at DESC, stable_id DESC").all() as Q2Row[];
-  return db.query("SELECT c.stable_id, c.origin, c.last_event_at FROM current c LEFT JOIN closeouts x ON x.stable_id=c.stable_id WHERE c.queue='q2' AND c.origin!='unknown' AND x.stable_id IS NULL ORDER BY c.last_event_at DESC, c.stable_id DESC").all() as Q2Row[];
+export function queryQ2(db: Database, now = Date.now()): Q2Row[] {
+  const cutoff = sessionCutoff(now);
+  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin!='unknown' AND last_event_at>=? ORDER BY last_event_at DESC, stable_id DESC").all(cutoff) as Q2Row[];
+  return db.query("SELECT c.stable_id, c.origin, c.last_event_at FROM current c LEFT JOIN closeouts x ON x.stable_id=c.stable_id WHERE c.queue='q2' AND c.origin!='unknown' AND x.stable_id IS NULL AND c.last_event_at>=? ORDER BY c.last_event_at DESC, c.stable_id DESC").all(cutoff) as Q2Row[];
 }
 
 /** Done: terminal sessions plus operator-closed Q2 work. Audit view, not a todo. */
-export function queryArchive(db: Database): ArchiveRow[] {
-  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q4' OR (queue='q2' AND origin='unknown') ORDER BY last_event_at DESC, stable_id DESC").all() as ArchiveRow[];
+export function queryArchive(db: Database, now = Date.now()): ArchiveRow[] {
+  const cutoff = sessionCutoff(now);
+  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE (queue='q4' OR (queue='q2' AND origin='unknown')) AND last_event_at>=? ORDER BY last_event_at DESC, stable_id DESC").all(cutoff) as ArchiveRow[];
   return db.query(`SELECT c.stable_id, c.origin, c.last_event_at, CASE WHEN x.stable_id IS NOT NULL THEN 1 END closed_out
     FROM current c LEFT JOIN closeouts x ON x.stable_id=c.stable_id
-    WHERE c.queue='q4' OR (c.queue='q2' AND (c.origin='unknown' OR x.stable_id IS NOT NULL))
-    ORDER BY c.last_event_at DESC, c.stable_id DESC`).all().map((row: any) => ({ ...row, ...(row.closed_out ? { closed_out: true as const } : { closed_out: undefined }) }));
+    WHERE (c.queue='q4' OR (c.queue='q2' AND (c.origin='unknown' OR x.stable_id IS NOT NULL)))
+      AND c.last_event_at>=?
+    ORDER BY c.last_event_at DESC, c.stable_id DESC`).all(cutoff).map((row: any) => ({ ...row, ...(row.closed_out ? { closed_out: true as const } : { closed_out: undefined }) }));
 }
 
-export function queryZombie(db: Database): ZombieView {
-  const rows = db.query("SELECT stable_id, q5_reason, last_event_at FROM current WHERE queue='q5' ORDER BY q5_reason, last_event_at DESC, stable_id DESC").all() as Array<{ stable_id: string; q5_reason: string; last_event_at: number }>;
+export function queryZombie(db: Database, now = Date.now()): ZombieView {
+  const rows = db.query("SELECT stable_id, q5_reason, last_event_at FROM current WHERE queue='q5' AND last_event_at>=? ORDER BY q5_reason, last_event_at DESC, stable_id DESC").all(sessionCutoff(now)) as Array<{ stable_id: string; q5_reason: string; last_event_at: number }>;
   const groups: ZombieView["groups"] = [];
   for (const row of rows) {
     // Hung turns have their own surface; counting them twice inflates Zombie.

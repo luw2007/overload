@@ -64,7 +64,7 @@ bun src/cli/overload.ts candidates|candidate <id>
 bun src/cli/overload.ts work create|revise|redirect|stop
 bun src/cli/overload.ts mgmt scan|works|show|track
 bun src/cli/overload.ts context purge --actor <id>
-bun src/cli/overload.ts sessions
+bun src/cli/overload.ts sessions                       # default: last 30 days
 bun src/cli/overload.ts jump <stable_id|request_uid>
 bun src/cli/overload.ts ack <request_uid>...
 bun src/cli/overload.ts doctor
@@ -74,6 +74,8 @@ bun src/cli/overload.ts audit
 ```
 
 Lower-level queue diagnostics (`q1`, `q4`, `hung`, `zombie`, `health`) are internal classifications for maintenance, not the primary interface. The shell equivalent of the dashboard's multi-select Ack is `q1 2>/dev/null | cut -f1 | xargs ... ack`.
+
+Session views — `sessions`, the Inbox (`q2`), the Done/archive surface, and `zombie` — default to sessions active in the last 30 days; older sessions remain in the journal and are still reachable through `show <stable_id>` and jump targets. `OVERLOAD_SESSION_WINDOW_DAYS` overrides the window (see [configuration](docs/guides/configuration.md)). Q1 pending requests, hung turns, and open incidents are not windowed: a decision or failure waiting on you is not history.
 
 Q1 **Ack** changes only Overload's local request state to `acked`; it never answers or unblocks the originating agent. Decisions that carry an answer (approve/deny on a registered gate) submit through the card button or a human takeover (below). Plain asks without an answer consumer remain jump/deep-link-only.
 

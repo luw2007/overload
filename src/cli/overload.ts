@@ -29,7 +29,7 @@ const note: Output = (line) => console.error(line);
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload now|inbox|done | attention <id> [ack|defer|resolve|feedback <json>] | works | candidates | candidate <id> approve|enable <json> | work <id> | work create|revise|redirect|stop <json> | mgmt scan|works|show|track | context purge --actor <id> | sessions | show <stable_id> | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot takeover <owner> <id> <answer> | orch ...\n       diagnostics: q1 | q4 | hung | zombie | health"); process.exit(2); }
+function usage(): never { console.error("usage: overload now|inbox|done | attention <id> [ack|defer|resolve|feedback <json>] | works | candidates | candidate <id> approve|enable <json> | work <id> | work create|revise|redirect|stop <json> | mgmt scan|works|show|track | context purge --actor <id> | sessions (recent 30d, OVERLOAD_SESSION_WINDOW_DAYS to change) | show <stable_id> | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot takeover <owner> <id> <answer> | orch ...\n       diagnostics: q1 | q4 | hung | zombie | health"); process.exit(2); }
 
 function jsonArg(value: string | undefined): Record<string, unknown> {
   if (!value) usage();
