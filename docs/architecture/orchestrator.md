@@ -454,10 +454,10 @@ orchestrator 只写：`orchestrator.db`、`artifacts/`、`worktrees/`、自己�
 
 ## 运行期异常止损（AnomalyMonitor，内部机制，无独立 CLI）
 
-`src/orchestrator/anomaly-monitor.ts` 是 orchestrator 在任务 `running` 期间的**内部止损机制**，随每个 5s tick 自动运行，**没有独立 CLI/Web 命令**，也不要求用户手动触发。设计依据见 `attention-anomaly-signals-design.md`。
+`src/orchestrator/anomaly-monitor.ts` 是 orchestrator 在任务 `running` 期间的**内部止损机制**，随每个 5s tick 自动运行，**没有独立 CLI/Web 命令**，也不要求用户手动触发。
 
 - **采样**：对进程存活的 running 任务按 `signal_sample_window_ms`（默认 60s）节流采样 git churn（`base...HEAD` numstat）与 `worktree/orchestrator.check` 的机器可读逐项检查。已围栏（`stop_state` 非空）的任务跳过采样，避免噪声。
-- **两类机器可验信号**：`fix_loop_exhausted`（同一归一化失败指纹连续 5 轮无 fail→pass 进展）与 `divergence_detected`（churn 升至近窗中位数 3 倍且连续 3 窗无检查项转通过、仍有失败项）。触发即围栏：请求停止 runner、把任务 `stop_state` 置位、投影一张决策卡到 Now。
+- **两类机器可验信号**：`fix_loop_exhausted`（同一归一化失败指纹连续 5 轮无 fail→pass 进展）与 `divergence_detected`（churn 升至近窗中位数 3 倍且连续 3 窗无检查项转通过、仍有失败项）。触发即围栏：先置 `stop_state='stop_requested'`，在同一事务写预算与决策卡 outbox，再按 `attempt_id + runner_pid + runner_boot_id` 核验身份并请求停止 runner。身份匹配且退出可核验置 `stopped_confirmed`，修复循环卡进 Inbox；进程仍活或不可探测置 `stop_unconfirmed` 并设 5 分钟期限，卡进 Now（分叉卡在围栏确认前也留在 Now）。`stop_unconfirmed` 到期只产生一个 `confirm_stopped` human_only 占用决定（`confirm-stopped` / `keep-held`），机器证实进程仍活时拒绝 confirm-stopped。
 - **预算**：`work_anomaly_budget` 按 work_id 持久化，新 attempt / clean_restart 继承不重置。人工 `continue_with_budget` 只追加有限观察窗（默认 2），**按采样窗消耗、不按 tick**；预算耗尽后才重新围栏，禁止自动续杯。
 - **决策回流**：人工在卡上选择 `clean_restart` / `continue_with_budget` / `narrow_or_redirect` / `stop`，由 `consumeDecisions` 应用——旋转 attempt 或清围栏续跑，并把结果写回预算与 `task_events`。检查项恢复通过后自动清退机器卡。
 - **弱信号**（无机器可读检查）只投 Inbox 卡、不围栏。
