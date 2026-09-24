@@ -14,7 +14,7 @@ function setup(git = false) {
  db.exec("PRAGMA foreign_keys=ON");
  db
   .query("INSERT INTO control_works VALUES (?,?,?,?,?,?,?,?,?)")
-  .run("w", "work", "test", "w", "active", 0, null, 1, 1);
+  .run("w", "work", "test", "w", "active", 1, null, 1, 1);
  db
   .query(
    "INSERT INTO mgmt_work_profile(work_id,origin_mode,closeout_owner,track_state,decision_owner,discovered_title,updated_at) VALUES ('w','discovered','mgmt','tracking','owner','work',1)",
@@ -188,7 +188,7 @@ describe("management submission gates", () => {
     "SELECT options FROM control_attention WHERE item_id='mgmt:effects:w:unknown'",
    )
    .get() as { options: string };
-  expect(card.options).toBe("[]");
+  expect(JSON.parse(card.options)).toEqual(["continue","reconcile","abort"]);
   expect(
    (
     db

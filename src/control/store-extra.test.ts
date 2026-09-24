@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
   createWork,
@@ -102,4 +102,87 @@ test("publishControlEvents claims pending events once and skips lease-held retri
   const second = publishControlEvents(d, "/nonexistent-ledger-path/x.db", () => {}, 2);
   expect(second.published).toBe(0);
   d.close();
+});
+
+import { ControlError, getAttention, recordAttentionResolution } from "./store";
+
+function openAttention(d: ReturnType<typeof db>, itemId: string, workId: string, rev: number) {
+  return upsertAttention(d, {
+    item_id: itemId, work_id: workId, state: "open", effect_state: "not_started",
+    urgency: "now", conclusion: "c", trigger: "t", impact: "i", recommendation: null,
+    options: [], owner: "owner", expires_at: null, source_link: null, approval_id: null,
+    consumer_owner: null, contract_revision: rev, decision_mode: "human_only", evidence: {},
+  }, rev);
+}
+
+describe("T19 attention resolution CAS（反例）", () => {
+  test("recordAttentionResolution 用错误的 expectedRevision → 抛 ControlError('conflict')", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const item = openAttention(d, "res-1", w.work_id, 1);
+    expect(() =>
+      recordAttentionResolution(d, item.item_id, 999, { verdict: "accepted", actor: "owner", evidence: {} }, 2),
+    ).toThrow(ControlError);
+    try { recordAttentionResolution(d, item.item_id, 999, { verdict: "accepted", actor: "owner", evidence: {} }, 2); }
+    catch (e) { expect((e as ControlError).code).toBe("conflict"); }
+    d.close();
+  });
+
+  test("accepted → state='resolved', effect_state='succeeded', revision+1, 有 attention_events 记录", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const item = openAttention(d, "res-acc", w.work_id, 1);
+    const resolved = recordAttentionResolution(d, item.item_id, item.revision, { verdict: "accepted", actor: "owner", evidence: { x: 1 } }, 2);
+    expect(resolved.state).toBe("resolved");
+    expect(resolved.effect_state).toBe("succeeded");
+    expect(resolved.revision).toBe(item.revision + 1);
+    const events = (d.query("SELECT kind FROM control_attention_events WHERE item_id=? ORDER BY revision").all(item.item_id) as Array<{ kind: string }>).map((r) => r.kind);
+    expect(events).toContain("resolved");
+    d.close();
+  });
+
+  test("rejected → state='superseded', effect_state='unknown'", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const item = openAttention(d, "res-rej", w.work_id, 1);
+    const sup = recordAttentionResolution(d, item.item_id, item.revision, { verdict: "rejected", actor: "owner", evidence: {} }, 2);
+    expect(sup.state).toBe("superseded");
+    expect(sup.effect_state).toBe("unknown");
+    d.close();
+  });
+
+  test("upsertAttention 并发模拟：第二个带错误 expected_revision → conflict", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    openAttention(d, "cas-1", w.work_id, 1);
+    // 第一次更新基于 revision=1 成功 → revision=2
+    const updated = upsertAttention(d, {
+      item_id: "cas-1", work_id: w.work_id, state: "open", effect_state: "not_started",
+      urgency: "now", conclusion: "c2", trigger: "t", impact: "i", recommendation: null,
+      options: [], owner: "owner", expires_at: null, source_link: null, approval_id: null,
+      consumer_owner: null, contract_revision: 1, decision_mode: "human_only", evidence: {},
+      expected_revision: 1,
+    }, 2);
+    expect(updated.revision).toBe(2);
+    // 第二个仍基于旧 revision=1 → conflict
+    expect(() =>
+      upsertAttention(d, {
+        item_id: "cas-1", work_id: w.work_id, state: "open", effect_state: "not_started",
+        urgency: "now", conclusion: "c3", trigger: "t", impact: "i", recommendation: null,
+        options: [], owner: "owner", expires_at: null, source_link: null, approval_id: null,
+        consumer_owner: null, contract_revision: 1, decision_mode: "human_only", evidence: {},
+        expected_revision: 1,
+      }, 3),
+    ).toThrow(ControlError);
+    try {
+      upsertAttention(d, {
+        item_id: "cas-1", work_id: w.work_id, state: "open", effect_state: "not_started",
+        urgency: "now", conclusion: "c3", trigger: "t", impact: "i", recommendation: null,
+        options: [], owner: "owner", expires_at: null, source_link: null, approval_id: null,
+        consumer_owner: null, contract_revision: 1, decision_mode: "human_only", evidence: {},
+        expected_revision: 1,
+      }, 3);
+    } catch (e) { expect((e as ControlError).code).toBe("conflict"); }
+    d.close();
+  });
 });

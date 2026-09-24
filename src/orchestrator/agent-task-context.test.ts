@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { ensureControlSchema, createWork } from "../control/store";
 import { ensureContextReducerSchema } from "../control/context-reducer";
 import type { Contract } from "../control/types";
-import { createObject, createProblem, linkProblemObject, type ContextObject } from "../control/context-pool";
+import { createObject, getProblem, linkProblemObject, rootProblemId, type ContextObject } from "../control/context-pool";
 import { buildAgentTaskContext, type AgentTaskContextResult } from "./agent-task-context";
 
 const orchSchema = readFileSync(join(import.meta.dir, "schema.sql"), "utf8");
@@ -91,7 +91,7 @@ describe("T6 agent-task-context", () => {
     const cdb = controlFixture();
     const odb = orchFixture();
     const work = createWork(cdb, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(cdb, { work_id: work.work_id, title: "root" }, 2);
+    const problem = getProblem(cdb, rootProblemId(work.work_id))!;
 
     // Fact matching scope: references /tmp/repo
     const factMatch = makeFact(cdb, work.work_id, "fact-match", {

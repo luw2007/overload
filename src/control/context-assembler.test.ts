@@ -5,10 +5,18 @@ import type { Contract } from "./types";
 import {
   createObject,
   createProblem,
+  getProblem,
   linkProblemObject,
+  rootProblemId,
   updateObject,
   type ContextObject,
 } from "./context-pool";
+
+// createWork(active) 已在同事务幂等建立根 problem（title="root"，id=rootProblemId）。
+// 测试不再手动 createProblem(title:"root")，直接取回自动建好的根 problem。
+function rootProblem(db: Database, workId: string) {
+  return getProblem(db, rootProblemId(workId))!;
+}
 import { shareObject } from "./context-pin";
 import { ensureContextReducerSchema, ingestFactObserved } from "./context-reducer";
 import {
@@ -90,7 +98,7 @@ describe("T5 context-assembler", () => {
   test("1. 决策视图包：完整装配，必需字段非空", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     makeAttention(db, work.work_id, "item-1");
 
     const fact = makeFact(db, work.work_id, "fact-1");
@@ -167,7 +175,7 @@ describe("T5 context-assembler", () => {
   test("4. 决策视图包：facts 从 pool 捞出非空", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     makeAttention(db, work.work_id, "item-1");
     const f1 = makeFact(db, work.work_id, "fact-a");
     const f2 = makeFact(db, work.work_id, "fact-b");
@@ -188,7 +196,7 @@ describe("T5 context-assembler", () => {
   test("5. Agent 任务包：objective + constraints + facts，constraints 结构化正确", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
 
     const objective = createObject(db, {
       work_id: work.work_id, ctype: "objective", object_canonical_key: "obj-1",
@@ -231,7 +239,8 @@ describe("T5 context-assembler", () => {
   test("6. Agent 任务包：pool 无 objective/constraints，从 contract 回退构造", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    // 根 problem 已由 createWork 自动建立
+    rootProblem(db, work.work_id);
 
     const result = getContextPackage({
       consumer_type: "agent_task", consumer_id: "task-1", work_id: work.work_id,
@@ -340,7 +349,7 @@ describe("T5 context-assembler", () => {
   test("11. 预算超限：大量 facts → budget_limited，必需字段不降级", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     makeAttention(db, work.work_id, "item-1");
     for (let i = 0; i < 30; i++) {
       const f = makeFact(db, work.work_id, `fact-${i}`, {
@@ -368,7 +377,7 @@ describe("T5 context-assembler", () => {
   test("12. stale 标记：对象出新版后对应 evidence 标 stale", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     makeAttention(db, work.work_id, "item-1");
     const fact = makeFact(db, work.work_id, "fact-1");
     linkProblemObject(db, { problem_id: problem.problem_id, object_id: fact.object_id, revision: 1, role: "fact" }, 3);
@@ -400,7 +409,7 @@ describe("T5 context-assembler", () => {
   test("13. visibility 投影：confirmed_secret 无 grant → 不出现在包中", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     makeAttention(db, work.work_id, "item-1");
 
     const clean = makeFact(db, work.work_id, "clean-fact");
@@ -426,7 +435,7 @@ describe("T5 context-assembler", () => {
   test("14. sensitivity=unknown fact → 不出现在包中", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     makeAttention(db, work.work_id, "item-1");
 
     const clean = makeFact(db, work.work_id, "clean-fact");
@@ -449,7 +458,7 @@ describe("T5 context-assembler", () => {
   test("15. 端到端 collector→reducer→assembler：ingestFactObserved 投影后 assembler 能捞出", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     makeAttention(db, work.work_id, "item-1");
 
     const ingested = ingestFactObserved(db, {

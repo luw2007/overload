@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { ControlError } from "../control/store";
+import { ControlError, supersedeOpenAttentionByWork } from "../control/store";
 import { ensureMgmtSchema } from "./schema";
 import { all, id, one } from "./store";
 
@@ -52,7 +52,7 @@ export function aliasWork(db:Database,aliasId:string,canonicalId:string,options:
   db.query("UPDATE mgmt_work_profile SET track_state='archived',archived_at=?,archive_reason='aliased',updated_at=? WHERE work_id=?").run(now,now,aliasId);
   db.query("INSERT INTO mgmt_discovery_log(at,reason,detail) VALUES(?,'work_aliased',?)").run(now,JSON.stringify({alias:aliasId,canonical:canonicalId,actor}));
   db.query("UPDATE mgmt_acceptances SET invalidated_at=?,invalidated_reason='work_scope_changed' WHERE work_id=? AND verdict='accepted' AND invalidated_at IS NULL").run(now,canonicalId);
-  db.query("UPDATE control_attention SET state='superseded',revision=revision+1,updated_at=? WHERE work_id=? AND item_id LIKE 'mgmt:accept:%' AND state='open'").run(now,canonicalId);
+  supersedeOpenAttentionByWork(db,canonicalId,{reason:"work_aliased",actor,evidence:{alias_work_id:aliasId,canonical_work_id:canonicalId}},now);
   return {alias_work_id:aliasId,canonical_work_id:canonicalId,archived:true};
  }).immediate();
 }

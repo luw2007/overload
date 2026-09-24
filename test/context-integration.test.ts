@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 import { openControl, createWork, upsertAttention, type Work } from "../src/control/store";
 import { ensureContextReducerSchema } from "../src/control/context-reducer";
-import { createProblem, createObject } from "../src/control/context-pool";
+import { getProblem, rootProblemId, createObject } from "../src/control/context-pool";
 import { ingestContextSpool } from "../src/control/context-ingest";
 import { fetchOnDemand, clearFetchCache } from "../src/control/on-demand-fetcher";
 import type { Contract } from "../src/control/types";
@@ -96,7 +96,7 @@ function seedControl(controlPath: string): { work: Work; problemId: string } {
   const db = openControl(controlPath);
   ensureContextReducerSchema(db);
   const work = createWork(db, { title: "w", source: "integ", contract: makeContract("alice") }, 1);
-  const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+  const problem = getProblem(db, rootProblemId(work.work_id))!;
   db.close();
   return { work, problemId: problem.problem_id };
 }

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
-import { ControlError } from "../control/store";
+import { ControlError, getAttention, getWork, upsertAttention, resolveAttentionByExternalSuccess } from "../control/store";
 import { setParentHandoff } from "./schema";
 import { buildSshArgv, localSourceFs, shellQuote, writeSourceFile, type SourceFs, type SourceHost } from "./source";
 
@@ -50,7 +50,34 @@ async function isolatedCwd(source:SourceFs,handoff:any,packet:any){
   if(workspace.patch_sha256!==Bun.SHA256.hash("","hex")){const applied=await source.exec(target,["git","apply","--index",workspace.patch_path],30_000);if(applied.code!==0)throw noEffect(`dirty patch apply failed: ${applied.stderr.trim()}`);}
   return target;
 }
-function unknownAttention(db:Database,handoff:any,now:number){const id=`mgmt:handoff:${handoff.handoff_id}:unknown`,options=JSON.stringify(["jump","attach","abandon"]);db.query(`INSERT INTO control_attention(item_id,work_id,revision,state,effect_state,urgency,conclusion,trigger,impact,recommendation,options,owner,contract_revision,decision_mode,evidence,created_at,updated_at) VALUES (?,?,1,'open','unknown','now','交接启动结果未知','handoff_launch_unknown','不得自动重试','检查并绑定或放弃',?,?,0,'human_only',?,?,?) ON CONFLICT(item_id) DO UPDATE SET updated_at=excluded.updated_at`).run(id,handoff.work_id,options,"decision_owner",JSON.stringify({handoff_id:handoff.handoff_id}),now,now);}
+function unknownAttention(db:Database,handoff:any,now:number){
+ const id=`mgmt:handoff:${handoff.handoff_id}:unknown`;
+ const work=getWork(db,handoff.work_id);if(!work)throw new ControlError("not_found","work not found");
+ const profile=row<{decision_owner:string}|null>(db,"SELECT decision_owner FROM mgmt_work_profile WHERE work_id=?",handoff.work_id);
+ const owner=work.contract?.decision_owner||profile?.decision_owner||"owner";
+ const existing=getAttention(db,id);
+ upsertAttention(db,{
+  item_id:id,
+  work_id:handoff.work_id,
+  state:"open",
+  effect_state:"unknown",
+  urgency:"now",
+  conclusion:"交接启动结果未知",
+  trigger:"handoff_launch_unknown",
+  impact:"不得自动重试",
+  recommendation:"检查并绑定或放弃",
+  options:["jump","attach","abandon"],
+  owner,
+  expires_at:null,
+  source_link:null,
+  approval_id:null,
+  consumer_owner:null,
+  contract_revision:work.revision,
+  decision_mode:"human_only",
+  evidence:{handoff_id:handoff.handoff_id},
+  ...(existing?{expected_revision:existing.revision}:{}),
+ },now);
+}
 
 export async function launchHandoff(db:Database,handoffId:string,opts:{confirmed?:boolean;executor?:LaunchExecutor;timeoutMs?:number;source?:SourceFs}={}){
   if(opts.confirmed!==true)throw new ControlError("invalid","launch confirmation required");
@@ -66,4 +93,4 @@ export async function launchHandoff(db:Database,handoffId:string,opts:{confirmed
 function createKey(handoff:any,attemptNo:number){return Bun.SHA256.hash(`${handoff.handoff_id}${handoff.workspace_fp}${handoff.target_agent}${attemptNo}`,"hex");}
 function failNoEffect(db:Database,handoff:any,attemptNo:number,error:unknown){db.transaction(()=>{db.query("UPDATE mgmt_handoff_launch_attempts SET state='failed_no_effect',reconcile_result=?,resolved_at=? WHERE handoff_id=? AND attempt_no=?").run(String(error),Date.now(),handoff.handoff_id,attemptNo);db.query("UPDATE mgmt_handoffs SET state='ready_to_launch' WHERE handoff_id=?").run(handoff.handoff_id);}).immediate();return {attempt_no:attemptNo,state:"ready_to_launch",outcome:"failed_no_effect"};}
 
-export function reconcileLaunches(db:Database,ledger:Database){const handoffs=db.query("SELECT * FROM mgmt_handoffs WHERE state IN ('launching','launch_unknown') AND target_agent<>'claude'").all() as any[];let bound=0;for(const handoff of handoffs){const session=row<any>(ledger,"SELECT stable_id,runtime,cwd FROM sessions WHERE origin=? ORDER BY first_seen_at DESC LIMIT 1",`mgmt:handoff:${handoff.handoff_id}`);if(!session)continue;const now=Date.now(),executionId=`${handoff.handoff_id}:${session.stable_id}`;db.transaction(()=>{db.query("INSERT OR IGNORE INTO mgmt_session_binding(stable_id,work_id,role,evidence_ref,bound_at) VALUES (?,?,'successor',?,?)").run(session.stable_id,handoff.work_id,`origin:mgmt:handoff:${handoff.handoff_id}`,now);const attempt=row<any>(db,"SELECT COALESCE(MAX(attempt_no),0) n FROM mgmt_executions WHERE work_id=?",handoff.work_id)?.n??0,packet=JSON.parse(handoff.packet||"{}");db.query(`INSERT OR IGNORE INTO mgmt_executions(execution_id,work_id,stable_id,writer_id,attempt_no,exec_state,source_coverage,input_head_at_start,ledger_evidence,agent,cwd,started_at,last_observed_at) VALUES (?,?,?,'successor',?,'running','ledger_full',?,?,?, ?,?,?)`).run(executionId,handoff.work_id,session.stable_id,attempt+1,packet.input_head??null,JSON.stringify({origin:`mgmt:handoff:${handoff.handoff_id}`}),session.runtime,session.cwd,now,now);setParentHandoff(db,executionId,handoff.handoff_id);db.query("UPDATE mgmt_handoffs SET state='bound',new_stable_id=? WHERE handoff_id=?").run(session.stable_id,handoff.handoff_id);db.query("UPDATE mgmt_handoff_launch_attempts SET state='bound',bound_stable_id=?,resolved_at=? WHERE handoff_id=? AND attempt_no=(SELECT MAX(attempt_no) FROM mgmt_handoff_launch_attempts WHERE handoff_id=?)").run(session.stable_id,now,handoff.handoff_id,handoff.handoff_id);db.query("UPDATE control_attention SET state='resolved',effect_state='succeeded',updated_at=? WHERE item_id=?").run(now,`mgmt:handoff:${handoff.handoff_id}:unknown`);}).immediate();bound++;}return {bound};}
+export function reconcileLaunches(db:Database,ledger:Database){const handoffs=db.query("SELECT * FROM mgmt_handoffs WHERE state IN ('launching','launch_unknown') AND target_agent<>'claude'").all() as any[];let bound=0;for(const handoff of handoffs){const session=row<any>(ledger,"SELECT stable_id,runtime,cwd FROM sessions WHERE origin=? ORDER BY first_seen_at DESC LIMIT 1",`mgmt:handoff:${handoff.handoff_id}`);if(!session)continue;const now=Date.now(),executionId=`${handoff.handoff_id}:${session.stable_id}`;db.transaction(()=>{db.query("INSERT OR IGNORE INTO mgmt_session_binding(stable_id,work_id,role,evidence_ref,bound_at) VALUES (?,?,'successor',?,?)").run(session.stable_id,handoff.work_id,`origin:mgmt:handoff:${handoff.handoff_id}`,now);const attempt=row<any>(db,"SELECT COALESCE(MAX(attempt_no),0) n FROM mgmt_executions WHERE work_id=?",handoff.work_id)?.n??0,packet=JSON.parse(handoff.packet||"{}");db.query(`INSERT OR IGNORE INTO mgmt_executions(execution_id,work_id,stable_id,writer_id,attempt_no,exec_state,source_coverage,input_head_at_start,ledger_evidence,agent,cwd,started_at,last_observed_at) VALUES (?,?,?,'successor',?,'running','ledger_full',?,?,?, ?,?,?)`).run(executionId,handoff.work_id,session.stable_id,attempt+1,packet.input_head??null,JSON.stringify({origin:`mgmt:handoff:${handoff.handoff_id}`}),session.runtime,session.cwd,now,now);setParentHandoff(db,executionId,handoff.handoff_id);db.query("UPDATE mgmt_handoffs SET state='bound',new_stable_id=? WHERE handoff_id=?").run(session.stable_id,handoff.handoff_id);db.query("UPDATE mgmt_handoff_launch_attempts SET state='bound',bound_stable_id=?,resolved_at=? WHERE handoff_id=? AND attempt_no=(SELECT MAX(attempt_no) FROM mgmt_handoff_launch_attempts WHERE handoff_id=?)").run(session.stable_id,now,handoff.handoff_id,handoff.handoff_id);const unknownItemId=`mgmt:handoff:${handoff.handoff_id}:unknown`;const unknownCard=getAttention(db,unknownItemId);if(unknownCard)resolveAttentionByExternalSuccess(db,unknownItemId,unknownCard.revision,{actor:"reconcile",evidence:{handoff_id:handoff.handoff_id,stable_id:session.stable_id,origin:`mgmt:handoff:${handoff.handoff_id}`}},now);}).immediate();bound++;}return {bound};}

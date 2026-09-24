@@ -440,7 +440,7 @@ test("generic stop changes work state and stale decision conflicts", async () =>
   const root = mkdtempSync(join(tmpdir(), "overload-control-web-")); roots.push(root);
   const controlPath = join(root, "control.db");
   const control = openControl(controlPath);
-  const work = createWork(control, { title: "release", source: "test" }, 100);
+  const work = createWork(control, { title: "release", source: "test", contract: { objective: "release train", acceptance: [{ id: "a1", kind: "human", description: "done" }], non_goals: [], scope: { cwd: "/tmp" }, budget: {}, stop_conditions: [], decision_owner: "operator" } }, 100);
   const item = upsertAttention(control, { item_id: "item-1", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "Choose release", trigger: "gate", impact: "deployment waits", recommendation: "approve", options: ["continue", "narrow", "stop"], owner: "operator", expires_at: Date.now() + 10000, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: { check: "passed" } }, 100);
   control.close();
   const { base } = await runningServer(seedLedger(), { controlPath, actor: "operator" });
@@ -483,7 +483,7 @@ test("POST resolve without server-side actor → 501, attention unchanged", asyn
   const root = mkdtempSync(join(tmpdir(), "overload-noactor-")); roots.push(root);
   const controlPath = join(root, "control.db");
   const control = openControl(controlPath);
-  const work = createWork(control, { title: "w", source: "test" }, 100);
+  const work = createWork(control, { title: "w", source: "test", contract: { objective: "decide", acceptance: [{ id: "a1", kind: "human", description: "done" }], non_goals: [], scope: { cwd: "/tmp" }, budget: {}, stop_conditions: [], decision_owner: "operator" } }, 100);
   const item = upsertAttention(control, { item_id: "noactor-item", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "decide", trigger: "t", impact: "i", recommendation: null, options: ["continue", "stop"], owner: "operator", expires_at: null, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {} }, 100);
   control.close();
   const { base } = await runningServer(seedLedger(), { controlPath });
@@ -500,7 +500,7 @@ test("POST resolve with server-side actor → 200", async () => {
   const root = mkdtempSync(join(tmpdir(), "overload-actor-ok-")); roots.push(root);
   const controlPath = join(root, "control.db");
   const control = openControl(controlPath);
-  const work = createWork(control, { title: "w", source: "test" }, 100);
+  const work = createWork(control, { title: "w", source: "test", contract: { objective: "decide", acceptance: [{ id: "a1", kind: "human", description: "done" }], non_goals: [], scope: { cwd: "/tmp" }, budget: {}, stop_conditions: [], decision_owner: "operator" } }, 100);
   const item = upsertAttention(control, { item_id: "actorok-item", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "decide", trigger: "t", impact: "i", recommendation: null, options: ["continue", "stop"], owner: "operator", expires_at: null, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {} }, 100);
   control.close();
   const { base } = await runningServer(seedLedger(), { controlPath, actor: "operator" });

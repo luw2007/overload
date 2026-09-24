@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Database } from "bun:sqlite";
-import { ControlError, getWork, upsertAttention } from "../control/store";
+import { ControlError, getWork, upsertAttention, recordAttentionResolution, supersedeAttentionById } from "../control/store";
+import { projectArtifactVersions } from "../control/artifact-projection";
 import { ensureMgmtSchema } from "./schema";
 import { canonicalWorkId, workScope } from "./relations";
 import type { SourceFs } from "./source";
@@ -241,6 +242,9 @@ export function requestAcceptance(
     },
     now,
   );
+  // acceptance 卡写入后、返回前投影该 work 的 artifact 版本进 context 问题池。
+  // manage 不直写 control 表：仅调用 Core 导出的投影器，由其内部写 control_context_*。
+  projectArtifactVersions(db, manifest.work_id, now);
   return { item_id: itemId };
 }
 
@@ -279,19 +283,7 @@ export function recordAcceptance(
         itemId,
       );
       if (card) {
-        const next = card.revision + 1;
-        db.query(
-          "UPDATE control_attention SET state='resolved',effect_state='succeeded',revision=?,acknowledged_at=?,updated_at=? WHERE item_id=?",
-        ).run(next, now, now, itemId);
-        db.query(
-          "INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES(?,?,?,?,?)",
-        ).run(
-          itemId,
-          next,
-          "resolved",
-          JSON.stringify({ selected_option: verdict, actor }),
-          now,
-        );
+        recordAttentionResolution(db, itemId, card.revision, { verdict, actor, evidence }, now);
       }
       return { acceptance_id: acceptanceId };
     })
@@ -319,9 +311,11 @@ export function invalidateAcceptances(
           "UPDATE mgmt_acceptances SET invalidated_at=?,invalidated_reason=? WHERE manifest_id=? AND verdict='accepted' AND invalidated_at IS NULL",
         )
         .run(now, reason, manifest_id).changes;
-      db.query(
-        "UPDATE control_attention SET state='superseded',revision=revision+1,updated_at=? WHERE item_id=? AND state='open'",
-      ).run(now, `mgmt:accept:${canonicalWork}:${manifest_id}`);
+      const itemId = `mgmt:accept:${canonicalWork}:${manifest_id}`;
+      const card = one<{ revision: number }>(db, "SELECT revision FROM control_attention WHERE item_id=? AND state='open'", itemId);
+      if (card) {
+        supersedeAttentionById(db, itemId, card.revision, { reason: "manifest_stale", actor: "collector", evidence: { manifest_id, work_id: canonicalWork, invalidation_reason: reason } }, now);
+      }
     }
     return count;
   };

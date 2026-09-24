@@ -25,7 +25,7 @@ export type SourceType = "orchestrator" | "extension" | "ingest" | "manual";
  *   - `journal:<seq>`               → ledger.db `journal.detail` 列的原始字符串。
  *   - `contract:<work_id>@<rev>`     → `control_contract_revisions.contract` 原始字符串。
  *   - `attention:<item_id>@<rev>`    → 该行被 fetch 时 `JSON.stringify(row)` 的字节。
- *   - `artifact:<id>@<ver>`         → 该行被 fetch 时 `JSON.stringify(row)` 的字节。
+ *   - `artifact:<id>@<ver>`         → `mgmt_artifact_versions.snapshot_path` 指向的原始文件字节（sha256 = content_sha256）。
  *
  * 纪律：
  *   - collector（Execution 侧）必须按本定义计算 content_hash 后再放进 payload；

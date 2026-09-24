@@ -112,13 +112,15 @@ describe("修复3: resolveAttentionDecision 复验 fail-closed", () => {
     db.close();
   });
 
-  test("actor 为空 + 纯 legacy 无 context → 兼容放行", () => {
+  test("actor 为空 + active work 已有根 problem → fail-closed 要求 actor 身份", () => {
+    // 新契约：createWork(active) 幂等建立根 problem，work 必然带 context。
+    // 因此无 actor 调用 resolve 一律 fail-closed（不再有"纯 legacy 无 context"放行路径）。
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
     const item = openContextItem(db, work.work_id, { owner: "alice", withEvidence: false });
     expect(() =>
       resolveAttentionDecision(db, item.item_id, item.revision, { selected_option: "stop" }),
-    ).not.toThrow();
+    ).toThrowError(/actor identity required/);
     db.close();
   });
 

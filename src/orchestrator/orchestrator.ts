@@ -4,6 +4,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getTask, claim, listTasks, openStore, renewLeases, transition, getRecovery, setRecovery, bumpUnknown, resetUnknown, type Task, type TransitionDetail } from "./store";
 import { getWork, publishControlEvents } from "../control/store";
+// §2.7 Execution 调用方契约：collector 必须把根 problem_id 注入 fact 事件。
+// rootProblemId(work_id) 是 Core 导出的确定性派生（= problemId(work_id, null, "root")），不查 DB。
+// Core 会在 promoteWork/createWork 事务内建好根 problem 行；orchestrator 只算 ID、不写 control 表（红线）。
+import { rootProblemId } from "../control/context-pool";
 import { SpoolWriter } from "./spool";
 import { ensureWorktree, worktreesRoot, gcCandidates, defaultCommandExecutor, defaultPidAlive, type CommandExecutor } from "./worktree";
 import { spawnRunner, bindRunnerSession, probeRunnerLiveness, defaultRunnerExecutor, type RunnerExecutor } from "./runner";
@@ -324,7 +328,15 @@ export class Orchestrator {
       ).all() as { work_id: string }[];
       for (const row of rows) {
         collectAndSpool(
-          { orchestratorDb: this.db, work_id: row.work_id, actor: "orchestrator", runtime_id: this.owner },
+          {
+            orchestratorDb: this.db,
+            work_id: row.work_id,
+            // §2.7: 注入根 problem_id，collector buildEvent 透传到 fact 事件。
+            // rootProblemId(work_id) 与 Core ensureRootProblem 建立的根 problem 行主键一致。
+            problem_id: rootProblemId(row.work_id),
+            actor: "orchestrator",
+            runtime_id: this.owner,
+          },
           this.spool.dir,
         );
       }

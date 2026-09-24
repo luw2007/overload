@@ -1,5 +1,7 @@
 import { describe, expect, test, beforeEach } from "bun:test";
-import { unlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { ensureControlSchema } from "./store";
@@ -482,7 +484,7 @@ describe("fetchOnDemand — orchestrator task_event source (cross-db readonly)",
 });
 
 describe("fetchOnDemand — artifact source (same DB mgmt tables)", () => {
-  test("artifact:<id>@<ver> → queries mgmt_artifacts + mgmt_artifact_versions", () => {
+  test("artifact:<id>@<ver> → reads snapshot file bytes, sha256 = content_sha256", () => {
     const db = fixture();
     // Insert control_works row first (FK constraint)
     db.run("INSERT INTO control_works(work_id,title,source,state,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
@@ -492,22 +494,29 @@ describe("fetchOnDemand — artifact source (same DB mgmt tables)", () => {
       ["w1", "contract_governed", "mgmt", "tracking", "owner", "test work", Date.now()]);
     db.run("INSERT INTO mgmt_artifacts(artifact_id,work_id,kind,canonical_key,created_at) VALUES(?,?,?,?,?)",
       ["art1", "w1", "file", "src/main.ts", Date.now()]);
-    const artifactRow = { artifact_id: "art1", kind: "file", canonical_key: "src/main.ts", version_id: "v1", content_kind: "content", content_sha256: "abc", snapshot_path: "/tmp/snap", snapshot_state: "stored", sensitivity: "clean" };
+    // 真实快照文件落在受管 snapshot_root 之下，content_sha256 与文件字节一致。
+    const snapRoot = mkdtempSync(join(tmpdir(), "overload-snap-"));
+    const content = "export const x = 1;\n";
+    const snapshotPath = join(snapRoot, "w1", "art1", "file-sha");
+    mkdirSync(join(snapRoot, "w1", "art1"), { recursive: true });
+    writeFileSync(snapshotPath, content, { mode: 0o600 });
+    process.env.OVERLOAD_SNAPSHOT_ROOT = snapRoot;
+    const contentSha = sha256(content);
     db.run("INSERT INTO mgmt_artifact_versions(version_id,artifact_id,content_kind,content_sha256,snapshot_path,snapshot_state,sensitivity,producer,history_available,stale_capture,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-      ["v1", "art1", "content", "abc", "/tmp/snap", "stored", "clean", "test", 1, 0, Date.now()]);
-    const expectedPayload = JSON.stringify(artifactRow);
+      ["v1", "art1", "content", contentSha, snapshotPath, "stored", "clean", "test", 1, 0, Date.now()]);
 
     makeObjectForReference(db, {
       work_id: "w1", ctype: "artifact",
       key: "art-key", reference: "artifact:art1@v1",
-      sensitivity: "clean", content_hash: sha256(expectedPayload),
+      sensitivity: "clean", content_hash: contentSha,
     });
     const result = fetchOnDemand({
       reference: "artifact:art1@v1", visibility: "full",
       actor: "owner", work_id: "w1", purpose: "decision_view", db,
     });
+    delete process.env.OVERLOAD_SNAPSHOT_ROOT;
     expect("blocked" in result).toBe(false);
-    if (!("blocked" in result)) expect(result.payload).toBe(expectedPayload);
+    if (!("blocked" in result)) expect(result.payload).toBe(content);
     db.close();
   });
 });
@@ -684,6 +693,118 @@ describe("fetchOnDemand — 预算按装配会话隔离", () => {
     });
     expect("blocked" in b2).toBe(false);
     if (!("blocked" in b2)) expect(b2.payload).toBe(contentB);
+    db.close();
+  });
+});
+
+// ===== 反例：artifact 快照 hash 篡改 / 非 stored 不可读（P0-MVP） =====
+import { mkdtempSync as _mktmp } from "node:fs";
+import { symlinkSync, unlinkSync } from "node:fs";
+
+function seedArtifactWork(db: Database, workId: string) {
+  db.run("INSERT INTO control_works(work_id,title,source,state,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+    [workId, "work", "test", "active", 1, Date.now(), Date.now()]);
+  db.run("INSERT INTO mgmt_work_profile(work_id,origin_mode,closeout_owner,track_state,decision_owner,discovered_title,updated_at) VALUES(?,?,?,?,?,?,?)",
+    [workId, "contract_governed", "mgmt", "tracking", "owner", "work", Date.now()]);
+  db.run("INSERT INTO mgmt_artifacts(artifact_id,work_id,kind,canonical_key,created_at) VALUES(?,?,?,?,?)",
+    ["art1", workId, "file", "src/x.ts", Date.now()]);
+}
+
+describe("fetchOnDemand — artifact 快照 hash 篡改（反例）", () => {
+  test("正确 hash → full 取源返回文件字节；篡改文件不改 DB hash → blocked unavailable(hash mismatch)", () => {
+    const db = fixture();
+    seedArtifactWork(db, "w1");
+    const snapRoot = mkdtempSync(join(tmpdir(), "overload-snap-tamper-"));
+    const content = "console.log('ok');\n";
+    const snapshotPath = join(snapRoot, "w1", "art1", "v1");
+    mkdirSync(join(snapRoot, "w1", "art1"), { recursive: true });
+    writeFileSync(snapshotPath, content, { mode: 0o600 });
+    process.env.OVERLOAD_SNAPSHOT_ROOT = snapRoot;
+    const contentSha = sha256(content);
+    db.run("INSERT INTO mgmt_artifact_versions(version_id,artifact_id,content_kind,content_sha256,snapshot_path,snapshot_state,sensitivity,producer,history_available,stale_capture,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+      ["v1", "art1", "content", contentSha, snapshotPath, "stored", "clean", "t", 1, 0, Date.now()]);
+    makeObjectForReference(db, { work_id: "w1", ctype: "artifact", key: "k", reference: "artifact:art1@v1", sensitivity: "clean", content_hash: contentSha });
+    // 正确 hash → 返回字节
+    const ok = fetchOnDemand({ reference: "artifact:art1@v1", visibility: "full", actor: "owner", work_id: "w1", purpose: "decision_view", db });
+    expect("blocked" in ok).toBe(false);
+    if (!("blocked" in ok)) expect(ok.payload).toBe(content);
+    clearFetchCache();
+    // 篡改文件内容，DB content_sha256 不动
+    writeFileSync(snapshotPath, "console.log('TAMPERED');\n", { mode: 0o600 });
+    const bad = fetchOnDemand({ reference: "artifact:art1@v1", visibility: "full", actor: "owner", work_id: "w1", purpose: "decision_view", db });
+    expect("blocked" in bad).toBe(true);
+    if ("blocked" in bad) {
+      expect(bad.code).toBe("unavailable");
+      expect(bad.reason).toContain("hash mismatch");
+    }
+    delete process.env.OVERLOAD_SNAPSHOT_ROOT;
+    db.close();
+  });
+
+  test("snapshot_path 含 .. 路径穿越 → blocked unavailable", () => {
+    const db = fixture();
+    seedArtifactWork(db, "w1");
+    const snapRoot = mkdtempSync(join(tmpdir(), "overload-snap-traverse-"));
+    process.env.OVERLOAD_SNAPSHOT_ROOT = snapRoot;
+    const evilPath = join(snapRoot, "..", "evil-snapshot.txt");
+    db.run("INSERT INTO mgmt_artifact_versions(version_id,artifact_id,content_kind,content_sha256,snapshot_path,snapshot_state,sensitivity,producer,history_available,stale_capture,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+      ["v1", "art1", "content", "x".repeat(64), evilPath, "stored", "clean", "t", 1, 0, Date.now()]);
+    makeObjectForReference(db, { work_id: "w1", ctype: "artifact", key: "k", reference: "artifact:art1@v1", sensitivity: "clean", content_hash: "x".repeat(64) });
+    const res = fetchOnDemand({ reference: "artifact:art1@v1", visibility: "full", actor: "owner", work_id: "w1", purpose: "decision_view", db });
+    expect("blocked" in res).toBe(true);
+    if ("blocked" in res) expect(res.code).toBe("unavailable");
+    delete process.env.OVERLOAD_SNAPSHOT_ROOT;
+    db.close();
+  });
+
+  test("snapshot_path 是指向 snapshot_root 之外的符号链接 → blocked unavailable", () => {
+    const db = fixture();
+    seedArtifactWork(db, "w1");
+    const snapRoot = mkdtempSync(join(tmpdir(), "overload-snap-symlink-"));
+    const outside = mkdtempSync(join(tmpdir(), "overload-snap-outside-"));
+    const outsideFile = join(outside, "secret.txt");
+    writeFileSync(outsideFile, "leak", { mode: 0o600 });
+    const linkPath = join(snapRoot, "w1", "art1", "v1");
+    mkdirSync(join(snapRoot, "w1", "art1"), { recursive: true });
+    symlinkSync(outsideFile, linkPath);
+    process.env.OVERLOAD_SNAPSHOT_ROOT = snapRoot;
+    db.run("INSERT INTO mgmt_artifact_versions(version_id,artifact_id,content_kind,content_sha256,snapshot_path,snapshot_state,sensitivity,producer,history_available,stale_capture,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+      ["v1", "art1", "content", "x".repeat(64), linkPath, "stored", "clean", "t", 1, 0, Date.now()]);
+    makeObjectForReference(db, { work_id: "w1", ctype: "artifact", key: "k", reference: "artifact:art1@v1", sensitivity: "clean", content_hash: "x".repeat(64) });
+    const res = fetchOnDemand({ reference: "artifact:art1@v1", visibility: "full", actor: "owner", work_id: "w1", purpose: "decision_view", db });
+    expect("blocked" in res).toBe(true);
+    if ("blocked" in res) expect(res.code).toBe("unavailable");
+    delete process.env.OVERLOAD_SNAPSHOT_ROOT;
+    db.close();
+  });
+});
+
+describe("fetchOnDemand — 非 stored 快照不可读（反例）", () => {
+  test.each([
+    ["pending", "pending"],
+    ["withheld_sensitive", "withheld_sensitive"],
+    ["lost", "lost"],
+  ])("snapshot_state=%s → blocked unavailable", (state) => {
+    const db = fixture();
+    seedArtifactWork(db, "w1");
+    db.run("INSERT INTO mgmt_artifact_versions(version_id,artifact_id,content_kind,content_sha256,snapshot_path,snapshot_state,sensitivity,producer,history_available,stale_capture,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+      ["v1", "art1", "content", "x".repeat(64), "/some/path", state, "clean", "t", 1, 0, Date.now()]);
+    makeObjectForReference(db, { work_id: "w1", ctype: "artifact", key: "k", reference: "artifact:art1@v1", sensitivity: "clean", content_hash: "x".repeat(64) });
+    const res = fetchOnDemand({ reference: "artifact:art1@v1", visibility: "full", actor: "owner", work_id: "w1", purpose: "decision_view", db });
+    expect("blocked" in res).toBe(true);
+    if ("blocked" in res) expect(res.code).toBe("unavailable");
+    db.close();
+  });
+
+  test("snapshot_path=NULL → blocked unavailable", () => {
+    const db = fixture();
+    seedArtifactWork(db, "w1");
+    db.run("INSERT INTO mgmt_artifact_versions(version_id,artifact_id,content_kind,content_sha256,snapshot_path,snapshot_state,sensitivity,producer,history_available,stale_capture,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+      ["v1", "art1", "content", "x".repeat(64), null, "stored", "clean", "t", 1, 0, Date.now()]);
+    makeObjectForReference(db, { work_id: "w1", ctype: "artifact", key: "k", reference: "artifact:art1@v1", sensitivity: "clean", content_hash: "x".repeat(64) });
+    const res = fetchOnDemand({ reference: "artifact:art1@v1", visibility: "full", actor: "owner", work_id: "w1", purpose: "decision_view", db });
+    expect("blocked" in res).toBe(true);
+    if ("blocked" in res) expect(res.code).toBe("unavailable");
     db.close();
   });
 });

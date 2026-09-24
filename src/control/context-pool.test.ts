@@ -37,7 +37,7 @@ const TABLES = [
 describe("T1 schema migration", () => {
   test("migration creates six context tables and leaves legacy tables intact", () => {
     const db = fixture();
-    expect(CONTROL_SCHEMA_VERSION).toBe(3);
+    expect(CONTROL_SCHEMA_VERSION).toBe(5);
     for (const table of TABLES) {
       const row = db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
       expect(row).toBeTruthy();
@@ -229,6 +229,106 @@ describe("T2 problem-object links", () => {
     db.query("INSERT INTO control_context_shares(share_id,object_id,revision,shared_with_work,granted_by,granted_at) VALUES (?,?,?,?,?,?)")
       .run("s1", obj.object_id, 1, "w1", "owner", 1);
     expect(() => linkProblemObject(db, { problem_id: p.problem_id, object_id: obj.object_id, revision: 1, role: "fact" })).not.toThrow();
+    db.close();
+  });
+});
+
+// ===== 反例测试：根 problem 幂等 + problem object 不冲突（P0-MVP 冻结契约） =====
+import { createWork, promoteWork } from "./store";
+import { ensureRootProblem, rootProblemId } from "./context-pool";
+import type { Contract } from "./types";
+
+const minimalContract: Contract = {
+  objective: "do thing",
+  acceptance: [{ id: "a1", kind: "human", description: "done" }],
+  non_goals: [],
+  scope: { cwd: "/tmp" },
+  budget: {},
+  stop_conditions: [],
+  decision_owner: "owner",
+};
+
+describe("T16 根 problem 幂等（createWork/promoteWork 自动建根）", () => {
+  test("ensureRootProblem 连续两次返回同一 problem（id 相同、不抛 conflict）", () => {
+    const db = fixture();
+    db.query("INSERT INTO control_works(work_id,title,source,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
+      .run("w", "w", "test", "active", 1, 1, 1);
+    const p1 = ensureRootProblem(db, "w", 1);
+    let p2: { problem_id: string } | null = null;
+    expect(() => { p2 = ensureRootProblem(db, "w", 2); }).not.toThrow();
+    expect(p2!.problem_id).toBe(p1.problem_id);
+    expect(p1.title).toBe("root");
+    const count = (db.query("SELECT COUNT(*) n FROM control_context_problems WHERE work_id=?").get("w") as { n: number }).n;
+    expect(count).toBe(1);
+    db.close();
+  });
+
+  test("createWork(active) 后 control_context_problems 有该 work 的根 problem（parent_problem_id IS NULL）", () => {
+    const db = fixture();
+    const work = createWork(db, { title: "w", source: "test", contract: minimalContract }, 1);
+    const rows = db.query("SELECT problem_id, parent_problem_id, title FROM control_context_problems WHERE work_id=?").all(work.work_id) as Array<{ problem_id: string; parent_problem_id: string | null; title: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].parent_problem_id).toBeNull();
+    expect(rows[0].title).toBe("root");
+    db.close();
+  });
+
+  test("promoteWork(candidate→active) 后根 problem 存在", () => {
+    const db = fixture();
+    const cand = createWork(db, { title: "idea", source: "operator", candidate: true }, 1);
+    // candidate 阶段不应有根 problem
+    expect((db.query("SELECT COUNT(*) n FROM control_context_problems WHERE work_id=?").get(cand.work_id) as { n: number }).n).toBe(0);
+    promoteWork(db, cand.work_id, 1, minimalContract, "promoted", 2);
+    const rows = db.query("SELECT problem_id, parent_problem_id, title FROM control_context_problems WHERE work_id=?").all(cand.work_id) as Array<{ problem_id: string; parent_problem_id: string | null; title: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].parent_problem_id).toBeNull();
+    expect(rows[0].title).toBe("root");
+    db.close();
+  });
+
+  test("rootProblemId(work_id) 是确定性的：同 work_id 两次返回相同字符串", () => {
+    expect(rootProblemId("w")).toBe(rootProblemId("w"));
+    expect(rootProblemId("w")).not.toBe(rootProblemId("w2"));
+  });
+
+  test("重复 promoteWork 不产生重复根 problem", () => {
+    const db = fixture();
+    const cand = createWork(db, { title: "idea", source: "operator", candidate: true }, 1);
+    promoteWork(db, cand.work_id, 1, minimalContract, "promoted", 2);
+    // promoteWork 已使 work 变 active；再手动 ensureRootProblem 不应新增行
+    ensureRootProblem(db, cand.work_id, 3);
+    const count = (db.query("SELECT COUNT(*) n FROM control_context_problems WHERE work_id=?").get(cand.work_id) as { n: number }).n;
+    expect(count).toBe(1);
+    db.close();
+  });
+});
+
+describe("T17 problem object 不冲突（重复 link 更新 revision）", () => {
+  test("linkProblemObject 同一 (problem_id,object_id,role) 两次：第二次更新 revision，不抛 UNIQUE", () => {
+    const db = fixture();
+    const p = createProblem(db, { work_id: "w", title: "root" }, 1);
+    db.query("INSERT INTO control_works(work_id,title,source,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("w", "w", "test", "active", 1, 1, 1);
+    const obj = createObject(db, { work_id: "w", ctype: "fact", fact_subtype: "code_state", object_canonical_key: "k", reference: "r", source_type: "orchestrator", content_hash: "h1" }, 1);
+    linkProblemObject(db, { problem_id: p.problem_id, object_id: obj.object_id, revision: 1, role: "fact" }, 2);
+    updateObject(db, { object_id: obj.object_id, expectedRevision: 1, patch: { content_hash: "h2" } }, 2);
+    expect(() => linkProblemObject(db, { problem_id: p.problem_id, object_id: obj.object_id, revision: 2, role: "fact" }, 3)).not.toThrow();
+    const links = db.query("SELECT revision, role FROM control_context_problem_objects WHERE problem_id=? AND object_id=?").all(p.problem_id, obj.object_id) as Array<{ revision: number; role: string }>;
+    expect(links).toHaveLength(1);
+    expect(links[0].revision).toBe(2);
+    db.close();
+  });
+
+  test("listObjectsByProblem 不重复枚举同一 object（即使经过多次 link）", () => {
+    const db = fixture();
+    db.query("INSERT INTO control_works(work_id,title,source,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("w", "w", "test", "active", 1, 1, 1);
+    const p = createProblem(db, { work_id: "w", title: "root" }, 1);
+    const obj = createObject(db, { work_id: "w", ctype: "fact", fact_subtype: "code_state", object_canonical_key: "k", reference: "r", source_type: "orchestrator", content_hash: "h1" }, 1);
+    updateObject(db, { object_id: obj.object_id, expectedRevision: 1, patch: { content_hash: "h2" } }, 2);
+    linkProblemObject(db, { problem_id: p.problem_id, object_id: obj.object_id, revision: 1, role: "fact" }, 3);
+    linkProblemObject(db, { problem_id: p.problem_id, object_id: obj.object_id, revision: 2, role: "fact" }, 4);
+    const listed = listObjectsByProblem(db, p.problem_id);
+    expect(listed).toHaveLength(1);
+    expect(listed[0].version.revision).toBe(2);
     db.close();
   });
 });

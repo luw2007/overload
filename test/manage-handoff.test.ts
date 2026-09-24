@@ -9,7 +9,7 @@ import { launchHandoff, reconcileLaunches } from "../src/manage/launch";
 function fixture(coverage="ledger_full", state="running") {
   const db=new Database(":memory:"); ensureControlSchema(db); ensureMgmtSchema(db);
   const ledger=new Database(":memory:"); ledger.exec(readFileSync(new URL("../src/ingest/schema.sql",import.meta.url),"utf8"));
-  db.query("INSERT INTO control_works VALUES (?,?,?,?,?,?,?,?,?)").run("w","work","test","w","active",0,null,1,1);
+  db.query("INSERT INTO control_works VALUES (?,?,?,?,?,?,?,?,?)").run("w","work","test","w","active",1,null,1,1);
   db.query("INSERT INTO mgmt_work_profile(work_id,origin_mode,closeout_owner,track_state,decision_owner,discovered_title,updated_at) VALUES ('w','discovered','mgmt','tracking','owner','work',1)").run();
   db.query("INSERT INTO mgmt_session_binding VALUES ('s','w','origin','seed',1)").run();
   db.query("INSERT INTO mgmt_executions(execution_id,work_id,stable_id,writer_id,attempt_no,exec_state,source_coverage,ledger_evidence,started_at,cwd) VALUES ('e','w','s','wr',1,'running',?,'{}',1,'/tmp')").run(coverage);

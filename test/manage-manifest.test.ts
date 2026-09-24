@@ -149,7 +149,7 @@ describe("management manifests", () => {
       .query("SELECT state FROM control_attention WHERE item_id=?")
       .get(item_id) as any
     ).state,
-   ).toBe("resolved");
+   ).toBe(verdict === "accepted" ? "resolved" : "superseded");
    expect(
     (db.query("SELECT verdict FROM mgmt_acceptances").get() as any).verdict,
    ).toBe(verdict);

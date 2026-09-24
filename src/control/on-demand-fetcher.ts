@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { lstatSync, readFileSync } from "node:fs";
 import { getObject, getObjectVersion } from "./context-pool";
 import type { ContextObject, ObjectVersion } from "./context-pool";
 import { checkVisibility } from "./visibility-policy";
@@ -207,7 +208,7 @@ function fetchFromSource(
     }
   }
 
-  // artifact:<artifact_id>@<version_id> — 从 control DB 同库查 mgmt_artifacts + mgmt_artifact_versions
+  // artifact:<artifact_id>@<version_id> — 读取受管快照文件字节（sha256 = content_sha256）
   const artifactMatch = reference.match(/^artifact:([^@]+)@([^@]+)$/);
   if (artifactMatch) {
     const [, artifactId, versionId] = artifactMatch;
@@ -218,7 +219,42 @@ function fetchFromSource(
        WHERE a.artifact_id=? AND v.version_id=? AND a.work_id=?`,
     ).get(artifactId, versionId, work_id) as Record<string, unknown> | null;
     if (!row) return { blocked: true, reason: "cross-work: artifact not bound to this work", code: "forbidden" };
-    return { payload: JSON.stringify(row) };
+    const snapshotState = row.snapshot_state as string;
+    if (snapshotState !== "stored") {
+      return { blocked: true, reason: `snapshot not stored: ${snapshotState}`, code: "unavailable" };
+    }
+    const snapshotPath = row.snapshot_path as string | null;
+    if (snapshotPath == null || snapshotPath.includes("\0")) {
+      return { blocked: true, reason: "invalid snapshot path", code: "unavailable" };
+    }
+    const snapshotRoot = resolve(process.env.OVERLOAD_SNAPSHOT_ROOT ?? join(homedir(), ".overload", "artifacts", "mgmt"));
+    const resolved = resolve(snapshotPath);
+    if (resolved.split(/[\\/]/).includes("..")) {
+      return { blocked: true, reason: "invalid snapshot path", code: "unavailable" };
+    }
+    const rel = relative(snapshotRoot, resolved);
+    if (rel.startsWith("..") || isAbsolute(rel)) {
+      return { blocked: true, reason: "snapshot path escapes managed root", code: "unavailable" };
+    }
+    let bytes: Buffer;
+    try {
+      const stat = lstatSync(resolved);
+      if (stat.isSymbolicLink()) {
+        return { blocked: true, reason: "snapshot path is a symlink", code: "unavailable" };
+      }
+      bytes = readFileSync(resolved);
+    } catch {
+      return { blocked: true, reason: "snapshot unreadable", code: "unavailable" };
+    }
+    const actualHash = createHash("sha256").update(bytes).digest("hex");
+    if (actualHash !== (row.content_sha256 as string)) {
+      return { blocked: true, reason: "snapshot hash mismatch", code: "unavailable" };
+    }
+    // 二进制本期不支持：前 8KB 含 NUL 字节即拒绝。
+    if (bytes.subarray(0, 8192).includes(0)) {
+      return { blocked: true, reason: "binary snapshot not supported", code: "unavailable" };
+    }
+    return { payload: bytes.toString("utf8") };
   }
 
   // 外部 git:<repo>@sha 和 http/https URL — 本阶段不实现

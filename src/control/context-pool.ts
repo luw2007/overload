@@ -94,6 +94,11 @@ export function problemId(work_id: string, parent_problem_id: string | null, tit
   return sha256Prefix(work_id + (parent_problem_id ?? "") + title);
 }
 
+// 根 problem 业务键确定性派生：Core 建根 problem 与 Execution collector 读取 problem_id 共用。
+export function rootProblemId(work_id: string): string {
+  return problemId(work_id, null, "root");
+}
+
 export function objectId(work_id: string, ctype: ContextCtype, canonical_key: string): string {
   return sha256Prefix(work_id + ctype + canonical_key);
 }
@@ -223,6 +228,25 @@ export function createProblem(
     return problem;
   });
   return tx.immediate() as Problem;
+}
+
+// 幂等 get-or-create：work 的根 problem（parent_problem_id IS NULL）。
+// 必须在 createWork(active 路径)/promoteWork 事务内调用（同事务，不另开外层事务）。
+// createProblem 在并发下会对撞抛出 conflict；捕获后重查返回，做幂等兜底。
+export function ensureRootProblem(db: Database, work_id: string, nowTs = now()): Problem {
+  ensureControlSchema(db);
+  if (typeof work_id !== "string" || !work_id.trim()) throw new ControlError("invalid", "work_id is required");
+  const existing = db.query("SELECT * FROM control_context_problems WHERE work_id=? AND parent_problem_id IS NULL").get(work_id) as Record<string, unknown> | null;
+  if (existing) return problemFrom(existing);
+  try {
+    return createProblem(db, { work_id, parent_problem_id: null, title: "root" }, nowTs);
+  } catch (err) {
+    if (err instanceof ControlError && err.code === "conflict") {
+      const retry = db.query("SELECT * FROM control_context_problems WHERE work_id=? AND parent_problem_id IS NULL").get(work_id) as Record<string, unknown> | null;
+      if (retry) return problemFrom(retry);
+    }
+    throw err;
+  }
 }
 
 export function resolveProblem(db: Database, problem_id: string, expectedRevision: number, nowTs = now()): Problem {
@@ -395,7 +419,9 @@ export function linkProblemObject(
         .get(input.object_id, revision, problem.work_id) as { 1?: number } | null;
       if (!share) throw new ControlError("conflict", "cross-work link requires a matching share");
     }
-    db.query("INSERT INTO control_context_problem_objects(problem_id,object_id,revision,role,created_at) VALUES (?,?,?,?,?)")
+    // 同一 (problem, object, role) 只保留一条最新 revision 指针：
+    // fact v1→v2 演进时覆盖 revision 指向，避免撞 PK (problem_id, object_id, role)。
+    db.query("INSERT INTO control_context_problem_objects(problem_id,object_id,revision,role,created_at) VALUES (?,?,?,?,?) ON CONFLICT(problem_id,object_id,role) DO UPDATE SET revision=excluded.revision, created_at=excluded.created_at")
       .run(input.problem_id, input.object_id, revision, input.role, nowTs);
   });
   tx.immediate();

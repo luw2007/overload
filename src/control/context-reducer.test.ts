@@ -364,3 +364,51 @@ describe("Fix3 reducer 乱序防护", () => {
     db.close();
   });
 });
+
+describe("T18 fact problem_objects 链接随版本演进（反例）", () => {
+  test("v1→v2（content_hash 变）：problem_objects.revision 从 1 更新到 2，不撞 PK", () => {
+    const db = fixture();
+    makeWork(db, "w1", "alice");
+    const p = createProblem(db, { work_id: "w1", title: "root" }, 1);
+    // v1
+    const r1 = ingestFactObserved(db, basePayload({ problem_id: p.problem_id, observation_revision: 1, content_hash: "h1", source_event_id: "e1" }));
+    expect(r1.status).toBe("created");
+    let row = db.query("SELECT revision, role FROM control_context_problem_objects WHERE problem_id=? AND object_id=?").get(p.problem_id, r1.object_id) as { revision: number; role: string };
+    expect(row.revision).toBe(1);
+    expect(row.role).toBe("fact");
+    // v2（新 observation_revision，新 source_event_id，content_hash 变）
+    const r2 = ingestFactObserved(db, basePayload({ problem_id: p.problem_id, observation_revision: 2, content_hash: "h2", source_event_id: "e2" }));
+    expect(r2.status).toBe("created");
+    expect(r2.revision).toBe(2);
+    row = db.query("SELECT revision FROM control_context_problem_objects WHERE problem_id=? AND object_id=?").get(p.problem_id, r2.object_id) as { revision: number };
+    expect(row.revision).toBe(2);
+    const count = (db.query("SELECT COUNT(*) n FROM control_context_problem_objects WHERE problem_id=? AND object_id=?").get(p.problem_id, r2.object_id) as { n: number }).n;
+    expect(count).toBe(1);
+    db.close();
+  });
+
+  test("重放同 v1（同 observation_revision）：走 dedup，不报错，problem_objects 仍指向 v2", () => {
+    const db = fixture();
+    makeWork(db, "w1", "alice");
+    const p = createProblem(db, { work_id: "w1", title: "root" }, 1);
+    ingestFactObserved(db, basePayload({ problem_id: p.problem_id, observation_revision: 1, content_hash: "h1", source_event_id: "e1" }));
+    ingestFactObserved(db, basePayload({ problem_id: p.problem_id, observation_revision: 2, content_hash: "h2", source_event_id: "e2" }));
+    // 重放 v1：同 idempotency_key（source_event_id=e1, obs_rev=1）
+    const replay = ingestFactObserved(db, basePayload({ problem_id: p.problem_id, observation_revision: 1, content_hash: "h1", source_event_id: "e1" }));
+    expect(replay.status).toBe("idempotent");
+    const objId = (replay as { object_id: string }).object_id;
+    const row = db.query("SELECT revision FROM control_context_problem_objects WHERE problem_id=? AND object_id=?").get(p.problem_id, objId) as { revision: number };
+    expect(row.revision).toBe(2);
+    db.close();
+  });
+
+  test("没有 problem_id 的 fact：不写 problem_objects（向后兼容）", () => {
+    const db = fixture();
+    makeWork(db, "w1", "alice");
+    const r = ingestFactObserved(db, basePayload({ problem_id: null, observation_revision: 1, content_hash: "h1", source_event_id: "e9" }));
+    expect(r.status).toBe("created");
+    const count = (db.query("SELECT COUNT(*) n FROM control_context_problem_objects WHERE object_id=?").get(r.object_id) as { n: number }).n;
+    expect(count).toBe(0);
+    db.close();
+  });
+});

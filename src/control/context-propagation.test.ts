@@ -5,9 +5,16 @@ import {
   createObject,
   createProblem,
   getObject,
+  getProblem,
   linkProblemObject,
+  rootProblemId,
   updateObject,
 } from "./context-pool";
+
+// createWork(active) 已幂等建立根 problem（title="root"）。测试不再手动建根。
+function rootProblem(db: Database, workId: string) {
+  return getProblem(db, rootProblemId(workId))!;
+}
 import {
   markObjectUpdated,
   isStale,
@@ -55,7 +62,7 @@ describe("T8 markObjectUpdated", () => {
   test("updates updated_at on directly referencing problems and emits context.updated event", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     const obj = makeObject(db, work.work_id, "k1", "h1");
     linkProblemObject(db, { problem_id: problem.problem_id, object_id: obj.object_id, revision: 1, role: "fact" }, 3);
 
@@ -80,7 +87,7 @@ describe("T8 markObjectUpdated", () => {
   test("does not cascade to indirect references (only direct problem_objects links)", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const root = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const root = rootProblem(db, work.work_id);
     const child = createProblem(db, { work_id: work.work_id, parent_problem_id: root.problem_id, title: "child" }, 3);
     const obj = makeObject(db, work.work_id, "k1", "h1");
     // 只把对象链接到 root，不链接到 child
@@ -98,7 +105,7 @@ describe("T8 isStale / getStaleObjects", () => {
   test("isStale returns true when linked object has a newer revision", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     const obj = makeObject(db, work.work_id, "k1", "h1");
     linkProblemObject(db, { problem_id: problem.problem_id, object_id: obj.object_id, revision: 1, role: "fact" }, 3);
 
@@ -111,7 +118,7 @@ describe("T8 isStale / getStaleObjects", () => {
   test("getStaleObjects returns correct version comparison", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     const obj1 = makeObject(db, work.work_id, "k1", "h1");
     const obj2 = makeObject(db, work.work_id, "k2", "h1");
     linkProblemObject(db, { problem_id: problem.problem_id, object_id: obj1.object_id, revision: 1, role: "fact" }, 3);
@@ -159,7 +166,7 @@ describe("T8 reverifyBeforeAction", () => {
   test("evidence purged → evidence_mismatch", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     const obj = makeObject(db, work.work_id, "k1", "h1");
     linkProblemObject(db, { problem_id: problem.problem_id, object_id: obj.object_id, revision: 1, role: "fact" }, 3);
     // purge the object
@@ -180,7 +187,7 @@ describe("T8 reverifyBeforeAction", () => {
   test("all checks pass → allowed", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     const obj = makeObject(db, work.work_id, "k1", "h1");
     linkProblemObject(db, { problem_id: problem.problem_id, object_id: obj.object_id, revision: 1, role: "fact" }, 3);
 
@@ -316,7 +323,7 @@ describe("actOnAttention 复验失败拒绝消费（真实路径内联复验）"
     const contract = makeContract("alice");
     const work = createWork(db, { title: "w", source: "test", contract }, 1);
     // work 带 context（problem + object），触发 needsAuth。
-    const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+    const problem = rootProblem(db, work.work_id);
     const obj = makeObject(db, work.work_id, "k-share", "h-share");
     linkProblemObject(db, { problem_id: problem.problem_id, object_id: obj.object_id, revision: 1, role: "fact" }, 3);
 

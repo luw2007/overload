@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
-import { ControlError } from "../control/store";
+import { ControlError, getAttention, upsertAttention } from "../control/store";
 import { checkPr } from "../orchestrator/pr";
 import {
  defaultCommandExecutor,
@@ -456,19 +456,33 @@ function openEffectsCard(db: Database, workId: string, now: number) {
    .query("SELECT decision_owner FROM mgmt_work_profile WHERE work_id=?")
    .get(workId) as { decision_owner: string }
  ).decision_owner;
- db
-  .query(
-   `INSERT OR IGNORE INTO control_attention(item_id,work_id,revision,state,effect_state,urgency,conclusion,trigger,impact,recommendation,options,owner,contract_revision,decision_mode,evidence,created_at,updated_at) VALUES (?,?,?,'open','unknown','now','外部效果未知','提交前发现未确认的外部副作用','继续提交可能重复执行外部副作用','先人工核对远端状态','[]',?,?, 'human_only','{}',?,?)`,
-  )
-  .run(
-   `mgmt:effects:${workId}:unknown`,
-   workId,
-   work.revision,
+ const itemId = `mgmt:effects:${workId}:unknown`;
+ const existing = getAttention(db, itemId);
+ upsertAttention(
+  db,
+  {
+   item_id: itemId,
+   work_id: workId,
+   state: "open",
+   effect_state: "unknown",
+   urgency: "now",
+   conclusion: "外部效果未知",
+   trigger: "pre_submit_unconfirmed_effects",
+   impact: "继续提交可能重复执行外部副作用",
+   recommendation: "先人工核对远端状态",
+   options: ["continue", "reconcile", "abort"],
    owner,
-   work.revision,
-   now,
-   now,
-  );
+   expires_at: null,
+   source_link: null,
+   approval_id: null,
+   consumer_owner: null,
+   contract_revision: work.revision,
+   decision_mode: "human_only",
+   evidence: {},
+   ...(existing ? { expected_revision: existing.revision } : {}),
+  },
+  now,
+ );
 }
 function recordEffects(
  db: Database,

@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openControl, createWork, upsertAttention } from "../control/store";
-import { createObject, createProblem, linkProblemObject, updateObject } from "../control/context-pool";
+import { createObject, getProblem, linkProblemObject, rootProblemId, updateObject } from "../control/context-pool";
 import { ensureContextReducerSchema } from "../control/context-reducer";
 import { clearFetchCache } from "../control/on-demand-fetcher";
 import { startWebServer } from "./server";
@@ -59,7 +59,7 @@ function seedControl(root: string): Seeded {
     decision_owner: "alice",
   };
   const work = createWork(db, { title: "w", source: "test", contract }, 1);
-  const problem = createProblem(db, { work_id: work.work_id, title: "root" }, 2);
+  const problem = getProblem(db, rootProblemId(work.work_id))!;
   upsertAttention(db, {
     item_id: "item-1", work_id: work.work_id, state: "open", effect_state: "not_started",
     urgency: "now", conclusion: "accept the public API change?", trigger: "exported signature changed",

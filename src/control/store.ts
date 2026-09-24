@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { enqueueControlEvent, ensureOutbox } from "./outbox";
 import { ensureMgmtSchema } from "../manage/schema";
+import { ensureRootProblem } from "./context-pool";
+import { ensureContextReducerSchema } from "./context-reducer";
 import type { AffectedAttentionCard, AttentionCardSnapshot, AttentionDecisionInput, AttentionItem, Contract, ContractRevisionPreview, Work } from "./types";
 
 export { type AffectedAttentionCard, type AttentionCardSnapshot, type AttentionDecisionInput, type AttentionItem, type Contract, type ContractRevisionPreview, type Work } from "./types";
@@ -15,8 +17,8 @@ export class ControlError extends Error {
   constructor(public readonly code: "not_found" | "conflict" | "invalid" | "blocked", message: string) { super(message); this.name = "ControlError"; }
 }
 
-export const CONTROL_SCHEMA_VERSION = 3;
-const CONTROL_SCHEMA = `
+export const CONTROL_SCHEMA_VERSION = 5;
+export const CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS control_schema_meta(
   id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, migrated_at INTEGER NOT NULL
 );
@@ -158,6 +160,14 @@ const CONTROL_MIGRATIONS:ControlMigration[]=[
   // v3 is the context schema; it also carries effect_detail (why an effect ended the way it did) so both
   // lineages' v3 shapes converge. Both steps are idempotent.
   {to:3,destructive:false,apply(db){db.exec(CONTEXT_SCHEMA);if(!(db.query("PRAGMA table_info(control_attention)").all() as Array<{name:string}>).some(column=>column.name==="effect_detail"))db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(3,Date.now());}},
+  {to:4,destructive:false,apply(db){ensureContextReducerSchema(db);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(4,Date.now());}},
+  // v5 回填：collector 无状态、redirectWork 可复活任意状态 work、orchestrator 无条件注入 rootProblemId，
+  // 因此全部 work（含 candidate/stopped/completed）都必须有根 problem。ensureRootProblem 幂等 get-or-create。
+  // 注意：ensureRootProblem→ensureControlSchema 会读 meta 版本；必须先把版本推进到 5，
+  // 否则重入时仍读到 4，会再次命中本迁移形成无限递归。版本更新与回填同事务，失败整体回滚。
+  {to:5,destructive:false,apply(db){db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(5,Date.now());
+    const rows=db.query("SELECT work_id FROM control_works").all() as {work_id:string}[];const now=Date.now();
+    for(const row of rows) ensureRootProblemLocked(db,row.work_id,now);}},
 ];
 export function ensureControlSchema(db: Database): void {
   const version=controlSchemaVersion(db);
@@ -222,6 +232,11 @@ function attentionFrom(row: Record<string, unknown>): AttentionItem {
 function emitWork(db: Database, work: Work, kind: string): void { enqueueControlEvent(db,{entity_id:work.work_id,entity_version:work.revision,kind,work_id:work.work_id,payload:{work}} ,work.updated_at); }
 function emitAttention(db: Database, item: AttentionItem, kind: string): void { enqueueControlEvent(db,{entity_id:item.item_id,entity_version:item.revision,kind,work_id:item.work_id,item_id:item.item_id,payload:{attention:item}},item.updated_at); }
 
+// 必须在已有事务内调用：work 进入 active 时同事务建立根 problem（不另开外层事务）。
+function ensureRootProblemLocked(db: Database, workId: string, now: number): void {
+  ensureRootProblem(db, workId, now);
+}
+
 export function createWork(db: Database,input:{title:string;source:string;source_id?:string;contract?:Contract;candidate?:boolean},now=Date.now()):Work {
   ensureControlSchema(db);
   if (typeof input.title!=="string"||!input.title.trim()||typeof input.source!=="string"||!input.source.trim()||input.source_id!==undefined&&(typeof input.source_id!=="string"||!input.source_id.trim())||input.candidate!==undefined&&typeof input.candidate!=="boolean") throw new ControlError("invalid", "invalid work input");
@@ -232,12 +247,16 @@ export function createWork(db: Database,input:{title:string;source:string;source
       if (existing) {
         const work=workFrom(existing);const requestedState=input.candidate?"candidate":"active";const requestedContract=input.contract??null;
         if(work.title!==input.title||work.state!==requestedState||JSON.stringify(work.contract)!==JSON.stringify(requestedContract))throw new ControlError("conflict","source identity already bound to different work");
+        // 幂等命中已存在 active work：补根 problem（升级前存量 work 可能缺根 problem）。
+        // candidate 不在此补，promoteWork 转正时再建（与新建 candidate 路径一致）。
+        if(work.state==="active") ensureRootProblemLocked(db,work.work_id,now);
         return work;
       }
     }
     const work:Work={work_id:randomUUID(),title:input.title,source:input.source,source_id:input.source_id??null,state:input.candidate?"candidate":"active",revision:1,contract:input.contract??null,created_at:now,updated_at:now};
     db.query("INSERT INTO control_works VALUES (?,?,?,?,?,?,?,?,?)").run(work.work_id,work.title,work.source,work.source_id,work.state,work.revision,work.contract?JSON.stringify(work.contract):null,now,now);
     if(work.contract) db.query("INSERT INTO control_contract_revisions VALUES (?,?,?,?,?)").run(work.work_id,1,JSON.stringify(work.contract),"created",now);
+    if(work.state==="active") ensureRootProblemLocked(db, work.work_id, now);
     emitWork(db,work,"work.created"); return work;
   }); return tx.immediate() as Work;
 }
@@ -271,6 +290,8 @@ export function redirectWork(db:Database,workId:string,expectedRevision:number,i
   const tx=db.transaction(()=>{const old=getWork(db,workId);if(!old)throw new ControlError("not_found","work not found");if(old.revision!==expectedRevision)throw new ControlError("conflict","stale work revision");
     const revision=old.revision+1; const state=input.action==="activate"?"active":input.action==="stop"?"stopped":old.state;
     if(!db.query("UPDATE control_works SET revision=?,state=?,updated_at=? WHERE work_id=? AND revision=?").run(revision,state,now,workId,expectedRevision).changes)throw new ControlError("conflict","stale work revision");
+    // activate 可把 candidate/stopped/completed 翻成 active，激活瞬间必须有根 problem，否则 orchestrator 注入后 fact 断流。
+    if(state==="active") ensureRootProblemLocked(db,workId,now);
     db.query("INSERT INTO control_redirects VALUES (?,?,?,?,?,?,?)").run(workId,revision,input.reason,JSON.stringify(input.affected_work_ids),input.action,JSON.stringify(input.evidence??{}),now);
     const work={...old,revision,state,updated_at:now};emitWork(db,work,"work.redirected");return work;});return tx.immediate() as Work;
 }
@@ -361,6 +382,148 @@ function verifyAffectedSnapshot(snapshot: AttentionCardSnapshot[] | undefined, s
 function persistAttention(db: Database, old: AttentionItem, item: AttentionItem, kind: string, detail: Record<string, unknown>, now: number): void {
   if (!db.query("UPDATE control_attention SET revision=?,state=?,effect_state=?,contract_revision=?,evidence=?,defer_until=?,acknowledged_at=?,updated_at=? WHERE item_id=? AND revision=?").run(item.revision, item.state, item.effect_state, item.contract_revision, JSON.stringify(item.evidence), item.defer_until, item.acknowledged_at, now, item.item_id, old.revision).changes) throw new ControlError("conflict", "stale attention revision");
   db.query("INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES (?,?,?,?,?)").run(item.item_id, item.revision, kind, JSON.stringify(detail), now); emitAttention(db, item, `attention.${kind}`);
+}
+
+// 权威收口：对一张 attention 卡做一次带 revision CAS 的结论落地。
+// accepted → resolved/succeeded（记录 acknowledged_at）；rejected → superseded/unknown。
+// 写 control_attention_events + enqueue outbox(attention.resolved)，替代 manage 层裸写。
+export function recordAttentionResolution(
+  db: Database,
+  itemId: string,
+  expectedRevision: number,
+  input: { verdict: "accepted" | "rejected"; actor: string; evidence: Record<string, unknown> },
+  now = Date.now(),
+): AttentionItem {
+  ensureControlSchema(db);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw new ControlError("invalid", "expected revision must be a positive integer");
+  if (input.verdict !== "accepted" && input.verdict !== "rejected") throw new ControlError("invalid", "verdict must be accepted or rejected");
+  if (typeof input.actor !== "string" || !input.actor.trim()) throw new ControlError("invalid", "actor is required");
+  if (!input.evidence || typeof input.evidence !== "object" || Array.isArray(input.evidence)) throw new ControlError("invalid", "invalid evidence");
+  const accepted = input.verdict === "accepted";
+  const tx = db.transaction(() => {
+    const old = getAttention(db, itemId);
+    if (!old) throw new ControlError("not_found", "attention item not found");
+    if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
+    const item: AttentionItem = {
+      ...old,
+      revision: old.revision + 1,
+      state: accepted ? "resolved" : "superseded",
+      effect_state: accepted ? "succeeded" : "unknown",
+      acknowledged_at: accepted ? now : old.acknowledged_at,
+      evidence: { ...old.evidence, ...input.evidence, resolution: { verdict: input.verdict, actor: input.actor, resolved_at: now } },
+      updated_at: now,
+    };
+    persistAttention(db, old, item, "resolved", { verdict: input.verdict, actor: input.actor, evidence: input.evidence }, now);
+    return item;
+  });
+  return tx.immediate() as AttentionItem;
+}
+
+type SupersedeInput = { reason: string; actor: string; evidence?: Record<string, unknown> };
+
+function validateSupersedeInput(input: SupersedeInput): void {
+  if (typeof input.reason !== "string" || !input.reason.trim()) throw new ControlError("invalid", "reason is required");
+  if (typeof input.actor !== "string" || !input.actor.trim()) throw new ControlError("invalid", "actor is required");
+  if (input.evidence !== undefined && (!input.evidence || typeof input.evidence !== "object" || Array.isArray(input.evidence))) throw new ControlError("invalid", "invalid evidence");
+}
+
+// 单卡权威 supersede：open/applying → superseded，带 revision CAS + events(attention.superseded) + outbox。
+// 与合同修订触发的 private supersedeAttention 不同：manage 层触发（work alias、manifest 漂移）没有 work revision 语义，
+// 因此不写 superseded_by_work_revision，改写 superseded_reason / superseded_by_actor。
+// 幂等：同 reason 重复 supersede 已 superseded 的卡，直接返回旧卡，不 bump revision、不重复发事件。
+export function supersedeAttentionById(
+  db: Database,
+  itemId: string,
+  expectedRevision: number,
+  input: SupersedeInput,
+  now = Date.now(),
+): AttentionItem {
+  ensureControlSchema(db);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw new ControlError("invalid", "expected revision must be a positive integer");
+  validateSupersedeInput(input);
+  const tx = db.transaction(() => {
+    const old = getAttention(db, itemId);
+    if (!old) throw new ControlError("not_found", "attention item not found");
+    const existingReason = (old.evidence as Record<string, unknown>)?.superseded_reason;
+    if (old.state === "superseded" && existingReason === input.reason) return old;
+    if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
+    if (old.state === "superseded") throw new ControlError("conflict", "attention card already superseded");
+    const detail: Record<string, unknown> = { reason: input.reason, actor: input.actor, ...(input.evidence ?? {}) };
+    const item: AttentionItem = {
+      ...old,
+      revision: old.revision + 1,
+      state: "superseded",
+      updated_at: now,
+      evidence: { ...old.evidence, ...(input.evidence ?? {}), superseded_reason: input.reason, superseded_by_actor: input.actor },
+    };
+    persistAttention(db, old, item, "superseded", detail, now);
+    return item;
+  });
+  return tx.immediate() as AttentionItem;
+}
+
+// 批量 supersede：把某 work 下所有 open/applying 的卡逐张 CAS supersede。
+// 用于 aliasWork/redirect：旧 work 的 attention 被新 work 取代。resolved/superseded 卡不动。
+// 返回实际 supersede 的张数。逐张调 supersedeAttentionById，保留 per-card 事件与 outbox。
+export function supersedeOpenAttentionByWork(
+  db: Database,
+  workId: string,
+  input: SupersedeInput,
+  now = Date.now(),
+): number {
+  ensureControlSchema(db);
+  if (typeof workId !== "string" || !workId.trim()) throw new ControlError("invalid", "work_id is required");
+  validateSupersedeInput(input);
+  const rows = db.query("SELECT item_id FROM control_attention WHERE work_id=? AND state IN ('open','applying') ORDER BY item_id").all(workId) as { item_id: string }[];
+  let count = 0;
+  for (const row of rows) {
+    const old = getAttention(db, row.item_id);
+    if (!old) continue;
+    supersedeAttentionById(db, row.item_id, old.revision, input, now);
+    count++;
+  }
+  return count;
+}
+
+// 外部效果确认式 resolve：open/applying → resolved/succeeded，带 CAS + events(attention.resolved) + outbox。
+// 语义守卫：effect_state=failed 的卡不得写成 succeeded；rejected（superseded/unknown）不得被外部成功复活。
+// 幂等：已 resolved/succeeded 且 revision 匹配 → 返回旧卡；已 superseded → 返回旧卡（不覆盖）。
+// 调用方先用 getAttention 读 expectedRevision；卡缺失由调用方自行 no-op（与原裸 UPDATE 0 行等价）。
+export function resolveAttentionByExternalSuccess(
+  db: Database,
+  itemId: string,
+  expectedRevision: number,
+  input: { actor: string; evidence?: Record<string, unknown> },
+  now = Date.now(),
+): AttentionItem {
+  ensureControlSchema(db);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw new ControlError("invalid", "expected revision must be a positive integer");
+  if (typeof input.actor !== "string" || !input.actor.trim()) throw new ControlError("invalid", "actor is required");
+  if (input.evidence !== undefined && (!input.evidence || typeof input.evidence !== "object" || Array.isArray(input.evidence))) throw new ControlError("invalid", "invalid evidence");
+  const tx = db.transaction(() => {
+    const old = getAttention(db, itemId);
+    if (!old) throw new ControlError("not_found", "attention item not found");
+    if (old.effect_state === "failed") throw new ControlError("invalid", "cannot resolve a failed effect as succeeded");
+    if (old.state === "superseded") return old;
+    if (old.state === "resolved" && old.effect_state === "succeeded") {
+      if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
+      return old;
+    }
+    if (old.state !== "open" && old.state !== "applying") throw new ControlError("invalid", "attention card is not resolvable");
+    if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
+    const detail: Record<string, unknown> = { actor: input.actor, ...(input.evidence ?? {}), external_success: true };
+    const item: AttentionItem = {
+      ...old,
+      revision: old.revision + 1,
+      state: "resolved",
+      effect_state: "succeeded",
+      updated_at: now,
+      evidence: { ...old.evidence, ...(input.evidence ?? {}), resolved_externally_by: input.actor, resolved_at: now },
+    };
+    persistAttention(db, old, item, "resolved", detail, now);
+    return item;
+  });
+  return tx.immediate() as AttentionItem;
 }
 
 export function resolveAttentionDecision(db: Database, itemId: string, expectedRevision: number, input: AttentionDecisionInput, now = Date.now(), actor?: string): AttentionItem {
@@ -484,6 +647,7 @@ export function promoteWork(db: Database, workId: string, expectedRevision: numb
     reviseContract(db, workId, expectedRevision, contract, reason, now);
     db.run("UPDATE control_works SET state='active',updated_at=? WHERE work_id=? AND state='candidate'", [now,workId]);
     const promoted = getWork(db, workId)!;
+    ensureRootProblemLocked(db, workId, now);
     emitWork(db, promoted, "work.promoted", {reason});
     return getWork(db, workId)!;
   }).immediate();
