@@ -2,22 +2,37 @@ import { Database } from "bun:sqlite";
 import { chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { enqueueControlEvent, ensureOutbox } from "./outbox";
+import { createHash, randomUUID } from "node:crypto";
+import { canonicalJson, enqueueControlEvent, ensureOutbox } from "./outbox";
 import { ensureMgmtSchema } from "../manage/schema";
-import { ensureRootProblem } from "./context-pool";
+import { ensureRootProblem, rootProblemId } from "./context-pool";
 import { ensureContextReducerSchema } from "./context-reducer";
-import type { AffectedAttentionCard, AttentionCardSnapshot, AttentionDecisionInput, AttentionItem, Contract, ContractRevisionPreview, Work } from "./types";
+import type { EffectObservation } from "../decision-bot/mailbox";
+import type {
+  AffectedAttentionCard, AttentionAuditLink, AttentionCardSnapshot, AttentionDecisionInput,
+  AttentionFollowUp, AttentionItem, AttentionMaterialProjection, AttentionZone, Contract,
+  ContractRevisionPreview, MaterialFingerprintInputs, StaleAttentionBody, Work,
+} from "./types";
 
-export { type AffectedAttentionCard, type AttentionCardSnapshot, type AttentionDecisionInput, type AttentionItem, type Contract, type ContractRevisionPreview, type Work } from "./types";
+export {
+  type AffectedAttentionCard, type AttentionAuditLink, type AttentionCardSnapshot,
+  type AttentionDecisionInput, type AttentionFollowUp, type AttentionItem,
+  type AttentionMaterialProjection, type AttentionZone, type Contract,
+  type ContractRevisionPreview, type MaterialFingerprintInputs, type StaleAttentionBody,
+  type Work,
+} from "./types";
 export { ensureOutbox, enqueueControlEvent, publishControlEvents } from "./outbox";
 export { applyControlEvent } from "./projection";
 
 export class ControlError extends Error {
-  constructor(public readonly code: "not_found" | "conflict" | "invalid" | "blocked", message: string) { super(message); this.name = "ControlError"; }
+  constructor(
+    public readonly code: "not_found" | "conflict" | "invalid" | "blocked",
+    message: string,
+    public readonly details?: StaleAttentionBody,
+  ) { super(message); this.name = "ControlError"; }
 }
 
-export const CONTROL_SCHEMA_VERSION = 5;
+export const CONTROL_SCHEMA_VERSION = 6;
 export const CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS control_schema_meta(
   id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, migrated_at INTEGER NOT NULL
@@ -54,6 +69,66 @@ CREATE TABLE IF NOT EXISTS control_feedback(
 CREATE TABLE IF NOT EXISTS control_redirects(
   work_id TEXT NOT NULL,revision INTEGER NOT NULL,reason TEXT NOT NULL,affected_work_ids TEXT NOT NULL,
   action TEXT NOT NULL,evidence TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(work_id,revision)
+);`;
+
+const CONTROL_V6_SCHEMA = `
+CREATE TABLE IF NOT EXISTS control_attention_material (
+  item_id TEXT PRIMARY KEY,
+  material_key TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  inputs TEXT NOT NULL,
+  computed_at INTEGER NOT NULL,
+  FOREIGN KEY(item_id) REFERENCES control_attention(item_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS control_attention_material_key
+  ON control_attention_material(material_key);
+
+CREATE TABLE IF NOT EXISTS control_notifications (
+  notification_id TEXT PRIMARY KEY,
+  subject TEXT NOT NULL,
+  material_key TEXT NOT NULL,
+  threshold TEXT NOT NULL CHECK(threshold IN ('new_now','material_change','expires_soon','expired')),
+  channel TEXT NOT NULL CHECK(channel IN ('macos','feishu')),
+  outcome TEXT NOT NULL CHECK(outcome IN ('shadowed','pending','sent','failed','unknown','suppressed')),
+  owner_epoch TEXT NOT NULL,
+  work_id TEXT,
+  item_id TEXT,
+  item_revision INTEGER,
+  approval_id TEXT,
+  receipt_id TEXT,
+  outbox_event_id TEXT,
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('attention','legacy_q1','legacy_hung')),
+  source_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+  next_attempt_at INTEGER,
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  attempted_at INTEGER,
+  completed_at INTEGER,
+  UNIQUE(subject, material_key, threshold, owner_epoch)
+);
+CREATE INDEX IF NOT EXISTS control_notifications_due
+  ON control_notifications(outcome, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS control_notifications_item
+  ON control_notifications(item_id, item_revision, created_at);
+
+CREATE TABLE IF NOT EXISTS control_notification_shadow (
+  comparison_id TEXT PRIMARY KEY,
+  subject TEXT NOT NULL,
+  material_key TEXT NOT NULL,
+  threshold TEXT NOT NULL,
+  legacy_would_send INTEGER NOT NULL CHECK(legacy_would_send IN (0,1)),
+  candidate_would_send INTEGER NOT NULL CHECK(candidate_would_send IN (0,1)),
+  legacy_reason TEXT NOT NULL,
+  candidate_reason TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('attention','legacy_q1','legacy_hung')),
+  source_id TEXT NOT NULL,
+  item_id TEXT,
+  item_revision INTEGER,
+  compared_at INTEGER NOT NULL,
+  UNIQUE(subject, material_key, threshold)
 );`;
 
 // 上下文对象池（T1）：建表顺序按外键依赖 problems → objects → versions → problem_objects → pins → shares。
@@ -162,12 +237,15 @@ const CONTROL_MIGRATIONS:ControlMigration[]=[
   {to:3,destructive:false,apply(db){db.exec(CONTEXT_SCHEMA);if(!(db.query("PRAGMA table_info(control_attention)").all() as Array<{name:string}>).some(column=>column.name==="effect_detail"))db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(3,Date.now());}},
   {to:4,destructive:false,apply(db){ensureContextReducerSchema(db);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(4,Date.now());}},
   // v5 回填：collector 无状态、redirectWork 可复活任意状态 work、orchestrator 无条件注入 rootProblemId，
-  // 因此全部 work（含 candidate/stopped/completed）都必须有根 problem。ensureRootProblem 幂等 get-or-create。
-  // 注意：ensureRootProblem→ensureControlSchema 会读 meta 版本；必须先把版本推进到 5，
-  // 否则重入时仍读到 4，会再次命中本迁移形成无限递归。版本更新与回填同事务，失败整体回滚。
-  {to:5,destructive:false,apply(db){db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(5,Date.now());
+  // 因此全部 work（含 candidate/stopped/completed）都必须有根 problem。这里直接执行迁移内部 SQL，
+  // 不能调用公开的 ensureRootProblem：公开 helper 会再次 ensureControlSchema，并把同一连接先推进到 v6。
+  {to:5,destructive:false,apply(db){
     const rows=db.query("SELECT work_id FROM control_works").all() as {work_id:string}[];const now=Date.now();
-    for(const row of rows) ensureRootProblemLocked(db,row.work_id,now);}},
+    const existing=db.query("SELECT 1 FROM control_context_problems WHERE work_id=? AND parent_problem_id IS NULL");
+    const insert=db.query("INSERT INTO control_context_problems(problem_id,work_id,parent_problem_id,root_problem_id,title,state,revision,created_at,updated_at) VALUES (?,?,NULL,?,?,'open',1,?,?)");
+    for(const row of rows){if(existing.get(row.work_id))continue;const rootId=rootProblemId(row.work_id);insert.run(rootId,row.work_id,rootId,"root",now,now);}
+    db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(5,Date.now());}},
+  {to:6,destructive:false,apply(db){db.exec(CONTROL_V6_SCHEMA);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(6,Date.now());}},
 ];
 export function ensureControlSchema(db: Database): void {
   const version=controlSchemaVersion(db);
@@ -314,7 +392,158 @@ export function upsertAttention(db:Database,input:Omit<AttentionItem,"revision"|
     db.query("INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES (?,?,?,?,?)").run(item.item_id,item.revision,"upsert",JSON.stringify(item.evidence),now);emitAttention(db,item,row?"attention.updated":"attention.created");return item;});return tx.immediate() as AttentionItem;
 }
 export function getAttention(db:Database,itemId:string):AttentionItem|null {ensureControlSchema(db);const row=db.query("SELECT * FROM control_attention WHERE item_id=?").get(itemId) as Record<string,unknown>|null;return row?attentionFrom(row):null;}
-export function listAttention(db:Database,zone?:"now"|"inbox"|"done",now=Date.now()):AttentionItem[]{ensureControlSchema(db);const rows=(db.query("SELECT * FROM control_attention ORDER BY updated_at DESC,item_id").all() as Record<string,unknown>[]).map(attentionFrom);return rows.filter(item=>{if(!zone)return true;if(zone==="done")return item.state==="resolved"||item.state==="superseded";if(item.state!=="open"||item.defer_until!==null&&item.defer_until>now)return false;return zone==="now"?item.urgency==="now"||item.expires_at!==null&&item.expires_at<=now:item.urgency==="inbox"&&!(item.expires_at!==null&&item.expires_at<=now);});}
+export function listAttention(db:Database,zone?:AttentionZone,now=Date.now()):AttentionItem[]{ensureControlSchema(db);const rows=(db.query("SELECT * FROM control_attention ORDER BY updated_at DESC,item_id").all() as Record<string,unknown>[]).map(attentionFrom);return rows.filter(item=>{if(!zone)return true;if(zone==="done")return item.state==="resolved"||item.state==="superseded";if(item.state!=="open"||item.defer_until!==null&&item.defer_until>now)return false;return zone==="now"?item.urgency==="now"||item.expires_at!==null&&item.expires_at<=now:item.urgency==="inbox"&&!(item.expires_at!==null&&item.expires_at<=now);});}
+
+function normalizeMaterialString(value: string): string {
+  return value.replace(/\r\n?/g, "\n").trim().replace(/\s+/gu, " ").normalize("NFC");
+}
+
+export function canonicalizeMaterialFingerprintInputs(input: MaterialFingerprintInputs): MaterialFingerprintInputs {
+  if (!input || typeof input !== "object" || Array.isArray(input)
+    || typeof input.risk !== "string" || typeof input.decision !== "string"
+    || typeof input.consequence !== "string" || !Array.isArray(input.option_effects)
+    || !Array.isArray(input.decisive_evidence) || !input.validity || typeof input.validity !== "object"
+    || (input.validity.expires_at !== null && (!Number.isSafeInteger(input.validity.expires_at) || input.validity.expires_at < 0))
+    || typeof input.validity.expired !== "boolean") throw new ControlError("invalid", "invalid material fingerprint inputs");
+  const optionEffects = input.option_effects.map((entry) => {
+    if (!entry || typeof entry.option !== "string" || typeof entry.effect !== "string") throw new ControlError("invalid", "invalid material option effect");
+    return { option: normalizeMaterialString(entry.option), effect: normalizeMaterialString(entry.effect) };
+  });
+  const decisiveEvidence = input.decisive_evidence.map((entry) => {
+    if (!entry || typeof entry.object_id !== "string" || !Number.isSafeInteger(entry.revision) || entry.revision < 1 || typeof entry.conclusion !== "string") {
+      throw new ControlError("invalid", "invalid decisive material evidence");
+    }
+    return { object_id: normalizeMaterialString(entry.object_id), revision: entry.revision, conclusion: normalizeMaterialString(entry.conclusion) };
+  }).sort((a, b) => a.object_id.localeCompare(b.object_id) || a.revision - b.revision || a.conclusion.localeCompare(b.conclusion));
+  return {
+    risk: normalizeMaterialString(input.risk),
+    decision: normalizeMaterialString(input.decision),
+    option_effects: optionEffects,
+    decisive_evidence: decisiveEvidence,
+    validity: { expires_at: input.validity.expires_at, expired: input.validity.expired },
+    consequence: normalizeMaterialString(input.consequence),
+  };
+}
+
+export function computeMaterialFingerprint(input: MaterialFingerprintInputs): { inputs: MaterialFingerprintInputs; fingerprint: string } {
+  const inputs = canonicalizeMaterialFingerprintInputs(input);
+  return { inputs, fingerprint: createHash("sha256").update(canonicalJson(inputs)).digest("hex") };
+}
+
+function materialFrom(row: Record<string, unknown>): AttentionMaterialProjection {
+  const itemId = row.item_id as string;
+  return {
+    item_id: itemId,
+    subject: `attention:${itemId}`,
+    material_key: row.material_key as string,
+    fingerprint: row.fingerprint as string,
+    generation: row.generation as number,
+    inputs: parseObject<MaterialFingerprintInputs>(row.inputs as string),
+    computed_at: row.computed_at as number,
+  };
+}
+
+export function getAttentionMaterial(db: Database, itemId: string): AttentionMaterialProjection | null {
+  ensureControlSchema(db);
+  const row = db.query("SELECT * FROM control_attention_material WHERE item_id=?").get(itemId) as Record<string, unknown> | null;
+  return row ? materialFrom(row) : null;
+}
+
+export function projectAttentionMaterial(db: Database, itemId: string, input: MaterialFingerprintInputs, now = Date.now()): AttentionMaterialProjection {
+  ensureControlSchema(db);
+  const computed = computeMaterialFingerprint(input);
+  return db.transaction(() => {
+    const item = getAttention(db, itemId);
+    if (!item) throw new ControlError("not_found", "attention item not found");
+    const existing = getAttentionMaterial(db, itemId);
+    const subject = `attention:${itemId}`;
+    const materialKey = `${subject}:${computed.fingerprint}`;
+    let changed = false;
+    if (!existing) {
+      db.query("INSERT INTO control_attention_material(item_id,material_key,fingerprint,generation,inputs,computed_at) VALUES(?,?,?,?,?,?)")
+        .run(itemId, materialKey, computed.fingerprint, 1, canonicalJson(computed.inputs), now);
+      changed = true;
+    } else if (existing.fingerprint === computed.fingerprint) {
+      db.query("UPDATE control_attention_material SET computed_at=? WHERE item_id=?").run(now, itemId);
+    } else {
+      db.query("UPDATE control_attention_material SET material_key=?,fingerprint=?,generation=generation+1,inputs=?,computed_at=? WHERE item_id=?")
+        .run(materialKey, computed.fingerprint, canonicalJson(computed.inputs), now, itemId);
+      changed = true;
+    }
+    const projection = getAttentionMaterial(db, itemId)!;
+    if (changed) {
+      enqueueControlEvent(db, {
+        entity_id: projection.material_key,
+        entity_version: projection.generation,
+        kind: "attention.material_projected",
+        work_id: item.work_id,
+        item_id: item.item_id,
+        payload: { attention: item, material: projection },
+      }, now);
+    }
+    return projection;
+  }).immediate() as AttentionMaterialProjection;
+}
+
+function tableExists(db: Database, name: string): boolean {
+  return !!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+}
+
+export function listAttentionFollowUps(db: Database, _now = Date.now()): AttentionFollowUp[] {
+  ensureControlSchema(db);
+  const items = listAttention(db);
+  const hasReceipts = tableExists(db, "decision_receipts") && tableExists(db, "approval_targets");
+  const hasObservations = tableExists(db, "receipt_effect_observations");
+  const followUps: AttentionFollowUp[] = [];
+  for (const item of items) {
+    const receipt = hasReceipts && item.approval_id && item.consumer_owner
+      ? db.query(`SELECT r.receipt_id,r.consumed_at,r.applied_at,r.outcome FROM decision_receipts r
+          WHERE r.consumer_owner=? AND r.approval_id=? ORDER BY r.consumed_at DESC LIMIT 1`)
+        .get(item.consumer_owner, item.approval_id) as { receipt_id: string; consumed_at: number; applied_at: number | null; outcome: string | null } | null
+      : null;
+    const observations = hasObservations && receipt
+      ? db.query("SELECT tool_call_id,state,evidence,observed_at FROM receipt_effect_observations WHERE receipt_id=? ORDER BY observed_at,tool_call_id")
+        .all(receipt.receipt_id) as Array<{ tool_call_id: string; state: string; evidence: string; observed_at: number }>
+      : [];
+    const occurredEffects = observations.map((observation) => ({
+      kind: observation.tool_call_id,
+      evidence: { ...parseObject<Record<string, unknown>>(observation.evidence), state: observation.state, observed_at: observation.observed_at },
+    }));
+    if (!occurredEffects.length && Array.isArray(item.evidence.occurred_effects)) {
+      for (const effect of item.evidence.occurred_effects as Array<Record<string, unknown>>) {
+        if (typeof effect.kind === "string" && effect.evidence && typeof effect.evidence === "object" && !Array.isArray(effect.evidence)) {
+          occurredEffects.push({ kind: effect.kind, evidence: effect.evidence as Record<string, unknown> });
+        }
+      }
+    }
+    const remaining = item.effect_state === "succeeded" && typeof item.evidence.effect_verified_at === "number"
+      ? ""
+      : explicitRemainingResponsibility(db, item, {});
+    const recorded = !!receipt && receipt.applied_at === null;
+    const visible = recorded || item.effect_state !== "succeeded" && item.state === "applying" || item.effect_state === "applying"
+      || item.effect_state === "failed" || item.effect_state === "unknown"
+      || (item.effect_state === "succeeded" && !!remaining);
+    if (!visible) continue;
+    const outcome = receipt?.outcome === "succeeded" || receipt?.outcome === "failed" || receipt?.outcome === "unknown"
+      ? receipt.outcome : item.effect_state === "succeeded" || item.effect_state === "failed" || item.effect_state === "unknown" ? item.effect_state : null;
+    const stage = recorded ? "answer_recorded"
+      : item.effect_state === "failed" ? "failed"
+      : item.effect_state === "unknown" ? "unknown"
+      : item.effect_state === "succeeded" && remaining ? "verification_required"
+      : "applying";
+    followUps.push({
+      item, stage, receipt_id: receipt?.receipt_id ?? null, consumed_at: receipt?.consumed_at ?? null,
+      applied_at: receipt?.applied_at ?? null, outcome, occurred_effects: occurredEffects,
+      remaining_responsibility: remaining || (stage === "failed" ? "Review failure and choose the next action." : stage === "unknown" ? "Confirm the external effect before retrying." : "Verify the recorded effect."),
+      next_action: stage === "answer_recorded" ? "Wait for the registered consumer to apply the answer."
+        : stage === "failed" ? "Review the failure without creating replacement Work."
+        : stage === "unknown" ? "Confirm the result; do not replay blindly."
+        : stage === "verification_required" ? "Complete the outstanding acceptance responsibility."
+        : "Wait for effect verification.",
+    });
+  }
+  return followUps;
+}
 
 function affectedAttention(db: Database, workId: string, nextRevision: number, excludeItemId?: string): AttentionItem[] {
   const rows = excludeItemId === undefined
@@ -382,6 +611,130 @@ function verifyAffectedSnapshot(snapshot: AttentionCardSnapshot[] | undefined, s
 function persistAttention(db: Database, old: AttentionItem, item: AttentionItem, kind: string, detail: Record<string, unknown>, now: number): void {
   if (!db.query("UPDATE control_attention SET revision=?,state=?,effect_state=?,contract_revision=?,evidence=?,defer_until=?,acknowledged_at=?,updated_at=? WHERE item_id=? AND revision=?").run(item.revision, item.state, item.effect_state, item.contract_revision, JSON.stringify(item.evidence), item.defer_until, item.acknowledged_at, now, item.item_id, old.revision).changes) throw new ControlError("conflict", "stale attention revision");
   db.query("INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES (?,?,?,?,?)").run(item.item_id, item.revision, kind, JSON.stringify(detail), now); emitAttention(db, item, `attention.${kind}`);
+}
+function staleAttentionError(item: AttentionItem, expectedRevision: number): ControlError {
+  const body: StaleAttentionBody = {
+    error: "conflict",
+    message: "stale attention revision",
+    code: "stale_attention",
+    item_id: item.item_id,
+    expected_revision: expectedRevision,
+    current_revision: item.revision,
+    current_state: item.state,
+    current_effect_state: item.effect_state,
+    decision_package_url: `/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`,
+  };
+  return new ControlError("conflict", body.message, body);
+}
+
+function explicitRemainingResponsibility(db: Database, item: AttentionItem, evidence: Record<string, unknown>): string {
+  const observed = evidence.remaining_responsibility;
+  if (typeof observed === "string" && observed.trim()) return observed.trim();
+  const recorded = item.evidence.remaining_responsibility;
+  if (typeof recorded === "string" && recorded.trim()) return recorded.trim();
+  const work = getWork(db, item.work_id);
+  const pendingHuman = work?.contract?.acceptance.filter((criterion) => criterion.kind === "human" && !criterion.evidence) ?? [];
+  return pendingHuman.map((criterion) => criterion.description.trim()).filter(Boolean).join("; ");
+}
+
+/**
+ * Projects a mailbox-accepted effect observation into Attention truth. The
+ * supplied outbox_event_id is the source effect event correlation; this
+ * projection enqueues its own deterministic `attention.effect_projected`
+ * event in the same immediate transaction.
+ */
+export function projectAttentionEffect(
+  db: Database,
+  link: AttentionAuditLink,
+  observation: EffectObservation,
+  now = Date.now(),
+): AttentionItem {
+  ensureControlSchema(db);
+  if (!link || typeof link !== "object" || !link.work_id?.trim() || !link.item_id?.trim()
+    || !Number.isSafeInteger(link.item_revision) || link.item_revision < 1
+    || !link.outbox_event_id?.trim()) throw new ControlError("invalid", "invalid attention audit link");
+  if (!observation || typeof observation !== "object" || !observation.receiptId?.trim()
+    || !observation.toolCallId?.trim() || !["succeeded", "failed", "unknown"].includes(observation.state)
+    || !Number.isSafeInteger(observation.observedAt) || observation.observedAt < 0
+    || !observation.evidence || typeof observation.evidence !== "object" || Array.isArray(observation.evidence)) {
+    throw new ControlError("invalid", "invalid effect observation");
+  }
+  if (link.receipt_id !== observation.receiptId) throw new ControlError("invalid", "effect receipt does not match audit link");
+
+  return db.transaction(() => {
+    const accepted = db.query(`SELECT state,evidence,observed_at FROM receipt_effect_observations
+      WHERE receipt_id=? AND tool_call_id=?`).get(observation.receiptId, observation.toolCallId) as
+      { state: string; evidence: string; observed_at: number } | null;
+    if (!accepted || accepted.state !== observation.state || accepted.observed_at !== observation.observedAt
+      || accepted.evidence !== canonicalJson(observation.evidence)) {
+      throw new ControlError("blocked", "effect observation was not accepted by mailbox");
+    }
+    const old = getAttention(db, link.item_id);
+    if (!old) throw new ControlError("not_found", "attention item not found");
+    if (old.work_id !== link.work_id || old.approval_id !== link.approval_id) throw new ControlError("invalid", "attention audit link does not match item");
+
+    const prior = old.evidence.effect_projection as Record<string, unknown> | undefined;
+    const sameObservation = prior?.receipt_id === observation.receiptId
+      && prior?.tool_call_id === observation.toolCallId
+      && prior?.observed_at === observation.observedAt
+      && prior?.state === observation.state;
+    if (sameObservation) return old;
+    if (old.revision !== link.item_revision) throw staleAttentionError(old, link.item_revision);
+    const priorObservedAt = typeof prior?.observed_at === "number" ? prior.observed_at : -1;
+    if (observation.observedAt < priorObservedAt) return old;
+    if (observation.observedAt === priorObservedAt) {
+      throw new ControlError("conflict", "effect observations at the same time disagree");
+    }
+
+    const remaining = explicitRemainingResponsibility(db, old, observation.evidence);
+    const succeeded = observation.state === "succeeded";
+    const nextState: AttentionItem["state"] = succeeded ? (remaining ? "applying" : "resolved") : "open";
+    const effectRecord = {
+      kind: observation.toolCallId,
+      evidence: observation.evidence,
+      state: observation.state,
+      observed_at: observation.observedAt,
+    };
+    const priorEffects = Array.isArray(old.evidence.occurred_effects) ? old.evidence.occurred_effects : [];
+    const auditLink = { ...link };
+    const item: AttentionItem = {
+      ...old,
+      revision: old.revision + 1,
+      state: nextState,
+      effect_state: observation.state,
+      effect_detail: typeof observation.evidence.reason === "string" ? observation.evidence.reason : null,
+      evidence: {
+        ...old.evidence,
+        occurred_effects: [...priorEffects, effectRecord],
+        remaining_responsibility: remaining || undefined,
+        effect_projection: {
+          receipt_id: observation.receiptId,
+          tool_call_id: observation.toolCallId,
+          observed_at: observation.observedAt,
+          state: observation.state,
+          audit_link: auditLink,
+        },
+        ...(succeeded && !remaining ? { effect_verified_at: observation.observedAt } : {}),
+      },
+      updated_at: now,
+    };
+    if (!db.query(`UPDATE control_attention SET revision=?,state=?,effect_state=?,effect_detail=?,evidence=?,updated_at=?
+      WHERE item_id=? AND revision=?`).run(item.revision, item.state, item.effect_state, item.effect_detail, JSON.stringify(item.evidence), now, item.item_id, old.revision).changes) {
+      throw staleAttentionError(getAttention(db, item.item_id) ?? old, link.item_revision);
+    }
+    const detail = { audit_link: auditLink, observation: effectRecord, remaining_responsibility: remaining };
+    db.query("INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES (?,?,?,?,?)")
+      .run(item.item_id, item.revision, "effect_projected", JSON.stringify(detail), now);
+    enqueueControlEvent(db, {
+      entity_id: item.item_id,
+      entity_version: item.revision,
+      kind: "attention.effect_projected",
+      work_id: item.work_id,
+      item_id: item.item_id,
+      payload: { attention: item, audit_link: auditLink, observation: effectRecord },
+    }, now);
+    return item;
+  }).immediate() as AttentionItem;
 }
 
 // 权威收口：对一张 attention 卡做一次带 revision CAS 的结论落地。
@@ -614,6 +967,27 @@ export function resolveAttentionDecision(db: Database, itemId: string, expectedR
     return resolved;
   });
   return tx.immediate() as AttentionItem;
+}
+
+export function resolveAttention(
+  db: Database,
+  itemId: string,
+  input: AttentionDecisionInput,
+  actor: string,
+  now = Date.now(),
+): AttentionItem {
+  ensureControlSchema(db);
+  if (!Number.isSafeInteger(input?.attention_revision) || input.attention_revision! < 1) {
+    throw new ControlError("invalid", "attention_revision is required");
+  }
+  const current = getAttention(db, itemId);
+  if (!current) throw new ControlError("not_found", "attention item not found");
+  if (current.revision !== input.attention_revision) throw staleAttentionError(current, input.attention_revision!);
+  const material = getAttentionMaterial(db, itemId);
+  if (!input.material_fingerprint || !material || material.fingerprint !== input.material_fingerprint) {
+    throw staleAttentionError(current, input.attention_revision!);
+  }
+  return resolveAttentionDecision(db, itemId, input.attention_revision!, input, now, actor);
 }
 
 export function actOnAttention(db: Database, itemId: string, expectedRevision: number, action: "ack" | "defer" | "resolve", input: { defer_until?: number; reason?: string; selected_option?: string; replacement_contract?: Contract; expected_contract_revision?: number; affected_cards?: AttentionCardSnapshot[] } = {}, actor?: string, now = Date.now()): AttentionItem {

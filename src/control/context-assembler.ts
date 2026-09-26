@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { ensureControlSchema, getAttention, getWork } from "./store";
+import { ensureControlSchema, getAttention, getWork, projectAttentionMaterial } from "./store";
 import type { Work } from "./types";
 import {
   getProblemTree,
@@ -56,25 +56,36 @@ export interface StaleObjectEntry {
   linked_revision: number;
 }
 
+export interface DecisionOption {
+  id: string;
+  label: string;
+  effect: string;
+  consequence: string;
+  requires_reason: boolean;
+  requires_contract: boolean;
+}
+
 export interface DecisionViewPackage {
   package_type: "decision_view";
   consumer_id: string;
   work_id: string;
-  problem_id?: string;
+  contract_revision: number;
+  attention_revision: number;
+  material_fingerprint: string;
   conclusion: string;
   trigger: string;
   trigger_evidence: TriggerEvidence[];
   impact: string;
   recommendation: string | null;
-  options: string[];
   owner: string;
   expires_at: number | null;
+  options: DecisionOption[];
+  stale_objects: StaleObjectEntry[];
+  source_link: string | null;
   scene_entry: SceneEntry | null;
   prior_decisions: PriorDecision[];
   artifacts: ArtifactRef[];
-  effect_state: string;
-  contract_revision: number;
-  stale_objects: StaleObjectEntry[];
+  effect_state: AttentionItem["effect_state"];
   budget_limited?: boolean;
 }
 
@@ -320,133 +331,101 @@ function buildStaleMap(entries: PoolEntry[]): Map<string, StaleObjectEntry> {
   return map;
 }
 
+const GENERIC_DECISION_OPTIONS: Record<string, Omit<DecisionOption, "id">> = {
+  stop: {
+    label: "Stop work",
+    effect: "stops the work and releases its controlled resources",
+    consequence: "Work moves to stopped and its remaining scope is not executed.",
+    requires_reason: false,
+    requires_contract: false,
+  },
+  continue: {
+    label: "Continue work",
+    effect: "records acceptance of the remaining risk and continues the work",
+    consequence: "Work continues under the current contract and budget.",
+    requires_reason: false,
+    requires_contract: false,
+  },
+  narrow: {
+    label: "Narrow scope",
+    effect: "replaces the work contract with a reviewed narrower contract",
+    consequence: "Other open cards for the previous contract are superseded.",
+    requires_reason: true,
+    requires_contract: true,
+  },
+};
+
+function targetEffect(db: Database, item: AttentionItem): string | null {
+  if (!item.approval_id || !item.consumer_owner) return null;
+  const table = db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_targets'").get();
+  if (!table) return null;
+  const row = db.query("SELECT effect FROM approval_targets WHERE consumer_owner=? AND approval_id=? AND state='active'").get(item.consumer_owner, item.approval_id) as { effect: string } | null;
+  return row?.effect ?? null;
+}
+
+function decisionOptions(db: Database, item: AttentionItem): DecisionOption[] | null {
+  const approvalEffect = targetEffect(db, item);
+  const options: DecisionOption[] = [];
+  for (const id of item.options) {
+    const generic = GENERIC_DECISION_OPTIONS[id];
+    if (generic) { options.push({ id, ...generic }); continue; }
+    if (!item.approval_id || !approvalEffect) return null;
+    options.push({ id, label: id, effect: `records answer; execution pending: ${approvalEffect}`, consequence: `Records “${id}” for the registered ${approvalEffect} target; success is not yet verified.`, requires_reason: false, requires_contract: false });
+  }
+  return options;
+}
+
+function materialFingerprint(db: Database, item: AttentionItem, options: DecisionOption[], evidence: TriggerEvidence[]): string {
+  return projectAttentionMaterial(db, item.item_id, {
+    risk: item.impact,
+    decision: item.conclusion,
+    option_effects: options.map(option => ({ option: option.id, effect: option.effect })),
+    decisive_evidence: evidence.map(entry => ({ object_id: entry.object_id, revision: entry.revision, conclusion: entry.summary })),
+    validity: { expires_at: item.expires_at, expired: item.expires_at !== null && item.expires_at <= Date.now() },
+    consequence: item.impact,
+  }).fingerprint;
+}
+
 // ========== 包类型 1: DecisionViewPackage ==========
 
 export function assembleDecisionView(db: Database, input: GetContextPackageInput): AssemblyResult {
   ensureControlSchema(db);
   const access = assertWorkAccess(db, input.work_id, input.actor, "decision_view");
   if (!access.ok) return blocked("actor is not decision owner and has no valid share", "forbidden");
-
   const item = getAttention(db, input.consumer_id);
-  if (!item) return blocked("attention item not found", "needs_context");
-
-  // 必需字段：conclusion/trigger/impact/options/owner（attention 行 NOT NULL，行存在即可读）。
-  if (!item.conclusion || !item.trigger || !item.impact || !item.options?.length || !item.owner) {
-    return blocked("required decision field unavailable", "needs_context");
-  }
+  if (!item || item.work_id !== input.work_id) return blocked("attention item not found", "needs_context");
+  if (!item.conclusion || !item.trigger || !item.impact || !item.options?.length || !item.owner) return blocked("required decision field unavailable", "needs_context");
 
   const purpose: Purpose = (input.purpose ?? input.package_type) as Purpose;
   const entries = selectPoolObjects(db, input.work_id, input.problem_id);
   const staleMap = buildStaleMap(entries);
   const budget: AssemblyBudget = input.budget ?? { max_bytes: 2048 };
-
-  const trigger_evidence: TriggerEvidence[] = [];
-  const prior_decisions: PriorDecision[] = [];
-  const artifacts: ArtifactRef[] = [];
+  const trigger_evidence: TriggerEvidence[] = [], prior_decisions: PriorDecision[] = [], artifacts: ArtifactRef[] = [];
   let scene_entry: SceneEntry | null = null;
-
   for (const entry of entries) {
     const { object, version, role } = entry;
-    if (role === "fact" && object.fact_subtype) {
-      const proj = projectEntry(db, {
-        actor: input.actor, work_id: input.work_id, problem_id: input.problem_id,
-        entry, purpose, channel: input.channel, target_model: input.target_model,
-        requested: "short", budget,
-      });
-      if (!proj.allowed) continue;
-      trigger_evidence.push({
-        object_id: object.object_id,
-        fact_subtype: object.fact_subtype,
-        summary: proj.summary,
-        reference: version.reference,
-        revision: version.revision,
-        ...(staleMap.has(object.object_id) ? { stale: true } : {}),
-      });
-    } else if (role === "decision") {
-      const proj = projectEntry(db, {
-        actor: input.actor, work_id: input.work_id, problem_id: input.problem_id,
-        entry, purpose, channel: input.channel, target_model: input.target_model,
-        requested: "short", budget,
-      });
-      if (!proj.allowed) continue;
-      prior_decisions.push({
-        object_id: object.object_id,
-        summary: proj.summary,
-        revision: version.revision,
-      });
-    } else if (role === "artifact") {
-      const proj = projectEntry(db, {
-        actor: input.actor, work_id: input.work_id, problem_id: input.problem_id,
-        entry, purpose, channel: input.channel, target_model: input.target_model,
-        requested: "short", budget,
-      });
-      if (!proj.allowed) continue;
-      artifacts.push({
-        object_id: object.object_id,
-        reference: version.reference,
-        content_hash: version.content_hash,
-      });
-    } else if (role === "scene") {
-      const proj = projectEntry(db, {
-        actor: input.actor, work_id: input.work_id, problem_id: input.problem_id,
-        entry, purpose, channel: input.channel, target_model: input.target_model,
-        requested: "short", budget,
-      });
-      if (!proj.allowed) continue;
-      scene_entry = {
-        reference: version.reference,
-        summary: proj.summary,
-        jump_target: item.source_link ?? version.reference,
-      };
-    }
+    const proj = projectEntry(db, { actor: input.actor, work_id: input.work_id, problem_id: input.problem_id, entry, purpose, channel: input.channel, target_model: input.target_model, requested: "short", budget });
+    if (!proj.allowed) continue;
+    if (role === "fact" && object.fact_subtype) trigger_evidence.push({ object_id: object.object_id, fact_subtype: object.fact_subtype, summary: proj.summary, reference: version.reference, revision: version.revision, ...(staleMap.has(object.object_id) ? { stale: true } : {}) });
+    else if (role === "decision") prior_decisions.push({ object_id: object.object_id, summary: proj.summary, revision: version.revision });
+    else if (role === "artifact") artifacts.push({ object_id: object.object_id, reference: version.reference, content_hash: version.content_hash });
+    else if (role === "scene" && !scene_entry) scene_entry = { reference: version.reference, summary: proj.summary, ...(item.source_link ? { jump_target: item.source_link } : {}) };
   }
-
+  const options = decisionOptions(db, item);
+  if (!options) return blocked("decision option semantics unavailable", "needs_context");
+  const fingerprint = materialFingerprint(db, item, options, trigger_evidence);
   const pkg: DecisionViewPackage = {
-    package_type: "decision_view",
-    consumer_id: input.consumer_id,
-    work_id: input.work_id,
-    ...(input.problem_id ? { problem_id: input.problem_id } : {}),
-    conclusion: item.conclusion,
-    trigger: item.trigger,
-    trigger_evidence,
-    impact: item.impact,
-    recommendation: item.recommendation,
-    options: item.options,
-    owner: item.owner,
-    expires_at: item.expires_at,
-    scene_entry,
-    prior_decisions,
-    artifacts,
-    effect_state: item.effect_state,
-    contract_revision: item.contract_revision,
-    stale_objects: [...staleMap.values()],
+    package_type: "decision_view", consumer_id: item.item_id, work_id: item.work_id,
+    contract_revision: item.contract_revision, attention_revision: item.revision, material_fingerprint: fingerprint,
+    conclusion: item.conclusion, trigger: item.trigger, trigger_evidence, impact: item.impact,
+    recommendation: item.recommendation, owner: item.owner, expires_at: item.expires_at,
+    options, stale_objects: [...staleMap.values()], source_link: item.source_link,
+    scene_entry, prior_decisions, artifacts, effect_state: item.effect_state,
   };
-
-  applyDecisionViewBudget(pkg, budget.max_bytes);
+  if (budget.max_bytes !== undefined && estimatePackageSize(pkg) > budget.max_bytes) pkg.budget_limited = true;
   return { ok: true, package: pkg, ...(pkg.budget_limited ? { budget_limited: true } : {}) };
 }
 
-/** 预算超限：降级/裁剪非必需数组，标 budget_limited；必需字段（conclusion/trigger/impact/options/owner）不动。 */
-function applyDecisionViewBudget(pkg: DecisionViewPackage, maxBytes?: number): void {
-  if (maxBytes === undefined) return;
-  if (estimatePackageSize(pkg) <= maxBytes) return;
-  pkg.budget_limited = true;
-  // 渐进裁剪可选数组，直到达标；必需字段不裁剪。
-  let guard = 0;
-  while (estimatePackageSize(pkg) > maxBytes && guard++ < 100) {
-    if (pkg.trigger_evidence.length > 2) {
-      pkg.trigger_evidence.length = Math.ceil(pkg.trigger_evidence.length / 2);
-    } else if (pkg.prior_decisions.length > 1) {
-      pkg.prior_decisions.length = Math.floor(pkg.prior_decisions.length / 2);
-    } else if (pkg.artifacts.length > 1) {
-      pkg.artifacts.length = Math.floor(pkg.artifacts.length / 2);
-    } else if (pkg.scene_entry !== null) {
-      pkg.scene_entry = null;
-    } else {
-      break;
-    }
-  }
-}
 
 // ========== 包类型 2: AgentTaskPackage ==========
 

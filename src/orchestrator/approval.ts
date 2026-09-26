@@ -5,9 +5,11 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SpoolWriter } from "./spool";
 import { getTask, transition } from "./store";
-import { closeTarget, consumeDecision, defaultMailboxPath, expireActiveTargets, getTarget, markReceipt, openMailbox, receipt, registerTarget } from "../decision-bot/mailbox";
+import type { Task } from "./store";
+import { closeTarget, consumeDecision, defaultMailboxPath, expireActiveTargets, getTarget, markReceipt, observeReceiptEffect, openMailbox, receipt, registerTarget } from "../decision-bot/mailbox";
+import type { EffectObservation } from "../decision-bot/mailbox";
 import { loadPolicy, policyAuthorizes } from "../decision-bot/policy";
-import { getWork, getAttention, supersedeAttentionById, upsertAttention, enqueueControlEvent } from "../control/store";
+import { getWork, getAttention, projectAttentionEffect, supersedeAttentionById, upsertAttention, enqueueControlEvent } from "../control/store";
 
 export const defaultAnswersPath=defaultMailboxPath; export const openAnswersDb=openMailbox;
 export type ApprovalGate="ready"|"ci_anomaly"|"confirm_stopped"|"keep_held";
@@ -20,7 +22,7 @@ export function repairApprovalIntents(db:Database,answers:Database,now=Date.now(
  let repaired=0; const rows=db.query("SELECT i.*,a.consumed_at FROM approval_intents i JOIN approvals a ON a.approval_id=i.approval_id WHERE i.repaired_at IS NULL").all() as any[];
  for(const row of rows){const task=getTask(db,row.task_id);if(!task)throw new Error(`intent task missing: ${row.task_id}`);const options=JSON.parse(row.options) as string[],evidence=parse(row.evidence);const work=task.work_id?getWork(answers,task.work_id):null;
    if(task.work_id&&(!work||work.revision!==task.contract_revision||work.state!=="active"))throw new Error("contract_revision_invalid");
-   const expected={consumerOwner:"orchestrator" as const,approvalId:row.approval_id,stableId:task.stable_id??task.task_id,question:row.question,options,effect:effectFor(row.gate),scope:{gate:row.gate,task_id:task.task_id,repo:task.repo,base:task.base_ref,branch:task.branch,work_id:task.work_id,contract_revision:task.contract_revision},evidence,expiresAt:row.expires_at,workId:task.work_id??undefined,contractRevision:task.contract_revision??undefined,decisionMode:"human_only" as const};
+   const expected={consumerOwner:"orchestrator" as const,approvalId:row.approval_id,stableId:task.stable_id??task.task_id,question:row.question,options,effect:effectFor(row.gate),scope:{gate:row.gate,task_id:task.task_id,repo:task.repo,base:task.base_ref,branch:task.branch,work_id:task.work_id,contract_revision:task.contract_revision},evidence,expiresAt:row.expires_at,workId:task.work_id??undefined,contractRevision:task.contract_revision??undefined,decisionMode:"human_only" as const,toolCallId:`orchestrator:${row.approval_id}:task`,attemptId:task.attempt_id??undefined};
    // Pre-repair targets from older executions lack canonical scope/evidence; only
    // reject a conflicting modern target, then replace the legacy projection.
    const compatible=(current:any)=>!current||current.decisionMode!="human_only"||JSON.stringify({question:current.question,options:current.options,effect:current.effect,scope:current.scope,evidence:current.evidence,expiresAt:current.expiresAt})===JSON.stringify({question:expected.question,options:expected.options,effect:expected.effect,scope:expected.scope,evidence:expected.evidence,expiresAt:expected.expiresAt});
@@ -38,15 +40,33 @@ export function requestApproval(db:Database,_spool:SpoolWriter,taskId:string,gat
 }
 export function updateAttention(answers:Database,approvalId:string,state:"open"|"applying"|"resolved",effect:"not_started"|"applying"|"succeeded"|"failed"|"unknown",now:number,detail:string|null=null){const old=getAttention(answers,`orchestrator:${approvalId}`);if(!old||(old.state===state&&old.effect_state===effect&&old.effect_detail===detail))return;upsertAttention(answers,{...old,expected_revision:old.revision,state,effect_state:effect,effect_detail:detail},now);}
 function terminalOutcome(answers:Database,receiptId:string):string|null{const row=answers.query("SELECT outcome FROM decision_receipts WHERE receipt_id=?").get(receiptId) as {outcome:string|null}|null;return row?.outcome??null;}
-/** Reconcile receipt/card only from observed task state; never manufacture success. */
-export function reconcileApprovalEffects(db:Database,answers:Database,now=Date.now()):void{for(const a of db.query("SELECT * FROM approvals WHERE consumed_at IS NOT NULL").all() as any[]){const task=getTask(db,a.task_id);if(!task)continue;const r=receipt(answers,"orchestrator",a.approval_id);if(!r)continue;const existingAttn=getAttention(answers,`orchestrator:${a.approval_id}`);if(existingAttn&&existingAttn.state==="superseded")continue;let state:"open"|"applying"|"resolved"="applying",effect:"applying"|"succeeded"|"failed"|"unknown"="applying",outcome:string|null=null;
+function effectObservation(task: Task, approvalId: string, receiptId: string, forcedUnknown: boolean, observedAt: number): EffectObservation | null {
+ const state = task.state === "done" ? "succeeded" : ["blocked", "failed", "abandoned"].includes(task.state) ? "failed" : task.state === "awaiting_human" || forcedUnknown ? "unknown" : null;
+ if (!state) return null;
+ const remaining = state === "failed" ? "Review the failed task before choosing the next action." : state === "unknown" ? "Confirm the task effect before retrying." : undefined;
  // The human is owed the reason, not just the verdict: carry the task's own blocked/terminal cause.
- let detail:string|null=null;
- if(task.state==="done"){state="resolved";effect="succeeded";outcome="succeeded";}
- else if(["blocked","failed","abandoned"].includes(task.state)){state="open";effect="failed";outcome="failed";detail=task.blocked_reason??task.terminal_reason??task.state;}
- else if(task.state==="awaiting_human"){state="open";effect="unknown";outcome="unknown";detail="answer recorded but the task is held again";}
- updateAttention(answers,a.approval_id,state,effect,now,detail);const existing=terminalOutcome(answers,r.receiptId);if(!existing||!['succeeded','failed'].includes(existing)||outcome===existing)markReceipt(answers,r.receiptId,outcome??"unknown",now);}}
-export function replayAppliedReceipts(db:Database,answers:Database,now=Date.now()):void{for(const prior of db.query("SELECT receipt_id FROM applied_receipts").all() as any[]){const outcome=terminalOutcome(answers,prior.receipt_id);if(!outcome)markReceipt(answers,prior.receipt_id,"unknown",now);}}
+ const reason = state === "failed" ? task.blocked_reason ?? task.terminal_reason ?? task.state : task.state === "awaiting_human" ? "answer recorded but the task is held again" : undefined;
+ return { receiptId, toolCallId:`orchestrator:${approvalId}:task:${task.state}`, attemptId:task.attempt_id??undefined, state, evidence:{task_id:task.task_id,task_state:task.state,...(remaining?{remaining_responsibility:remaining}:{}),...(reason?{reason}:{})}, observedAt };
+}
+function projectApprovalEffect(db: Database, answers: Database, task: Task, approvalId: string, receiptId: string, forcedUnknown: boolean, now: number): boolean {
+ const observation=effectObservation(task,approvalId,receiptId,forcedUnknown,now);if(!observation)return false;
+ const item=getAttention(answers,`orchestrator:${approvalId}`);if(!item||item.state==="superseded")return false;
+ const source=db.query("SELECT control_event_id FROM approval_intents WHERE approval_id=?").get(approvalId) as {control_event_id:string|null}|null;
+ if(!source?.control_event_id)throw new Error(`approval effect source event missing: ${approvalId}`);
+ if(!observeReceiptEffect(answers,observation))throw new Error(`approval effect observation rejected: ${approvalId}`);
+ projectAttentionEffect(answers,{work_id:item.work_id,item_id:item.item_id,item_revision:item.revision,approval_id:approvalId,receipt_id:receiptId,outbox_event_id:source.control_event_id},observation,now);
+ return true;
+}
+/** Reconcile receipt/card only from observed task state; never manufacture success. */
+export function reconcileApprovalEffects(db:Database,answers:Database,now=Date.now()):void{
+ for(const approval of db.query("SELECT * FROM approvals WHERE consumed_at IS NOT NULL").all() as Array<{approval_id:string;task_id:string}>){
+  const task=getTask(db,approval.task_id);if(!task)continue;const currentReceipt=receipt(answers,"orchestrator",approval.approval_id);if(!currentReceipt)continue;
+  const forcedUnknown=terminalOutcome(answers,currentReceipt.receiptId)==="unknown";
+  if(projectApprovalEffect(db,answers,task,approval.approval_id,currentReceipt.receiptId,forcedUnknown,now))continue;
+  updateAttention(answers,approval.approval_id,"applying","applying",now);
+ }
+}
+export function replayAppliedReceipts(db:Database,answers:Database,now=Date.now()):void{for(const prior of db.query("SELECT receipt_id FROM applied_receipts").all() as Array<{receipt_id:string}>){const outcome=terminalOutcome(answers,prior.receipt_id);if(!outcome)markReceipt(answers,prior.receipt_id,"unknown",now);}}
 export function consumeAnswers(db:Database,answers:Database,spool:SpoolWriter,now=Date.now()):void{
  repairApprovalIntents(db,answers,now);const policy=loadPolicy(undefined,answers);
  replayAppliedReceipts(db,answers,now);reconcileApprovalEffects(db,answers,now);

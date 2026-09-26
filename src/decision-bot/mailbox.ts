@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import {ensureControlSchema,getAttention,upsertAttention} from "../control/store";
+import { ensureControlSchema } from "../control/store";
 
 export const defaultMailboxPath = join(homedir(), ".overload", "orchestrator-answers.db");
 export type ConsumerOwner = "extension" | "orchestrator";
@@ -75,7 +75,36 @@ export function consumeDecision(db:Database,input:ConsumeInput):Receipt|null { c
   const receiptId=randomUUID(); db.run("INSERT INTO decision_receipts(receipt_id,consumer_owner,approval_id,target_version,answer,actor,attempt_id,consumed_at) VALUES(?,?,?,?,?,?,?,?)",[receiptId,input.consumerOwner,input.approvalId,input.targetVersion,answer,actor,p?.attempt_id??null,now]); db.run("UPDATE approval_targets SET state='consumed',consumed_at=? WHERE consumer_owner=? AND approval_id=? AND state='active'",[now,input.consumerOwner,input.approvalId]); db.run("UPDATE bot_proposals SET invalidated_at=? WHERE consumer_owner=? AND approval_id=? AND invalidated_at IS NULL",[now,input.consumerOwner,input.approvalId]); if(human){db.run("DELETE FROM answers WHERE approval_id=?",input.approvalId);db.run("DELETE FROM answer_metadata WHERE approval_id=?",input.approvalId);} return {receiptId,consumerOwner:input.consumerOwner,approvalId:input.approvalId,targetVersion:input.targetVersion,answer,actor,attemptId:p?.attempt_id??null,consumedAt:now,appliedAt:null,outcome:null};
   }).immediate(); }
 export function receipt(db:Database,owner:ConsumerOwner,id:string):Receipt|null { const r=db.query("SELECT * FROM decision_receipts WHERE consumer_owner=? AND approval_id=?").get(owner,id) as any; return r?{receiptId:r.receipt_id,consumerOwner:r.consumer_owner,approvalId:r.approval_id,targetVersion:r.target_version,answer:r.answer,actor:r.actor,attemptId:r.attempt_id,consumedAt:r.consumed_at,appliedAt:r.applied_at,outcome:r.outcome}:null; }
-export function observeReceiptEffect(db:Database,observation:EffectObservation):boolean{return db.transaction(()=>{const receiptRow=db.query("SELECT r.receipt_id,r.attempt_id,t.tool_call_id,t.attempt_id target_attempt,t.evidence FROM decision_receipts r JOIN approval_targets t ON t.consumer_owner=r.consumer_owner AND t.approval_id=r.approval_id WHERE r.receipt_id=? AND t.target_version=r.target_version").get(observation.receiptId) as any;if(!receiptRow)return false;const expectedTool=receiptRow.tool_call_id??JSON.parse(receiptRow.evidence).toolCallId;if(expectedTool&&expectedTool!==observation.toolCallId)return false;const expectedAttempt=receiptRow.target_attempt??receiptRow.attempt_id;if(expectedAttempt&&expectedAttempt!==observation.attemptId)return false;const prior=db.query("SELECT state,evidence FROM receipt_effect_observations WHERE receipt_id=? AND tool_call_id=?").get(observation.receiptId,observation.toolCallId) as any;if(prior){if(prior.state!==observation.state||prior.evidence!==canonical(observation.evidence))throw new Error("conflicting_effect_observation");return true;}db.run("INSERT INTO receipt_effect_observations VALUES(?,?,?,?,?,?)",[observation.receiptId,observation.toolCallId,observation.attemptId??null,observation.state,canonical(observation.evidence),observation.observedAt]);db.run("UPDATE decision_receipts SET applied_at=?,outcome=? WHERE receipt_id=?",[observation.observedAt,observation.state,observation.receiptId]);const linked=db.query("SELECT item_id FROM control_attention WHERE approval_id=(SELECT approval_id FROM decision_receipts WHERE receipt_id=?) AND consumer_owner=(SELECT consumer_owner FROM decision_receipts WHERE receipt_id=?) ORDER BY updated_at DESC LIMIT 1").get(observation.receiptId,observation.receiptId) as any;if(linked?.item_id){const item=getAttention(db,linked.item_id);if(item){const {revision,created_at,updated_at,defer_until,acknowledged_at,...input}=item;upsertAttention(db,{...input,effect_state:observation.state,state:observation.state==="succeeded"?"resolved":"open",expected_revision:revision},observation.observedAt);}}return true;})();}
+export function observeReceiptEffect(db: Database, observation: EffectObservation): boolean {
+  return db.transaction(() => {
+    type EffectReceiptRow = { receipt_id: string; attempt_id: string | null; tool_call_id: string | null; target_attempt: string | null; evidence: string };
+    const receiptRow = db.query(`SELECT r.receipt_id,r.attempt_id,t.tool_call_id,t.attempt_id target_attempt,t.evidence
+      FROM decision_receipts r JOIN approval_targets t
+      ON t.consumer_owner=r.consumer_owner AND t.approval_id=r.approval_id
+      WHERE r.receipt_id=? AND t.target_version=r.target_version`).get(observation.receiptId) as EffectReceiptRow | null;
+    if (!receiptRow) return false;
+    const expectedTool = receiptRow.tool_call_id ?? JSON.parse(receiptRow.evidence).toolCallId;
+    // A receipt may report multiple effect steps; later steps must carry its attempt credential.
+    if (expectedTool && expectedTool !== observation.toolCallId && !observation.toolCallId.startsWith(`${expectedTool}:`)) return false;
+    const expectedAttempt = receiptRow.target_attempt ?? receiptRow.attempt_id;
+    if (expectedAttempt && expectedAttempt !== observation.attemptId) return false;
+    const evidence = canonical(observation.evidence);
+    const prior = db.query("SELECT state,evidence FROM receipt_effect_observations WHERE receipt_id=? AND tool_call_id=?")
+      .get(observation.receiptId, observation.toolCallId) as { state: string; evidence: string } | null;
+    if (prior) {
+      if (prior.state !== observation.state || prior.evidence !== evidence) throw new Error("conflicting_effect_observation");
+      return true;
+    }
+    db.run("INSERT INTO receipt_effect_observations VALUES(?,?,?,?,?,?)", [
+      observation.receiptId, observation.toolCallId, observation.attemptId ?? null,
+      observation.state, evidence, observation.observedAt,
+    ]);
+    db.run("UPDATE decision_receipts SET applied_at=?,outcome=? WHERE receipt_id=?", [
+      observation.observedAt, observation.state, observation.receiptId,
+    ]);
+    return true;
+  })();
+}
 export function reconcileOutstandingReceipts(db:Database,deadline:number,now=Date.now()):number{return db.run("UPDATE decision_receipts SET applied_at=?,outcome='unknown' WHERE applied_at IS NULL AND consumed_at<=?",[now,deadline]).changes;}
 export function reconcileEffectEvents(mailbox:Database,ledgerPath:string,now=Date.now()):void{const ledger=new Database(ledgerPath,{readonly:true});try{const cursor=(mailbox.query("SELECT ingest_seq FROM effect_reconcile_cursor WHERE id=1").get() as any)?.ingest_seq??0;const rows=ledger.query("SELECT ingest_seq,detail,at FROM journal_all WHERE kind='control_event' AND ingest_seq>? ORDER BY ingest_seq").all(cursor) as Array<{ingest_seq:number;detail:string;at:number}>;mailbox.transaction(()=>{let high=cursor;for(const row of rows){high=row.ingest_seq;let envelope:any;try{envelope=JSON.parse(row.detail);}catch{continue;}if(envelope?.event_kind!=="effect_observed")continue;const d=envelope.payload;if(!d||typeof d.receipt_id!=="string"||typeof d.toolCallId!=="string"||!["succeeded","failed","unknown"].includes(d.effect_state)||!d.evidence||typeof d.evidence!=="object")continue;observeReceiptEffect(mailbox,{receiptId:d.receipt_id,toolCallId:d.toolCallId,attemptId:typeof d.attempt_id==="string"?d.attempt_id:undefined,state:d.effect_state,evidence:d.evidence,observedAt:Number.isSafeInteger(row.at)?row.at:now});}mailbox.run("INSERT INTO effect_reconcile_cursor(id,ingest_seq) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET ingest_seq=excluded.ingest_seq",high);mailbox.run("UPDATE decision_receipts SET applied_at=?,outcome='unknown' WHERE applied_at IS NULL AND EXISTS(SELECT 1 FROM approval_targets t WHERE t.consumer_owner=decision_receipts.consumer_owner AND t.approval_id=decision_receipts.approval_id AND t.expires_at<=?)",[now,now]);})();}finally{ledger.close();}}
 export function markReceipt(db:Database,id:string,outcome:string,now=Date.now()):void{if(outcome==="applied")outcome="unknown";if(!["succeeded","failed","unknown"].includes(outcome))throw new Error("invalid receipt outcome");db.run("UPDATE decision_receipts SET applied_at=COALESCE(applied_at,?),outcome=? WHERE receipt_id=?",[now,outcome,id]);}

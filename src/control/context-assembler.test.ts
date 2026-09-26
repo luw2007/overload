@@ -76,7 +76,7 @@ function makeAttention(db: Database, workId: string, itemId = "item-1", over: Re
     trigger: "exported function signature changed",
     impact: "existing callers will break",
     recommendation: "accept",
-    options: ["accept", "revert"],
+    options: ["stop", "continue"],
     owner: "alice",
     expires_at: null,
     source_link: "session://jump/1",

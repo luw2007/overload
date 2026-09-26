@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AdapterService } from "./service";
-import { createWork, getAttention, upsertAttention } from "../control/store";
+import { createWork, getAttention, getAttentionMaterial, projectAttentionMaterial, upsertAttention } from "../control/store";
 import type {
  AgentRuntime,
  SessionHandle,
@@ -122,6 +122,77 @@ test("channel resolve uses the authenticated owner, not a fixed system identity"
    answer: "continue",
   });
   const after = getAttention(h.db, "manual-decision")!;
+  expect(after.state).toBe("resolved");
+  expect(after.effect_state).toBe("succeeded");
+ } finally {
+  await h.close();
+ }
+});
+
+test("channel resolve with a material projection consumes via the strict CAS path", async () => {
+ const h = harness();
+ try {
+  await h.service.start();
+  await h.service.accept(h.event("one"));
+  await h.service.tick();
+  const c = h.db.query("SELECT id FROM conversations").get() as { id: string };
+  const work = createWork(h.db, {
+   title: "decision work",
+   source: "decision-test",
+   contract: {
+    objective: "do the work",
+    acceptance: [{ id: "owner", kind: "human", description: "operator reviews" }],
+    non_goals: [],
+    scope: { cwd: h.root },
+    budget: {},
+    stop_conditions: [{ id: "approval", kind: "judgment", description: "needs ok" }],
+    decision_owner: "operator",
+   },
+  });
+  h.db.run("UPDATE conversations SET work_id=? WHERE id=?", [work.work_id, c.id]);
+  upsertAttention(h.db, {
+   item_id: "material-decision",
+   work_id: work.work_id,
+   state: "open",
+   effect_state: "not_started",
+   urgency: "now",
+   conclusion: "needs a decision",
+   trigger: "runtime blocked",
+   impact: "work held",
+   recommendation: null,
+   options: ["continue", "stop"],
+   owner: "operator",
+   expires_at: null,
+   source_link: null,
+   approval_id: null,
+   consumer_owner: null,
+   contract_revision: work.revision,
+   decision_mode: "human_only",
+   evidence: {},
+  });
+  projectAttentionMaterial(h.db, "material-decision", {
+   risk: "wrong call wastes the run",
+   decision: "operator picks continue or stop",
+   option_effects: [
+    { option: "continue", effect: "proceed" },
+    { option: "stop", effect: "halt" },
+   ],
+   decisive_evidence: [{ object_id: "obj-1", revision: 1, conclusion: "blocked on operator" }],
+   validity: { expires_at: null, expired: false },
+   consequence: "work drifts if misjudged",
+  });
+  expect(getAttentionMaterial(h.db, "material-decision")).not.toBeNull();
+  const item = getAttention(h.db, "material-decision")!;
+  h.db.run("INSERT INTO channel_card_bindings(item_id,conversation_id,message_id) VALUES(?,?,?)", ["material-decision", c.id, "card-1"]);
+  await h.service.accept({
+   ...h.event("answer"),
+   messageId: "card-1",
+   kind: "decision",
+   itemId: "material-decision",
+   revision: item.revision,
+   answer: "continue",
+  });
+  const after = getAttention(h.db, "material-decision")!;
   expect(after.state).toBe("resolved");
   expect(after.effect_state).toBe("succeeded");
  } finally {

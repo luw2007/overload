@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ControlError, CONTROL_SCHEMA_VERSION, ensureControlSchema, openControl } from "../src/control/store";
+import { CONTROL_SCHEMA_VERSION, ControlError, ensureControlSchema, openControl } from "../src/control/store";
 import { setInputHead, setParentHandoff } from "../src/manage/schema";
 
 const tables = [

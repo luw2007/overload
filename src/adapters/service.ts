@@ -3,8 +3,11 @@ import { randomUUID } from "node:crypto";
 import {
  getAttention,
  actOnAttention,
+ getAttentionMaterial,
  createWork,
  getWork,
+ projectAttentionEffect,
+ resolveAttention,
  upsertAttention,
 } from "../control/store";
 import {
@@ -232,12 +235,22 @@ export class AdapterService {
      if (event.answer === "narrow") throw new Error("contract_review_required");
      // owner is the authenticated channel identity resolved from
      // config.authorize(event.identity, event.address) and already verified to
-     // equal item.owner. A resolve changes work state/contract, so it must be
-     // attributed to that real owner — never to a fixed system pseudo-identity.
-     actOnAttention(this.db, item.item_id, item.revision, "resolve", {
-      selected_option: event.answer,
-      reason: "channel operator decision",
-     }, owner);
+     // equal item.owner. Revision and material fingerprint are trusted
+     // server-side tokens; channel payloads never supply either value.
+     const material = getAttentionMaterial(this.db, item.item_id);
+     if (material) {
+      resolveAttention(this.db, item.item_id, {
+       selected_option: event.answer,
+       reason: "channel operator decision",
+       attention_revision: item.revision,
+       material_fingerprint: material.fingerprint,
+      }, owner);
+     } else {
+      actOnAttention(this.db, item.item_id, item.revision, "resolve", {
+       reason: "channel operator decision",
+       selected_option: event.answer,
+      }, owner);
+     }
     }
     if (
      this.db
@@ -828,34 +841,33 @@ export class AdapterService {
        item.effect_state === "failed"
       )
        continue;
-      if (event.kind === "unknown") {
-       const {
-        revision,
-        created_at,
-        updated_at,
-        defer_until,
-        acknowledged_at,
-        ...values
-       } = item;
-       upsertAttention(this.db, {
-        ...values,
-        expected_revision: revision,
-        state: "open",
-        effect_state: "unknown",
-        evidence: { ...item.evidence, runtime_event: event.eventId },
-       });
-      } else
-       observeReceiptEffect(this.db, {
-        receiptId: decision.receipt_id,
-        toolCallId: decision.request_id,
-        attemptId: turn.id,
-        state: event.kind === "completed" ? "succeeded" : "failed",
-        evidence: {
-         runtime_event: event.eventId,
-         text: event.text ?? turn.output,
-        },
-        observedAt: Date.now(),
-       });
+      const observation = {
+       receiptId: decision.receipt_id,
+       toolCallId: decision.request_id,
+       attemptId: turn.id,
+       state: event.kind === "completed" ? "succeeded" : event.kind === "failed" ? "failed" : "unknown",
+       evidence: {
+        runtime_event: event.eventId,
+        text: event.text ?? turn.output,
+       },
+       observedAt: Date.now(),
+      } as const;
+      if (!observeReceiptEffect(this.db, observation))
+       throw new Error(`runtime effect observation rejected: ${decision.request_id}`);
+      const source = this.db.query(`SELECT event_id FROM control_outbox
+       WHERE item_id=? AND entity_version<=? AND kind IN ('attention.created','attention.updated')
+       ORDER BY entity_version DESC LIMIT 1`).get(item.item_id, item.revision);
+      if (!source || typeof source !== "object" || !("event_id" in source)
+       || typeof source.event_id !== "string" || !source.event_id)
+       throw new Error(`runtime effect source event missing: ${decision.request_id}`);
+      projectAttentionEffect(this.db, {
+       work_id: item.work_id,
+       item_id: item.item_id,
+       item_revision: item.revision,
+       approval_id: item.approval_id,
+       receipt_id: decision.receipt_id,
+       outbox_event_id: source.event_id,
+      }, observation, observation.observedAt);
      }
     }
    })

@@ -63,7 +63,7 @@ function seedControl(root: string): Seeded {
   upsertAttention(db, {
     item_id: "item-1", work_id: work.work_id, state: "open", effect_state: "not_started",
     urgency: "now", conclusion: "accept the public API change?", trigger: "exported signature changed",
-    impact: "existing callers will break", recommendation: "accept", options: ["accept", "revert"],
+    impact: "existing callers will break", recommendation: "stop", options: ["stop", "continue"],
     owner: "alice", expires_at: null, source_link: "session://jump/1", approval_id: null,
     consumer_owner: null, contract_revision: 1, decision_mode: "human_only", evidence: {},
   }, 3);

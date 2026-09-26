@@ -277,6 +277,19 @@ export class FeishuChannel implements ChannelAdapter {
     );
     return;
    }
+   if (
+    error instanceof Error &&
+    (error.message === "stale_decision" ||
+     error.message === "stale attention revision" ||
+     error.message === "decision_material_unavailable")
+   ) {
+    await this.channel.send(
+     action.chatId,
+     { markdown: "该决定已更新或失效，请刷新后查看当前状态。" },
+     { replyTo: action.messageId },
+    );
+    return;
+   }
    throw error;
   }
  }

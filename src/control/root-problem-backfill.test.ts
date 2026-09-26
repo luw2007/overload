@@ -14,7 +14,7 @@ import { getProblem, problemId, rootProblemId } from "./context-pool";
 import { ingestFactObserved, type FactObservedPayload } from "./context-reducer";
 
 // 重建一个停在 v3 的库：回放 v1..v3 的 DDL，再把 meta 版本钉死在 3。
-// v4（reducer DDL）与 v5（根 problem 回填）由 ensureControlSchema 真正执行。
+// v4（reducer DDL）、v5（根 problem 回填）与 v6（Phase A 表）由 ensureControlSchema 真正执行。
 function makeV3Db(): Database {
   const db = new Database(":memory:");
   db.exec("PRAGMA foreign_keys=ON");
@@ -23,6 +23,27 @@ function makeV3Db(): Database {
   ensureMgmtSchema(db);
   db.exec(CONTEXT_SCHEMA);
   db.query("INSERT INTO control_schema_meta(id,version,migrated_at) VALUES (1,?,?)").run(3, 1);
+  return db;
+}
+
+function makeVersionDb(version: 0 | 1 | 2 | 3 | 4 | 5): Database {
+  const db = new Database(":memory:");
+  db.exec("PRAGMA foreign_keys=ON");
+  if (version === 0) return db;
+  db.exec(CONTROL_SCHEMA);
+  ensureOutbox(db);
+  db.query("INSERT INTO control_schema_meta(id,version,migrated_at) VALUES (1,?,?)").run(version, 1);
+  if (version >= 2) ensureMgmtSchema(db);
+  if (version >= 3) db.exec(CONTEXT_SCHEMA);
+  if (version >= 4) {
+    db.exec(`CREATE TABLE control_context_fact_dedup(
+      idempotency_key TEXT PRIMARY KEY, object_id TEXT NOT NULL, revision INTEGER NOT NULL,
+      content_hash TEXT NOT NULL, created_at INTEGER NOT NULL
+    ); CREATE TABLE control_context_fact_quarantine(
+      idempotency_key TEXT NOT NULL, content_hash TEXT NOT NULL, created_at INTEGER NOT NULL,
+      PRIMARY KEY (idempotency_key, content_hash)
+    );`);
+  }
   return db;
 }
 
@@ -44,11 +65,46 @@ function metaVersion(db: Database): number {
 }
 
 describe("存量 work 根 problem 回填 hotfix", () => {
-  test("schema 常量版本为 5", () => {
-    expect(CONTROL_SCHEMA_VERSION).toBe(5);
+  test("schema 常量版本为 6", () => {
+    expect(CONTROL_SCHEMA_VERSION).toBe(6);
   });
 
-  test("1. v3→v5 升级回填根 problem，id 与 rootProblemId 一致", () => {
+  test("every supported v0-v5 schema upgrades exactly through v6", () => {
+    for (const version of [0, 1, 2, 3, 4, 5] as const) {
+      const db = makeVersionDb(version);
+      if (version >= 3 && version <= 4) insertWork(db, `w-v${version}`, "active");
+      ensureControlSchema(db);
+      expect(metaVersion(db)).toBe(CONTROL_SCHEMA_VERSION);
+      for (const table of ["control_attention_material", "control_notifications", "control_notification_shadow"]) {
+        expect(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)).toBeTruthy();
+      }
+      if (version >= 3 && version <= 4) {
+        const roots = db.query("SELECT COUNT(*) AS n FROM control_context_problems WHERE work_id=? AND parent_problem_id IS NULL")
+          .get(`w-v${version}`) as { n: number };
+        expect(roots.n).toBe(1);
+      }
+      expect(() => ensureControlSchema(db)).not.toThrow();
+      expect(metaVersion(db)).toBe(CONTROL_SCHEMA_VERSION);
+      db.close();
+    }
+  });
+
+  test("v5→v6 preserves the completed v5 root backfill while creating Phase A tables", () => {
+    const db = makeVersionDb(5);
+    insertWork(db, "w-v5", "completed");
+    const rootId = rootProblemId("w-v5");
+    db.query("INSERT INTO control_context_problems(problem_id,work_id,parent_problem_id,root_problem_id,title,state,revision,created_at,updated_at) VALUES (?,?,NULL,?,?,'open',1,?,?)")
+      .run(rootId, "w-v5", rootId, "root", 1, 1);
+    ensureControlSchema(db);
+    expect(metaVersion(db)).toBe(CONTROL_SCHEMA_VERSION);
+    const roots = db.query("SELECT COUNT(*) AS n FROM control_context_problems WHERE work_id=? AND parent_problem_id IS NULL")
+      .get("w-v5") as { n: number };
+    expect(roots.n).toBe(1);
+    expect(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_notifications'").get()).toBeTruthy();
+    db.close();
+  });
+
+  test("1. v3→v6 升级执行 v5 根 problem 回填，id 与 rootProblemId 一致", () => {
     const db = makeV3Db();
     insertWork(db, "w-old", "active");
     // 升级前无根 problem（用裸 SQL，避免 getProblem 内部 ensureControlSchema 提前触发迁移）
@@ -57,7 +113,7 @@ describe("存量 work 根 problem 回填 hotfix", () => {
       .get("w-old");
     expect(before).toBeNull();
     ensureControlSchema(db);
-    expect(metaVersion(db)).toBe(5);
+    expect(metaVersion(db)).toBe(CONTROL_SCHEMA_VERSION);
     const root = getProblem(db, rootProblemId("w-old"));
     expect(root).not.toBeNull();
     expect(root!.problem_id).toBe(rootProblemId("w-old"));
@@ -135,7 +191,7 @@ describe("存量 work 根 problem 回填 hotfix", () => {
     db.close();
   });
 
-  test("6. v5 迁移重入幂等：已升级库再 ensureControlSchema 不报错、版本仍 5、无重复 problem", () => {
+  test("6. 迁移重入幂等：已升级库再 ensureControlSchema 不报错、版本仍为当前版本、无重复 problem", () => {
     const db = makeV3Db();
     insertWork(db, "w-re", "active");
     ensureControlSchema(db);
@@ -144,7 +200,7 @@ describe("存量 work 根 problem 回填 hotfix", () => {
       .get("w-re") as { n: number };
     expect(before.n).toBe(1);
     expect(() => ensureControlSchema(db)).not.toThrow();
-    expect(metaVersion(db)).toBe(5);
+    expect(metaVersion(db)).toBe(CONTROL_SCHEMA_VERSION);
     const after = db
       .query("SELECT COUNT(*) AS n FROM control_context_problems WHERE work_id=? AND parent_problem_id IS NULL")
       .get("w-re") as { n: number };

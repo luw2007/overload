@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore, addTask, transition, claim } from "./store";
+import { getTarget } from "../decision-bot/mailbox";
 import {
   openAnswersDb,
   requestApproval,
@@ -101,8 +102,9 @@ test("ORC-04 reconcileApprovalEffects maps done to resolved/succeeded and blocke
   const { root, db, answers, spool, task } = setup();
   try {
     const id = requestApproval(db, spool, task.task_id, "ready", "q", ["a"], 1000, answers);
-    answers.run("INSERT INTO decision_receipts(receipt_id,consumer_owner,approval_id,target_version,answer,actor,consumed_at) VALUES(?,?,?,?,?,?,?)",
-      ["r1", "orchestrator", id, "v", "approve", "cli", 1]);
+    const target = getTarget(answers, "orchestrator", id)!;
+    answers.run("INSERT INTO decision_receipts(receipt_id,consumer_owner,approval_id,target_version,answer,actor,attempt_id,consumed_at) VALUES(?,?,?,?,?,?,?,?)",
+      ["r1", "orchestrator", id, target.targetVersion, "approve", "cli", target.attemptId ?? null, 1]);
     db.run("INSERT INTO applied_receipts VALUES(?,?,?,?,?)", ["r1", task.task_id, "approve", 1, "transitioned"]);
     db.run("UPDATE approvals SET consumed_at=1 WHERE approval_id=?", id);
     db.run("UPDATE tasks SET state='done' WHERE task_id=?", task.task_id);

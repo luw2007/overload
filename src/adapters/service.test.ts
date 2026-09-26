@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { openMailbox } from "../decision-bot/mailbox";
+import { createWork, getAttention, projectAttentionMaterial, upsertAttention } from "../control/store";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -325,6 +326,52 @@ test("duplicate messages execute once and same conversation serializes turns", a
   await f.close();
  }
 });
+test("generic channel decisions resolve with trusted revision and material tokens", async () => {
+ const h = harness();
+ try {
+  await h.service.start();
+  await h.service.accept(h.event("one"));
+  const conversation = h.db.query("SELECT id FROM conversations").get();
+  if (!conversation || typeof conversation !== "object" || !("id" in conversation)
+   || typeof conversation.id !== "string") throw new Error("missing conversation");
+  const work = createWork(h.db, {
+   title: "generic decision",
+   source: "test",
+   contract: {
+    objective: "choose",
+    acceptance: [{ id: "check", kind: "check", description: "choice applied" }],
+    non_goals: [],
+    scope: { cwd: h.root },
+    budget: {},
+    stop_conditions: [],
+    decision_owner: "operator",
+   },
+  });
+  h.db.run("UPDATE conversations SET work_id=? WHERE id=?", [work.work_id, conversation.id]);
+  const item = upsertAttention(h.db, {
+   item_id: "generic", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox",
+   conclusion: "Continue?", trigger: "choice", impact: "work changes", recommendation: "continue",
+   options: ["continue", "stop"], owner: "operator", expires_at: null, source_link: null,
+   approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {},
+  });
+  projectAttentionMaterial(h.db, item.item_id, {
+   risk: item.impact,
+   decision: item.conclusion,
+   option_effects: item.options.map((option) => ({ option, effect: option })),
+   decisive_evidence: [],
+   validity: { expires_at: null, expired: false },
+   consequence: item.impact,
+  });
+  h.db.run("INSERT INTO channel_card_bindings(item_id,conversation_id,message_id) VALUES(?,?,?)", [item.item_id, conversation.id, "card-generic"]);
+  const input = h.event("choose");
+  await h.service.accept({ ...input, messageId: "card-generic", kind: "decision", itemId: item.item_id, revision: item.revision, answer: "continue" });
+  expect(getAttention(h.db, item.item_id)).toMatchObject({ state: "resolved", effect_state: "succeeded" });
+  expect(h.db.query("SELECT COUNT(*) n FROM channel_inbound WHERE event_id='choose'").get()).toEqual({ n: 1 });
+ } finally {
+  await h.close();
+ }
+});
+
 test("unknown fences queued work and owner rejection does not persist event", async () => {
  const f = harness();
  try {
@@ -360,7 +407,7 @@ test("unknown fences queued work and owner rejection does not persist event", as
   await f.close();
  }
 });
-test("native approval consumes once and updates original decision card with effect", async () => {
+test("native approval projects success but keeps independent human acceptance visible", async () => {
  const f = harness();
  try {
   await f.service.start();
@@ -408,7 +455,7 @@ test("native approval consumes once and updates original decision card with effe
   await f.service.tick();
   const updates = f.sent.filter((m) => m.decision);
   expect(updates.at(-1)?.replaceMessageId).toBeTruthy();
-  expect(updates.at(-1)?.decision?.state).toBe("Applied");
+  expect(updates.at(-1)?.decision?.state).toBe("Applying");
   expect(
    f.db
     .query(
@@ -418,15 +465,113 @@ test("native approval consumes once and updates original decision card with effe
   ).toEqual({
    message_id: updates.at(-1)?.replaceMessageId,
    last_revision: updates.at(-1)?.decision?.revision,
-   last_state: "Applied",
+   last_state: "Applying",
   });
   expect(f.db.query("SELECT COUNT(*) n FROM decision_receipts").get()).toEqual({
    n: 1,
   });
+  const attentionRow = f.db.query("SELECT state,effect_state,evidence FROM control_attention WHERE item_id=?")
+   .get(card!.decision!.itemId);
+  expect(attentionRow).toMatchObject({ state: "applying", effect_state: "succeeded" });
+  if (!attentionRow || typeof attentionRow !== "object" || !("evidence" in attentionRow)
+   || typeof attentionRow.evidence !== "string") throw new Error("missing attention evidence");
+  const evidence = JSON.parse(attentionRow.evidence) as Record<string, unknown>;
+  expect(evidence.remaining_responsibility).toBe("Operator reviews returned execution evidence");
+  expect(evidence.occurred_effects).toEqual([
+   expect.objectContaining({ kind: "q", state: "succeeded", evidence: expect.objectContaining({ runtime_event: "done" }) }),
+  ]);
+  expect(evidence.effect_projection).toMatchObject({
+   receipt_id: expect.any(String),
+   tool_call_id: "q",
+   state: "succeeded",
+   audit_link: expect.objectContaining({
+    work_id: expect.any(String),
+    item_id: card!.decision!.itemId,
+    approval_id: card!.decision!.itemId,
+    outbox_event_id: expect.any(String),
+   }),
+  });
+  const projected = f.db.query("SELECT COUNT(*) n FROM control_outbox WHERE item_id=? AND kind='attention.effect_projected'")
+   .get(card!.decision!.itemId);
+  expect(projected).toEqual({ n: 1 });
+  f.service.recordRuntimeEvent(c.id, {
+   eventId: "done",
+   sessionId: ref.sessionId,
+   turnId: f.submitted[0],
+   kind: "completed",
+   text: "verified",
+  });
+  expect(f.db.query("SELECT COUNT(*) n FROM control_outbox WHERE item_id=? AND kind='attention.effect_projected'")
+   .get(card!.decision!.itemId)).toEqual({ n: 1 });
  } finally {
   await f.close();
  }
 });
+test("native failed and unknown effects reopen the same attention", async () => {
+ for (const kind of ["failed", "unknown"] as const) {
+  const f = harness();
+  try {
+   await f.service.start();
+   await f.service.accept(f.event(`one-${kind}`));
+   await f.service.tick();
+   const conversation = f.db.query("SELECT id,session_reference FROM conversations").get();
+   if (!conversation || typeof conversation !== "object" || !("id" in conversation)
+    || typeof conversation.id !== "string" || !("session_reference" in conversation)
+    || typeof conversation.session_reference !== "string") throw new Error("missing conversation");
+   const reference = JSON.parse(conversation.session_reference) as SessionReference;
+   f.service.recordRuntimeEvent(conversation.id, {
+    eventId: `blocked-${kind}`,
+    sessionId: reference.sessionId,
+    turnId: f.submitted[0],
+    kind: "blocked",
+    requestId: `q-${kind}`,
+    requestMethod: "confirm",
+    options: ["yes", "no"],
+    text: "Proceed?",
+   });
+   await f.service.tick();
+   const card = f.sent.find((message) => message.decision);
+   if (!card?.decision) throw new Error("missing decision card");
+   const cardMessage = (f.db.query("SELECT message_id FROM channel_card_bindings WHERE item_id=?")
+    .get(card.decision.itemId) as { message_id: string }).message_id;
+   const input = f.event(`approve-${kind}`);
+   await f.service.accept({
+    ...input,
+    messageId: cardMessage,
+    kind: "decision",
+    itemId: card.decision.itemId,
+    revision: card.decision.revision,
+    answer: "yes",
+   });
+   await f.service.tick();
+   f.service.recordRuntimeEvent(conversation.id, {
+    eventId: `terminal-${kind}`,
+    sessionId: reference.sessionId,
+    turnId: f.submitted[0],
+    kind,
+    text: `${kind} result`,
+   });
+   await f.service.tick();
+   const item = getAttention(f.db, card.decision.itemId);
+   expect(item).toMatchObject({ item_id: card.decision.itemId, state: "open", effect_state: kind });
+   expect(item?.evidence.occurred_effects).toEqual([
+    expect.objectContaining({
+     kind: `q-${kind}`,
+     state: kind,
+     evidence: expect.objectContaining({ runtime_event: `terminal-${kind}` }),
+    }),
+   ]);
+   expect(f.db.query("SELECT outcome FROM decision_receipts").get()).toEqual({ outcome: kind });
+   expect(f.db.query("SELECT COUNT(*) n FROM control_works").get()).toEqual({ n: 1 });
+   expect(f.db.query("SELECT COUNT(*) n FROM control_attention WHERE item_id=?").get(card.decision.itemId)).toEqual({ n: 1 });
+   expect(f.db.query("SELECT COUNT(*) n FROM control_outbox WHERE item_id=? AND kind='attention.effect_projected'")
+    .get(card.decision.itemId)).toEqual({ n: 1 });
+  } finally {
+   await f.close();
+  }
+ }
+});
+
 test("restart retains binding and does not re-submit unknown work", async () => {
  const f = harness();
  let next: AdapterService | undefined;

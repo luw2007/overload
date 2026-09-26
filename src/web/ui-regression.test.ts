@@ -191,11 +191,11 @@ describe("attention defer integration", () => {
 });
 
 describe("generic attention option filtering", () => {
-  test("app.js decisionRow filters non-valid options for generic attention", () => {
-    // decisionRow renders only stop/continue/narrow/defer as buttons for items without approval_id;
-    // other options (approve/deny) render as disabled .option-chip with title explaining they need linked approval.
-    expect(APP_JS).toContain("item.approval_id?item.options:item.options.filter(o=>['stop','continue','narrow','defer'].includes(o))");
-    expect(APP_JS).toContain("此选项需要 linked approval");
+  test("app.js renders only server-owned DecisionOption metadata", () => {
+    expect(APP_JS).toContain("const pkg=item.decision_package");
+    expect(APP_JS).toContain("pkg.options.map");
+    expect(APP_JS).toContain('data-option="${e(o.id)}"');
+    expect(APP_JS).not.toContain("item.options.filter");
   });
 
   test("app.js resolveItem sends defer to /api/attention/:id/defer with defer_until", () => {

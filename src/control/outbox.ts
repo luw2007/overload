@@ -5,14 +5,13 @@ const MAX_RETAINED_BYTES = 64 * 1024 * 1024;
 const LEASE_MS = 30_000;
 const BATCH_SIZE = 100;
 
-function canonical(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const row = value as Record<string, unknown>;
-  return `{${Object.keys(row).sort().map((key) => `${JSON.stringify(key)}:${canonical(row[key])}`).join(",")}}`;
+  return `{${Object.keys(row).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(row[key])}`).join(",")}}`;
 }
-function hash(value: unknown): string { return createHash("sha256").update(canonical(value)).digest("hex"); }
-
+function hash(value: unknown): string { return createHash("sha256").update(canonicalJson(value)).digest("hex"); }
 export function ensureOutbox(db: Database): void {
   db.exec(`CREATE TABLE IF NOT EXISTS control_identity(
     id INTEGER PRIMARY KEY CHECK(id=1), producer_id TEXT NOT NULL
@@ -39,7 +38,7 @@ export function enqueueControlEvent(db: Database, input: {
   const producer = db.query("SELECT producer_id FROM control_identity WHERE id=1").get() as { producer_id: string };
   const identity = `${producer.producer_id}\0${input.entity_id}\0${input.entity_version}\0${input.kind}`;
   const eventId = createHash("sha256").update(identity).digest("hex");
-  const payload = canonical(input.payload);
+  const payload = canonicalJson(input.payload);
   const payloadHash = hash(input.payload);
   const existing = db.query("SELECT payload_hash FROM control_outbox WHERE event_id=?").get(eventId) as { payload_hash: string } | null;
   if (existing && existing.payload_hash !== payloadHash) throw new Error(`control event identity collision: ${eventId}`);

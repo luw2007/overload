@@ -220,6 +220,33 @@ test("replies when a non-owner submits a card decision", async () => {
  await instance.stop();
 });
 
+test("replies once when a card decision is stale", async () => {
+ const instance = channel();
+ let attempts = 0;
+ await instance.start(async () => {
+  attempts++;
+  throw new Error("stale attention revision");
+ });
+ const action = {
+  messageId: "card-stale",
+  chatId: "chat",
+  operator: { openId: "owner" },
+  action: {
+   tag: "button",
+   value: { itemId: "item-stale", revision: 1, answer: "continue" },
+  },
+  raw: raw("action-stale", "tenant"),
+ };
+ await fake.emit("cardAction", action);
+ expect(attempts).toBe(1);
+ expect(fake.sent).toEqual([{
+  to: "chat",
+  input: { markdown: "该决定已更新或失效，请刷新后查看当前状态。" },
+  options: { replyTo: "card-stale" },
+ }]);
+ await instance.stop();
+});
+
 test("normalizes card callbacks without unauthenticated tenant bypass", async () => {
  const instance = channel();
  const events: ChannelEvent[] = [];

@@ -40,7 +40,7 @@ class FakeRuntime implements AgentRuntime {
   async connect(_ref: SessionReference): Promise<SessionHandle> { throw new Error("not used"); }
 }
 
-const FAKE_CHANNEL_KEYS = ["OVERLOAD_CHANNEL", "OVERLOAD_RUNTIME", "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_INSTANCE_ID", "OVERLOAD_CHANNEL_AUTH_FILE", "OVERLOAD_RUNTIME_CWD", "OVERLOAD_ANSWERS_PATH", "OVERLOAD_WEB_PORT"];
+const FAKE_CHANNEL_KEYS = ["OVERLOAD_CHANNEL", "OVERLOAD_RUNTIME", "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_INSTANCE_ID", "OVERLOAD_CHANNEL_AUTH_FILE", "OVERLOAD_RUNTIME_CWD", "OVERLOAD_ANSWERS_PATH", "OVERLOAD_WEB_PORT", "HOME"];
 
 function setupEnv(): { root: string; channel: FakeChannel } {
   saveEnv(FAKE_CHANNEL_KEYS);
@@ -63,6 +63,7 @@ function setupEnv(): { root: string; channel: FakeChannel } {
   process.env.OVERLOAD_CHANNEL = "fake";
   process.env.OVERLOAD_RUNTIME = "fake";
   process.env.OVERLOAD_WEB_PORT = "0"; // the daemon hosts its own dashboard; never collide with a live one
+  process.env.HOME = root; // ...nor read the operator's real ledger
 
   const channel = new FakeChannel();
   return { root, channel };
@@ -84,7 +85,7 @@ describe("ADP-01 startAdapterDaemon factory injection", () => {
     // The daemon registers a 1s setInterval; after stop() the timer is cleared.
     await daemon.stop();
     expect(channel.stopped).toBe(1);
-  });
+  }, 20_000); // the daemon hosts a web server whose first ledger initialization takes seconds
 
   test("missing FEISHU_APP_ID throws before connecting to network", async () => {
     setupEnv();
@@ -116,5 +117,5 @@ describe("ADP-01 startAdapterDaemon factory injection", () => {
     failingChannel.stop = async () => { stopped = true; await origStop(); };
     await expect(startAdapterDaemon(fakeFactories(failingChannel))).rejects.toThrow("connect failed");
     expect(stopped).toBe(true);
-  });
+  }, 20_000);
 });

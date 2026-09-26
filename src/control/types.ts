@@ -65,6 +65,67 @@ export type AttentionItem = {
   created_at: number;
   updated_at: number;
 };
+
+export type AttentionZone = "now" | "inbox" | "done";
+
+export type FollowUpStage =
+  | "answer_recorded"
+  | "applying"
+  | "verification_required"
+  | "failed"
+  | "unknown";
+
+export type AttentionFollowUp = {
+  item: AttentionItem;
+  stage: FollowUpStage;
+  receipt_id: string | null;
+  consumed_at: number | null;
+  applied_at: number | null;
+  outcome: "succeeded" | "failed" | "unknown" | null;
+  occurred_effects: Array<{ kind: string; evidence: Record<string, unknown> }>;
+  remaining_responsibility: string;
+  next_action: string;
+};
+
+export type MaterialFingerprintInputs = {
+  risk: string;
+  decision: string;
+  option_effects: Array<{ option: string; effect: string }>;
+  decisive_evidence: Array<{ object_id: string; revision: number; conclusion: string }>;
+  validity: { expires_at: number | null; expired: boolean };
+  consequence: string;
+};
+
+export type AttentionMaterialProjection = {
+  item_id: string;
+  subject: string;
+  material_key: string;
+  fingerprint: string;
+  generation: number;
+  inputs: MaterialFingerprintInputs;
+  computed_at: number;
+};
+
+export type AttentionAuditLink = {
+  work_id: string;
+  item_id: string;
+  item_revision: number;
+  approval_id: string | null;
+  receipt_id: string | null;
+  outbox_event_id: string;
+};
+
+export type StaleAttentionBody = {
+  error: "conflict";
+  message: "stale attention revision";
+  code: "stale_attention";
+  item_id: string;
+  expected_revision: number;
+  current_revision: number;
+  current_state: AttentionItem["state"];
+  current_effect_state: AttentionItem["effect_state"];
+  decision_package_url: string;
+};
 export type AttentionCardSnapshot = { item_id: string; revision: number };
 
 export type AffectedAttentionCard = { item_id: string; conclusion: string; revision: number };
@@ -81,4 +142,7 @@ export type AttentionDecisionInput = {
   reason?: string;
   expected_contract_revision?: number;
   affected_cards?: AttentionCardSnapshot[];
+  /** Freshness tokens used by the Phase A decision package. */
+  attention_revision?: number;
+  material_fingerprint?: string;
 };

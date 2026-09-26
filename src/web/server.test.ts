@@ -444,11 +444,24 @@ test("generic stop changes work state and stale decision conflicts", async () =>
   const { base } = await runningServer(seedLedger(), { controlPath, actor: "operator" });
   const inbox = await (await fetch(`${base}/api/attention/inbox`)).json();
   expect(inbox).toHaveLength(1);
-  const selected = await fetch(`${base}/api/attention/item-1/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "stop" }) });
+  const decisionPackage = await (await fetch(`${base}/api/context/decision-package?item_id=item-1&work_id=${encodeURIComponent(work.work_id)}`)).json() as Record<string, unknown>;
+  const selected = await fetch(`${base}/api/attention/item-1/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ attention_revision: decisionPackage.attention_revision, material_fingerprint: decisionPackage.material_fingerprint, selected_option: "stop" }) });
   expect(selected.status).toBe(200);
   const inspect = openControl(controlPath); const event = inspect.query("SELECT detail FROM control_attention_events WHERE item_id=? AND kind='applying'").get("item-1") as {detail:string}; expect(JSON.parse(event.detail).selected_option).toBe("stop"); expect(getWork(inspect, work.work_id)?.state).toBe("stopped"); inspect.close();
-  const stale = await fetch(`${base}/api/attention/item-1/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "continue" }) });
+  const stale = await fetch(`${base}/api/attention/item-1/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ attention_revision: decisionPackage.attention_revision, material_fingerprint: decisionPackage.material_fingerprint, selected_option: "continue" }) });
   expect(stale.status).toBe(409);
+  const conflict = await stale.json() as Record<string, unknown>;
+  expect(conflict).toMatchObject({
+    error: "conflict",
+    message: "stale attention revision",
+    code: "stale_attention",
+    item_id: "item-1",
+    expected_revision: item.revision,
+    current_state: "resolved",
+    current_effect_state: "succeeded",
+  });
+  expect(conflict.current_revision).toBeGreaterThan(item.revision);
+  expect(conflict.decision_package_url).toContain("/api/context/decision-package?");
 });
 
 test("generic narrow without replacement contract stays open", async () => {
@@ -502,6 +515,7 @@ test("POST resolve with server-side actor → 200", async () => {
   const item = upsertAttention(control, { item_id: "actorok-item", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "decide", trigger: "t", impact: "i", recommendation: null, options: ["continue", "stop"], owner: "operator", expires_at: null, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {} }, 100);
   control.close();
   const { base } = await runningServer(seedLedger(), { controlPath, actor: "operator" });
-  const res = await fetch(`${base}/api/attention/actorok-item/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "stop" }) });
+  const decisionPackage = await (await fetch(`${base}/api/context/decision-package?item_id=actorok-item&work_id=${encodeURIComponent(work.work_id)}`)).json() as Record<string, unknown>;
+  const res = await fetch(`${base}/api/attention/actorok-item/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ attention_revision: decisionPackage.attention_revision, material_fingerprint: decisionPackage.material_fingerprint, selected_option: "stop" }) });
   expect(res.status).toBe(200);
 });

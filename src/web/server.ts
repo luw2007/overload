@@ -17,9 +17,9 @@ import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } 
 import { mgmtRoute } from "./mgmt-routes";
 import { contextRoute } from "./context-routes";
 import { recordAcceptance } from "../manage/manifest";
-import { actOnAttention, ControlError, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract, promoteWork } from "../control/store";
+import { actOnAttention, ControlError, createWork, getAttention, getAttentionMaterial, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, resolveAttention, reviseContract, promoteWork } from "../control/store";
 import { previewContractRevision } from "../control/store";
-import type { Contract } from "../control/types";
+import type { AttentionDecisionInput, AttentionItem, Contract, StaleAttentionBody } from "../control/types";
 import { notificationCapability } from "../notify/nudge";
 import { initializeLedger } from "../ingest/ingest";
 import { publishControlEvents } from "../control/outbox";
@@ -91,6 +91,20 @@ function controlError(error: unknown): Response {
     return json({ error: error.code, message: error.message }, { status });
   }
   throw error;
+}
+
+function staleAttentionBody(item: AttentionItem, expectedRevision: number): StaleAttentionBody {
+  return {
+    error: "conflict",
+    message: "stale attention revision",
+    code: "stale_attention",
+    item_id: item.item_id,
+    expected_revision: expectedRevision,
+    current_revision: item.revision,
+    current_state: item.state,
+    current_effect_state: item.effect_state,
+    decision_package_url: `/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`,
+  };
 }
 
 async function bodyObject(request: Request): Promise<Record<string, unknown>> {
@@ -299,75 +313,96 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         }
         const attentionRoute = url.pathname.match(/^\/api\/attention\/([^/]+)\/(ack|defer|resolve|feedback)$/);
         if (request.method === "POST" && attentionRoute) {
-          const itemId = routeParameter(attentionRoute[1]!); const action = attentionRoute[2]!; const input = await bodyObject(request); const control = openControl(controlPath);
+          const itemId = routeParameter(attentionRoute[1]!);
+          const action = attentionRoute[2]!;
+          const control = openControl(controlPath);
+          let revision: number | null = null;
           try {
-            const revision = expectedRevision(input.expected_revision);
-            if(action==="resolve"&&input.selected_option==="narrow"&&(!Number.isSafeInteger(input.expected_contract_revision)||!Array.isArray(input.affected_cards)))throw new ControlError("invalid","Review the contract and affected cards before applying narrow.");
-            if (action === "feedback") { recordAttentionFeedback(control, itemId, revision, input.useful === true, typeof input.reason === "string" ? input.reason : undefined); return json(getAttention(control, itemId)); }
-            const attention = getAttention(control, itemId);
-            if (itemId.startsWith("mgmt:accept:") && action === "resolve") {
-              if (input.selected_option === "defer") return json(attention);
-              if (
-                input.selected_option !== "accept" &&
-                input.selected_option !== "reject"
-              )
-                throw new ControlError(
-                  "invalid",
-                  "invalid acceptance decision",
-                );
-              const manifestId = itemId.slice(itemId.lastIndexOf(":") + 1);
-              return json(
-                recordAcceptance(
-                  control,
-                  manifestId,
-                  input.selected_option === "accept" ? "accepted" : "rejected",
-                  attention?.owner || "operator",
-                  typeof input.reason === "string"
-                    ? { reason: input.reason }
-                    : {},
-                  Date.now(),
-                ),
-              );
+            const input = await bodyObject(request);
+            const suppliedRevision = input.attention_revision ?? input.expected_revision;
+            if (typeof suppliedRevision !== "number") return json({ error: "invalid", message: "attention_revision required" }, { status: 400 });
+            revision = expectedRevision(suppliedRevision);
+            if (action === "resolve" && input.selected_option === "narrow" && (!Number.isSafeInteger(input.expected_contract_revision) || !Array.isArray(input.affected_cards))) {
+              throw new ControlError("invalid", "Review the contract and affected cards before applying narrow.");
             }
-            // 决策消费必须有服务端注入的可信 actor；缺身份 → 501，不得伪造 "web-server" 默认值。
-            if (action === "resolve" && (!actor || !actor.trim())) return json({ error: "not_implemented", message: "decision action requires server-side actor identity" }, { status: 501 });
-            if (
-              action === "resolve" &&
-              attention?.evidence.kind === "coordinator_delivery"
-            ) {
-              const tasks = openStore(options.orchestratorPath);
-              try {
-                const coordinator = new Coordinator(tasks, control);
-                if (input.selected_option === "accept")
-                  return json(
-                    coordinator.acceptDelivery(
-                      attention.work_id,
-                      itemId,
-                      revision,
-                      attention.owner,
-                    ).attention,
-                  );
-                if (input.selected_option === "reject")
-                  return json(
-                    coordinator.rejectDelivery(
-                      attention.work_id,
-                      itemId,
-                      revision,
-                      attention.owner,
-                    ),
-                  );
-                throw new ControlError(
-                  "invalid",
-                  "invalid coordinator decision",
-                );
-              } finally {
-                tasks.close();
+            if (action === "feedback") {
+              recordAttentionFeedback(control, itemId, revision, input.useful === true, typeof input.reason === "string" ? input.reason : undefined);
+              return json(getAttention(control, itemId));
+            }
+            const current = getAttention(control, itemId);
+            const suppliedFingerprint = typeof input.material_fingerprint === "string" ? input.material_fingerprint : "";
+            if (current && suppliedFingerprint) {
+              const material = getAttentionMaterial(control, itemId);
+              if (!material || material.fingerprint !== suppliedFingerprint) {
+                return json(staleAttentionBody(current, revision), { status: 409 });
               }
             }
-            return json(actOnAttention(control, itemId, revision, action as "ack" | "defer" | "resolve", { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined, selected_option: typeof input.selected_option === "string" ? input.selected_option : undefined, replacement_contract: input.replacement_contract as
-                    | Contract | undefined, expected_contract_revision: input.expected_contract_revision as number | undefined, affected_cards: input.affected_cards as
-                    | Array<{item_id:string;revision:number}> | undefined }, actor));
-          } catch (error) { return controlError(error); } finally { control.close(); }
+            if (itemId.startsWith("mgmt:accept:") && action === "resolve") {
+              if (current && current.revision !== revision) return json(staleAttentionBody(current, revision), { status: 409 });
+              if (input.selected_option === "defer") return json(current);
+              if (input.selected_option !== "accept" && input.selected_option !== "reject") {
+                throw new ControlError("invalid", "invalid acceptance decision");
+              }
+              const manifestId = itemId.slice(itemId.lastIndexOf(":") + 1);
+              return json(recordAcceptance(
+                control,
+                manifestId,
+                input.selected_option === "accept" ? "accepted" : "rejected",
+                current?.owner || "operator",
+                typeof input.reason === "string" ? { reason: input.reason } : {},
+                Date.now(),
+              ));
+            }
+            // Decision consumption requires a trusted server-injected actor. Never accept identity from request data.
+            if (action === "resolve") {
+              if (!actor || !actor.trim()) return json({ error: "not_implemented", message: "decision action requires server-side actor identity" }, { status: 501 });
+              if (current?.evidence.kind === "coordinator_delivery") {
+                const tasks = openStore(options.orchestratorPath);
+                try {
+                  const coordinator = new Coordinator(tasks, control);
+                  if (input.selected_option === "accept")
+                    return json(coordinator.acceptDelivery(current.work_id, itemId, revision!, current.owner).attention);
+                  if (input.selected_option === "reject")
+                    return json(coordinator.rejectDelivery(current.work_id, itemId, revision!, current.owner));
+                  throw new ControlError("invalid", "invalid coordinator decision");
+                } finally {
+                  tasks.close();
+                }
+              }
+              if (!suppliedFingerprint) {
+                // No material token supplied → legacy resolve path for historical
+                // attention items that never got a context-assembler projection.
+                return json(actOnAttention(control, itemId, revision!, "resolve", {
+                  reason: typeof input.reason === "string" ? input.reason : undefined,
+                  selected_option: typeof input.selected_option === "string" ? input.selected_option : undefined,
+                  replacement_contract: input.replacement_contract as Contract | undefined,
+                  expected_contract_revision: input.expected_contract_revision as number | undefined,
+                  affected_cards: input.affected_cards as Array<{ item_id: string; revision: number }> | undefined,
+                }, actor));
+              }
+              const decision: AttentionDecisionInput = {
+                attention_revision: revision,
+                material_fingerprint: suppliedFingerprint,
+                selected_option: typeof input.selected_option === "string" ? input.selected_option : "",
+                reason: typeof input.reason === "string" ? input.reason : undefined,
+                replacement_contract: input.replacement_contract as Contract | undefined,
+                expected_contract_revision: input.expected_contract_revision as number | undefined,
+                affected_cards: input.affected_cards as Array<{ item_id: string; revision: number }> | undefined,
+              };
+              return json(resolveAttention(control, itemId, decision, actor));
+            }
+            return json(actOnAttention(control, itemId, revision, action as "ack" | "defer", {
+              defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined,
+              reason: typeof input.reason === "string" ? input.reason : undefined,
+            }, actor));
+          } catch (error) {
+            if (error instanceof ControlError && error.code === "conflict") {
+              if (error.details) return json(error.details, { status: 409 });
+              const current = revision === null ? null : getAttention(control, itemId);
+              if (current && revision !== null) return json(staleAttentionBody(current, revision), { status: 409 });
+            }
+            return controlError(error);
+          } finally { control.close(); }
         }
         if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive) }))));
         if (request.method === "GET" && url.pathname === "/api/q1") return json(withReadonlyDb(ledgerPath, queryQ1).map(({ platform: _platform, ...row }) => row));
