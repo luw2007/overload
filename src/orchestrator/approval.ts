@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SpoolWriter } from "./spool";
 import { getTask, transition } from "./store";
-import { closeTarget, consumeDecision, defaultMailboxPath, getTarget, markReceipt, openMailbox, receipt, registerTarget } from "../decision-bot/mailbox";
+import { closeTarget, consumeDecision, defaultMailboxPath, expireActiveTargets, getTarget, markReceipt, openMailbox, receipt, registerTarget } from "../decision-bot/mailbox";
 import { loadPolicy, policyAuthorizes } from "../decision-bot/policy";
-import { getWork, getAttention, upsertAttention, enqueueControlEvent } from "../control/store";
+import { getWork, getAttention, supersedeAttentionById, upsertAttention, enqueueControlEvent } from "../control/store";
 
 export const defaultAnswersPath=defaultMailboxPath; export const openAnswersDb=openMailbox;
 export type ApprovalGate="ready"|"ci_anomaly"|"confirm_stopped"|"keep_held";
@@ -39,7 +39,7 @@ export function requestApproval(db:Database,_spool:SpoolWriter,taskId:string,gat
 export function updateAttention(answers:Database,approvalId:string,state:"open"|"applying"|"resolved",effect:"not_started"|"applying"|"succeeded"|"failed"|"unknown",now:number,detail:string|null=null){const old=getAttention(answers,`orchestrator:${approvalId}`);if(!old||(old.state===state&&old.effect_state===effect&&old.effect_detail===detail))return;upsertAttention(answers,{...old,expected_revision:old.revision,state,effect_state:effect,effect_detail:detail},now);}
 function terminalOutcome(answers:Database,receiptId:string):string|null{const row=answers.query("SELECT outcome FROM decision_receipts WHERE receipt_id=?").get(receiptId) as {outcome:string|null}|null;return row?.outcome??null;}
 /** Reconcile receipt/card only from observed task state; never manufacture success. */
-export function reconcileApprovalEffects(db:Database,answers:Database,now=Date.now()):void{for(const a of db.query("SELECT * FROM approvals WHERE consumed_at IS NOT NULL").all() as any[]){const task=getTask(db,a.task_id);if(!task)continue;const r=receipt(answers,"orchestrator",a.approval_id);if(!r)continue;let state:"open"|"applying"|"resolved"="applying",effect:"applying"|"succeeded"|"failed"|"unknown"="applying",outcome:string|null=null;
+export function reconcileApprovalEffects(db:Database,answers:Database,now=Date.now()):void{for(const a of db.query("SELECT * FROM approvals WHERE consumed_at IS NOT NULL").all() as any[]){const task=getTask(db,a.task_id);if(!task)continue;const r=receipt(answers,"orchestrator",a.approval_id);if(!r)continue;const existingAttn=getAttention(answers,`orchestrator:${a.approval_id}`);if(existingAttn&&existingAttn.state==="superseded")continue;let state:"open"|"applying"|"resolved"="applying",effect:"applying"|"succeeded"|"failed"|"unknown"="applying",outcome:string|null=null;
  // The human is owed the reason, not just the verdict: carry the task's own blocked/terminal cause.
  let detail:string|null=null;
  if(task.state==="done"){state="resolved";effect="succeeded";outcome="succeeded";}
@@ -59,4 +59,4 @@ export function consumeAnswers(db:Database,answers:Database,spool:SpoolWriter,no
    updateAttention(answers,approval.approval_id,"applying","applying",now);if(!terminalOutcome(answers,r.receiptId))markReceipt(answers,r.receiptId,"unknown",now);spool.emit(task.stable_id??task.task_id,"decision_resolved",{request_id:approval.approval_id,state:"applying",receipt_id:r.receiptId});
  }
 }
-export function expireApprovals(db:Database,_spool:SpoolWriter,now=Date.now(),answers=openMailbox()):void{for(const a of db.query("SELECT * FROM approvals WHERE consumed_at IS NULL AND expires_at<=?").all(now) as {approval_id:string;task_id:string}[]){const task=getTask(db,a.task_id);if(task?.state==="awaiting_human")transition(db,a.task_id,"gate_expire",{reason:"gate_expired"},now);closeTarget(answers,"orchestrator",a.approval_id,"expired");updateAttention(answers,a.approval_id,"open","failed",now,"gate_expired");}}
+export function expireApprovals(db:Database,_spool:SpoolWriter,now=Date.now(),answers=openMailbox()):void{for(const a of db.query("SELECT * FROM approvals WHERE consumed_at IS NULL AND expires_at<=?").all(now) as {approval_id:string;task_id:string}[]){const task=getTask(db,a.task_id);if(task?.state==="awaiting_human")transition(db,a.task_id,"gate_expire",{reason:"gate_expired"},now);closeTarget(answers,"orchestrator",a.approval_id,"expired");const attn=getAttention(answers,`orchestrator:${a.approval_id}`);if(attn&&(attn.state==="open"||attn.state==="applying"))supersedeAttentionById(answers,attn.item_id,attn.revision,{reason:"gate_expired",actor:"orchestrator-expire"},now);}expireActiveTargets(answers,now);}
