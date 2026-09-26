@@ -18,11 +18,13 @@
 
 **需要新 schema 版本 v5**，在迁移里幂等回填所有缺根 problem 的 work。
 
+[已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
+
 ---
 
 ## 1. control/store.ts：schema 版本与迁移
 
-- `CONTROL_SCHEMA_VERSION = 4`：`src/control/store.ts:20`。
+- `CONTROL_SCHEMA_VERSION = 4`：`src/control/store.ts:20`。[已变更]：当前 CONTROL_SCHEMA_VERSION=5（store.ts:20），迁移链 v1→v2→v3→v4→v5。v4 收编 ensureContextReducerSchema，v5 回填根 problem（store.ts:166-168）。
 - `CONTROL_MIGRATIONS` 数组：`src/control/store.ts:157-162`。
   - v1 `:158` 建 `CONTROL_SCHEMA` + outbox。
   - v2 `:159` `ensureMgmtSchema`。
@@ -71,6 +73,8 @@
 - `:487` resolveAttentionDecision —— 前置 `:475 work.state!=="active" throw`，只在 active 内转 stopped，不产生新激活。
 - `:527` promoteWork —— 已建。
 
+[已过时]：redirectWork activate 分支已补 `ensureRootProblemLocked`（store.ts:292），createWork 幂等返回 active 也已补建（store.ts:250）。根 problem 由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建，orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
+
 ---
 
 ## 4. ensureRootProblem / ensureRootProblemLocked / rootProblemId
@@ -94,6 +98,8 @@
   - `:320-331` 对每个 work 调 `collectAndSpool({... problem_id: rootProblemId(row.work_id) ...})`。
   - **`:326` 无条件注入 `problem_id: rootProblemId(row.work_id)`**，无「problem 行是否存在」的判断。注释 `:324-325` 假设 Core 已建行。
 - `CollectorContext.problem_id` 是可选字段（`context-collector.ts:29`），但 orchestrator 总是传值；`buildEvent` `:127` 透传 `ctx.problem_id ?? null`。
+
+[已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 
 ---
 
@@ -165,6 +171,8 @@ DDL：`src/control/store.ts:62-75`。
 3. **redirectWork activate 分支补根 problem**：`src/control/store.ts:280` 之后（`:281` 之前），当 `state==="active"` 时 `ensureRootProblemLocked(db, workId, now);`。
 
 > 注：1 是对存量已部署库的一次性回填；2、3 是堵住今后再次产生「active 但无根 problem」的入口。三者互补，缺一不可——只做 1 不做 2/3，下次 createWork 幂等命中或 redirect activate 又会破。
+
+[已过时]：以上三项改动已全部落地。v5 迁移（store.ts:166-168）+ createWork 幂等返回补建（store.ts:250）+ redirectWork activate 补建（store.ts:292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 
 ### 9.3 archived 范围决策
 - 「archived」是 mgmt 层 `mgmt_work_profile.track_state='archived'`（`src/manage/archive.ts:23`），**不删 orchestrator 的 tasks 行，也不改 control_works.state**。

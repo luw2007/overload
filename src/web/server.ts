@@ -11,7 +11,7 @@ import type { ConsumerOwner } from "../decision-bot/mailbox";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate, loadPolicy, matchingRule, policyAuthorizes, rulesReport } from "../decision-bot/policy";
 import { disablePolicyRule, enablePolicyRule, proposeRuleFromAttention } from "../decision-bot/policy";
 import { DecisionBotService } from "../decision-bot/service";
-import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
+import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
 import { mgmtRoute } from "./mgmt-routes";
@@ -225,7 +225,10 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
           const control = openControl(controlPath);
-          try { return { q1: queryQ1(db).length, q2: queryQ2(db).length, hung: queryHung(db).length, open_incidents: health.open_incidents.length, coverage_gaps: health.coverage_gaps, telemetry_gaps: health.telemetry_gaps }; }
+          try {
+            const q2Count = (db.query("SELECT count(*) n FROM current WHERE queue='q2'").get() as { n: number }).n;
+            return { q1: queryQ1(db).length, q2: q2Count, hung: queryHung(db).length, open_incidents: health.open_incidents.length, coverage_gaps: health.coverage_gaps, telemetry_gaps: health.telemetry_gaps };
+          }
           finally { control.close(); }
         }));
         if (request.method === "GET" && /^\/api\/attention\/(now|inbox|done)$/.test(url.pathname)) {
@@ -368,7 +371,6 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         }
         if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive) }))));
         if (request.method === "GET" && url.pathname === "/api/q1") return json(withReadonlyDb(ledgerPath, queryQ1).map(({ platform: _platform, ...row }) => row));
-        if (request.method === "GET" && url.pathname === "/api/q2") return json(withReadonlyDb(ledgerPath, queryQ2));
         if (request.method === "GET" && url.pathname === "/api/archive") return json(withReadonlyDb(ledgerPath, queryArchive));
         if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyDb(ledgerPath, (db) => {
           const view = queryZombie(db);
@@ -562,7 +564,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
 }
 
 function dashboardRoute(path: string): boolean {
-  return /^\/(conversations|decide|ledger|works|tasks|candidates|rules|agents|now|inbox|done|sessions|health|q1|q2|archive|hung|zombie)(?:\/.*)?$/.test(path);
+  return /^\/(conversations|decide|ledger|works|tasks|candidates|rules|agents|now|inbox|done|sessions|health|q1|archive|hung|zombie)(?:\/.*)?$/.test(path);
 }
 
 if (import.meta.main) {

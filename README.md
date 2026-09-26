@@ -21,7 +21,7 @@ The dashboard listens exclusively on `127.0.0.1:4870`. Do not proxy or bind it t
 ```sh
 cd /path/to/overload
 bun test
-scripts/setup.sh --install
+scripts/setup.sh
 bun src/cli/overload.ts doctor
 open http://127.0.0.1:4870
 ```
@@ -59,12 +59,16 @@ bun src/cli/overload.ts inbox               # items that can wait; batch later
 bun src/cli/overload.ts done                # decided or archived
 bun src/cli/overload.ts attention <id>                 # inspect one card
 bun src/cli/overload.ts attention <id> ack|defer|resolve
+bun src/cli/overload.ts attention <id> feedback <json>  # rate a card's usefulness
 bun src/cli/overload.ts works
-bun src/cli/overload.ts candidates|candidate <id>
+bun src/cli/overload.ts candidates
+bun src/cli/overload.ts candidate <id> approve|enable <json>
 bun src/cli/overload.ts work create|revise|redirect|stop
 bun src/cli/overload.ts mgmt scan|works|show|track
+bun src/cli/overload.ts mgmt works --track <tracking|paused|archived>
 bun src/cli/overload.ts context purge --actor <id>
 bun src/cli/overload.ts sessions                       # default: last 30 days
+bun src/cli/overload.ts show <stable_id>                # read-only single-session view
 bun src/cli/overload.ts jump <stable_id|request_uid>
 bun src/cli/overload.ts ack <request_uid>...
 bun src/cli/overload.ts doctor
@@ -83,7 +87,7 @@ Q1 **Ack** changes only Overload's local request state to `acked`; it never answ
 shows gated decisions, consequential tool classes, captured `HANDOFF.md`
 status, human-wait dwell, pass rate, repeated failure patterns, and suggested
 approval rules. `--sample N` limits the most recently active sessions (`0`
-means all); `--since` accepts a duration such as `7d`, `24h`, or milliseconds.
+means all); `--since` accepts a duration with suffix `ms|s|m|h|d` (e.g. `7d`, `24h`, `30m`, `5000ms`; a bare number is milliseconds).
 Settled handoffs with `partial` or `blocked` status, or non-zero
 `uncertainties`, remain in the Inbox for human follow-up; complete,
 zero-uncertainty handoffs are archived normally.

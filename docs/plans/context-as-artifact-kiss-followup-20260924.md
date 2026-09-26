@@ -295,6 +295,8 @@ export function resolveAttentionByExternalSuccess(
 | skip          | **1**      |
 | fail          | **0**      |
 | 测试文件数         | **149**    |
+
+> [未采纳，时点快照不可证伪]：以上测试计数为成文时点基线，后续代码漂移后数字已变化，无法只读证伪。
 | expect () 调用数 | **3808**   |
 | 耗时            | **73.58s** |
 

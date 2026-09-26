@@ -110,7 +110,7 @@ Task ↔ Session：`bindRunnerSession` 按 `sessions.origin='orch:task:<id>:<att
 | `coordinator` | Work completion | `control_works.state='completed'`（只能通过 `acceptDelivery`） | mgmt 不得干预；此时 mgmt 也不归档 profile（不变式 ③） |
 | `orchestrator` | 受管 Task 完成 | `tasks` 状态机 + 其已有链路 | 同上 |
 
-不变式（均为单行条件更新，不依赖读后写）：① `origin_mode` 只能 `discovered → contract_governed`（`UPDATE … WHERE origin_mode='discovered'`，`changes=0` 即拒绝；与 `promoteWork` 同事务）；② `closeout_owner` 只能 `mgmt → coordinator`，恰好一次，只在 coordinator 首次 `dispatch` 时发生，反向不允许；③ manage 写 `track_state='archived'` 前必须附加 `AND closeout_owner='mgmt'`，故 coordinator 接管后 mgmt 归档自动失效，不与 `acceptDelivery` 竞争；④ **manage 的所有 SQL 中不得出现 `UPDATE control_works`**（可由 `src/manage/*.ts` 的源级抖动断言固定，见 §13.1）；⑤ 一个 Work 同时只能有一条活跃交接（§12.1 部分唯一索引）。
+不变式（均为单行条件更新，不依赖读后写）：① `origin_mode` 只能 `discovered → contract_governed`（`UPDATE … WHERE origin_mode='discovered'`，`changes=0` 即拒绝；与 `promoteWork` 同事务）；② `closeout_owner` 只能 `mgmt → coordinator`，恰好一次，只在 coordinator 首次 `dispatch` 时发生，反向不允许；③ 归档候选 work 在 SELECT 阶段已限定 `closeout_owner='mgmt'`（`src/manage/archive.ts:17`），UPDATE 语句未内联该条件（`archive.ts:23`），故 coordinator 接管后 mgmt 归档自动失效，不与 `acceptDelivery` 竞争；④ **manage 的所有 SQL 中不得出现 `UPDATE control_works`**（可由 `src/manage/*.ts` 的源级抖动断言固定，见 §13.1）；⑤ 一个 Work 同时只能有一条活跃交接（§12.1 部分唯一索引）。
 
 **用户可见语义（UI 必须如实表达，§11.3）**：归档的 discovered Work 在 Done 区显示为"**已归档（未作为正式 Work 完成）**"，**不得**显示为"已完成"；卡上并列"升级为 Work"入口，告知"升级后才能走验收与完成流程"。若用户确实需要一个"完成"结论，路径是：升级（`promoteWork`）→ 建 manifest → 验收卡 → 人工 accept，全程人在环。
 
@@ -270,16 +270,20 @@ control_works 0..1 ── orchestrator.tasks（coordinator 接管后，closeout_
 {"manage":{"enabled":false,"agents":["pi","omp","claude"],
   "hosts":[{"host":"devbox","kind":"local"},
            {"host":"builder","kind":"ssh","remote":"builder","ssh_cmd":"ssh"}],
-  "lookback_ms":604800000,"follow_new":true,"freshness_ms":120000,"archive_grace_ms":1800000,
+  "lookback_ms":604800000,"follow_new":true,"archive_grace_ms":1800000,
   "cwd_allow":["/path/to/repos","/path/to/workspaces"],
   "cwd_deny":["/","/tmp"],
-  "snapshot":{"file_max_bytes":2097152,"task_max_bytes":67108864,"retention_days":30}}}
+  "snapshot_root":"~/.overload/artifacts/mgmt",
+  "snapshot":{"file_max_bytes":2097152,"work_max_bytes":67108864,"retain_ms":2592000000}}}
 ```
 
 - 默认 `enabled:false`，与 `approval_gate`、`decision_bot` 一致（`docs/guides/configuration.md`）。
 - `hosts[]` 由 v3 的字符串数组改为对象数组（D1，§6.4.1）；`kind:"local"` 最多一项，其 `host` 必须等于本机 `~/.overload/host` 的内容。
 - `cwd_allow` 为空表示全部；**没有 `cwd_allow` 时仍拒绝 `$HOME` 根与 `/`**。
 - 三种范围分离：`agents/hosts/lookback/follow_new` = **发现范围**；`mgmt_work_profile.track_state='tracking'` = **持续同步范围**；UI 查询参数 = **筛选**。改变前两者不删除任何 `mgmt_*` 行与任何 Work。
+- `snapshot_root` 默认 `~/.overload/artifacts/mgmt`（`src/manage/manage.ts:23`）。`home_root` 不读 config.json，取环境变量 `OVERLOAD_HOME_ROOT`，缺省 `$HOME`（`manage.ts:23`）。
+- `follow_new` 被 `loadManageConfig` 读取（`manage.ts:23`），但 `scanOnce` 未使用——**死配置**，配置它无效果。
+- `freshness_ms` 是配置键，默认 `120000`（`src/manage/manage.ts` 的 `ManageConfig.freshness_ms`）；交接前置门禁把它作为 freshness 阈值，经 `checkHandoffPreconditions`/`createHandoff` 的 `freshnessMs` 选项传入（`src/manage/handoff.ts`）。
 
 ### 6.3 历史回填与持续增量
 
@@ -379,7 +383,7 @@ ssh 不可达（连接拒绝、`ConnectTimeout` 超时、认证失败、`ssh` �
 | kind | 来源证据 | canonical_key | 版本内容 |
 |---|---|---|---|
 | `file` | jsonl 中 `edit`/`write`（pi/omp）、`Edit`/`Write`/`MultiEdit`（claude）的 path 参数 + 工具结果非错误；bash 重定向仅作 `weak` 线索 | 仓库相对路径（在 `git rev-parse --show-toplevel` 内）或绝对路径 | 观察时刻的内容快照 + sha256 + size + mtime |
-| `git_commit` | `commit_observed{sha,repo}`；jsonl 中 bash `git commit` 成功后 `git rev-parse HEAD`；`Overload-Session` trailer（`src/extension/overload.ts:770-773`）为**强证据** | `repo_root@sha` | `git show --stat --format=fuller <sha>` + `git diff <sha>^..<sha>`（受大小限制） |
+| `git_commit` | `commit_observed{sha,repo}`；jsonl 中 bash `git commit` 成功后 `git rev-parse HEAD`；`Overload-Session` trailer（`src/extension/overload.ts:767-770`）为**强证据** | `repo_root@sha` | `git show --stat --format=fuller <sha>` + `git diff <sha>^..<sha>`（受大小限制） |
 | `git_dirty` | 采集时 `git status --porcelain` + `git diff` + 未跟踪列表 | `repo_root@dirty` | diff 快照（未跟踪只记路径与 sha256，除非已是 `file` 产物） |
 | `external` | jsonl 中 bash `gh pr create`/`gh pr view` 输出 URL；`tasks.pr_url`；用户手填 | 规范化 URL | `{url, provider, id, title?, state?, observed_at}`；历史不可取 → `history_available=false` |
 
@@ -410,7 +414,7 @@ ssh 不可达（连接拒绝、`ConnectTimeout` 超时、认证失败、`ssh` �
 
 ### 7.5 大小与保留
 
-单文件 > `file_max_bytes`（默认 2 MiB）→ 只存 sha256/size，`snapshot_state='too_large'`；单 Work 快照总量 > `task_max_bytes`（64 MiB）→ 新版本只存哈希并发一次 Inbox 卡 `mgmt:budget:<work_id>`；`retention_days` 后非 `accepted`、非 manifest/handoff 绑定的版本 blob 删除、行保留、`snapshot_state='pruned'`，被验收或被 manifest 引用的版本永久保留；忽略 `node_modules/`、`.git/`、`dist/`、`build/`、`target/`，lock 文件保留（lock 是产物）。
+单文件 > `file_max_bytes`（默认 2 MiB）→ 只存 sha256/size，`snapshot_state='too_large'`；单 Work 快照总量 > `work_max_bytes`（64 MiB）→ 新版本只存哈希并发一次 Inbox 卡 `mgmt:budget:<work_id>`；`retain_ms` 后非 `accepted`、非 manifest/handoff 绑定的版本 blob 删除、行保留、`snapshot_state='pruned'`，被验收或被 manifest 引用的版本永久保留；忽略 `node_modules/`、`.git/`、`dist/`、`build/`、`target/`，lock 文件保留（lock 是产物）。
 
 ### 7.6 历史版本不可取得
 
@@ -465,7 +469,7 @@ ssh 不可达（连接拒绝、`ConnectTimeout` 超时、认证失败、`ssh` �
 
 门禁基于 §5.0 三分与 `source_coverage`，**不允许只读 `current.state`**。
 
-**可信终止**：执行 `E` 可信终止当且仅当 (1) `source_coverage='ledger_full'`；(2) 该平台无未关闭 `incidents`（`src/ingest/reducer.ts:40-42`）；(3) `current.last_event_at >= now - freshness_ms`（默认 120 000）；(4) 满足其一——`state='done'|'failed'` 且有 `session_ended`；或 `state='idle'` 且该 `(stable_id, writer_id)` 的 `pid` 为 NULL 或 `process.kill(pid,0)` 失败（复用 `src/shared/resume.ts:26,47-49`）；或 `state='vanished'` **且**有进程级证明（pid 已死或 `emitter_drained`）——**仅凭平台快照缺席不足**，`session_vanished` 只表示平台视图缺席（`src/recon/recon.ts:374-383`）。不满足任一条 → `exec_state='unknown'`。
+**可信终止**：执行 `E` 可信终止当且仅当 (1) `source_coverage='ledger_full'`；(2) 该平台无未关闭 `incidents`（`src/ingest/reducer.ts:40-42`）；(3) `current.last_event_at >= now - freshness_ms`（阈值取配置键 `manage.freshness_ms`，默认 120000 ms，`src/manage/manage.ts`；门禁谓词在 `src/manage/handoff.ts` 的 `blocked()`）；(4) 满足其一——`state='done'|'failed'` 且有 `session_ended`；或 `state='idle'` 且该 `(stable_id, writer_id)` 的 `pid` 为 NULL 或 `process.kill(pid,0)` 失败（复用 `src/shared/resume.ts:26,47-49`）；或 `state='vanished'` **且**有进程级证明（pid 已死或 `emitter_drained`）——**仅凭平台快照缺席不足**，`session_vanished` 只表示平台视图缺席（`src/recon/recon.ts:374-383`）。不满足任一条 → `exec_state='unknown'`。
 
 | 场景 | 判定 | 同目录启动 | 隔离 worktree |
 |---|---|---|---|
@@ -604,7 +608,7 @@ UPDATE mgmt_executions SET exec_state=:verdict, ended_at=:decided_at, closeout_e
 
 **可逆性**：若该 `(stable_id, writer_id)` 后续又出现 `working`/`tool_activity`，说明判断错误 → 该执行回 `running`、`closeout_evidence` 追加 `revoked_at` 并保留原证据，同时触发 §9.8.3 的 reopen。这是本方案**唯一**允许从 `ended_*` 退回 `running` 的路径，必须留审计。
 
-**与 §9.1 启动门禁的关系**：两者用同一组证据但阈值不同——§9.1 的"可信终止"要求 `last_event_at >= now - freshness_ms`（**新鲜**，默认 120 s，因为要立刻启动新 Agent）；§9.8.0 相反要求 `last_event_at <= now - grace`（**陈旧**）。两者不冲突：前者是"刚结束，可以接力"，后者是"结束很久，可以归档"。实现上是两个独立谓词，不得共用一个布尔函数。
+**与 §9.1 启动门禁的关系**：两者用同一组证据但阈值不同——§9.1 的"可信终止"要求 `last_event_at >= now - freshness_ms`（**新鲜**，阈值取配置键 `manage.freshness_ms` 默认 120 s，因为要立刻启动新 Agent；谓词在 `src/manage/handoff.ts`）；§9.8.0 相反要求 `last_event_at <= now - grace`（**陈旧**）。两者不冲突：前者是"刚结束，可以接力"，后者是"结束很久，可以归档"。实现上是两个独立谓词，不得共用一个布尔函数。
 
 **file_only 执行**：条件 1 不成立（`source_coverage≠'ledger_full'`），故 `derived_closeout` 永远不成立，其 Work 不自动归档。这是有意的：没有 ledger 就没有进程级证据。用户可在 UI 显式"手动归档"（写 `archive_reason='manual'` + `actor`），这是人类动作而非派生转移。
 
@@ -617,7 +621,7 @@ UPDATE mgmt_executions SET exec_state=:verdict, ended_at=:decided_at, closeout_e
 满足谓词 → manage 在一个事务内**只做一件事**：
 
 ```sql
-UPDATE mgmt_work_profile SET track_state='archived', archived_at=?, archive_reason='closeout'
+UPDATE mgmt_work_profile SET track_state='archived', archived_at=?, archive_reason='all_executions_ended'
  WHERE work_id=? AND track_state='tracking' AND closeout_owner='mgmt';
 ```
 
@@ -662,11 +666,13 @@ reopen **不回滚** `control_works.state`：若已 `completed`（由 coordinato
 
 ## 11. API / CLI / UI 最小变更
 
-### 11.1 API（web server，loopback，同源校验沿用 `checkOrigin`，`src/web/server.ts:109-116`）
+### 11.1 API（web server，loopback，同源校验沿用 `checkOrigin`，`src/web/server.ts:112-119`）
 
 所有 `/api/mgmt/*` 的写操作与内容读取额外要求调用方为该 Work 的 `mgmt_work_profile.decision_owner`（§7.4.3）。
 
-`GET /works?track=&agent=&since=` 列表 · `GET /works/<id>` 详情（输入头、产物最新版本、manifest/验收状态、执行列表含 `source_coverage`、交接记录、跳转目标、缺口）· `POST /works/<id>/track` · `POST /works/<id>/promote {contract, reason}`（转调 `promoteWork`，`src/control/store.ts:337-350`）· `POST /works/<id>/inputs` · `POST /works/<id>/manifests {artifact_ids[], verification[]}` → `manifest_id` · `POST /works/<id>/handoffs {target_agent, isolate?, manifest_id?}`（**只生成不启动**）· `POST /handoffs/<id>/launch`（写 `_launch_attempts`）· `POST /handoffs/<id>/reconcile`（§9.6.2 只读）· `POST /handoffs/<id>/bind {stable_id}` · `POST /handoffs/<id>/abandon {attempt_id, reason}` · `POST /links/<id>/correct` · `POST /manifests/<id>/accept {verdict, reason}` · `POST /acceptances/<id>/submit {target, base?}`（先跑 §10.2 重算）· `GET /versions/<id>/content`（非 `stored` 或敏感态返回 404+state）· `POST /works/<id>/share-package {manifest_id}`（§7.4.3 白名单拼装）。
+`GET /works?track=&agent=&since=` 列表 · `GET /works/<id>` 详情（输入头、产物最新版本、manifest/验收状态、执行列表含 `source_coverage`、交接记录、跳转目标、缺口）· `POST /works/<id>/track` · `POST /works/<id>/promote {contract, reason}`（转调 `promoteWork`，`src/control/store.ts:337-350`）· `POST /works/<id>/inputs` · `POST /works/<id>/manifests {artifact_ids[], verification[]}` → `manifest_id` · `POST /works/<id>/handoffs {target_agent, isolate?, manifest_id?}`（**只生成不启动**）· `POST /handoffs/<id>/launch`（写 `_launch_attempts`）· `POST /handoffs/<id>/reconcile`（§9.6.2 只读）· `POST /handoffs/<id>/bind {stable_id}` · `POST /handoffs/<id>/abandon {attempt_id, reason}` · `POST /links/<id>/correct` · `POST /manifests/<id>/acceptance {verdict, reason}` · `POST /acceptances/<id>/submit {target, base?}`（先跑 §10.2 重算）· `GET /versions/<id>/content`（非 `stored` 或敏感态返回 404+state）· `POST /works/<id>/share-package {manifest_id}`（§7.4.3 白名单拼装）。
+
+其中 `POST /works/<id>/inputs`、`POST /handoffs/<id>/reconcile`、`POST /handoffs/<id>/bind`、`GET /versions/<id>/content`、`POST /works/<id>/share-package` 属后续阶段，未实现（`src/web/mgmt-routes.ts` 无对应路由）。
 
 关键响应差异（省略成功包体）：
 
@@ -722,7 +728,7 @@ overload mgmt share-package <work_id> --manifest <id> --out <dir>
 overload mgmt correct <link_id> --remove --reason "…"
 ```
 
-### 11.3 UI（沿用 Now/Inbox/Done + 新增 `Tasks` 页；`dashboardRoute` 加 `tasks`，`src/web/server.ts:339-341`）
+### 11.3 UI（沿用 Now/Inbox/Done + 新增 `Tasks` 页；`dashboardRoute` 加 `tasks`，`src/web/server.ts:424-426`）
 
 任务卡自上而下：① 一句话结论 + 状态；discovered（`candidate`）显示"未契约治理"徽章与"升级为 Work"入口。② 当前输入头版本（摘录 ≤ 200 字）与已确认约束。③ 产物列表：路径、版本 sha 前 8 位、"较上版 +12/-3 行"、验收徽章（草稿/待验收/已接受/已失效）、提交徽章（未提交/已推送/PR #n/已合并/提交失败）、共享徽章（**默认"不可分享"**）。④ 验证结果。⑤ 待决策：该 Work 下 open 的 Attention（内联）。⑥ Agent 接力记录：**执行**时间线（agent、`(stable_id, writer_id, attempt_no)`、起止、`exec_state`、`source_coverage`、跳转按钮）；`exec_state` 由 §9.8.0 派生得出时附"依据"浮层，展示 `closeout_evidence` 的判据（idle 时长、writer 证明、无待回答），**不得只写"已结束"**。⑦ 交接：选目标 Agent → 展示前置条件（`termination`/`coverage`/`freshness`）+ 缺口 → 生成交接包 → 启动；不满足时按钮禁用并显示具体原因 + "返回原现场"；`unknown`（含全部 file-only 源）时界面上 **不存在**同目录启动控件，只有一个"在隔离 worktree 中继续"按钮 + 必填风险确认勾选与理由（§9.1.1）。⑧ 折叠：完整执行记录、现场材料（uncertain）、可能相关任务、alias 来源历史。
 
@@ -1124,7 +1130,7 @@ sqlite3 /tmp/t.db "PRAGMA foreign_keys=ON; INSERT INTO c VALUES('x',NULL);"     
 14. **启动失败可恢复且不重复副作用**（P0-2，三子场景缺一不可）· **14a** executor 返回 `ENOENT` → `failed_no_effect`、handoff 回 `ready_to_launch`；重试后 `attempt_no=2` 而 handoffs 仍 1 行。**14b（危险路径）** executor 已 spawn 成功后 manage 被 `kill -9`（DB 只有 `requested` 行），重启 → 该行转 **`unknown`**（不是 `failed_no_effect`）；`handoff.state='launch_unknown'`；恰好 1 张卡且 `options` **精确等于** `['jump','attach','abandon']`（**不含 retry**）；再跑 10 轮，attempts 仍 1 行（证明不自动重试）。**14c** 14b 后 ledger 出现该 origin 的 Session，`POST /reconcile` → 转 `bound`、卡 `resolved`、无第二次启动。通用：任何路径下 `unknown` 的 external effect 行数不因重试增加，且不被自动流程重放。
 15. **产物改变后旧验收失效**（P1-7）· G M1 = {`a.ts@v1`, `b.ts@v1`} + `git_head=H1` + `verification=[checks exit 0]`；A1 accepted。W 分别改变 (i) `a.ts`→v2；(ii) **`b.ts`**→v2（manifest 中的另一个文件）；(iii) `git_head`→H2；(iv) checks 证据哈希变化，然后 submit。T **四种全部** 409 `manifest_drift`（含两个 manifest_id）；A1 `invalidated_at` 非空；无任何 push/PR 发生。(ii)(iii)(iv) 正是单版本绑定会漏掉的。
 16. **接受但提交失败不显示成功** · W `git push` 失败。T `state='failed'`；`external_ref IS NULL`；UI 徽章"提交失败"而非"已推送"；对应 external effect `unknown`；后续 submit 被阻止直到 reconcile。
-17. **结果回流并自动归档**（P1-6）· G 场景 12 完成，B 已 `session_ended`，无 open Attention、无在途 handoff/submission，存在 `mgmt_inputs(kind='acceptance')`。W 越过 `archive_grace_ms` 后 `--once`。T `track_state='archived'` + `archived_at` 非空 + `archive_reason='closeout'`（**真实状态转移**，非视图过滤）；`control_works.state` **保持原值**（本例仍 `candidate`）——manage 从不写它；outbox 有 `work.archived`。**17b** `closeout_owner='coordinator'` → `changes=0`，**profile 也不归档**，`control_works.state` 更不被 manage 改写。**17c reopen** 归档后出现新 `tool_activity` → 回 `tracking`、`archive_reason='reopened:new_activity'`；若已 `completed`（由 coordinator/人写入）则**保持** `completed`。**17d（本版新增，P1-6 残留项）无 `session_ended` 的外部 Session 也能归档**· G 一个 `source_coverage='ledger_full'` 的 pi 执行，最后事件是 `settled`（故 `current.state='idle'`），**从未出现 `session_ended`**；journal 有该 writer 的 `emitter_drained`；`requests` 无 pending 行。W 越过 `max(drain_grace_ms, archive_grace_ms)` 后 `--once`。T 该执行 `exec_state='ended_ok'` 且 `closeout_evidence` 非空并含 `rule='derived_closeout'`、`writer_proof.kind='emitter_drained'`（§9.8.0）；随后 `track_state='archived'`。**17e 负向** 同样场景但 (i) `requests` 有 pending 行，或 (ii) `pid` 仍存活，或 (iii) grace 未越，或 (iv) `source_coverage='file_only'` → 四种情形下 `exec_state` **仍为 `running`**、`closeout_evidence IS NULL`、`track_state` 仍 `tracking`。**17f 撤销** 17d 后又出现 `working` → `exec_state` 回 `running`、`closeout_evidence.revoked_at` 非空且**原证据字段保留**、Work 回 `tracking`。
+17. **结果回流并自动归档**（P1-6）· G 场景 12 完成，B 已 `session_ended`，无 open Attention、无在途 handoff/submission，存在 `mgmt_inputs(kind='acceptance')`。W 越过 `archive_grace_ms` 后 `--once`。T `track_state='archived'` + `archived_at` 非空 + `archive_reason='all_executions_ended'`（**真实状态转移**，非视图过滤）；`control_works.state` **保持原值**（本例仍 `candidate`）——manage 从不写它；outbox 有 `work.archived`。**17b** `closeout_owner='coordinator'` → `changes=0`，**profile 也不归档**，`control_works.state` 更不被 manage 改写。**17c reopen** 归档后出现新 `tool_activity` → 回 `tracking`、`archive_reason='reopened:new_activity'`；若已 `completed`（由 coordinator/人写入）则**保持** `completed`。**17d（本版新增，P1-6 残留项）无 `session_ended` 的外部 Session 也能归档**· G 一个 `source_coverage='ledger_full'` 的 pi 执行，最后事件是 `settled`（故 `current.state='idle'`），**从未出现 `session_ended`**；journal 有该 writer 的 `emitter_drained`；`requests` 无 pending 行。W 越过 `max(drain_grace_ms, archive_grace_ms)` 后 `--once`。T 该执行 `exec_state='ended_ok'` 且 `closeout_evidence` 非空并含 `rule='derived_closeout'`、`writer_proof.kind='emitter_drained'`（§9.8.0）；随后 `track_state='archived'`。**17e 负向** 同样场景但 (i) `requests` 有 pending 行，或 (ii) `pid` 仍存活，或 (iii) grace 未越，或 (iv) `source_coverage='file_only'` → 四种情形下 `exec_state` **仍为 `running`**、`closeout_evidence IS NULL`、`track_state` 仍 `tracking`。**17f 撤销** 17d 后又出现 `working` → `exec_state` 回 `running`、`closeout_evidence.revoked_at` 非空且**原证据字段保留**、Work 回 `tracking`。
 18. **敏感信息不进入可分享产物或交接包**（P0-3）· G (a) 普通 `src/x.ts`，密钥由字符串拼接构成、**故意不匹配任何单条正则**；(b) bash 工具结果含 `AWS_SECRET_ACCESS_KEY=…`；(c) 含前两者的 diff；(d) `.env`。W `/share-package` 与生成交接包。T 两者**均不含任何 blob 内容**，只有 `{path, size, content_sha256}` 引用；(a)(b)(c) 行 `shareable=0`（**因默认拒绝，而非因被扫出**）；(d) `withheld_sensitive`；`GET /versions/<id>/content` 对非 owner 403、对 `withheld_sensitive` 404+state。**诚实声明**：该断言证明的是**导出边界**，不是"扫描器能发现所有密钥"（§7.4）。
 
 ### 模型边界自查

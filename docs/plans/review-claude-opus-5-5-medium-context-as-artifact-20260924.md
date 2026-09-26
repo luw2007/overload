@@ -253,8 +253,8 @@
 
 | #   | 级别      | 标题                                                       | 位置                                                                | 建议修正                                                                                       |
 | --- | ------- | -------------------------------------------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| B1  | Blocker | createProblem 不幂等，且无法指定 `prob:<work_id>`                 | `context-pool.ts:181,184,93`；方案 §4.3 / §6 P0                      | 新增 `ensureRootProblem(work_id)`，做 get-or-create，id 由哈希派生并返回；禁止 reducer 直接 INSERT problem 行 |
-| B2  | Blocker | link 主键冲突，fact 出新 revision 时摄入失败                         | `context-pool.ts:397`、`store.ts:114`、`context-reducer.ts:189-224` | 改为 `ON CONFLICT(problem_id, object_id, role) DO UPDATE SET revision`；补充 rev1→rev2 的测试反例    |
+| B1  | Blocker | createProblem 不幂等，且无法指定 `prob:<work_id>`                 | `context-pool.ts:181,184,93`；方案 §4.3 / §6 P0                      | 新增 `ensureRootProblem(work_id)`，做 get-or-create，id 由哈希派生并返回；禁止 reducer 直接 INSERT problem 行 | [已修复] [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
+| B2  | Blocker | link 主键冲突，fact 出新 revision 时摄入失败                         | `context-pool.ts:397`、`store.ts:114`、`context-reducer.ts:189-224` | 改为 `ON CONFLICT(problem_id, object_id, role) DO UPDATE SET revision`；补充 rev1→rev2 的测试反例    | [已修复] [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 | B3  | Blocker | outbox / `applyControlEvent` 在 ledger 库，不是权威 attention 表 | `reducer.ts:84`、`outbox.ts:56-63`、`projection.ts:42-49`；方案 §3.4   | manage 调用 `upsertAttention` 及对应的状态流转 API，在同一 control 库事务内完成，带 `expected_revision`          |
 | B4  | Blocker | `ADD COLUMN` 不可重跑、回退不可行                                  | 方案 §3.2 / P0；`store.ts:155-163`                                   | 用 `PRAGMA table_info` 守卫；列只放在迁移里；回退 = 恢复 `VACUUM INTO` 备份                                  |
 | B5  | Blocker | P0 范围过大、依赖有缺陷的设计                                         | 方案 §6 P0                                                          | 拆成 P0'（见第 7 节），chunk /candidate 表后移                                                        |
@@ -308,8 +308,8 @@
 
 | 引用                                                                                                                    | 核验结果 |
 | --------------------------------------------------------------------------------------------------------------------- | ---- |
-| `src/control/context-pool.ts:181` = `problemId(work_id, parent, title)` 哈希派生 id                                       | ✅ 准确 |
-| `src/control/store.ts:114` = `PRIMARY KEY (problem_id, object_id, role)`                                              | ✅ 准确 |
+| `src/control/context-pool.ts:205（原 :181，createProblem 起始）` = `problemId(work_id, parent, title)` 哈希派生 id                                       | ✅ 准确 |
+| `src/control/store.ts:116（原 :114）` = `PRIMARY KEY (problem_id, object_id, role)`                                              | ✅ 准确 |
 | `src/ingest/reducer.ts:84` = `applyControlEvent(db, detail, row.at)`                                                  | ✅ 准确 |
 | `src/manage/schema.ts:109` = `CREATE TABLE mgmt_observations`                                                         | ✅ 准确 |
 | `src/manage/schema.ts:162` = `CREATE TABLE mgmt_summaries(subject_id, subject_version, generator)`                    | ✅ 准确 |
@@ -318,8 +318,8 @@
 | `src/control/projection.ts:42` = 读 `control_attention` 当前 revision                                                    | ✅ 准确 |
 | `src/control/outbox.ts:56` = `new Database(ledgerPath, {readonly:true})`                                              | ✅ 准确 |
 | `src/control/on-demand-fetcher.ts:211` = `reference.match(/^artifact:([^@]+)@([^@]+)$/)`                              | ✅ 准确 |
-| `src/control/store.ts:118` = `CREATE TABLE control_context_pins`                                                      | ✅ 准确 |
-| `src/control/store.ts:284` = `export function upsertAttention(...)`                                                   | ✅ 准确 |
+| `src/control/store.ts:120（原 :118）` = `CREATE TABLE control_context_pins`                                                      | ✅ 准确 |
+| `src/control/store.ts:292（原 :284）` = `export function upsertAttention(...)`                                                   | ✅ 准确 |
 | `src/manage/schema.ts:57` = `CREATE INDEX mgmt_versions_artifact ON mgmt_artifact_versions(artifact_id, observed_at)` | ✅ 准确 |
 | `src/manage/schema.ts:129` = `CREATE TABLE mgmt_links`                                                                | ✅ 准确 |
 | `src/manage/manifest.ts:106` = manifest 按 artifact/version 查 kind                                                     | ✅ 准确 |

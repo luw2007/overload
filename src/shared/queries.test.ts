@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ackRequest, queryHealth, queryHung, queryJumpTarget, querySession, querySessions, queryQ1, requestSession, queryQ2, queryArchive, queryZombie, sessionCutoff, SESSION_WINDOW_MS } from "./queries";
+import { ackRequest, queryHealth, queryHung, queryJumpTarget, querySession, querySessions, queryQ1, requestSession, queryArchive, queryZombie, sessionCutoff, SESSION_WINDOW_MS } from "./queries";
 
 const NOW = 1_755_000_000_000;
 const HOUR = 3_600_000;
@@ -206,7 +206,7 @@ describe("session list / inbox / archive surfaces", () => {
     db.close();
   });
 
-  test("queryQ2 lists ended inbox rows and queryArchive lists terminal rows without closeouts table", () => {
+  test("queryArchive lists terminal rows without closeouts table", () => {
     const db = sessionFixture();
     db.run("ALTER TABLE current ADD COLUMN origin TEXT");
     db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", ["local:pi:a", NOW, NOW]);
@@ -214,7 +214,6 @@ describe("session list / inbox / archive surfaces", () => {
     db.run("INSERT INTO current VALUES ('local:pi:a', 'idle', 'q2', NULL, ?, ?, ?, 'agent')", [NOW, NOW, NOW]);
     db.run("INSERT INTO current VALUES ('local:pi:b', 'idle', 'q4', NULL, ?, ?, ?, 'agent')", [NOW, NOW, NOW]);
 
-    expect(queryQ2(db, NOW).map((r) => r.stable_id)).toEqual(["local:pi:a"]);
     expect(queryArchive(db, NOW).map((r) => r.stable_id)).toEqual(["local:pi:b"]);
     db.close();
   });

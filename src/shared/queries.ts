@@ -21,7 +21,6 @@ export type SessionDetail = {
 };
 export type Q1Row = { request_uid: string; stable_id: string; host: string | null; kind: string; created_at: number; detail: Record<string, unknown> | null; binding: string | null; platform: string | null; host_probe_error: string | null; summary: string | null; options: string[] | null };
 export type JumpTarget = { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null; host_probe_error: string | null };
-export type Q2Row = { stable_id: string; origin: string; last_event_at: number };
 export type ArchiveRow = { stable_id: string; origin: string; last_event_at: number; closed_out?: true };
 export type HungRow = { stable_id: string; q5_reason: string; state: string; host: string | null; since: number | null; hung_ms: number; binding: string | null; detail: Record<string, unknown> | null; resume_capability?: ResumeCapability | null };
 export type ZombieView = {
@@ -204,13 +203,6 @@ export function queryHung(db: Database, now = Date.now()): HungRow[] {
     WHERE c.q5_reason IN ('turn_hung','dead_connection')
     ORDER BY since DESC, c.stable_id DESC`).all() as Array<Omit<HungRow, "detail" | "hung_ms"> & JsonRow>;
   return rows.map((row) => ({ ...withParsedDetail(row), hung_ms: row.since ? Math.max(0, now - row.since) : 0 }));
-}
-
-/** Inbox: ended sessions that have not been explicitly closed out by an operator. */
-export function queryQ2(db: Database, now = Date.now()): Q2Row[] {
-  const cutoff = sessionCutoff(now);
-  if (!hasCloseouts(db)) return db.query("SELECT stable_id, origin, last_event_at FROM current WHERE queue='q2' AND origin!='unknown' AND last_event_at>=? ORDER BY last_event_at DESC, stable_id DESC").all(cutoff) as Q2Row[];
-  return db.query("SELECT c.stable_id, c.origin, c.last_event_at FROM current c LEFT JOIN closeouts x ON x.stable_id=c.stable_id WHERE c.queue='q2' AND c.origin!='unknown' AND x.stable_id IS NULL AND c.last_event_at>=? ORDER BY c.last_event_at DESC, c.stable_id DESC").all(cutoff) as Q2Row[];
 }
 
 /** Done: terminal sessions plus operator-closed Q2 work. Audit view, not a todo. */

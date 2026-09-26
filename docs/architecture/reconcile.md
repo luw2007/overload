@@ -8,6 +8,8 @@
 
 **基线**：`1ba45da` 上 `bun test` 为 354 pass / 0 fail / 1 skip。
 
+> 行号为 2026-09-04 基线快照，后续波次（control/anomaly/decision-bot）使 orchestrator.ts/store.ts 等整体漂移约 20–130 行；语义仍以符号名（`renewLeases`/`ownedByMe`/`probeRunnerLiveness`/`task_recovery` 等）为准，不逐行校订。
+
 ---
 
 ## §0 先纠正三条对现状的误述
@@ -121,6 +123,14 @@ ownedByMe(task, now) := task.owner_instance IS NULL
 - **向后跳**：过期被推迟，真正死掉的 owner 的任务在时钟追平之前无人接管。**接受，并具名。** 后果是任务停滞、人等不到 gate；没有静默的错误结果。缓解只有一条：§2.2 的不可判定计数用 **tick 计数**而非墙钟，因此活性判定的那条界本身不受时钟跳变影响。
 
 不引入单调时钟。跨进程的单调基准需要新列 + 启动时校准，而收益只覆盖一个已被围栏降级的场景。**这是一条明示接受的风险，不是未发现的缺陷。**
+
+### 1.6 后续 control/budget 波次加入的三个 tick 谓词（与 lease 语义正交）
+
+`orchestrator.ts` 在本文基线之后又加入三个 tick 期检查，它们**不改变** §1.1–§1.5 的租约/围栏/活性判定，只在其外层短路或收尾，记录于此以免读者误以为它们是 lease 机制的一部分：
+
+- `superseded(task, now)`（`orchestrator.ts:59`）— work 的 contract 被新版取代时，写 `contract_superseded_occupancy_held` 事件并让该 tick 跳过此任务（`:147`）。它**不**抢租约、**不**判活、**不**触发 runner 恢复；占用保留在原 work 上，等人工处置。
+- `deadlineExceeded(task, now)`（`orchestrator.ts:80`）— `budget_deadline_at` 到期即 `human_abandon`（`:83`，理由 `managed_budget_deadline_exceeded`）。这是预算侧的终局收尾，与 lease 是否过期、runner 是否存活都无关。
+- `attemptRecovery(taskId)`（`orchestrator.ts:391`）— 对已落 `done/failed/abandoned/awaiting_human/blocked` 的任务做事后回流（`:153`），与 §3.2 的 `task_recovery`（spawn 提交记录）同名但不同职责：后者是崩溃前 spawn 的恢复凭证，前者是终态后的结果回流。二者不要混淆。
 
 ---
 

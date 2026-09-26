@@ -104,6 +104,8 @@ open (Now 或 Inbox)
 
 **结论**：底层能力齐全，但**回执推送通道**是本轮前端落地的最大缺口——原型用模拟弹窗演示，真实环境必须补 WebSocket/SSE 或轮询。
 
+注：服务端路由 `/api/context/decision-package`、`/api/context/fetch-full` 已存在（`src/web/context-routes.ts:40-41`），但前端 `src/web/static/app.js:348` 未接线 DecisionViewPackage，decide 页仍直接渲染 `/api/attention/*`。
+
 ---
 
 ## 4. 恢复自动化的边界

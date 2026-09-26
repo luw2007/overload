@@ -92,4 +92,4 @@ its origin, so agent-spawned worktrees classify as agent work.
 
 ## Remote spool pull
 
-The optional pull job copies a remote spool through SSH and `rsync`. Configure the remote, spool path, destination, command paths, failure threshold, and timeout in `~/.overload/config.json`; see [configuration.md](configuration.md). `scripts/deploy-devbox.sh` installs the pi/omp extension onto a reachable remote host over SSH; set `OVERLOAD_REMOTE` (and optionally `OVERLOAD_HOST_ID`) to target a host other than the default.
+The optional pull job copies a remote spool through SSH and `rsync`. Configure the remote, spool path, destination, command paths, failure threshold, and timeout as CLI flags to `src/pull/pull.ts` (see [configuration.md](configuration.md)). `scripts/deploy-devbox.sh` installs the pi/omp extension onto a reachable remote host over SSH; set `OVERLOAD_REMOTE` (and optionally `OVERLOAD_HOST_ID`) to target a host other than the default.

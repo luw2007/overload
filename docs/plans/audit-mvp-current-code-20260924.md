@@ -42,7 +42,7 @@
 
 - `createWork` — `store.ts:223-241`：INSERT control_works + control_contract_revisions + emitWork。**无任何 problem 创建**。
 - `promoteWork` — `store.ts:475-488`：reviseContract + UPDATE state='active' + emitWork。**无 problem 创建**。
-- 全仓非测试代码 grep `createProblem|problemId(`：仅命中 `context-pool.ts:93,172,181` 自身。**生产代码从未调用 createProblem**。
+- 全仓非测试代码 grep `createProblem|problemId(`：仅命中 `context-pool.ts:93,172,181` 自身。**生产代码从未调用 createProblem**。 [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 
 **`context-reducer.ts` 是否直接 INSERT problem 行：否。**
 
@@ -51,7 +51,7 @@
 ### 1.2 问题判定
 
 - B1 **确认**：`createProblem` 不幂等（撞 key 抛 conflict），id 由哈希派生不可指定（`context-pool.ts:181,93`）。
-- 更严重：**整个系统当前没有任何根 problem 被创建**。work 激活后 `control_context_problems` 为空，reducer 里 `payload.problem_id` 总是 null（见 §2），`resolveAttentionDecision` 里 `workHasContext`（`store.ts:392`）永远 false。
+- 更严重：**整个系统当前没有任何根 problem 被创建**。work 激活后 `control_context_problems` 为空，reducer 里 `payload.problem_id` 总是 null（见 §2），`resolveAttentionDecision` 里 `workHasContext`（`store.ts:392`）永远 false。 [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 
 ### 1.3 精确改动点
 
@@ -123,7 +123,7 @@
 399     .run(input.problem_id, input.object_id, revision, input.role, nowTs);
 ```
 
-普通 INSERT，**无 ON CONFLICT**。
+普通 INSERT，**无 ON CONFLICT**。 [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 
 **problem_objects 主键** — `store.ts:108-117`
 
@@ -287,7 +287,7 @@ db.query("UPDATE control_attention SET state='resolved',effect_state='succeeded'
 222   }
 ```
 
-**当前返回 `JSON.stringify(row)`（一行元数据 JSON），不读 snapshot_path 文件字节。**
+**当前返回 `JSON.stringify(row)`（一行元数据 JSON），不读 snapshot_path 文件字节。** [已过时]：fetcher artifact 分支已重写为读 snapshot_path 字节并 sha256 复验（on-demand-fetcher.ts:211-258），context-contract.ts:28 已同步。
 
 后续 hash 校验 — `on-demand-fetcher.ts:347-351`
 
@@ -347,7 +347,7 @@ db.query("UPDATE control_attention SET state='resolved',effect_state='succeeded'
 
 ### 5.1 当前代码事实
 
-**`CONTROL_SCHEMA_VERSION = 3`** — `store.ts:18`。
+**`CONTROL_SCHEMA_VERSION = 3`** — `store.ts:18`。 [已变更]：当前 CONTROL_SCHEMA_VERSION=5（store.ts:20），迁移链 v1→v2→v3→v4→v5。v4 收编 ensureContextReducerSchema，v5 回填根 problem（store.ts:166-168）。
 
 **迁移链** — `store.ts:155-159`
 
@@ -497,7 +497,7 @@ export function recordAttentionResolution(
 
 ### 8.3 schema 变更
 
-- `CONTROL_SCHEMA_VERSION` 3 → 4。
+- `CONTROL_SCHEMA_VERSION` 3 → 4。 [已变更]：当前 CONTROL_SCHEMA_VERSION=5（store.ts:20），迁移链 v1→v2→v3→v4→v5。v4 收编 ensureContextReducerSchema，v5 回填根 problem（store.ts:166-168）。
 - v4 迁移：把 `ensureContextReducerSchema` 的 dedup/quarantine 表 DDL 收编进版本链（CREATE TABLE IF NOT EXISTS 已在，ALTER 已守卫）。无新列、无 destructive。
 - `control_context_problem_objects` PK 不变（仍 `(problem_id, object_id, role)`），靠 upsert 语义处理 revision 演进。
 - mgmt schema 本期不加版本号。

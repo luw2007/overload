@@ -18,7 +18,7 @@
 | 5 | 里程碑不独立 | **已修**。§6 重排：M1 用 `repo` 路径作 `cwd`（不依赖 M2 worktree）；`awaiting_human` 在 M3 引入且同期就有 CLI 消费方；web 答复（M4）是 M3 的叠加面而非前提。 |
 | 6 | submitted 路径缺失 | **已修**。§3.8 定义 push / PR create / `pr_url` 写入 / CI 轮询 / `gh` 缺失 → `blocked(tool_missing)`。 |
 | 7 | failed 发 gate 与终态规则矛盾 | **已修**。新增非终态 `blocked`；`failed` 永不发 gate（§3.3）。 |
-| 8 | 预算与 follow-up 无限繁殖 | **已修**。ready 拒绝 → `blocked`（不扣预算，由人决定重跑并重置或放弃）；CI 异常 → 一条 `decision_requested`，人选 rerun/new-task/abandon，**不自动建单**、无 ancestry 机制。 |
+| 8 | 预算与 follow-up 无限繁殖 | **已修**。ready 拒绝 → `blocked`（不扣预算，由人决定重跑并重置或放弃）；CI 异常 → 一条 `decision_requested`，人选 recheck/manual-followup/abandon，**不自动建单**、无 ancestry 机制。 |
 | 9 | 并发上限计入非活跃态 | **已修**。上限只计 `starting|running`（§3.4）。 |
 | 10 | jump 降级不可接受 | **已修**。runner 经 `cmux new-workspace` 启动（与 `src/shared/resume.ts:40` 同一命令形态），会话取得真实 cmux surface，走既有 jump 链路。见 §3.7。 |
 | 11 | worktree 永不清理 | **已修**。`creating` 折进 `starting`（幂等探测）；`overload orch gc --older-than` 供人手动清理，orchestrator 自身每 5 分钟扫一次（见 §3.6）。只删 clean + 终态 + 无活进程者，dirty 只列不删。 |
@@ -94,7 +94,7 @@ M6 metrics / `queue_transitions` 读取方（决定 3）；plan gate（决定 2�
 2. `server.ts:83` `/api/summary` 的 `q2` 字段、`:87` `/api/q2` 路由删除；`tile-inbox`（`app.js:34`）改为 zombie + orphaned 计数。
 3. `queries.ts:145-147` 删 `queryQ2`；`queryArchive`（`:150-152`）谓词改为 `queue IN ('q2','q4')`。CLI `q2` 子命令（`src/cli/overload.ts:49-53`）删除，`printQ4`（`:54-58`）保留。`src/shared/types.ts:50` 的 `QueueName` 加 `"q4"`（`classifier.ts:64-66` 已实际产出）。
 
-**Done 的新定义**：会话已终结，Overload 不再需要你的注意力；它是审计视图，不是待办。终态 sticky（`reducer.ts:144`）保证进入即不再离开。**验收**：`/api/q2` 返回 404；`/api/archive` 同时含 `q2` 与 `q4` 行。
+**Done 的新定义**：会话已终结，Overload 不再需要你的注意力；它是审计视图，不是待办。终态 sticky（`reducer.ts:144`）保证进入即不再离开。**验收（用户 2026-09-26 裁定）**：删除 /api/q2 读取面（路由、queryQ2、summary 字段、agents 页 Closeout 区），POST /api/closeout 保留；q2 队列生产与 archive 投影不变。原 D1 的 /api/q2 返回 404 意图已按此落地：`server.ts` 不再注册 /api/q2，`queries.ts` 不再导出 queryQ2，agents 页不再渲染 Closeout 卡片与 bulk-closeout 按钮（POST /api/closeout 路由保留，UI 暂无入口，资格仍基于 queue='q2'）。
 
 ### 2.4 并行独立项（**不阻塞** orchestrator，各自独立提交）
 
@@ -114,7 +114,7 @@ M6 metrics / `queue_transitions` 读取方（决定 3）；plan gate（决定 2�
 
 独立 launchd 作业 `app.overload.orchestrator`（与现有四个同构，`KeepAlive=true`，`ProcessType=Background`，日志落 `~/.overload/logs/`）。单进程、单事件循环、**5s tick**，无线程、无 worker pool（并发 ≤4 = 最多 4 个受管会话）。
 
-独立进程而非 ingest 模块：(a) 爆炸半径隔离，orchestrator 是唯一持 repo 写权限并起长生命周期子进程的组件；(b) ingest 是无状态 2s 管道，混入有状态服务会让其重启不安全；(c) 它挂掉时可由 recon 的 `source_outage`（`src/pull/pull.ts:36`）报成 incident，Overload 侧零改动即可观测。
+独立进程而非 ingest 模块：(a) 爆炸半径隔离，orchestrator 是唯一持 repo 写权限并起长生命周期子进程的组件；(b) ingest 是无状态 2s 管道，混入有状态服务会让其重启不安全；(c) 它挂掉时可由 recon 的 `source_outage`（`src/pull/pull.ts:65`）报成 incident，Overload 侧零改动即可观测。
 
 ### 3.2 数据模型
 
@@ -132,6 +132,10 @@ CREATE TABLE IF NOT EXISTS tasks(
   runner_pid INTEGER, runner_boot_id TEXT,   -- 绑定后由 ledger 回填
   retry_budget INTEGER NOT NULL DEFAULT 2,
   stable_id TEXT, pr_url TEXT, blocked_reason TEXT, terminal_reason TEXT,
+  -- 以下 8 列由 control/anomaly 波次加入，旧库经 store.openStore 幂等 ALTER TABLE 补列（store.ts:34）
+  work_id TEXT, contract_revision INTEGER, budget_deadline_at INTEGER,
+  ci_observation_failures INTEGER NOT NULL DEFAULT 0,
+  stop_state TEXT, stop_requested_at INTEGER, stop_deadline_at INTEGER, stop_reason TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 
 -- queued 不持锁；活跃态每 repo 至多一个，由 DB 强制而非查询强制。
@@ -144,7 +148,7 @@ CREATE TABLE IF NOT EXISTS task_events(
 
 CREATE TABLE IF NOT EXISTS approvals(
   approval_id TEXT PRIMARY KEY,     -- 同时是 spool 事件的 request_id
-  task_id TEXT NOT NULL, gate TEXT NOT NULL CHECK(gate IN ('ready','ci_anomaly')),
+  task_id TEXT NOT NULL, gate TEXT NOT NULL CHECK(gate IN ('ready','ci_anomaly','confirm_stopped','keep_held')),
   question TEXT NOT NULL, options TEXT NOT NULL,   -- JSON 白名单
   requested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
   consumed_at INTEGER, actor TEXT);                -- 'ui' | 'cli'；消费即转移，不双写 answer
@@ -154,6 +158,16 @@ CREATE TABLE IF NOT EXISTS spool_seq(id INTEGER PRIMARY KEY CHECK(id=1),
 ```
 
 无 `worktree_locks` 表：锁即上面的 partial unique index。
+
+**后续波次新增的表**（control/anomaly/decision-bot 波次加入，建表 SQL 见 `src/orchestrator/schema.sql:47-127`，初版本文档未记）：
+- `task_recovery`（`schema.sql:38`）— spawn 提交记录，见 reconcile.md §3.2。
+- `applied_receipts`（`:47`）— decision-bot 回执落库。
+- `approval_intents`（`:53`）— 审批意图登记。
+- `context_collector_cursor`（`:63`）— 上下文采集器游标。
+- `attempt_signal_samples`（`:71`）— anomaly-monitor 按窗采样的 git churn 信号。
+- `attempt_check_results`（`:86`）— `orchestrator.check` 逐项机器可读结果。
+- `work_anomaly_budget`（`:102`）— 按 work_id 持久化的异常预算，新 attempt 继承不重置。
+- `anomaly_card_intents`（`:115`）— anomaly 决策卡意图。
 
 ### 3.3 状态机（全量转移表）
 
@@ -183,8 +197,8 @@ CREATE TABLE IF NOT EXISTS spool_seq(id INTEGER PRIMARY KEY CHECK(id=1),
 | submitted | `push_fail`（非快进 / 认证失败） | blocked(push_failed) | — |
 | submitted | `ci_merged` | done | — |
 | submitted | `ci_anomaly`（失败 / request-changes / 24h 无变化） | awaiting_human(gate=ci_anomaly) | — |
-| awaiting_human(ci) | `answer=rerun` | submitted（重触发，幂等） | — |
-| awaiting_human(ci) | `answer=new-task` | done（人另建任务；**不自动建单**） | — |
+| awaiting_human(ci) | `answer=recheck` | submitted（重触发，幂等） | — |
+| awaiting_human(ci) | `answer=manual-followup` | blocked(manual_followup)（人另建任务；**不自动建单**） | — |
 | blocked | `human_reopen`（CLI） | starting，预算重置为 2 | 重置 |
 | blocked | `human_abandon` | abandoned | — |
 | 任意活跃态 | `lease_expired` + reconciliation 判活进程已死 | 见 §3.5 | — |
@@ -192,6 +206,12 @@ CREATE TABLE IF NOT EXISTS spool_seq(id INTEGER PRIMARY KEY CHECK(id=1),
 **规则**：`failed` **永不发 gate**（只用于不可恢复：`repo_gone`、启动期 `tool_missing` 之外的结构性失败）；预算耗尽 → `blocked` 而非 `failed`；一切「需要人」的出口都是 `blocked` 或 `awaiting_human`，两者都非终态、都被 tick 覆盖，因此答案永远有消费方（修评审 §2-7）。
 
 **每态 tick 行为**：`queued` 尝试 claim（§3.4），不发事件、不占并发、不占 repo 锁；`starting` 幂等建 worktree → 持久化 `attempt_id` → spawn → 等绑定；`running` 查 runner 活性（§3.5），退出则采集 evidence 判定，每 60s 发一条 `heartbeat`；`awaiting_human` 消费 mailbox（§3.9）并检查 `expires_at`；`submitted` **每 5 分钟**（非每 tick）`gh pr view`；`blocked` 只等人且**不发新 gate**（只在进入时发一次）；终态不触碰。除终态外每 tick 续租。
+
+**control/budget 波次新增的运行态事件**（写 `task_events`，`store.ts:16-17` 转移表与 `orchestrator.ts` tick 内）：
+- `contract_superseded_occupancy_held`（`orchestrator.ts:72,76`）— work 的 contract 被新版取代，仍占用 repo 锁（`superseded()`），不自动抢占。
+- `budget_deadline_at` 到期 → `deadlineExceeded()`（`orchestrator.ts:80,83`）触发 `human_abandon`，理由 `managed_budget_deadline_exceeded`。
+- `no_attempt`（`store.ts:16-17`、`orchestrator.ts:191,264`）— 活跃任务缺 `attempt_id`，落 `blocked(no_attempt)`，不再静默空转。
+- `context_pending`（`orchestrator.ts:215,227`）— 必需上下文不可读时记录并等下 tick 重试，不 spawn、不静默回退。
 
 ### 3.4 claim：单事务 + partial unique index
 
@@ -252,7 +272,7 @@ cmux new-workspace --cwd <worktree> --focus false \
 | `commits.txt` | `git -C <wt> log --oneline <base_ref>..HEAD` | 是，≥1 行 |
 | `status.txt` | `git -C <wt> status --porcelain` | 是，为空 |
 | `checks.txt` | 执行 worktree 根的 `orchestrator.check` | 是，退出码 0 |
-| `runner.log` | 子进程输出尾部 | 否 |
+| `runner-<attempt_id>.log` | 子进程输出尾部（按 attempt 分文件，`runner.ts:46` 追加写；`evidence.ts:91` 取最新一个，回退才用 `runner.log`） | 否 |
 
 无 `orchestrator.check` → `blocked(no_check)`（不是 `failed`：装一个脚本就能继续，属人可恢复）。**不提供跳过开关**。
 
@@ -264,20 +284,22 @@ cmux new-workspace --cwd <worktree> --focus false \
 4. 持久化 `pr_url` → 状态 `submitted`。
 5. `gh` 不存在（`which gh` 失败或退出码 127）→ `blocked(tool_missing)`，**绝不静默转 done**。
 
-**CI recon**：`submitted` 期间每 **5 分钟** `gh pr view <url> --json statusCheckRollup,reviewDecision,mergeable`。合并 → `done`。异常（check 失败 / `reviewDecision=CHANGES_REQUESTED` / 24h 无任何变化）→ 发**一条** `decision_requested`，options `["rerun","new-task","abandon"]`，人选（决定 3）。同一 PR 的同一异常只发一次（`approvals` 以 `task_id+gate` 去重）。**不自动建任何任务。**
+**CI recon**：`submitted` 期间每 **5 分钟** `gh pr view <url> --json statusCheckRollup,reviewDecision,mergeable`。合并 → `done`。异常（check 失败 / `reviewDecision=CHANGES_REQUESTED` / 24h 无任何变化）→ 发**一条** `decision_requested`，options `["recheck","manual-followup","abandon"]`，人选（决定 3）。同一 PR 的同一异常只发一次（`approvals` 以 `task_id+gate` 去重）。**不自动建任何任务。**
 
 ### 3.9 审批 mailbox（唯一获准的反向通道）
 
-**选定：独立文件 `~/.overload/orchestrator-answers.db`（0600），单表。** 三行理由：(1) web 因此**永不打开** `orchestrator.db`，一个 web 侧缺陷无法枚举任务、approval 或状态；(2) schema 由 **orchestrator 启动时创建并迁移**（单一 DDL 所有者，避免 `dropRetiredColumns` 式的双进程迁移事故），web 只做 `INSERT OR IGNORE`，文件不存在时静默失败而不是自建；(3) 独立文件让「web 只写 / orchestrator 只读+删」的权限方向在文件系统层面就成立，无需靠代码自律。
+**选定：独立文件 `~/.overload/orchestrator-answers.db`（0600）。** 初版单表，现由 decision-bot mailbox 扩展为多表（`approval_targets`/`decision_receipts`/`bot_*` 等），文件路径不变。三行理由：(1) web 因此**永不打开** `orchestrator.db`，一个 web 侧缺陷无法枚举任务、approval 或状态；(2) schema 由 **orchestrator 启动时创建并迁移**（单一 DDL 所有者，避免 `dropRetiredColumns` 式的双进程迁移事故），web 与 orchestrator 共用 `openMailbox`，首次访问即建库建表（`mkdirSync` + `new Database(...,{create:true})`，`mailbox.ts:27`）；(3) 独立文件让「web 只写 / orchestrator 只读+删」的权限方向在文件系统层面就成立，无需靠代码自律。
 
 ```sql
 CREATE TABLE IF NOT EXISTS answers(
   approval_id TEXT PRIMARY KEY, answer TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL);
 ```
 
+**decision-bot 波次扩展的 mailbox 表与回执机制**（`src/decision-bot/mailbox.ts:28-42`，与初版 `answers` 同库同文件）：`approval_targets`（按 `consumer_owner+approval_id` 注册的审批目标，带 `target_version`/`effect`/`scope`/`state`）、`decision_receipts`（人或 bot 作答后落库的回执，UNIQUE `(consumer_owner,approval_id,target_version)`，保证同一目标版本只消费一次）、`bot_identity`/`bot_control`/`bot_attempts`/`bot_proposals`（bot 自身的身份、开关、租约与提案）、`receipt_effect_observations`（extension 回传的工具结果观测，按 `receipt_id+tool_call_id`）、`policy_candidates`/`policy_candidate_samples`/`policy_rule_state`/`policy_rule_events`（策略学习与治理）、`effect_reconcile_cursor`（对账游标）。作答即写 `decision_receipts` 并把对应 `approval_targets` 置 `consumed`；`expireActiveTargets`（`mailbox.ts:85`）把过期 active target 置 `closed/expired`，不删除。`answers` 表仍由人类 UI/CLI 写入，bot 路径走 `approval_targets`+`decision_receipts`。
+
 **写入方**：web 的 `POST /api/orchestrator/answer/<approval_id>`（`actor='ui'`）与 `overload orch answer <approval_id> <option>`（`actor='cli'`）写**同一张表**，因此 CLI 路径在 M3 就是完整可用的降级面，web 只是叠加。
 
-**消费（orchestrator 侧，每 tick）**：`approval_id` 必须在自有 `approvals` 有行、`consumed_at IS NULL`、`now < expires_at`、`answer` 命中 `options` JSON 白名单——四条全过才产生一次状态转移并写 `task_events`（含 `actor`），随后删除 answers 行；未知 `approval_id` **跳过且不消费**，因为这些 foreign rows 属于其他 mailbox consumer（例如按包含 `#` 的 `request_uid` 识别的 extension action gate），由其自身消费者处理，并在 7 天后过期清理。其余任一校验不过仍丢弃并记 `task_events`。**不把 answer 回写 `approvals`**（决定：删双写，审计留在 `task_events`）。保留策略：每 tick 删除 `at < now-7d` 的残留行。明确：伪造一个不存在 approval 的 answer 永远不会被 orchestrator 消费，forgery defense 不变。approval_id 命名空间隐式 distinct（UUID vs 含 `#` 的 request_uid）；若新增第三个 consumer，应增加 owner 列，而不是继续增加 skip 规则。
+**消费（orchestrator 侧，每 tick）**：`approval_id` 必须在自有 `approvals` 有行、`consumed_at IS NULL`、`now < expires_at`、`answer` 命中 `options` JSON 白名单——四条全过才产生一次状态转移并写 `task_events`（含 `actor`），随后删除 answers 行；未知 `approval_id` **跳过且不消费**，因为这些 foreign rows 属于其他 mailbox consumer（例如按包含 `#` 的 `request_uid` 识别的 extension action gate），由其自身消费者处理，并在 7 天后过期清理。其余任一校验不过仍丢弃并记 `task_events`。**不把 answer 回写 `approvals`**（决定：删双写，审计留在 `task_events`）。当前无 7d 残留行清理；过期 target 由 `expireActiveTargets`（`mailbox.ts:85`）关闭而非删除。明确：伪造一个不存在 approval 的 answer 永远不会被 orchestrator 消费，forgery defense 不变。approval_id 命名空间隐式 distinct（UUID vs 含 `#` 的 request_uid）；若新增第三个 consumer，应增加 owner 列，而不是继续增加 skip 规则。
 
 **web 侧附加检查（廉价，非保证）**：拒绝没有 `Sec-Fetch-Site`/`Sec-Fetch-Mode` 头的答复请求。浏览器必带，`curl` 默认不带；一行 `if` 就能提高本地脚本误触/顺手滥用的门槛，但攻击者补上头即可绕过——**这是卫生措施，不是认证**。
 
@@ -324,9 +346,11 @@ CREATE TABLE IF NOT EXISTS answers(
 
 不新增 kind 的理由：`types.ts:1-4` 是冻结契约，新增会波及 `classifier.ts:49-62` 与 `reducer.ts:127`，把 orchestrator 语义泄漏进核心。代价是「任务」在 Overload 眼里就是一个 `runtime=overload` 的会话——这恰好正确。
 
+**control_event outbox 投影（后续 control 波次加入，本文初版未记）**：core 侧 `src/control/outbox.ts` 提供 `ensureOutbox`/`enqueueControlEvent`/`publishControlEvents`，把 work/attention 变更以 `control_event` envelope kind 投到 ledger；`src/control/projection.ts` 的 `applyControlEvent` 在 ingest reducer 同一事务内把事件投影成 ledger 侧的 `applied_control_events`（事件去重 + payload_hash 校验）与 `control_attention`/`control_attention_feedback` 投影表。orchestrator 的 work/attention 状态变更经此 outbox 进 ledger，而非直接写 ingest 表；通知与只读查询消费 ledger 投影，权威状态仍在 control DB。详见 implementation-contract.md「Event transport」节。
+
 ### 4.2 边界
 
-orchestrator 只写：`orchestrator.db`、`artifacts/`、`worktrees/`、自己的 spool 目录。对 `ledger.db` 仅 `{readonly:true}` 打开，只查 `sessions` / `session_incarnations` / `journal`。`src/ingest/schema.sql` 的 14 张表**一律不写**。
+orchestrator 只写：`orchestrator.db`、`artifacts/`、`worktrees/`、自己的 spool 目录。对 `ledger.db` 仅 `{readonly:true}` 打开，只查 `sessions` / `session_incarnations` / `journal`。`src/ingest/schema.sql` 的 17 张表**一律不写**（其中 `applied_control_events`/`control_attention`/`control_attention_feedback` 为 control 投影表，由 `src/control/projection.ts` 在 ingest 事务内写入，orchestrator 仍不直接写）。
 
 反向：`src/web|recon|ingest|notify|pull|shared` **不得 import `src/orchestrator/`**，一行 CI grep 守：
 `grep -rn "from \"\.\./orchestrator\|from '\.\./orchestrator" src/ --include=*.ts | grep -v "^src/orchestrator/"` 必须无输出。
@@ -407,7 +431,7 @@ orchestrator 只写：`orchestrator.db`、`artifacts/`、`worktrees/`、自己�
 ### M5 — submitted：push + PR + CI recon
 - 新建：`src/orchestrator/submit.ts`（§3.8 的 push/PR 幂等链）、`pr.ts`（5 分钟 `gh pr view`、异常 → 一条 `decision_requested`）
 - 降级行为：`gh` 缺失 → `blocked(tool_missing)`，人手工建 PR 后 CLI `advance`；不静默成功。
-- 验收：批准后自动 push + 建 PR 且重复执行不产生第二个 PR；`gh` 不存在 → `blocked(tool_missing)`；CI 通过合并 → 静默 `done`（**无通知**）；CI 失败 → 一条含 rerun/new-task/abandon 的卡，**不自动建任务**
+- 验收：批准后自动 push + 建 PR 且重复执行不产生第二个 PR；`gh` 不存在 → `blocked(tool_missing)`；CI 通过合并 → 静默 `done`（**无通知**）；CI 失败 → 一条含 recheck/manual-followup/abandon 的卡，**不自动建任务**
 - **≈ 170 行**；回滚 = `submitted` 转 `blocked(manual_submit)` 交人处理
 
 **总计 ≈ +1085 / −35 行生产代码。** 依赖仅两条：M0 ≺ M4（web 守卫是答复路由的前提）；M2 ≺ M3（evidence 需要 worktree）。M4/M5 之间无依赖。
@@ -418,7 +442,7 @@ orchestrator 只写：`orchestrator.db`、`artifacts/`、`worktrees/`、自己�
 
 ### 7.1 删
 
-只一项：`queryQ2`、`/api/q2`、CLI `q2`、`app.js` 的 q2 表格（`queries.ts:145-147`、`server.ts:87`、`cli/overload.ts:49-53`、`app.js:102-110`）——D1，已在 M0。
+只一项：q2 读取面按用户 2026-09-26 裁定删除——`/api/q2` 路由、`queryQ2`、`/api/summary` 的 q2 取数（改为直接 `count(*) WHERE queue='q2'`）、`app.js` agents 页 Closeout 区与 bulk-closeout 按钮全部移除（`server.ts`、`queries.ts`、`app.js`）。POST /api/closeout 路由保留（资格仍基于 queue='q2'，UI 暂无入口），q2 队列生产（classifier）与 archive 投影不变。
 
 ### 7.2 **不删**（v1 相应条目撤销）
 

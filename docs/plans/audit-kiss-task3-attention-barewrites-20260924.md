@@ -1,4 +1,4 @@
-# 只读审计：收编剩余裸写 control_attention（KISS Task 3）
+# 只读审计：收编剩余裸写 control_attention（KISS Task 3）[已完成 2026-09-24 晚]
 
 - 审计时间：2026-09-24
 - 范围：`src/manage/` 全目录；对照 `src/control/store.ts`、`src/control/outbox.ts`、`src/control/types.ts`
@@ -8,6 +8,8 @@
 ---
 
 ## 0. 核心结论（先读）
+
+[已完成 2026-09-24 晚]：6 处裸写全部改走 control store 权威 API（supersedeOpenAttentionByWork / supersedeAttentionById / resolveAttentionByExternalSuccess / upsertAttention / recordAttentionResolution），manage/ 对 control_attention 仅剩 SELECT。
 
 `src/manage/` 下剩余直接写 `control_attention` 的裸写共 **3 处**：
 
@@ -25,7 +27,7 @@ P0 已收编的三处复核确认均已改调 Core API、无裸写：
 - `manifest.ts:247 recordAcceptance` → `recordAttentionResolution`（`manifest.ts:282`）
 - `launch.ts:53 unknownAttention` → `upsertAttention`（`launch.ts:59`）
 
-Core 当前 **缺两个导出 API**：(a) 按 item_id / 按 work+prefix 的 supersede；(b) 外部成功确认式 resolve（幂等、可在卡已终止时 no-op）。`supersedeAttention` 在 Core 内已有实现但是 private（`store.ts:330`），不导出。
+Core 当前 **缺两个导出 API**：(a) 按 item_id / 按 work+prefix 的 supersede；(b) 外部成功确认式 resolve（幂等、可在卡已终止时 no-op）。`supersedeAttention` 在 Core 内已有实现但是 private（`store.ts:342`，原 :330），不导出。
 
 ---
 
@@ -123,16 +125,16 @@ grep `control_works` 在 `src/manage/` 命中 10 处，逐处核对：
 | `upsertAttention` | `(db, input: Omit<AttentionItem,'revision'|'created_at'|'updated_at'|'defer_until'|'acknowledged_at'> & {expected_revision?}, now?)` → `AttentionItem` | 全字段 upsert；存在则 CAS（`WHERE item_id AND revision=old.revision`），不存在则 insert；写 events `upsert` + emit outbox | `store.ts:293-301` | 间接（可手工传 state='superseded'，但调用方要自己造全字段证据，且无理由字段约定） | 间接（可传 resolved/succeeded，但要自己读 revision、自己判断幂等） |
 | `getAttention` | `(db, itemId)` → `AttentionItem\|null` | 按主键读 | `store.ts:302` | — | — |
 | `listAttention` | `(db, zone?: 'now'\|'inbox'\|'done', now?)` → `AttentionItem[]` | 列表 + 分区过滤；done = resolved 或 superseded | `store.ts:303` | — | — |
-| `recordAttentionResolution` | `(db, itemId, expectedRevision, {verdict:'accepted'\|'rejected', actor, evidence}, now?)` → `AttentionItem` | 单卡带 revision CAS 的结论落地；accepted→resolved/succeeded（记 acknowledged_at）；rejected→superseded/**unknown**；persistAttention 写 events + outbox | `store.ts:376-406` | **半覆盖**：仅 rejected 分支写 superseded，且强制要求 actor、evidence，不适用"工件漂移自动 supersede"（无 actor） | 否 |
-| `resolveAttentionDecision` | `(db, itemId, expectedRevision, input: AttentionDecisionInput, now?, actor?)` → `AttentionItem` | 人工决策流：要求 pre-state open+not_started，选中 stop/continue/narrow，会 CAS 改 `control_works.revision` 并 supersede 受影响卡 | `store.ts:408-496` | 内部对 affected 卡调 `supersedeAttention`（`store.ts:488`），但这是合同修订副作用，不是外部触发的 supersede API | 否（会动 control_works，且要求 open+not_started） |
-| `actOnAttention` | `(db, itemId, expectedRevision, action:'ack'\|'defer'\|'resolve', input, actor?, now?)` → `AttentionItem` | ack/defer/裸 resolve；resolve 分支对 approval 关联卡有 `effect_state IN (not_started,applying,unknown)` 拦截（`store.ts:506`） | `store.ts:498-515` | 否 | 否（resolve 只置 state='resolved'，不显式置 effect_state='succeeded'，且对 unknown 卡会被 506 行拦截） |
+| `recordAttentionResolution` | `(db, itemId, expectedRevision, {verdict:'accepted'\|'rejected', actor, evidence}, now?)` → `AttentionItem` | 单卡带 revision CAS 的结论落地；accepted→resolved/succeeded（记 acknowledged_at）；rejected→superseded/**unknown**；persistAttention 写 events + outbox | `store.ts:388-418`（原 :376-406） | **半覆盖**：仅 rejected 分支写 superseded，且强制要求 actor、evidence，不适用"工件漂移自动 supersede"（无 actor） | 否 |
+| `resolveAttentionDecision` | `(db, itemId, expectedRevision, input: AttentionDecisionInput, now?, actor?)` → `AttentionItem` | 人工决策流：要求 pre-state open+not_started，选中 stop/continue/narrow，会 CAS 改 `control_works.revision` 并 supersede 受影响卡 | `store.ts:527-615`（原 :408-496） | 内部对 affected 卡调 `supersedeAttention`（`store.ts:607`，原 :488），但这是合同修订副作用，不是外部触发的 supersede API | 否（会动 control_works，且要求 open+not_started） |
+| `actOnAttention` | `(db, itemId, expectedRevision, action:'ack'\|'defer'\|'resolve', input, actor?, now?)` → `AttentionItem` | ack/defer/裸 resolve；resolve 分支对 approval 关联卡有 `effect_state IN (not_started,applying,unknown)` 拦截（`store.ts:625`，原 :506） | `store.ts:617-634`（原 :498-515） | 否 | 否（resolve 只置 state='resolved'，不显式置 effect_state='succeeded'，且对 unknown 卡会被 625 行拦截） |
 | `recordAttentionFeedback` | `(db, itemId, expectedRevision, useful, reason?, now?)` → void | 反馈；写 control_feedback + enqueue outbox `attention.feedback` | `store.ts:516` | 否 | 否 |
 | `recordStopCondition` | `(db, workId, conditionId, evidence, now?, expectedRevision?)` → `AttentionItem` | 开 stop-condition 卡（走 upsertAttention） | `store.ts:285-291` | 否（只开卡） | 否 |
 | `getWork` / `listWorks` / `createWork` / `reviseContract` / `redirectWork` / `promoteWork` | — | work 级操作；其中 reviseContract（`store.ts:268`）和 resolveAttentionDecision（`store.ts:488`）内部对 stale 卡调 private `supersedeAttention` | 见各行 | 仅内部使用 | — |
 
 **private 复用件（不导出，但新 API 应复用）：**
 - `persistAttention(db, old, item, kind, detail, now)` — `store.ts:368-371`：CAS UPDATE + INSERT events + emitAttention(outbox)。
-- `supersedeAttention(db, prior, workRevision, detail, now)` — `store.ts:330-339`：把 prior 置 superseded，evidence 合并 `superseded_by_work_revision`，调 persistAttention。**需要调用方先把 prior 整条 AttentionItem 读出来，且绑定一个 workRevision**——这正是 manage 层不直接用它的原因。
+- `supersedeAttention(db, prior, workRevision, detail, now)` — `store.ts:342-351`（原 :330-339）：把 prior 置 superseded，evidence 合并 `superseded_by_work_revision`，调 persistAttention。**需要调用方先把 prior 整条 AttentionItem 读出来，且绑定一个 workRevision**——这正是 manage 层不直接用它的原因。
 - `emitAttention(db, item, kind)` — `store.ts:224`：enqueueControlEvent，kind 形如 `attention.<kind>`。
 
 **覆盖矩阵结论：**

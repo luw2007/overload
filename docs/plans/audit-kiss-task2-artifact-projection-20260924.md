@@ -121,7 +121,7 @@ scanOnce (manage/manage.ts:38)
 
 合约定义：`src/shared/context-contract.ts:28`（`artifact:<id>@<ver>` → snapshot 原始字节，sha256=content_sha256）。
 
-**当前缺口：没有任何 producer 写入 reference 为 `artifact:...` 的 `control_context_object_versions` 行**（见第 5 节），故该分支虽可用但不可达。
+**当前缺口：没有任何 producer 写入 reference 为 `artifact:...` 的 `control_context_object_versions` 行**（见第 5 节），故该分支虽可用但不可达。[已过时 2026-09-24 晚]：新增 src/control/artifact-projection.ts，ctype='artifact' 由 requestAcceptance（manifest.ts:247）投影写入，createObject 不再零调用。
 
 ---
 
@@ -195,7 +195,7 @@ upsert 行为：`INSERT ... ON CONFLICT(problem_id,object_id,role) DO UPDATE SET
    - INSERT objects（:198-200）/ INSERT versions（:203-221）/ linkProblemObject（:224）/ dedup 表（:227-229）/ enqueue context.updated（:231-242）。
    - 仅服务 `ctype='fact'`，带 idempotency_key / quarantine / 乱序防护。
 
-**除测试外，没有任何地方用 `ctype='artifact'` 调 createObject。** grep 结果中非测试调用 createObject 为 0 处；唯一活写路径是 fact 摄入。投影器应复用范式 1（createObject/updateObject/linkProblemObject），不要走 fact reducer（reducer 强制 fact_subtype，context-reducer.ts:199-200）。
+**除测试外，没有任何地方用 `ctype='artifact'` 调 createObject。** grep 结果中非测试调用 createObject 为 0 处；唯一活写路径是 fact 摄入。投影器应复用范式 1（createObject/updateObject/linkProblemObject），不要走 fact reducer（reducer 强制 fact_subtype，context-reducer.ts:199-200）。[已过时 2026-09-24 晚]：新增 src/control/artifact-projection.ts，ctype='artifact' 由 requestAcceptance（manifest.ts:247）投影写入，createObject 不再零调用。
 
 ---
 
@@ -240,6 +240,8 @@ control 侧：`'unknown' | 'clean' | 'suspected' | 'confirmed_secret'`（store.t
 | `none` | stored（唯一落盘分支，collect.ts:26） | `clean` | 透传 mgmt.shareable（默认 0） |
 | `suspect`（二进制） | withheld_sensitive | `suspected` | 0 |
 | `withheld`（denylist/secret） | withheld_sensitive | `confirmed_secret` | 强制 0（pool 校验 :325） |
+
+> 实际实现：withheld→unknown（artifact-projection.ts:28），采纳 review-claude M6 反对意见，绝不映射成 confirmed_secret。
 | `unknown`（DDL 默认，如 deleted 行 collect.ts:24） | reference_only | `unknown` | 0 |
 
 ---
@@ -265,6 +267,8 @@ DDL CHECK 全集（schema.ts:51-52）+ 产生位置（collect.ts:61 派生）：
 
 ### 9.2 推荐触发点
 `requestAcceptance`（`src/manage/manifest.ts:213` upsertAttention 之前）调用 Core 新导出函数 `projectManifestArtifacts(db, manifestId, now)`，实现放 `src/control/`（建议新文件 `src/control/artifact-projection.ts`，复用 context-pool 的 createObject/updateObject/linkProblemObject）。
+
+> 实际实现：函数名 `projectArtifactVersions(db, work_id, now)`（artifact-projection.ts:67），按 work 全量投影 stored/reference_only version，触发点 `manifest.ts:247`（在 upsertAttention 之后调用）。
 
 对象建模：
 - 一个 mgmt artifact ↔ 一个 control object：`object_id = objectId(work_id, 'artifact', artifact_id)`（canonical_key 用 artifact_id 本身）。

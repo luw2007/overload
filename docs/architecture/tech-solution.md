@@ -86,12 +86,14 @@ watchdog（launchd 独立脚本，monotonic + 唤醒感知）
 ### 2.4c 队列
 
 - Q1 = requests.pending（唯一来源）。
-- Q2 = done ∧ origin∈{agent,unknown}；**Q4 v1 关闭**（auto_verified 为 P4 特性）。
+- Q2 = done ∧ origin∈{agent,unknown}。Q4 已落地，判据为 `done ∧ origin=agent ∧ 无变更证据`（`classifier.ts:77-79`）；原「Q4 v1 关闭、auto_verified 为 P4 特性」的说法已过时。
 - Q3 = working/idle 有心跳。
-- Q5 互斥 reason：`stalled`（心跳超时∧存活确认）、`dead_incarnation`（仅 process 域：pid 死∧无 shutdown）、`telemetry_gap`（对账见活 agent 进程∧spool 无对应 writer 或长静默——**这是降级检测的权威路径**，见 §3）、`orphaned_request`。
+- Q5 互斥 reason：`stalled`（心跳超时∧存活确认）、`dead_incarnation`（仅 process 域：pid 死∧无 shutdown）、`telemetry_gap`（对账见活 agent 进程∧spool 无对应 writer 或长静默——**这是降级检测的权威路径**，见 §3）、`orphaned_request`。后续扩展新增 `turn_hung`（一轮 turn 有心跳但无进度事件超过阈值）、`dead_connection`（连接失联）、`handoff_blocked`（交接被 partial/blocked 状态或不确定性卡住），三者见 `src/shared/types.ts:57` 的 `Q5Reason` 联合。
 - source_outage ≠ Q5：host/平台不可达 → 单条聚合 incident，受影响 session 冻结标记，恢复自动消解。
 
 ### 2.5 通知 outbox（N-1 终解）
+
+【已移除】v1 未实现 outbox；通知由 `src/notify/nudge.ts` 集合差直投，无重试/退避/failed_permanent。以下为原设计契约，保留作历史记录。
 
 `notifications(notification_uid INTEGER PRIMARY KEY, request_uid, sink, kind, reminder_seq, state, attempt_at, sent_at, retry_count)`，`kind ∈ {initial, reminder}`，UNIQUE`(request_uid, sink, kind, reminder_seq)`（initial 恒 reminder_seq=0，reminder 递增——多次提醒身份确定，重复插入被约束拒绝）（R4-B1），状态机 `pending → attempting → sent | pending(退避重试) | failed_permanent`：
 - **入队原子性**（R3-B2）：outbox 行由 reducer 在创建 pending 请求的**同一事务**内插入（outbox 是派生表，§2.4b 事务边界覆盖之）——不存在"cursor 已推进、通知未入队"窗口。

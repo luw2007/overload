@@ -8,9 +8,9 @@
 
 | 文件 | 存在 | 行数 | 备注 |
 |---|---|---|---|
-| src/control/store.ts | 是 | 488 | 含 `CONTROL_SCHEMA` + `CONTEXT_SCHEMA`(L59-137)；context CRUD 不在此文件 |
+| src/control/store.ts | 是 | 652 | 含 `CONTROL_SCHEMA` + `CONTEXT_SCHEMA`；context CRUD 不在此文件。[后续行数已漂移，原 482→652] |
 | src/control/types.ts | 是 | 82 | **无任何 context 类型**，只有 Work/Attention/Contract |
-| src/control/context-pool.ts | 是 | 407 | problem/object/version/pin(部分)/share 的 CRUD |
+| src/control/context-pool.ts | 是 | 433 | problem/object/version/pin(部分)/share 的 CRUD。[原 407→433] |
 | src/control/context-assembler.ts | 是 | 730 | 三类包装配主逻辑 |
 | src/control/context-reducer.ts | 是 | 266 | FactObserved → pool 投影 + 幂等/隔离 |
 | src/control/context-ingest.ts | 是 | 273 | spool NDJSON 摄入 |
@@ -18,7 +18,7 @@
 | src/control/context-propagation.ts | 是 | 237 | stale 检测 + 三入口复验 |
 | src/control/context-events.ts | 是 | 23 | outbox 事件别名 |
 | src/control/visibility-policy.ts | 是 | 163 | hide/short/long/full 可见性梯 |
-| src/control/on-demand-fetcher.ts | 是 | 375 | full 取源 + content_hash 校验 |
+| src/control/on-demand-fetcher.ts | 是 | 411 | full 取源 + content_hash 校验。[原 375→411] |
 | src/control/projection.ts | 是 | 59 | outbox 消费侧投影（attention） |
 | src/control/outbox.ts | 是 | 105 | control_outbox 队列 |
 | src/shared/context-contract.ts | 是 | 122 | FactObservedPayload + content_hash 权威定义 |
@@ -28,8 +28,8 @@
 | src/shared/resume.ts | 是 | 62 | 通用 session resume（journal 级） |
 | src/shared/redact.ts | 是 | 11 | 正则脱敏 |
 | src/orchestrator/context-collector.ts | 是 | 459 | observation 采集 → spool |
-| src/orchestrator/recovery-context.ts | 是 | 377 | 恢复包聚合 |
-| src/orchestrator/agent-task-context.ts | 是 | 143 | Agent 任务包 + prompt 注入 |
+| src/orchestrator/recovery-context.ts | 是 | 376 | 恢复包聚合。[原 377→376] |
+| src/orchestrator/agent-task-context.ts | 是 | 142 | Agent 任务包 + prompt 注入。[原 143→142] |
 | src/web/context-routes.ts | 是 | 123 | 2 个只读 GET 端点 |
 
 ---
@@ -38,7 +38,7 @@
 
 **结论：ctype 枚举齐全，但 ctype='artifact' 在生产中无任何写入方。**
 
-- 枚举定义：`control_context_objects.ctype` CHECK 在 `store.ts:78`（objective|constraints|fact|decision|artifact|scene）；TypeScript 镜像在 `context-pool.ts:7,101`。
+- 枚举定义：`control_context_objects.ctype` CHECK 在 `store.ts:80`（objective|constraints|fact|decision|artifact|scene）；TypeScript 镜像在 `context-pool.ts:7,101`。[行号 +2，原 :78→:80]
 - fact_subtype 约束：`store.ts:79,85-86`（fact 必须带 subtype，其余必须为 NULL）。
 - **artifact 对象与 mgmt_artifacts 的关系是松耦合的字符串引用，没有 FK、没有同步任务。**
   - `control_context_object_versions.reference` 是裸 TEXT，无格式校验（`context-pool.ts:93,143`）。
@@ -49,6 +49,7 @@
   - `createObject(` 全仓非测试调用方 = 0（仅 `context-pool.ts:284` 定义本身）。
   - 唯一的生产写入路径 `context-reducer.ts:198-200` 硬编码 `ctype="fact"`。
   - `reference` 字符串 `"artifact:..."` 的生产写入方 = 0（仅 `shared/context-contract.ts:28` 注释里描述）。
+  - [已过时 2026-09-24 晚]：新增 src/control/artifact-projection.ts，ctype='artifact' 由 requestAcceptance（manifest.ts:247）投影写入，createObject 不再零调用。
 - 判定：**ctype 表结构与 artifact reference 解析 = 已有实现；artifact 对象的生产写入 = 完全缺失（仅测试可达）。**
 
 ## 2. 是否存在 chunk 切分
@@ -80,7 +81,7 @@
 
 - 权威定义（`shared/context-contract.ts:16-37`）：
   - `content_hash = sha256(canonical_source_bytes)`。
-  - 逐源字节约定：`orchestrator:task_event:<id>` → `task_events.detail` 原文（L24）；`journal:<seq>` → `journal.detail`（L25）；`contract:<w>@<rev>` → `control_contract_revisions.contract` 原文（L26）；`attention:<id>@<rev>` → `JSON.stringify(row)`（L27）；`artifact:<id>@<ver>` → `JSON.stringify(row)`（L28）。
+  - 逐源字节约定：`orchestrator:task_event:<id>` → `task_events.detail` 原文（L24）；`journal:<seq>` → `journal.detail`（L25）；`contract:<w>@<rev>` → `control_contract_revisions.contract` 原文（L26）；`attention:<id>@<rev>` → `JSON.stringify(row)`（L27）；`artifact:<id>@<ver>` → `JSON.stringify(row)`（L28）。[已过时]：fetcher artifact 分支已重写为读 snapshot_path 字节并 sha256 复验（on-demand-fetcher.ts:211-258），context-contract.ts:28 已同步。
   - 纪律：collector 算 hash，reducer 只存比不算（L31-34）。
 - collector 侧实际：
   - test_result / observation_evidence：`sha256(task_events.detail ?? "")`（`context-collector.ts:211,313`），与 fetcher 返回的 `detail` 列逐字节一致（fetcher L193-201）。
@@ -93,13 +94,14 @@
   - **不读 snapshot_path 指向的文件字节**。`snapshot_path` 仅作为字符串出现在行 JSON 里。
   - 因此 artifact 的 content_hash = sha256(这 9 列固定顺序行的 JSON)，**不是** mgmt_artifact_versions.content_sha256（后者是 snapshot 文件字节哈希），二者无校验关系。
   - mgmt 侧真正读 snapshot 文件字节算 sha256 只发生在 `manage/submit.ts:166-167`（发布校验），与 context 闭环无关。
+  - [已过时]：fetcher artifact 分支已重写为读 snapshot_path 字节并 sha256 复验（on-demand-fetcher.ts:211-258），context-contract.ts:28 已同步。
 - 判定：task_event/journal/contract/attention 四条链 = 已有实现且闭环；artifact 行 JSON 闭环 = 已有实现但脆弱（依赖 SELECT 列集合与 collector 计算时完全一致，无测试/契约锁死该列序）；code_state/external_state 的 full 闭环 = 缺失；对 mgmt content_sha256/snapshot 字节的闭环 = 完全缺失。
 
 ## 5. pin 机制
 
 **结论：pin 钉住 (object_id, revision) 整版本；过期只读时返回 expired，不自动清理；purpose 枚举齐全。**
 
-- DDL：`control_context_pins`（`store.ts:118-127`），FK 到 `(object_id, revision)`，purpose CHECK `decision_evidence|recovery_checkpoint|other`（L123），`expires_at` 可空。
+- DDL：`control_context_pins`（`store.ts:120-129`），FK 到 `(object_id, revision)`，purpose CHECK `decision_evidence|recovery_checkpoint|other`（L125），`expires_at` 可空。[行号 +2，原 :118-127]
 - 创建：`context-pin.ts:59-84 pinContext`，显式要求 revision，校验版本存在。
 - **钉粒度 = object + 具体 revision，不是更细粒度（无 chunk、无 range）。** `getPinnedVersion` JOIN 到 pinned revision 而非 latest（`context-pin.ts:96-115`，注释 L92-95 明确“对象出新版后 pin 仍取旧版”）。
 - 过期处理：`readPinnedContent`（`context-pin.ts:146-183`）是**读取时惰性判定**：
@@ -113,7 +115,7 @@
 
 **结论：share 是 (object_id, revision, shared_with_work) 三元授权；confirmed_secret 在当前约束下自相矛盾，实际永远不可见。**
 
-- DDL：`control_context_shares`（`store.ts:128-137`），UNIQUE(object_id, revision, shared_with_work)，无 actor 列。
+- DDL：`control_context_shares`（`store.ts:130-139`），UNIQUE(object_id, revision, shared_with_work)，无 actor 列。[行号 +2，原 :128-137]
 - 授权：`context-pin.ts:187-228 shareObject`；**confirmed_secret 禁止 share**（L205-207 抛错）。
 - 建对象时同样禁止：`context-pool.ts:301`（createObject）与 `context-pool.ts:336`（updateObject）都强制 `confirmed_secret && shareable≠0 → invalid`。
 - visibility 过滤（`visibility-policy.ts:98-163 checkVisibility`）：
@@ -124,7 +126,7 @@
   5. 跨 work 对象要求 `shareable==1` 且有 share（L138-145）。
   6. 级别被 `SENSITIVITY_CAP` 封顶：confirmed_secret→full、suspected→short、clean→full（L29-33,148-160）。
 - **死锁**：confirmed_secret 对象既被建表/建对象时禁止 share（pool L301、pin L205），又在 checkVisibility 要求 share（L123）。两条约束合起来 = confirmed_secret 对象在装配时恒为 forbidden，full 正文永不可达。`SENSITIVITY_CAP[confirmed_secret]="full"` 是死代码。
-- 决策入口复验另有独立 fail-closed：`store.ts:390-416`（context 决策必须 decision_owner 本人）与 `context-propagation.ts:131-154`（share 必须精确绑 object_id+revision+work，禁止“B 名下任意 share 放行”）。
+- 决策入口复验另有独立 fail-closed：`store.ts:549-593`（context 决策必须 decision_owner 本人）与 `context-propagation.ts:131-154`（share 必须精确绑 object_id+revision+work，禁止”B 名下任意 share 放行”）。[行号大幅后移，原 :390-416→:549-593]
 - 判定：share 三元授权 + visibility 梯 + 跨 work 绑定 = 已有实现；confirmed_secret 闭环 = 自相矛盾（仅有表结构与两处互斥校验，无可用路径）。
 
 ## 7. 事件流全链路
@@ -164,7 +166,7 @@ control_outbox 表  [outbox.ts:20-27]
 
 - **outbox 在 reducer 写 pool 之后介入**（`context-reducer.ts:231-242`）：pool 落库与 outbox 入队在同一 immediate 事务内。
 - 决策卡侧：collector 的 `spoolContextEnvelope`（`context-collector.ts:424-435`）由 orchestrator.ts:358 调用，发 `context.pending/recovery_jump/recovery_package/recovery_reconcile`，ingest 把它们 upsert 成 `control_attention` 行（item_id=`ctx:<kind>:<work>:<task>`，`context-ingest.ts:126`）。
-- **关键断裂**：collector 从不设置 `problem_id`（`context-collector.ts:127` 用 `ctx.problem_id ?? null`，而 `orchestrator.ts:316-320` 的 collectContextFacts 不传 problem_id）。因此 reducer L223 的 linkProblemObject **永不执行**，`control_context_problem_objects` 恒空 → assembler `selectPoolObjects` 恒空。
+- **关键断裂**：collector 从不设置 `problem_id`（`context-collector.ts:127` 用 `ctx.problem_id ?? null`，而 `orchestrator.ts:316-320` 的 collectContextFacts 不传 problem_id）。因此 reducer L223 的 linkProblemObject **永不执行**，`control_context_problem_objects` 恒空 → assembler `selectPoolObjects` 恒空。[已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 - 判定：管道骨架 = 已有实现；pool→problem 绑定这一段 = 实际上空转。
 
 ## 8. 失效传播
@@ -197,7 +199,7 @@ control_outbox 表  [outbox.ts:20-27]
 - context 侧对 mgmt 表的唯一读：`on-demand-fetcher.ts:214-219` 的 artifact 分支（`mgmt_artifacts JOIN mgmt_artifact_versions`，强制 work_id 绑定）。
 - **不访问 `mgmt_artifact_versions.snapshot_path` 指向的文件**；snapshot_path 仅作为 SELECT 出的一列字符串进入行 JSON。
 - mgmt 自己的写/读在 `manage/collect.ts:62`（登记版本）、`manage/submit.ts:106,166-167`（发布时读 snapshot 字节复核 sha256），与 context 系统无回调、无事件同步。
-- 反向（mgmt → context）：无任何代码把新 artifact version 投影成 ctype='artifact' 的 context object；`context-propagation` 也不监听 mgmt 版本变化。
+- 反向（mgmt → context）：无任何代码把新 artifact version 投影成 ctype='artifact' 的 context object；`context-propagation` 也不监听 mgmt 版本变化。[已过时 2026-09-24 晚]：新增 src/control/artifact-projection.ts，ctype='artifact' 由 requestAcceptance（manifest.ts:247）投影写入，createObject 不再零调用。
 - 判定：读路径 = 已有实现；artifact version → context object 的生产投影 = 完全缺失。
 
 ---
@@ -233,3 +235,14 @@ control_outbox 表  [outbox.ts:20-27]
 | artifact version → context 自动投影/失效 | 完全缺失 |
 | snapshot 字节级 content_hash 闭环 | 完全缺失 |
 | confirmed_secret 可用路径 | 自相矛盾 |
+
+---
+
+## 后续新增（2026-09-24 晚 P0-MVP + KISS 三项 hotfix 落地）
+
+本文成文后，代码新增以下生产文件与 API，早期快照未覆盖：
+
+- `src/control/artifact-projection.ts`（约 263 行投影器）：`projectArtifactVersions(db, work_id, now)` 按 work 全量投影 mgmt stored/reference_only version 为 ctype='artifact' 的 context object，触发点 `manifest.ts:247` requestAcceptance。
+- v5 迁移：`store.ts:166-168` 遍历 `control_works` 逐行 `ensureRootProblemLocked` 幂等回填根 problem；`CONTROL_SCHEMA_VERSION` 现为 5。
+- 3 个 attention 收编 API：`store.ts:432 supersedeOpenAttentionByWork`、`store.ts:466 supersedeAttentionById`、`store.ts:490 resolveAttentionByExternalSuccess`。
+- `ensureRootProblem` / `rootProblemId` 导出：`context-pool.ts:98,236`，幂等 get-or-create 根 problem。

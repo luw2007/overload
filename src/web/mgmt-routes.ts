@@ -141,9 +141,9 @@ export async function mgmtRoute(request: Request, url: URL, options: MgmtRouteOp
       return json(await pollSubmissions(control, {}));
     if (m && request.method === "GET" && !m[2]) { const result = showWork(control, idOf(m[1]!)); return result ? json(result) : json({ error: "not found" }, { status: 404 }); }
     if (m && m[2] === "track" && request.method === "POST") { const x = await body(request); setTracking(control, idOf(m[1]!), x.on === true); return json({ ok: true }); }
-    if (m && m[2] === "handoff/preconditions" && request.method === "GET") return json(checkHandoffPreconditions(control, null, idOf(m[1]!)));
+    if (m && m[2] === "handoff/preconditions" && request.method === "GET") return json(checkHandoffPreconditions(control, null, idOf(m[1]!), { freshnessMs: loadManageConfig(options.overloadHome).freshness_ms }));
     if (m && m[2] === "handoffs" && request.method === "POST") {
-      const x = await body(request); if(!loadManageConfig(options.overloadHome).hosts.some(h=>h.host===String(x.target_host||"local")))throw new ControlError("conflict","target_host_unconfigured"); const result = createHandoff(control, null, idOf(m[1]!), { target_agent: x.target_agent as any, target_host: String(x.target_host || "local"), isolate: x.isolate === true, override_actor: typeof x.override_actor === "string" ? x.override_actor : undefined, override_reason: typeof x.override_reason === "string" ? x.override_reason : undefined });
+      const x = await body(request); const cfg = loadManageConfig(options.overloadHome); if(!cfg.hosts.some(h=>h.host===String(x.target_host||"local")))throw new ControlError("conflict","target_host_unconfigured"); const result = createHandoff(control, null, idOf(m[1]!), { target_agent: x.target_agent as any, target_host: String(x.target_host || "local"), isolate: x.isolate === true, override_actor: typeof x.override_actor === "string" ? x.override_actor : undefined, override_reason: typeof x.override_reason === "string" ? x.override_reason : undefined, freshnessMs: cfg.freshness_ms });
       return json(result, { status: 201 });
     }
     if (handoff && request.method === "GET" && handoff[2] === "packet") return json(buildHandoffPacket(control, idOf(handoff[1]!)));

@@ -21,7 +21,7 @@
 2. **problem_id 链路**：Execution collector 实际把根 problem_id 传入 fact 事件；fact v1/v2 都能幂等关联到问题。修复 `control_context_problem_objects` 普通 INSERT 在同一 object 多 revision 下主键冲突——改为 upsert 跟踪当前选定 revision。
 3. **attention 写路径**：manage 中核心 acceptance/manifest 路径的裸写 `control_attention` 改为调用 control store 权威 API，带 revision CAS 与事件。
 4. **artifact full 取源真实闭环**：on-demand-fetcher 的 artifact 分支读取 snapshot_path 对应快照字节，用 `mgmt_artifact_versions.content_sha256` 校验完整内容。snapshot 状态为 stored 才可读；路径安全限定在受管 snapshot。
-5. **schema 迁移安全**：CONTROL_SCHEMA_VERSION 3→4，迁移可重入（PRAGMA table_info 守卫），把游离的 `ensureContextReducerSchema` 收编进版本链。
+5. **schema 迁移安全**：CONTROL_SCHEMA_VERSION 3→4，迁移可重入（PRAGMA table_info 守卫），把游离的 `ensureContextReducerSchema` 收编进版本链。 [已变更]：当前 CONTROL_SCHEMA_VERSION=5（store.ts:20），迁移链 v1→v2→v3→v4→v5。v4 收编 ensureContextReducerSchema，v5 回填根 problem（store.ts:166-168）。
 6. **owner 红线**：Core 写 control 权威逻辑；Execution 只发事件/写 orchestrator 自有 DB；manage 不直写 control_works；Surface 只读/调 API。
 
 ### 明确不做（后续阶段）
@@ -102,7 +102,7 @@ export function recordAttentionResolution(
 
 ### 2.5 schema 变更
 
-- `CONTROL_SCHEMA_VERSION`：3 → 4
+- `CONTROL_SCHEMA_VERSION`：3 → 4 [已变更]：当前 CONTROL_SCHEMA_VERSION=5（store.ts:20），迁移链 v1→v2→v3→v4→v5。v4 收编 ensureContextReducerSchema，v5 回填根 problem（store.ts:166-168）。
 - v4 迁移（`src/control/store.ts` CONTROL_MIGRATIONS 追加）：
   ```ts
   { to: 4, destructive: false, apply(db) {

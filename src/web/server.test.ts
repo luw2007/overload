@@ -5,7 +5,7 @@ import { loadPolicy, proposePolicyCandidate } from "../decision-bot/policy";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { queryArchive, queryQ2 } from "../shared/queries";
+import { queryArchive } from "../shared/queries";
 import { createWork, getWork, getAttention, openControl, upsertAttention } from "../control/store";
 import { startWebServer } from "./server";
 
@@ -79,7 +79,6 @@ describe("web API", () => {
     writable.run("INSERT INTO current(stable_id, writer_id, state, queue, origin, last_event_at) VALUES ('known', 'w', 'done', 'q2', 'agent', 2), ('unknown', 'w', 'done', 'q2', 'unknown', 1)");
     writable.close();
     const readonly = new Database(path, { readonly: true });
-    expect(queryQ2(readonly, 0)).toEqual([{ stable_id: "known", origin: "agent", last_event_at: 2 }]);
     expect(queryArchive(readonly, 0)).toEqual([{ stable_id: "unknown", origin: "unknown", last_event_at: 1 }]);
     readonly.close();
   });
@@ -89,7 +88,6 @@ describe("web API", () => {
     const { base } = await runningServer(path);
     const headers = { origin: base };
     expect(await (await fetch(`${base}/api/closeout/done:pi:beta`, { method: "POST", headers })).json()).toEqual({ closed: true });
-    expect(await (await fetch(`${base}/api/q2`)).json()).toEqual([]);
     expect(await (await fetch(`${base}/api/archive`)).json()).toContainEqual(expect.objectContaining({ stable_id: "done:pi:beta", origin: "agent", closed_out: true }));
     expect((await fetch(`${base}/api/closeout/missing`, { method: "POST", headers })).status).toBe(404);
   });
@@ -292,7 +290,7 @@ describe("web API", () => {
 
   test("serves dashboard routes for zones, legacy tabs, and session deep links", async () => {
     const { base } = await runningServer(seedLedger());
-    for (const path of ["/now", "/inbox", "/done", "/sessions", "/health", "/q1", "/q2", "/archive", "/hung", "/zombie", `/sessions/${encodeURIComponent("remote:pi:alpha")}`]) {
+    for (const path of ["/now", "/inbox", "/done", "/sessions", "/health", "/q1", "/archive", "/hung", "/zombie", `/sessions/${encodeURIComponent("remote:pi:alpha")}`]) {
       const response = await fetch(`${base}${path}`);
       expect(response.status).toBe(200);
       expect(await response.text()).toContain('id="main"');

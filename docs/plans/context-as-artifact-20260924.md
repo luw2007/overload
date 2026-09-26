@@ -28,6 +28,8 @@ Artifact（权威内容：交付产物 / 过程产物 / 运行产物；owner、�
 
 ---
 
+> **现状快照（2026-09-24 晚补注）**：本 plan 成文后，P0-MVP + KISS 三项 hotfix 已落地：artifact-projection.ts 投影器、v5 根 problem 迁移、3 个 attention 收编 API。chunk 切分与自动失效传播仍未实现。下文为历史设计快照，关键矛盾段落已逐条标注。
+
 ## 1. 现状与差距判定
 
 ### 1.1 产物权威表与上下文对象表：双轨，且两侧都在空转
@@ -35,7 +37,7 @@ Artifact（权威内容：交付产物 / 过程产物 / 运行产物；owner、�
 **答案：双轨。**
 
 - 权威产物侧是 mgmt 库：`mgmt_artifacts` / `mgmt_artifact_versions`。但 `kind` DDL 声明 4 值（`file|git_commit|git_dirty|external`，`src/manage/schema.ts:44`），实际只写 `file` 和 `git_dirty`（`src/manage/collect.ts:58-61`）；`git_commit`、`external` 无写入点（审计 A §1）。
-- 上下文对象侧是 control 库：`control_context_objects` / `control_context_object_versions`，六张表 DDL 齐全（`src/control/store.ts:59-137`），但 `createObject` 全仓生产调用方为 0；唯一生产写入路径 `src/control/context-reducer.ts:198-200` 硬编码 `ctype='fact'`（审计 B §1、§7）。
+- 上下文对象侧是 control 库：`control_context_objects` / `control_context_object_versions`，六张表 DDL 齐全（`src/control/store.ts:59-137`），但 `createObject` 全仓生产调用方为 0；唯一生产写入路径 `src/control/context-reducer.ts:198-200` 硬编码 `ctype='fact'`（审计 B §1、§7）。 [已过时 2026-09-24 晚]：新增 src/control/artifact-projection.ts，ctype='artifact' 由 requestAcceptance（manifest.ts:247）投影写入，createObject 不再零调用。
 - 两侧之间没有同步任务。context 不维护 artifact 从属关系，mgmt 也从不把新 version 投影成 context object（审计 B §10）。
 
 ### 1.2 control_context_object_versions.reference 如何指向 mgmt artifact
@@ -44,7 +46,7 @@ Artifact（权威内容：交付产物 / 过程产物 / 运行产物；owner、�
 
 - `reference` 是裸 TEXT（`src/control/context-pool.ts:93,143`），格式由可见性策略白名单正则承认：`artifact:<id>@<version>`（`src/control/visibility-policy.ts:48`，正则 `/^artifact:.+@.+/`）。
 - 真正取源时才解析：`src/control/on-demand-fetcher.ts:211-222` 用 `^artifact:([^@]+)@([^@]+)$` 拆出 artifactId/versionId，同库 JOIN `mgmt_artifacts a JOIN mgmt_artifact_versions v`，并强制 `a.work_id = 当前 work_id` 做跨 work 绑定。
-- 生产中没有任何代码写入 `reference="artifact:..."`（审计 B §1）。即这条反查路径只有解析器，没有生产上游。
+- 生产中没有任何代码写入 `reference="artifact:..."`（审计 B §1）。即这条反查路径只有解析器，没有生产上游。 [已过时 2026-09-24 晚]：新增 src/control/artifact-projection.ts，ctype='artifact' 由 requestAcceptance（manifest.ts:247）投影写入，createObject 不再零调用。
 
 ### 1.3 决定 / pin / checkpoint 等过程产物是否已纳入统一产物归档
 
@@ -73,13 +75,13 @@ Artifact（权威内容：交付产物 / 过程产物 / 运行产物；owner、�
 **半通，且哈希对象错位。**
 
 - 契约定义 `content_hash = sha256(canonical_source_bytes)`，且 artifact 源约定为"被 fetch 时该行 `JSON.stringify(row)` 的字节"（`src/shared/context-contract.ts:28`）。
-- 实际 artifact 分支取源（`on-demand-fetcher.ts:214-219`）SELECT 固定 9 列（artifact_id/kind/canonical_key/version_id/content_kind/content_sha256/snapshot_path/snapshot_state/sensitivity），返回 `JSON.stringify(row)`。**它不读 `snapshot_path` 指向的快照文件字节**，snapshot_path 只是作为一列字符串出现在行 JSON 里。
+- 实际 artifact 分支取源（`on-demand-fetcher.ts:214-219`）SELECT 固定 9 列（artifact_id/kind/canonical_key/version_id/content_kind/content_sha256/snapshot_path/snapshot_state/sensitivity），返回 `JSON.stringify(row)`。**它不读 `snapshot_path` 指向的快照文件字节**，snapshot_path 只是作为一列字符串出现在行 JSON 里。 [已过时]：fetcher artifact 分支已重写为读 snapshot_path 字节并 sha256 复验（on-demand-fetcher.ts:211-258），context-contract.ts:28 已同步。
 - 因此 artifact 的 content_hash = sha256(9 列行 JSON)，与 `mgmt_artifact_versions.content_sha256`（快照文件字节哈希）**无校验关系**。mgmt 侧真正读快照字节复核 sha256 只发生在 `src/manage/submit.ts:166-167`（发布校验），与 context 闭环无关（审计 B §4）。
 - 另外 code_state / external_state 两类 reference 在 fetcher 里没有 handler，full 恒为 unavailable（`on-demand-fetcher.ts:229-230`）。
 
 ### 1.7 两条最致命断裂（方案必须优先接上）
 
-1. **pool 生产空转**：collector 从不传 `problem_id`（`src/orchestrator/context-collector.ts:127` 用 `ctx.problem_id ?? null`，而 `src/orchestrator.ts:316-320` 的 `collectContextFacts` 不传）→ reducer 的 `linkProblemObject`（`context-reducer.ts:223-225`）永不执行 → `control_context_problem_objects` 恒空 → `selectPoolObjects` 恒空。`createProblem` 零生产调用方。结果是三类包退化为"contract 直读 + 空数组"。
+1. **pool 生产空转**：collector 从不传 `problem_id`（`src/orchestrator/context-collector.ts:127` 用 `ctx.problem_id ?? null`，而 `src/orchestrator.ts:316-320` 的 `collectContextFacts` 不传）→ reducer 的 `linkProblemObject`（`context-reducer.ts:223-225`）永不执行 → `control_context_problem_objects` 恒空 → `selectPoolObjects` 恒空。`createProblem` 零生产调用方。结果是三类包退化为"contract 直读 + 空数组"。 [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 2. **失效传播是孤儿函数**：`markObjectUpdated` / `isStale` / `getStaleObjects`（`src/control/context-propagation.ts:15-96`）均无生产调用方；无 stale 列、无后台扫描、`staleness_ms` 列无人读（审计 B §8）。
 
 ---
@@ -233,7 +235,7 @@ control_context_candidate_log(
   1. **work 激活时建根问题（主路径）**：Execution 把一个 candidate work 激活为 active（`createWork`/`promoteWork` 已在 `control/store.ts`）时，同事务由 Core 调 `createProblem`，以 `problem_id = "prob:" + work_id` 为业务键建一条根 problem，绑定 work_id。这是"一个 work = 一个根问题树"的锚点，对应界面 Works 页的根节点。
   2. **首个 observation 到达时按需补建（兜底路径）**：若某条 `fact_observed` 事件带了 `problem_id` 但该 problem 行还不存在（例如老 session 先有 fact、work 后激活），Core reducer 在 `linkProblemObject` 前做一次 `INSERT OR IGNORE` 兜底建根，`problem_id` 沿用事件带来的值，`work_id` 从 payload 反查。这条路径只补不建全新语义，防止事实事件因缺 problem 行被丢进 quarantine。
   3. **人开新问题分支时建子问题**：Surface 在 Works 页"新建问题分支"（context-interaction-design §2.4）时调 Core 的 createProblem，挂到父 problem 下。
-- **幂等策略**：`problem_id` 为业务主键，三条路径全部 `INSERT OR IGNORE`；重复到达的激活信号/observation 不产生重复 problem。`problem_id` 命名稳定（`prob:<work_id>`），保证 work 重激活、resume、handoff 续跑都钉到同一条 problem 行，而不是每次新开会话建一个新问题。
+- **幂等策略**：`problem_id` 为业务主键，三条路径全部 `INSERT OR IGNORE`；重复到达的激活信号/observation 不产生重复 problem。`problem_id` 命名稳定（`prob:<work_id>`），保证 work 重激活、resume、handoff 续跑都钉到同一条 problem 行，而不是每次新开会话建一个新问题。 [未采纳，plan 性质命名选择差异]：实际实现为 sha256 派生 problem_id（context-pool.ts:181），非 prob:<work_id> 格式。
 - **为什么不让 orchestrator 直接写 problem 行**：problem 表在 control 库，按四 owner 红线只有 Core 能写 control 库；orchestrator 只负责"发出激活/有事实"的信号（经事件或在调用 Core API 时传入），由 Core 落 problem 行。这样 problem 的并发创建仍走 Core 的事务与 revision，不出现 orchestrator 直写 control 表的越界。
 
 ---
@@ -491,10 +493,10 @@ owner 划分遵循 §2.7。每阶段标注契约与验收反例。
 - artifact_versions DDL：`src/manage/schema.ts:47-56`；version INSERT：`src/manage/collect.ts:62`
 - exec_records 空表：`src/manage/schema.ts:114-119`
 - inputs 只写 user_message：`src/manage/store.ts:33-34`
-- sensitivity 分类器：`src/manage/classify.ts:3,16-28`；control sensitivity CHECK：`src/control/store.ts:95`
+- sensitivity 分类器：`src/manage/classify.ts:3,16-28`；control sensitivity CHECK：`src/control/store.ts:97（原 :95→:97）`
 - manage 不写 outbox / 直写 attention：`src/manage/manifest.ts:284,323`、`relations.ts:55`、`launch.ts:53,69`、`submit.ts:461`
 - acceptance 失效三路径：`manifest.ts:319`、`submit.ts:118`、`relations.ts:54`
-- context ctype CHECK：`src/control/store.ts:78`；唯一生产写入 ctype='fact'：`context-reducer.ts:198-200`
+- context ctype CHECK：`src/control/store.ts:80（原 :78→:80）`；唯一生产写入 ctype='fact'：`context-reducer.ts:198-200`
 - artifact reference 正则：`visibility-policy.ts:48`；full 反查 mgmt：`on-demand-fetcher.ts:211-222`
 - 装配规则分桶/预算：`context-assembler.ts:245-251,348-402,430-449`
 - content_hash 契约：`src/shared/context-contract.ts:16-37`

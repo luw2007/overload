@@ -8,7 +8,7 @@ import { canonicalWorkId, workScope } from "./relations";
 export type Precondition={ok:boolean;cause?:"source_running"|"blocked_on_ask"|"liveness_unknown"|"coverage_gap"|"inflight_handoff"|"contention";allowed:("same_workspace"|"isolate_with_confirmation")[];evidence:Record<string,unknown>};
 export type HandoffPacket=Record<string,unknown>;
 
-function blocked(ledger:Database|null,e:any,now:number):Precondition|null{
+function blocked(ledger:Database|null,e:any,now:number,freshnessMs=120_000):Precondition|null{
   let c:any=null;try{c=ledger?.query("SELECT state,last_event_at,last_heartbeat_at FROM current WHERE stable_id=?").get(e.stable_id);}catch{}
   let ask:any=null;try{ask=ledger?.query("SELECT 1 yes FROM requests WHERE stable_id=? AND state='pending' LIMIT 1").get(e.stable_id);}catch{}
   if(ask||c?.state==="awaiting"||c?.state==="blocked")return {ok:false,cause:"blocked_on_ask",allowed:[],evidence:{execution_id:e.execution_id,state:c?.state,pending_ask:!!ask}};
@@ -16,7 +16,7 @@ function blocked(ledger:Database|null,e:any,now:number):Precondition|null{
   if(["file_only","ledger_stale","gapped"].includes(e.source_coverage))return {ok:false,cause:"liveness_unknown",allowed:["isolate_with_confirmation"],evidence:{execution_id:e.execution_id,cause:e.source_coverage==="gapped"?"telemetry_gap":e.source_coverage,coverage:e.source_coverage}};
   if(!["ended_ok","ended_failed"].includes(e.exec_state)){
     if(!c&&e.exec_state==="running")return {ok:false,cause:"source_running",allowed:[],evidence:{execution_id:e.execution_id,state:e.exec_state}};
-    const last=Math.max(c?.last_event_at??0,c?.last_heartbeat_at??0,e.last_observed_at??0);if(!c||now-last>120_000)return {ok:false,cause:"liveness_unknown",allowed:["isolate_with_confirmation"],evidence:{execution_id:e.execution_id,cause:"stale",last_observed_at:last}};
+    const last=Math.max(c?.last_event_at??0,c?.last_heartbeat_at??0,e.last_observed_at??0);if(!c||now-last>freshnessMs)return {ok:false,cause:"liveness_unknown",allowed:["isolate_with_confirmation"],evidence:{execution_id:e.execution_id,cause:"stale",last_observed_at:last}};
   }
   return null;
 }
@@ -30,12 +30,12 @@ function contention(db:Database,workId:string){
   return {paths:[...new Set(rows.map(r=>r.path).filter(Boolean))],executions:[...new Set(rows.flatMap(r=>r.execution_id?[r.execution_id]:r.producer==="multiple"?["multiple"]:[]))],links:rows.map(r=>({version_id:r.version_id,relation:r.relation,confidence:r.confidence,producer:r.producer}))};
 }
 
-export function checkHandoffPreconditions(db:Database,ledger:Database|null,workId:string,opts:{now?:number}={}):Precondition{
-  const now=opts.now??Date.now();const execution=one<any>(db,"SELECT work_id FROM mgmt_executions WHERE execution_id=?",workId);if(execution)workId=execution.work_id;workId=canonicalWorkId(db,workId);const scope=workScope(db,workId),marks=scope.map(()=>"?").join(","),profile=one<any>(db,"SELECT work_id,track_state FROM mgmt_work_profile WHERE work_id=?",workId);
+export function checkHandoffPreconditions(db:Database,ledger:Database|null,workId:string,opts:{now?:number;freshnessMs?:number}={}):Precondition{
+  const now=opts.now??Date.now();const freshnessMs=opts.freshnessMs??120_000;const execution=one<any>(db,"SELECT work_id FROM mgmt_executions WHERE execution_id=?",workId);if(execution)workId=execution.work_id;workId=canonicalWorkId(db,workId);const scope=workScope(db,workId),marks=scope.map(()=>"?").join(","),profile=one<any>(db,"SELECT work_id,track_state FROM mgmt_work_profile WHERE work_id=?",workId);
   if(profile.track_state!=="tracking")return {ok:false,cause:"liveness_unknown",allowed:[],evidence:{reason:"work_not_tracking",track_state:profile.track_state}};
   const inflight=one<any>(db,`SELECT handoff_id,state FROM mgmt_handoffs WHERE work_id IN (${marks}) AND state IN ('ready_to_launch','launching','launch_unknown','bound')`,...scope);if(inflight)return {ok:false,cause:"inflight_handoff",allowed:[],evidence:inflight};
   const executions=all<any>(db,`SELECT * FROM mgmt_executions WHERE work_id IN (${marks})`,...scope);if(!executions.length)return {ok:false,cause:"liveness_unknown",allowed:["isolate_with_confirmation"],evidence:{reason:"no_executions"}};
-  for(const e of executions){const result=blocked(ledger,e,now);if(result)return result;}
+  for(const e of executions){const result=blocked(ledger,e,now,freshnessMs);if(result)return result;}
   const contended=scope.map(id=>contention(db,id)).find(Boolean);if(contended)return {ok:false,cause:"contention",allowed:["isolate_with_confirmation"],evidence:contended};
   return {ok:true,allowed:["same_workspace"],evidence:{execution_ids:executions.map(x=>x.execution_id)}};
 }
@@ -47,11 +47,11 @@ export function buildHandoffPacket(db:Database,workId:string,opts:{now?:number}=
   return {schema_version:1,work_id:workId,title:profile.title,goal:inputs.find(x=>x.kind==="user_message")?.excerpt??profile.title,constraints:inputs.filter(x=>x.kind==="constraint").map(x=>x.excerpt),done:[],verified:[],undone:[],artifacts:share,inputs,source,created_at:opts.now??Date.now()};
 }
 
-type HandoffInput={target_agent:"pi"|"omp"|"claude";target_host:string;isolate:boolean;override_reason?:string;override_actor?:string;now?:number};
+type HandoffInput={target_agent:"pi"|"omp"|"claude";target_host:string;isolate:boolean;override_reason?:string;override_actor?:string;now?:number;freshnessMs?:number};
 export function createHandoff(db:Database,ledgerOrInput:Database|null|any,workIdArg?:string,inputArg?:HandoffInput){
-  const legacy=inputArg===undefined&&ledgerOrInput&&!(ledgerOrInput instanceof Database),old=legacy?ledgerOrInput:null,ledger:Database|null=legacy?old.ledger:ledgerOrInput;let workId=legacy?old.workId:workIdArg!;const input:any=legacy?{target_agent:old.targetAgent,target_host:old.targetHost??"local",isolate:old.isolate??false,override_reason:old.override_reason??old.overrideReason,override_actor:old.override_actor??old.overrideActor,now:old.now}:inputArg!;
+  const legacy=inputArg===undefined&&ledgerOrInput&&!(ledgerOrInput instanceof Database),old=legacy?ledgerOrInput:null,ledger:Database|null=legacy?old.ledger:ledgerOrInput;let workId=legacy?old.workId:workIdArg!;const input:any=legacy?{target_agent:old.targetAgent,target_host:old.targetHost??"local",isolate:old.isolate??false,override_reason:old.override_reason??old.overrideReason,override_actor:old.override_actor??old.overrideActor,now:old.now,freshnessMs:old.freshnessMs}:inputArg!;
   if(!input||!["pi","omp","claude"].includes(input.target_agent)||!input.target_host)throw new ControlError("invalid","invalid handoff target");
-  workId=canonicalWorkId(db,workId);const pre=checkHandoffPreconditions(db,ledger,workId,{now:input.now});
+  workId=canonicalWorkId(db,workId);const pre=checkHandoffPreconditions(db,ledger,workId,{now:input.now,freshnessMs:input.freshnessMs});
   if(!pre.ok&&pre.allowed.length===0)throw conflict(pre);
   if(!pre.ok&&!input.isolate)throw conflict(pre);
   const owner=one<any>(db,"SELECT decision_owner FROM mgmt_work_profile WHERE work_id=?",workId)?.decision_owner;

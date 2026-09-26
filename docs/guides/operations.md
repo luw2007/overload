@@ -100,7 +100,7 @@ pending decision is addressed as a request while a hung turn has no request to
 jump from. A session with no recorded binding reports that nothing was ever
 observed rather than a failed attempt.
 
-The watchdog relies on `~/.overload/ingest.heartbeat`. Service stdout and stderr are in `/tmp/overload-*.{log,err}`. An unavailable remote source or integration becomes a visible incident; do not delete ledger rows to clear it.
+The watchdog relies on `~/.overload/ingest.heartbeat`. Service stdout and stderr are in `/tmp/overload-*.{log,err}`. The optional orchestrator job writes its logs under `~/.overload/logs/` instead. An unavailable remote source or integration becomes a visible incident; do not delete ledger rows to clear it.
 
 Recon checks process liveness directly for sessions owned by its own host and
 uses `remote_probe_cmd` for other ledger hosts. The default SSH command maps

@@ -11,14 +11,14 @@
 | 文件 | 存在 | 行数 | 备注 |
 |---|---|---|---|
 | `src/manage/schema.ts` | 是 | 180 | DDL 全量 |
-| `src/manage/manifest.ts` | 是 | 373 | digest / acceptance / invalidate |
+| `src/manage/manifest.ts` | 是 | 367 | digest / acceptance / invalidate。[原 373→367] |
 | `src/manage/collect.ts` | 是 | 72 | 行极长（压缩风格），实际逻辑密度高 |
-| `src/manage/submit.ts` | 是 | 558 | 提交/漂移校验/external effects |
+| `src/manage/submit.ts` | 是 | 572 | 提交/漂移校验/external effects。[原 558→572] |
 | `src/manage/relations.ts` | 是 | 114 | alias / link correction / hints |
 | `src/manage/source.ts` | 是 | 160 | local + SSH SourceFs |
 | `src/manage/handoff.ts` | 是 | 69 | preconditions / packet / create |
 | `src/manage/identity.ts` | 是 | 13 | id 派生 |
-| `src/manage/launch.ts` | 是 | 69 | launch / worktree / reconcile |
+| `src/manage/launch.ts` | 是 | 96 | launch / worktree / reconcile。[原 69→96] |
 | `src/manage/archive.ts` | 是 | 26 | closeout + archive |
 | `src/manage/classify.ts` | 是 | 40 | sensitivity 扫描 |
 | `src/manage/manage.ts` | 是 | 81 | scanOnce 主编排 |
@@ -144,7 +144,7 @@
 - 密钥模式命中返回 `withheld` — `classify.ts:27`
 
 **control 侧**：
-- `sensitivity TEXT NOT NULL DEFAULT 'unknown' CHECK (sensitivity IN ('unknown','clean','suspected','confirmed_secret'))` — `src/control/store.ts:95`
+- `sensitivity TEXT NOT NULL DEFAULT 'unknown' CHECK (sensitivity IN ('unknown','clean','suspected','confirmed_secret'))` — `src/control/store.ts:97`（原 :95）
 
 **两侧枚举不一致**：
 
@@ -222,6 +222,7 @@ manage 模块**不写 control_outbox**。它对 control 库的写入只有两类
 1. **`control_attention`**：
    - `manifest.ts:213` 通过 `upsertAttention`（走 control store 的 revision 检查路径）
    - `manifest.ts:284`、`manifest.ts:323`、`relations.ts:55`、`launch.ts:53`、`launch.ts:69`、`submit.ts:461`：**直接写 SQL 操作 control_attention**，绕过 control store 的 revision 乐观锁
+   - [已完成 2026-09-24 晚]：6 处裸写全部改走 control store 权威 API（supersedeOpenAttentionByWork / supersedeAttentionById / resolveAttentionByExternalSuccess / upsertAttention / recordAttentionResolution），manage/ 对 control_attention 仅剩 SELECT。
 
 2. **`control_works`**：**零写入**（grep 证实 manage 目录下没有任何 INSERT/UPDATE control_works）
 
@@ -253,7 +254,7 @@ manage 对 control_works 只读（`manage.ts:65,68`、`handoff.ts:44`、`submit.
 - `store.ts:10-16` `createDiscoveredWork`：通过 control store 的 `createWork()` 函数创建 work（`control/store.ts:237` INSERT），不直接写 SQL
 - 所有对 control_attention 的写操作：
   - `manifest.ts:213` 走 `upsertAttention`（带 revision 检查）
-  - 但 `launch.ts:53`、`submit.ts:461`、`manifest.ts:284`、`manifest.ts:323`、`relations.ts:55`、`launch.ts:69` **直接写 SQL**，绕过了 control store 的 revision 乐观锁
+  - 但 `launch.ts:53`、`submit.ts:461`、`manifest.ts:284`、`manifest.ts:323`、`relations.ts:55`、`launch.ts:69` **直接写 SQL**，绕过了 control store 的 revision 乐观锁。[已完成 2026-09-24 晚]：6 处裸写全部改走 control store 权威 API，manage/ 对 control_attention 仅剩 SELECT。
 - `schema.ts:12` `mgmt_work_profile` 以 `work_id` 为 PK 并 `REFERENCES control_works(work_id)`——外键约束保证 mgmt 不能孤儿引用 work
 
 **红线评估**：
@@ -426,4 +427,15 @@ CREATE TABLE mgmt_manifest_entries(
 - evidence 落盘：`src/orchestrator/evidence.ts:77-97`
 - mgmt HTTP API：`src/web/mgmt-routes.ts:35-170`
 - control outbox：`src/control/outbox.ts:31-50`
-- control sensitivity CHECK：`src/control/store.ts:95`
+- control sensitivity CHECK：`src/control/store.ts:97`（原 :95）
+
+---
+
+## 后续新增（2026-09-24 晚 P0-MVP + KISS 三项 hotfix 落地）
+
+本文成文后，代码新增以下生产文件与 API，早期快照未覆盖：
+
+- `src/control/artifact-projection.ts`（约 263 行投影器）：`projectArtifactVersions(db, work_id, now)` 按 work 全量投影 mgmt stored/reference_only version 为 ctype='artifact' 的 context object，触发点 `manifest.ts:247` requestAcceptance。
+- v5 迁移：`store.ts:166-168` 遍历 `control_works` 逐行 `ensureRootProblemLocked` 幂等回填根 problem；`CONTROL_SCHEMA_VERSION` 现为 5。
+- 3 个 attention 收编 API：`store.ts:432 supersedeOpenAttentionByWork`、`store.ts:466 supersedeAttentionById`、`store.ts:490 resolveAttentionByExternalSuccess`。manage 下 6 处裸写全部收编，仅剩 SELECT。
+- `ensureRootProblem` / `rootProblemId` 导出：`context-pool.ts:98,236`，幂等 get-or-create 根 problem。

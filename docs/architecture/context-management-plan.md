@@ -1,7 +1,7 @@
 # Overload 上下文管理专项开发方案
 
 - 日期：2026-09-22
-- 性质：设计方案，本轮只写方案、不实现、不激活。
+- 性质：已实现（T1–T7），路由见 `src/web/context-routes.ts`。
 - 设计内核：Jev 参考材料的显式类型状态、上下文按问题装配而非堆积、visibility ladder（hide/short/long/full）、按需取源、tiered disclosure。
 - 基线引用：代码核查（本地审计稿 overload-code-audit-20260922，未入库）；需求综合 `docs/history/plans/requirements-synthesis-20260922.md`；Jev 参考 `docs/research/jev-reference/README.md`（独立整理稿，非权威论文；token 占比/路由算例为示意估算非实测）；产品原则 `AGENTS.md`；核心设计 `docs/architecture/human-decision-design.md`（仅作现有能力参考，不作为本方案范围约束）。
 
@@ -227,7 +227,7 @@ CREATE TABLE IF NOT EXISTS control_context_shares (
 
 **消费者身份**：`consumer_type='decision_ui'`，`consumer_id=attention_item_id`。
 
-这是现有 `AttentionItem` 的扩展。AttentionItem 已有字段（`src/control/types.ts`）：conclusion、trigger、impact、recommendation、options、owner、expires_at、defer_until、acknowledged_at、source_link、contract_revision、effect_state、decision_mode、evidence（自由 Record）。这些**复用**。本方案新增的是 evidence 的结构化投影和场景入口。
+这是现有 `AttentionItem` 的扩展。AttentionItem 已有字段（`src/control/types.ts`）：conclusion、trigger、impact、recommendation、options、owner、expires_at、defer_until、acknowledged_at、source_link、approval_id、consumer_owner、contract_revision、effect_state、decision_mode、evidence（自由 Record；`approval_id`、`consumer_owner` 列见 `src/control/store.ts:41`）。这些**复用**。本方案新增的是 evidence 的结构化投影和场景入口。
 
 **装配规则**：
 1. 权限预检（§4.2）：actor 必须是该 work 的 decision_owner 或显式共享方。无权限直接返回 blocked，不给摘要。

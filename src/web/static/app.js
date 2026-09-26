@@ -3,7 +3,7 @@
   const escapeHtml = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const e = escapeHtml;
   const pages = ['decide','conversations','ledger','works','tasks','candidates','agents'];
-  const LEGACY_ZONE = {now:'decide',inbox:'decide',done:'decide',q1:'agents',hung:'agents',q2:'agents',zombie:'agents',archive:'agents',sessions:'agents',health:'agents'};
+  const LEGACY_ZONE = {now:'decide',inbox:'decide',done:'decide',q1:'agents',hung:'agents',zombie:'agents',archive:'agents',sessions:'agents',health:'agents'};
   const state = {
     page: "decide",
     mgmtWorks: [],
@@ -18,7 +18,6 @@
     session: null,
     detail: null,
     q1: [],
-    q2: [],
     archive: [],
     hung: [],
     zombie: { groups: [], orphaned_requests: [] },
@@ -226,7 +225,6 @@
     </article>`;
   }
 
-  function closeoutCard(row) { return `<article class="card">${rowCheckbox(row.stable_id)}<div class="card-main">${sessionLink(row.stable_id)}<div class="meta">${e(row.origin)} · ${e(formatTime(row.last_event_at))}</div></div><button class="closeout" data-id="${e(row.stable_id)}">Close out</button></article>`; }
   function zombieCard(group) { return `<article class="card"><div class="card-main"><h3>${e(group.q5_reason)}</h3><p>${e(zombieHint[group.q5_reason] || 'Needs review.')}</p>${(group.rows||[]).map(row=>`<div class="inline">${sessionLink(row.stable_id)} · ${e(formatTime(row.last_event_at))}${resumeCapability(row)}${jumpActions(row,'stable_id','jump-session')}${handoffLine(row.handoff)}</div>`).join('')}</div></article>`; }
   function renderDetail() {
     const view = state.detail;
@@ -333,7 +331,7 @@
     throw new Error('Conversation response was not a list.');
   }
   function renderAgents() {
-    return head('Agents','Session diagnostics and legacy recovery actions.')+`<div id="agent-summary" class="meta">${e(state.health?.open_incidents?.length||0)} open incidents · ${e(state.health?.coverage_gaps||0)} coverage gaps · ${e(state.health?.telemetry_gaps||0)} telemetry gaps</div><div id="agent-status" role="status"></div><section id="detail"></section><section id="content"><h2>Decision requests</h2>${button('Acknowledge selected','bulk-ack')}${state.q1.map(decisionCard).join('')||empty('No decision requests.')}<h2>Hung sessions</h2>${state.hung.map(hungCard).join('')||empty('No hung sessions.')}<h2>Closeout</h2>${button('Close out selected','bulk-closeout')}${button('Clear selection','clear-selection')}${state.q2.map(closeoutCard).join('')||empty('No closeout requests.')}<h2>Zombie / handoff</h2>${state.zombie.groups.map(zombieCard).join('')||empty('No zombie groups.')}<h3>Orphaned requests</h3>${state.zombie.orphaned_requests.map(r=>`<article class="card">${e(r.summary || r.request_uid)}${button('Acknowledge','orphan-ack',r.request_uid)}</article>`).join('')||empty('No orphaned requests.')}<h2>Sessions</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Agent</th><th>Host</th><th>State / queue</th><th>Last event</th></tr></thead><tbody>${state.sessions.map(r=>`<tr><td>${sessionLink(r.stable_id)} ${resumeCapability(r)} ${jumpActions(r, "stable_id", "jump-session")}</td><td>${e(r.agent)}</td><td>${e(r.host)}</td><td>${e(r.run_state)} · ${e(r.queue)}</td><td>${e(formatTime(r.last_event_at))}</td></tr>`).join('')}</tbody></table></div><h2>Archive</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Kind</th><th>Status</th><th>Time</th><th>Summary</th></tr></thead><tbody>${state.archive.map(r=>`<tr><td>${sessionLink(r.stable_id)}</td><td>${e(r.origin)}</td><td>${r.closed_out?'Closed out':'Archived'}</td><td>${e(formatTime(r.last_event_at))}</td><td>${e(r.state || r.run_state)}</td></tr>`).join('')}</tbody></table></div><h2>Health</h2>${json(state.health)}</section>`;
+    return head('Agents','Session diagnostics and legacy recovery actions.')+`<div id="agent-summary" class="meta">${e(state.health?.open_incidents?.length||0)} open incidents · ${e(state.health?.coverage_gaps||0)} coverage gaps · ${e(state.health?.telemetry_gaps||0)} telemetry gaps</div><div id="agent-status" role="status"></div><section id="detail"></section><section id="content"><h2>Decision requests</h2>${button('Acknowledge selected','bulk-ack')}${button('Clear selection','clear-selection')}${state.q1.map(decisionCard).join('')||empty('No decision requests.')}<h2>Hung sessions</h2>${state.hung.map(hungCard).join('')||empty('No hung sessions.')}<h2>Zombie / handoff</h2>${state.zombie.groups.map(zombieCard).join('')||empty('No zombie groups.')}<h3>Orphaned requests</h3>${state.zombie.orphaned_requests.map(r=>`<article class="card">${e(r.summary || r.request_uid)}${button('Acknowledge','orphan-ack',r.request_uid)}</article>`).join('')||empty('No orphaned requests.')}<h2>Sessions</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Agent</th><th>Host</th><th>State / queue</th><th>Last event</th></tr></thead><tbody>${state.sessions.map(r=>`<tr><td>${sessionLink(r.stable_id)} ${resumeCapability(r)} ${jumpActions(r, "stable_id", "jump-session")}</td><td>${e(r.agent)}</td><td>${e(r.host)}</td><td>${e(r.run_state)} · ${e(r.queue)}</td><td>${e(formatTime(r.last_event_at))}</td></tr>`).join('')}</tbody></table></div><h2>Archive</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Kind</th><th>Status</th><th>Time</th><th>Summary</th></tr></thead><tbody>${state.archive.map(r=>`<tr><td>${sessionLink(r.stable_id)}</td><td>${e(r.origin)}</td><td>${r.closed_out?'Closed out':'Archived'}</td><td>${e(formatTime(r.last_event_at))}</td><td>${e(r.state || r.run_state)}</td></tr>`).join('')}</tbody></table></div><h2>Health</h2>${json(state.health)}</section>`;
   }
   function render() {if(editor)return;document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.page));$('main').innerHTML=({decide:renderDecide,conversations:renderConversations,ledger:renderLedger,works:renderWorks,tasks:renderTasks,candidates:renderCandidates,agents:renderAgents})[state.page]();$('workspace-actions').hidden=state.page==='conversations';if(state.page!=='conversations')$('workspace-actions').innerHTML=`<div>Operator workspace<small>真实数据 · 需要你判断时才介入</small></div><span class="muted">选择工作项，审阅证据与影响</span>`;if(state.page==='agents'&&state.session){$('content').hidden=true;renderDetail();}}
   async function refresh() {
@@ -348,7 +346,7 @@
         if(page==='ledger') return {ledger:await fetchJson(`/api/ledger?since=${since}`)};
         if(page==='works'||page==='candidates') return {works:await fetchJson('/api/works')};
         if(page==='conversations') return {conversations:conversationPayload(await fetchJson('/api/conversations'))};
-        if(page==='agents') { const keys=['q1','q2','hung','zombie','sessions','health','archive']; const rows=await Promise.all(keys.map(k=>fetchJson(`/api/${k}`))); const result=Object.fromEntries(keys.map((k,i)=>[k,rows[i]])); if(state.session)result.detail=await fetchJson(`/api/sessions/${encodeURIComponent(state.session)}`); return result; }
+        if(page==='agents') { const keys=['q1','hung','zombie','sessions','health','archive']; const rows=await Promise.all(keys.map(k=>fetchJson(`/api/${k}`))); const result=Object.fromEntries(keys.map((k,i)=>[k,rows[i]])); if(state.session)result.detail=await fetchJson(`/api/sessions/${encodeURIComponent(state.session)}`); return result; }
         return {};
       })();
       const [rules,result]=await Promise.all([rulesPromise,pagePromise]); data={...result,rules};
@@ -668,22 +666,16 @@
     }
     if (
       action === "bulk-ack" ||
-      action === "bulk-closeout" ||
       action === "orphan-ack"
     ) {
-      const closing = action === "bulk-closeout";
       const ids =
         action === "orphan-ack"
           ? [id]
           : [...state.selected].filter((uid) =>
-              (closing ? state.q2 : state.q1).some(
-                (r) => (closing ? r.stable_id : r.request_uid) === uid,
-              ),
+              state.q1.some((r) => r.request_uid === uid),
             );
       for (const uid of ids) {
-        await post(
-          `/api/${closing ? "closeout" : "ack"}/${encodeURIComponent(uid)}`,
-        );
+        await post(`/api/ack/${encodeURIComponent(uid)}`);
         state.selected.delete(uid);
       }
       return refresh();
@@ -697,13 +689,8 @@
       target.textContent = "已复制";
       return;
     }
-    if (
-      target.classList.contains("ack") ||
-      target.classList.contains("closeout")
-    ) {
-      await post(
-        `/api/${target.classList.contains("ack") ? "ack" : "closeout"}/${encodeURIComponent(id)}`,
-      );
+    if (target.classList.contains("ack")) {
+      await post(`/api/ack/${encodeURIComponent(id)}`);
       state.selected.delete(id);
       return refresh();
     }

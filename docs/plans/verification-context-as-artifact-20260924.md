@@ -54,7 +54,7 @@
 | 项目 | 内容 |
 |---|---|
 | 方案断言 | "mgmt 用 none/suspect/withheld（classify.ts:3），control 用 clean/suspected/confirmed_secret（store.ts:95）" |
-| 代码证据 | `classify.ts:3` `export type Sensitivity = "none" \| "suspect" \| "withheld"`；`store.ts:95` `CHECK (sensitivity IN ('unknown','clean','suspected','confirmed_secret'))`。两套词汇无映射层。 |
+| 代码证据 | `classify.ts:3` `export type Sensitivity = "none" \| "suspect" \| "withheld"`；`store.ts:97（原 :95→:97）` `CHECK (sensitivity IN ('unknown','clean','suspected','confirmed_secret'))`。两套词汇无映射层。 |
 | 判定 | ✅成立 |
 
 ### 2.6 manage 是否写 control_outbox
@@ -79,7 +79,7 @@
 |---|---|
 | 方案断言 | "manifest.ts:284,323、relations.ts:55、launch.ts:53,69、submit.ts:461 直写 SQL 绕过 revision 乐观锁" |
 | 代码证据 | `manifest.ts:284` `UPDATE control_attention SET state='resolved',effect_state='succeeded',revision=?,...`（手动管理 revision，不经过 upsertAttention 的 expected_revision 校验）；`manifest.ts:323` `UPDATE control_attention SET state='superseded',revision=revision+1,...`；`relations.ts:55` `UPDATE control_attention SET state='superseded',revision=revision+1,...`；`launch.ts:53` `INSERT INTO control_attention ... ON CONFLICT(item_id) DO UPDATE SET updated_at=excluded.updated_at`（revision 硬编码为 1）；`launch.ts:69` `UPDATE control_attention SET state='resolved',effect_state='succeeded',updated_at=? WHERE item_id=?`（不更新 revision）；`submit.ts:461` `INSERT OR IGNORE INTO control_attention(...,revision,...) VALUES(...,1,...)`（revision 硬编码为 1）。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已完成 2026-09-24 晚]：6 处裸写全部改走 control store 权威 API（supersedeOpenAttentionByWork / supersedeAttentionById / resolveAttentionByExternalSuccess / upsertAttention / recordAttentionResolution），manage/ 对 control_attention 仅剩 SELECT。
 | 备注 | 这 6 处确实绕过了 `upsertAttention` 的 CAS（expected_revision）机制。但注意：`manifest.ts:213` 的 `requestAcceptance` 是走 `upsertAttention` 的（带 revision 检查），`manifest.ts:284` 的 `recordAcceptance` 才是直写。 |
 
 ### 2.9 acceptance 失效路径
@@ -95,7 +95,7 @@
 | 项目 | 内容 |
 |---|---|
 | 方案断言 | "ctype CHECK ∈ (objective\|constraints\|fact\|decision\|artifact\|scene)" |
-| 代码证据 | `store.ts:78` `CHECK (ctype IN ('objective','constraints','fact','decision','artifact','scene'))`。 |
+| 代码证据 | `store.ts:80（原 :78→:80）` `CHECK (ctype IN ('objective','constraints','fact','decision','artifact','scene'))`。 |
 | 判定 | ✅成立 |
 
 ### 2.11 createObject 生产调用方数量
@@ -104,7 +104,7 @@
 |---|---|
 | 方案断言 | "createObject 全仓生产调用方为 0" |
 | 代码证据 | `grep -rn "createObject(" src/ --include="*.ts"` 排除 `.test.ts` 和定义本身，零命中。唯一生产写入路径是 `context-reducer.ts:197-200` 直接 INSERT（不经过 createObject 函数）。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已过时 2026-09-24 晚]：新增 src/control/artifact-projection.ts，ctype='artifact' 由 requestAcceptance（manifest.ts:247）投影写入，createObject 不再零调用。
 
 ### 2.12 context-reducer 硬编码 ctype='fact'
 
@@ -112,7 +112,7 @@
 |---|---|
 | 方案断言 | "唯一生产写入路径 context-reducer.ts:198-200 硬编码 ctype='fact'" |
 | 代码证据 | `context-reducer.ts:197-200` `INSERT INTO control_context_objects(...,ctype,...) VALUES(...,?,...)` 其中第 4 个参数是字面量 `"fact"`。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已过时 2026-09-24 晚]：新增 src/control/artifact-projection.ts，ctype='artifact' 由 requestAcceptance（manifest.ts:247）投影写入，createObject 不再零调用。
 
 ### 2.13 reference="artifact:<id>@<ver>" 格式
 
@@ -152,7 +152,7 @@
 |---|---|
 | 方案断言 | "artifact 的 content_hash = sha256(9 列行 JSON)，与 mgmt_artifact_versions.content_sha256（快照文件字节哈希）无校验关系" |
 | 代码证据 | `on-demand-fetcher.ts:214-221` SELECT 固定 9 列（artifact_id/kind/canonical_key/version_id/content_kind/content_sha256/snapshot_path/snapshot_state/sensitivity），返回 `JSON.stringify(row)`。`context-contract.ts:28` 注释 `artifact:<id>@<ver> → JSON.stringify(row) 的字节`。`submit.ts:166-167` 才真正读 snapshot 文件字节算 sha256 做发布校验。两者无交叉校验。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已过时]：fetcher artifact 分支已重写为读 snapshot_path 字节并 sha256 复验（on-demand-fetcher.ts:211-258），context-contract.ts:28 已同步。
 
 ### 2.18 on-demand-fetcher 的 full 取源路径
 
@@ -160,7 +160,7 @@
 |---|---|
 | 方案断言 | "artifact 分支不读 snapshot_path 指向的快照文件字节，snapshot_path 只是作为一列字符串出现在行 JSON 里" |
 | 代码证据 | `on-demand-fetcher.ts:214-221` 确实只做 SQL 查询 + JSON.stringify，不读文件系统。`on-demand-fetcher.ts:229-230` 对 git:/http:/未知 handle 返回 `unavailable`。code_state/external_state 的 reference 无 handler。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已过时]：fetcher artifact 分支已重写为读 snapshot_path 字节并 sha256 复验（on-demand-fetcher.ts:211-258），context-contract.ts:28 已同步。
 
 ### 2.19 pin 粒度（object+revision）
 
@@ -184,7 +184,7 @@
 |---|---|
 | 方案断言 | "collector 从不传 problem_id（context-collector.ts:127 用 ctx.problem_id ?? null，而 orchestrator.ts:316-320 的 collectContextFacts 不传）" |
 | 代码证据 | `context-collector.ts:127` `problem_id: ctx.problem_id ?? null`；`orchestrator.ts:316-320` `collectAndSpool({ orchestratorDb, work_id, actor, runtime_id }, spoolDir)` — 调用参数中无 problem_id 字段。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 
 ### 2.22 createProblem 零调用方
 
@@ -192,7 +192,7 @@
 |---|---|
 | 方案断言 | "createProblem 零生产调用方" |
 | 代码证据 | `grep -rn "createProblem(" src/ --include="*.ts"` 排除 `.test.ts` 和 `export function createProblem` 定义，零命中。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 
 ### 2.23 control_context_problem_objects 恒空
 
@@ -200,7 +200,7 @@
 |---|---|
 | 方案断言 | "collector 不传 problem_id → linkProblemObject 永不执行 → control_context_problem_objects 恒空" |
 | 代码证据 | `context-reducer.ts:223-225` `if (payload.problem_id) { linkProblemObject(...) }`。因 collector 侧 problem_id 恒为 null（见 2.21），此分支永不进入。表存在但生产无数据。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已过时]：根 problem 已由 v5 迁移（store.ts:166-168）+ createWork/redirectWork/promoteWork 补建（store.ts:250,257,292），orchestrator.ts:326 注入 rootProblemId，linkProblemObject 已改 upsert（context-pool.ts:424）。
 
 ### 2.24 失效传播函数无生产调用方
 
@@ -224,7 +224,7 @@
 |---|---|
 | 方案断言 | "ensureControlSchema 对库版本 > 支持版本抛 blocked" |
 | 代码证据 | `store.ts:18` `export const CONTROL_SCHEMA_VERSION = 3`；`store.ts:162` `if(version>CONTROL_SCHEMA_VERSION)throw new ControlError("blocked",...)`。版本迁移链在 `store.ts:155-159` CONTROL_MIGRATIONS 数组（v1→v2→v3）。 |
-| 判定 | ✅成立 |
+| 判定 | ✅成立 | [已变更]：当前 CONTROL_SCHEMA_VERSION=5（store.ts:20），迁移链 v1→v2→v3→v4→v5。v4 收编 ensureContextReducerSchema，v5 回填根 problem（store.ts:166-168）。
 
 ### 2.27 manifest digest 计算方式
 
@@ -432,3 +432,14 @@ P0-P4 各阶段的验收反例覆盖了：
 ### 核心结论摘要
 
 方案对现状的 28 条断言全部经独立代码验证成立，file:line 引用精确，无过度乐观。目标架构（复用 mgmt_artifacts + chunk 投影）方向正确，符合"上下文是投影而非权威"的设计原则。主要风险在于：sensitivity 词汇统一的 DDL 复杂度被低估（不是纯追加）、createProblem 生产调用方缺失、以及 P3-P4 的模型评分和恢复包引用目前仍是设计而非已验证原型。建议修正上述 3 个阻塞问题后进入 P0 开发。
+
+---
+
+## 后续新增（2026-09-24 晚 P0-MVP + KISS 三项 hotfix 落地）
+
+本文成文后，代码新增以下生产文件与 API，早期快照未覆盖：
+
+- `src/control/artifact-projection.ts`（约 263 行投影器）：`projectArtifactVersions(db, work_id, now)` 按 work 全量投影 mgmt stored/reference_only version 为 ctype='artifact' 的 context object，触发点 `manifest.ts:247` requestAcceptance。
+- v5 迁移：`store.ts:166-168` 遍历 `control_works` 逐行 `ensureRootProblemLocked` 幂等回填根 problem；`CONTROL_SCHEMA_VERSION` 现为 5。
+- 3 个 attention 收编 API：`store.ts:432 supersedeOpenAttentionByWork`、`store.ts:466 supersedeAttentionById`、`store.ts:490 resolveAttentionByExternalSuccess`。manage 下 6 处裸写全部收编，仅剩 SELECT。
+- `ensureRootProblem` / `rootProblemId` 导出：`context-pool.ts:98,236`，幂等 get-or-create 根 problem。

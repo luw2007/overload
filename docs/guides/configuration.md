@@ -29,6 +29,12 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 - `--orca-cmd <path>`：覆盖 orca 可执行文件路径
 - `--cmux-sessions-file <path>`：覆盖 cmux sessions 文件路径
 
+### audit CLI flags
+- `--since <dur>`：时间窗，后缀 `ms|s|m|h|d`（如 `7d`、`24h`、`30m`、`5000ms`）；裸数字按毫秒。见 `src/cli/audit.ts:113`。
+
+### Manage（外部 Session 纳管与交接）
+- `manage.freshness_ms`：交接前置门禁的新鲜度阈值，默认 120,000 ms（2 分钟）；超过该时长无事件的 running 执行判 stale，禁止同目录续跑。
+
 ## Session view window (env var)
 
 `sessions`, the Inbox (`q2`), the Done/archive surface, and the `zombie` view show only sessions whose last event falls within the last 30 days. History is filtered, never deleted: old sessions stay in the journal and are reachable through `show <stable_id>`, `jump`, and the closeout workflow.
