@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
   CONTROL_SCHEMA_VERSION,
+  CONTROL_SCHEMA,
   ControlError,
-  computeMaterialFingerprint,
   createWork,
+  deriveAttentionMaterialInputs,
+  computeMaterialFingerprint,
   ensureControlSchema,
   getAttention,
   getAttentionMaterial,
@@ -20,6 +22,7 @@ import {
   upsertAttention,
 } from "./store";
 import { enqueueControlEvent, ensureOutbox, publishControlEvents } from "./outbox";
+import { createObject } from "./context-pool";
 import type { Contract } from "./types";
 
 const contract: Contract = {
@@ -213,7 +216,62 @@ describe("Phase A control foundation", () => {
     ]);
   });
 
-  test("material fingerprint ignores revision prose and heartbeat but changes for risk and effects", () => {
+  test("v6 migration backfills existing open Attention material but preserves historical closed rows", () => {
+    const d = new Database(":memory:");
+    d.exec(CONTROL_SCHEMA);
+    d.query("INSERT INTO control_schema_meta(id,version,migrated_at) VALUES(1,5,0)").run();
+    const workId = "legacy-work";
+    d.query("INSERT INTO control_works VALUES (?,?,?,?,?,?,?,?,?)").run(workId, "legacy", "test", null, "active", 1, JSON.stringify(contract), 1, 1);
+    const insert = d.query(`INSERT INTO control_attention VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const values = (id: string, state: "open" | "resolved") => [
+      id, workId, 1, state, state === "open" ? "not_started" : "succeeded", null, "now", "Choose", "risk", "impact", null,
+      JSON.stringify(["continue"]), "owner", null, null, null, null, null, null, 1, "human_only", "{}", 2, 2,
+    ];
+    insert.run(...values("legacy-open", "open"));
+    insert.run(...values("legacy-done", "resolved"));
+
+    ensureControlSchema(d);
+
+    expect(getAttentionMaterial(d, "legacy-open")).toMatchObject({ item_id: "legacy-open", generation: 1 });
+    expect(getAttentionMaterial(d, "legacy-done")).toBeNull();
+    expect(d.query("SELECT kind FROM control_outbox WHERE item_id='legacy-open'").all()).toEqual([{ kind: "attention.material_projected" }]);
+    d.close();
+  });
+
+  test("v6 ensure repairs an interrupted open-item backfill idempotently", () => {
+    const d = db();
+    const work = createWork(d, { title: "repair", source: "test", contract }, 1);
+    const item = openAttention(d, "repair-open", work.work_id, work.revision);
+    d.query("DELETE FROM control_attention_material WHERE item_id=?").run(item.item_id);
+    d.query("DELETE FROM control_outbox WHERE item_id=? AND kind='attention.material_projected'").run(item.item_id);
+    const before = 0;
+
+    ensureControlSchema(d);
+    ensureControlSchema(d);
+
+    expect(getAttentionMaterial(d, item.item_id)).toMatchObject({ generation: 1 });
+    const after = d.query("SELECT COUNT(*) AS n FROM control_outbox WHERE item_id=? AND kind='attention.material_projected'").get(item.item_id) as { n: number };
+    expect(after.n).toBe(before + 1);
+    d.close();
+  });
+
+  test("unknown option IDs receive neutral material effects but no actionable display metadata", () => {
+    const d = db();
+    const work = createWork(d, { title: "unknown", source: "test", contract }, 1);
+    const item = upsertAttention(d, {
+      item_id: "unknown-option", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "now",
+      conclusion: "Choose", trigger: "native", impact: "held", recommendation: null, options: ["allow-once"],
+      owner: "owner", expires_at: null, source_link: null, approval_id: null, consumer_owner: null,
+      contract_revision: work.revision, decision_mode: "human_only", evidence: {},
+    }, 2);
+    expect(deriveAttentionMaterialInputs(d, item, 2).option_effects).toEqual([
+      { option: "allow-once", effect: "records answer; execution semantics unavailable" },
+    ]);
+    expect(getAttentionMaterial(d, item.item_id)).toMatchObject({ generation: 1 });
+    d.close();
+  });
+
+  test("upsert projects baseline atomically and changes generation only for material fields", () => {
     const base = {
       risk: "  destructive\r\n write  ",
       decision: "Choose\tpath",
@@ -237,17 +295,60 @@ describe("Phase A control foundation", () => {
 
     const d = db();
     const work = createWork(d, { title: "w", source: "test", contract }, 1);
-    let item = openAttention(d, "material", work.work_id, 1);
-    const first = projectAttentionMaterial(d, item.item_id, base, 10);
-    item = upsertAttention(d, { ...item, conclusion: "rewritten prose", evidence: { heartbeat: 99 }, expected_revision: item.revision }, 11);
-    const same = projectAttentionMaterial(d, item.item_id, equivalent.inputs, 12);
-    expect(same).toMatchObject({ fingerprint: first.fingerprint, generation: 1, computed_at: 12 });
-    const changed = projectAttentionMaterial(d, item.item_id, { ...base, consequence: "Deletes production" }, 13);
-    expect(changed.generation).toBe(2);
-    expect(changed.fingerprint).not.toBe(first.fingerprint);
-    expect(getAttentionMaterial(d, item.item_id)?.subject).toBe(`attention:${item.item_id}`);
+    let item = upsertAttention(d, {
+      item_id: "material", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "now",
+      conclusion: "Choose path", trigger: "initial prose", impact: "destructive write", recommendation: null,
+      options: ["continue"], owner: "owner", expires_at: null, source_link: null, approval_id: null,
+      consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {},
+    }, 10);
+    const first = getAttentionMaterial(d, item.item_id)!;
+    expect(first).toMatchObject({ generation: 1, computed_at: 10 });
+
+    item = upsertAttention(d, {
+      ...item, expected_revision: item.revision, trigger: "rewritten prose", recommendation: "continue",
+      evidence: { heartbeat: 99, ordinary_log: "progress" },
+    }, 11);
+    expect(getAttentionMaterial(d, item.item_id)).toMatchObject({ fingerprint: first.fingerprint, generation: 1, computed_at: 11 });
+
+    item = upsertAttention(d, { ...item, expected_revision: item.revision, impact: "data loss" }, 12);
+    const changedRisk = getAttentionMaterial(d, item.item_id)!;
+    expect(changedRisk.generation).toBe(2);
+    expect(changedRisk.fingerprint).not.toBe(first.fingerprint);
+
+    item = upsertAttention(d, { ...item, expected_revision: item.revision, options: ["stop", "continue"] }, 13);
+    expect(getAttentionMaterial(d, item.item_id)?.generation).toBe(3);
+    item = upsertAttention(d, { ...item, expected_revision: item.revision, expires_at: 20 }, 14);
+    expect(getAttentionMaterial(d, item.item_id)?.generation).toBe(4);
+
     const materialEvents = d.query("SELECT kind FROM control_outbox WHERE kind='attention.material_projected'").all();
-    expect(materialEvents).toHaveLength(2);
+    expect(materialEvents).toHaveLength(4);
+    expect(getAttentionMaterial(d, item.item_id)?.subject).toBe(`attention:${item.item_id}`);
+    d.close();
+  });
+
+  test("server-owned decisive evidence conclusion participates in the baseline fingerprint", () => {
+    const d = db();
+    const work = createWork(d, { title: "w", source: "test", contract }, 1);
+    const evidence = createObject(d, {
+      work_id: work.work_id, ctype: "fact", fact_subtype: "test_result", object_canonical_key: "decisive",
+      reference: "orchestrator:submit_result:decisive", source_type: "orchestrator", content_hash: "h1",
+      sensitivity: "clean", summary_short: "tests failed",
+    }, 2);
+    let item = upsertAttention(d, {
+      item_id: "evidence-material", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "now",
+      conclusion: "Choose path", trigger: "test result", impact: "release risk", recommendation: null,
+      options: ["continue", "stop"], owner: "owner", expires_at: null, source_link: null, approval_id: null,
+      consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: { object_id: evidence.object_id, revision: 1 },
+    }, 3);
+    expect(getAttentionMaterial(d, item.item_id)?.inputs.decisive_evidence).toEqual([
+      { object_id: evidence.object_id, revision: 1, conclusion: "tests failed" },
+    ]);
+    const first = getAttentionMaterial(d, item.item_id)!;
+    d.query("UPDATE control_context_object_versions SET summary_short='tests pass' WHERE object_id=? AND revision=1").run(evidence.object_id);
+    item = upsertAttention(d, { ...item, expected_revision: item.revision }, 4);
+    const changed = getAttentionMaterial(d, item.item_id)!;
+    expect(changed.generation).toBe(first.generation + 1);
+    expect(changed.inputs).toEqual(deriveAttentionMaterialInputs(d, item, 4));
     d.close();
   });
 

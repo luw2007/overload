@@ -29,6 +29,7 @@ import {
 } from "./anomaly-store";
 import { parseStructuredCheckOutput } from "./evidence";
 import { enqueueControlEvent, getAttention, getWork, reviseContract, upsertAttention } from "../control/store";
+import type { AttentionItem } from "../control/types";
 import { closeTarget, consumeDecision, getTarget, openMailbox, registerTarget, receipt } from "../decision-bot/mailbox";
 import { requestApproval } from "./approval";
 
@@ -79,52 +80,56 @@ export function repairAnomalyIntents(db: Database, answers: Database, now: numbe
     const conclusion = typeof evidence.conclusion === "string" ? evidence.conclusion : `异常信号触发：${row.signal_kind}`;
     const options = Array.isArray(evidence.options) ? (evidence.options as string[]) : ["stop"];
     const urgency = row.stop_state === "stop_unconfirmed" ? "now" : "inbox";
-    const existing = getAttention(answers, row.item_id);
-    const item = upsertAttention(
-      answers,
-      {
-        item_id: row.item_id,
-        work_id: row.work_id,
-        state: "open",
-        effect_state: "not_started",
-        urgency,
-        conclusion,
-        trigger: `异常信号触发：${row.signal_kind}`,
-        impact: `继续运行预计持续消耗预算，现场可能继续偏离验收。stop_state=${row.stop_state}`,
-        recommendation: options.includes("clean_restart") ? "clean_restart" : options[0] ?? "stop",
+    let item: AttentionItem;
+    let eventId: string;
+    answers.transaction(() => {
+      registerTarget(answers, {
+        consumerOwner: "orchestrator",
+        approvalId: row.item_id,
+        question: conclusion,
         options,
-        owner,
-        expires_at: now + CARD_TTL_MS,
-        source_link: row.work_id ? `cmux://work/${row.work_id}/task/${row.task_id}` : (task?.worktree ?? null),
-        approval_id: row.item_id,
-        consumer_owner: "orchestrator",
-        contract_revision: work.revision,
-        decision_mode: "human_only",
+        effect: "anomaly_decision",
+        scope: { task_id: row.task_id, work_id: row.work_id, signal_kind: row.signal_kind },
         evidence,
-        ...(existing ? { expected_revision: existing.revision } : {}),
-      },
-      now,
-    );
-    registerTarget(answers, {
-      consumerOwner: "orchestrator",
-      approvalId: row.item_id,
-      question: conclusion,
-      options,
-      effect: "anomaly_decision",
-      scope: { task_id: row.task_id, work_id: row.work_id, signal_kind: row.signal_kind },
-      evidence,
-      expiresAt: now + CARD_TTL_MS,
-      decisionMode: "human_only",
-      workId: row.work_id,
-      contractRevision: work.revision,
-      attemptId: task?.attempt_id ?? undefined,
-    });
-    const eventId = enqueueControlEvent(
-      answers,
-      { entity_id: item.item_id, entity_version: item.revision, kind: "attention.opened", work_id: row.work_id, item_id: item.item_id, payload: { attention: item } },
-      now,
-    );
-    db.run("UPDATE anomaly_card_intents SET repaired_at=?, control_event_id=? WHERE item_id=?", [now, eventId, row.item_id]);
+        expiresAt: now + CARD_TTL_MS,
+        decisionMode: "human_only",
+        workId: row.work_id!,
+        contractRevision: work.revision,
+        attemptId: task?.attempt_id ?? undefined,
+      });
+      const existing = getAttention(answers, row.item_id);
+      item = upsertAttention(
+        answers,
+        {
+          item_id: row.item_id,
+          work_id: row.work_id!,
+          state: "open",
+          effect_state: "not_started",
+          urgency,
+          conclusion,
+          trigger: `异常信号触发：${row.signal_kind}`,
+          impact: `继续运行预计持续消耗预算，现场可能继续偏离验收。stop_state=${row.stop_state}`,
+          recommendation: options.includes("clean_restart") ? "clean_restart" : options[0] ?? "stop",
+          options,
+          owner,
+          expires_at: now + CARD_TTL_MS,
+          source_link: `cmux://work/${row.work_id}/task/${row.task_id}`,
+          approval_id: row.item_id,
+          consumer_owner: "orchestrator",
+          contract_revision: work.revision,
+          decision_mode: "human_only",
+          evidence,
+          ...(existing ? { expected_revision: existing.revision } : {}),
+        },
+        now,
+      );
+      eventId = enqueueControlEvent(
+        answers,
+        { entity_id: item.item_id, entity_version: item.revision, kind: "attention.opened", work_id: row.work_id!, item_id: item.item_id, payload: { attention: item } },
+        now,
+      );
+    }).immediate();
+    db.run("UPDATE anomaly_card_intents SET repaired_at=?, control_event_id=? WHERE item_id=?", [now, eventId!, row.item_id]);
     repaired++;
   }
   return repaired;
@@ -193,19 +198,20 @@ export class AnomalyMonitor {
           }
         }
       }
-      // 结构化检查（存在才执行）
+      // 结构化检查（存在才执行）。检查结果的 durable identity 是 (work_id,result_set_version,check_id)，
+      // 未绑定 Work 的任务无法证明归属，不执行也不落库检查结果（evaluateAndFence 同样只按 Work 读取）。
+      const workId = task.work_id ?? undefined;
       const checkPath = join(task.worktree, "orchestrator.check");
       let items: { check_id: string; status: string; fingerprint?: string | null; check_def_version?: string | null }[] = [];
-      if (existsSync(checkPath)) {
+      if (workId && existsSync(checkPath)) {
         const out = await this.worktreeExec(checkPath, [], { cwd: task.worktree });
         const parsed = parseStructuredCheckOutput(`${out.stdout}${out.stderr}`);
         if (parsed) items = parsed;
       }
-      const workId = task.work_id ?? undefined;
       const nextVersion = workId ? getNextResultSetVersion(this.db, workId) : 1;
       const run = this.db.transaction(() => {
         insertSignalSample(this.db, task.task_id, task.attempt_id, now, commitCount, diffAdded, diffDeleted, nextVersion, workId);
-        if (items.length > 0) insertCheckResults(this.db, nextVersion, task.task_id, task.attempt_id, now, items, workId);
+        if (workId && items.length > 0) insertCheckResults(this.db, nextVersion, task.task_id, task.attempt_id, now, items, workId);
         if (workId) pruneSignalHistory(this.db, workId);
       });
       run();
@@ -238,11 +244,12 @@ export class AnomalyMonitor {
 
   // ---- 1.2 检测与围栏 ----
   async evaluateAndFence(task: Task, now: number): Promise<void> {
-    if (!task.work_id || !task.attempt_id) return;
-    const rows = getSignalSamples(this.db, task.work_id, 100).slice(-20);
+    const workId = task.work_id;
+    if (!workId || !task.attempt_id) return;
+    const rows = getSignalSamples(this.db, workId, 100).slice(-20);
     if (rows.length === 0) return;
     const samples: SignalSample[] = rows.map((r) => {
-      const checks = getCheckResults(this.db, r.result_set_version).map((c) => ({
+      const checks = getCheckResults(this.db, workId, r.result_set_version).map((c) => ({
         check_id: c.check_id,
         status: c.status,
         fingerprint: c.fingerprint,

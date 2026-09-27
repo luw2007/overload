@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS reducer_cursor(id INTEGER PRIMARY KEY CHECK(id=1), jo
 CREATE TABLE IF NOT EXISTS applied_control_events(
   event_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, applied_at INTEGER NOT NULL
 );
+-- Terminal reducer verdict for a control event that can never apply (verification failure, projection conflict,
+-- deterministic data error). Keyed by event_id so republished copies are skipped and yield exactly one coverage
+-- gap; the publisher reads it to stop re-leasing. payload_hash is NULL when the envelope carried none.
+CREATE TABLE IF NOT EXISTS rejected_control_events(
+  event_id TEXT PRIMARY KEY, payload_hash TEXT, reason TEXT NOT NULL,
+  ingest_seq INTEGER NOT NULL, rejected_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS control_attention(
   item_id TEXT PRIMARY KEY, work_id TEXT NOT NULL, revision INTEGER NOT NULL,
   state TEXT NOT NULL, effect_state TEXT NOT NULL, effect_detail TEXT, urgency TEXT NOT NULL, owner TEXT NOT NULL,
@@ -69,6 +76,16 @@ CREATE INDEX IF NOT EXISTS journal_30d_stable_writer_kind ON journal_30d(stable_
 CREATE INDEX IF NOT EXISTS journal_finding ON journal(kind, json_extract(detail, '$.emitter_id'), at);
 CREATE INDEX IF NOT EXISTS journal_7d_finding ON journal_7d(kind, json_extract(detail, '$.emitter_id'), at);
 CREATE INDEX IF NOT EXISTS journal_30d_finding ON journal_30d(kind, json_extract(detail, '$.emitter_id'), at);
+-- Kind lookups (dashboard health/hung, recon findings, effect reconcile) seek by
+-- kind instead of scanning the journal; the (stable_id, kind) index keeps per-session
+-- kind lookups (latest settled, session_ended, session_started) on an exact seek so
+-- the planner never trades the stable_id prefix for a kind-wide scan.
+CREATE INDEX IF NOT EXISTS journal_kind_ingest_seq ON journal(kind, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_stable_id_kind_ingest_seq ON journal(stable_id, kind, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_7d_kind_ingest_seq ON journal_7d(kind, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_30d_kind_ingest_seq ON journal_30d(kind, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_7d_stable_id_kind_ingest_seq ON journal_7d(stable_id, kind, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_30d_stable_id_kind_ingest_seq ON journal_30d(stable_id, kind, ingest_seq);
 CREATE INDEX IF NOT EXISTS requests_stable_id_state ON requests(stable_id, state);
 CREATE INDEX IF NOT EXISTS incarnations_stable_id_started_at ON session_incarnations(stable_id, started_at);
 

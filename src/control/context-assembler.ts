@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
-import { ensureControlSchema, getAttention, getWork, projectAttentionMaterial } from "./store";
-import type { Work } from "./types";
+import { deriveAttentionDecisionOptions, deriveAttentionMaterialInputs, ensureControlSchema, getAttention, getWork, projectAttentionMaterial } from "./store";
+import type { AttentionItem, DecisionOption, Work } from "./types";
 import {
   getProblemTree,
   listObjectsByProblem,
@@ -56,14 +56,6 @@ export interface StaleObjectEntry {
   linked_revision: number;
 }
 
-export interface DecisionOption {
-  id: string;
-  label: string;
-  effect: string;
-  consequence: string;
-  requires_reason: boolean;
-  requires_contract: boolean;
-}
 
 export interface DecisionViewPackage {
   package_type: "decision_view";
@@ -331,60 +323,6 @@ function buildStaleMap(entries: PoolEntry[]): Map<string, StaleObjectEntry> {
   return map;
 }
 
-const GENERIC_DECISION_OPTIONS: Record<string, Omit<DecisionOption, "id">> = {
-  stop: {
-    label: "Stop work",
-    effect: "stops the work and releases its controlled resources",
-    consequence: "Work moves to stopped and its remaining scope is not executed.",
-    requires_reason: false,
-    requires_contract: false,
-  },
-  continue: {
-    label: "Continue work",
-    effect: "records acceptance of the remaining risk and continues the work",
-    consequence: "Work continues under the current contract and budget.",
-    requires_reason: false,
-    requires_contract: false,
-  },
-  narrow: {
-    label: "Narrow scope",
-    effect: "replaces the work contract with a reviewed narrower contract",
-    consequence: "Other open cards for the previous contract are superseded.",
-    requires_reason: true,
-    requires_contract: true,
-  },
-};
-
-function targetEffect(db: Database, item: AttentionItem): string | null {
-  if (!item.approval_id || !item.consumer_owner) return null;
-  const table = db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_targets'").get();
-  if (!table) return null;
-  const row = db.query("SELECT effect FROM approval_targets WHERE consumer_owner=? AND approval_id=? AND state='active'").get(item.consumer_owner, item.approval_id) as { effect: string } | null;
-  return row?.effect ?? null;
-}
-
-function decisionOptions(db: Database, item: AttentionItem): DecisionOption[] | null {
-  const approvalEffect = targetEffect(db, item);
-  const options: DecisionOption[] = [];
-  for (const id of item.options) {
-    const generic = GENERIC_DECISION_OPTIONS[id];
-    if (generic) { options.push({ id, ...generic }); continue; }
-    if (!item.approval_id || !approvalEffect) return null;
-    options.push({ id, label: id, effect: `records answer; execution pending: ${approvalEffect}`, consequence: `Records “${id}” for the registered ${approvalEffect} target; success is not yet verified.`, requires_reason: false, requires_contract: false });
-  }
-  return options;
-}
-
-function materialFingerprint(db: Database, item: AttentionItem, options: DecisionOption[], evidence: TriggerEvidence[]): string {
-  return projectAttentionMaterial(db, item.item_id, {
-    risk: item.impact,
-    decision: item.conclusion,
-    option_effects: options.map(option => ({ option: option.id, effect: option.effect })),
-    decisive_evidence: evidence.map(entry => ({ object_id: entry.object_id, revision: entry.revision, conclusion: entry.summary })),
-    validity: { expires_at: item.expires_at, expired: item.expires_at !== null && item.expires_at <= Date.now() },
-    consequence: item.impact,
-  }).fingerprint;
-}
 
 // ========== 包类型 1: DecisionViewPackage ==========
 
@@ -411,9 +349,9 @@ export function assembleDecisionView(db: Database, input: GetContextPackageInput
     else if (role === "artifact") artifacts.push({ object_id: object.object_id, reference: version.reference, content_hash: version.content_hash });
     else if (role === "scene" && !scene_entry) scene_entry = { reference: version.reference, summary: proj.summary, ...(item.source_link ? { jump_target: item.source_link } : {}) };
   }
-  const options = decisionOptions(db, item);
+  const options = deriveAttentionDecisionOptions(db, item);
   if (!options) return blocked("decision option semantics unavailable", "needs_context");
-  const fingerprint = materialFingerprint(db, item, options, trigger_evidence);
+  const fingerprint = projectAttentionMaterial(db, item.item_id, deriveAttentionMaterialInputs(db, item)).fingerprint;
   const pkg: DecisionViewPackage = {
     package_type: "decision_view", consumer_id: item.item_id, work_id: item.work_id,
     contract_revision: item.contract_revision, attention_revision: item.revision, material_fingerprint: fingerprint,

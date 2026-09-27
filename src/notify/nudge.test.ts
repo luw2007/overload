@@ -13,11 +13,6 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "overload-notify-")); roots.push(root);
   const control = openControl(join(root, "control.db"));
-  // Notification tests tolerate a pre-v6 store while the v6 migration lands concurrently.
-  control.exec(`CREATE TABLE IF NOT EXISTS control_attention_material(item_id TEXT PRIMARY KEY,material_key TEXT NOT NULL,fingerprint TEXT NOT NULL,generation INTEGER NOT NULL,inputs TEXT NOT NULL,computed_at INTEGER NOT NULL);
-    CREATE UNIQUE INDEX IF NOT EXISTS control_attention_material_key ON control_attention_material(material_key);
-    CREATE TABLE IF NOT EXISTS control_notifications(notification_id TEXT PRIMARY KEY,subject TEXT NOT NULL,material_key TEXT NOT NULL,threshold TEXT NOT NULL,channel TEXT NOT NULL,outcome TEXT NOT NULL,owner_epoch TEXT NOT NULL,work_id TEXT,item_id TEXT,item_revision INTEGER,approval_id TEXT,receipt_id TEXT,outbox_event_id TEXT,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,reason TEXT NOT NULL,attempt_count INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER,error TEXT,created_at INTEGER NOT NULL,attempted_at INTEGER,completed_at INTEGER,UNIQUE(subject,material_key,threshold,owner_epoch));
-    CREATE TABLE IF NOT EXISTS control_notification_shadow(comparison_id TEXT PRIMARY KEY,subject TEXT NOT NULL,material_key TEXT NOT NULL,threshold TEXT NOT NULL,legacy_would_send INTEGER NOT NULL,candidate_would_send INTEGER NOT NULL,legacy_reason TEXT NOT NULL,candidate_reason TEXT NOT NULL,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,item_id TEXT,item_revision INTEGER,compared_at INTEGER NOT NULL,UNIQUE(subject,material_key,threshold));`);
   const ledger = new Database(":memory:");
   ledger.exec(`CREATE TABLE requests(request_uid TEXT PRIMARY KEY,stable_id TEXT,kind TEXT,state TEXT,created_at INTEGER,detail TEXT);
     CREATE TABLE sessions(stable_id TEXT PRIMARY KEY,host TEXT);
@@ -28,12 +23,28 @@ function fixture() {
   return { control, ledger };
 }
 
-function attention(control: Database, id: string, now: number, material: string, generation = 1, expiresAt: number | null = null) {
+function attention(control: Database, id: string, now: number, material?: string, generation = 1, expiresAt: number | null = null, identity: { approvalId?: string; requestUid?: string; stableId?: string } = {}) {
   const work = createWork(control, { title: id, source: "test", source_id: id, candidate: true }, now);
   const active = promoteWork(control, work.work_id, work.revision, { objective: "decide", acceptance: [{ id: "a", kind: "check", description: "checked" }], non_goals: ["none"], scope: { cwd: "/tmp" }, budget: {}, stop_conditions: [], decision_owner: "owner" }, "test activation", now);
-  const item = upsertAttention(control, { item_id: id, work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "now", conclusion: "Choose", trigger: "risk", impact: "impact", recommendation: "approve", options: ["approve", "stop"], owner: "owner", expires_at: expiresAt, source_link: null, approval_id: null, consumer_owner: null, contract_revision: active.revision, decision_mode: "human_only", evidence: { decisive: "fact" } }, now);
-  control.query("INSERT OR REPLACE INTO control_attention_material VALUES (?,?,?,?,?,?)").run(id, `attention:${id}:${material}`, material, generation, "{}", now);
+  const item = upsertAttention(control, { item_id: id, work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "now", conclusion: "Choose", trigger: "risk", impact: "impact", recommendation: "approve", options: ["approve", "stop"], owner: "owner", expires_at: expiresAt, source_link: null, approval_id: identity.approvalId ?? null, consumer_owner: identity.approvalId ? "extension" : null, contract_revision: active.revision, decision_mode: "human_only", evidence: { decisive: "fact", ...(identity.requestUid || identity.stableId ? { notification_bindings: { ...(identity.requestUid ? { request_uid: identity.requestUid } : {}), ...(identity.stableId ? { stable_id: identity.stableId } : {}) } } : {}) } }, now);
+  if (material !== undefined || generation !== 1) {
+    const fingerprint = material ?? `generation-${generation}`;
+    control.query("UPDATE control_attention_material SET material_key=?,fingerprint=?,generation=? WHERE item_id=?")
+      .run(`attention:${id}:${fingerprint}`, fingerprint, generation, id);
+  }
   return item;
+}
+
+function pendingQ1(ledger: Database, requestUid: string, stableId: string, detail: Record<string, unknown> = {}): void {
+  ledger.query("INSERT OR IGNORE INTO sessions VALUES (?,?)").run(stableId, "local");
+  ledger.query("INSERT INTO requests VALUES (?,?,?,'pending',?,?)").run(requestUid, stableId, "decision", 1_700_000_000_000, JSON.stringify(detail));
+}
+
+let journalId = 0;
+function hung(ledger: Database, stableId: string, detail: Record<string, unknown> = {}): void {
+  ledger.query("INSERT OR IGNORE INTO sessions VALUES (?,?)").run(stableId, "local");
+  ledger.query("INSERT INTO current VALUES (?,'turn_hung','working',?,?)").run(stableId, 1_699_999_000_000, 1_699_999_000_000);
+  ledger.query("INSERT INTO journal VALUES (?,?,'turn_hung',?)").run(++journalId, stableId, JSON.stringify({ stable_id: stableId, ...detail }));
 }
 
 class Sender implements NotificationSender {
@@ -57,11 +68,24 @@ describe("notificationCapability", () => {
 describe("notification projection and durable claims", () => {
   test("A01/A03 uses material identity, not attention revision or prose", async () => {
     const { control, ledger } = fixture(); const now = 1_700_000_000_000;
-    const first = attention(control, "i1", now, "fp-one"); const sender = new Sender();
+    const first = attention(control, "i1", now); const sender = new Sender();
     expect((await runNotificationCycle({ ledger, control, policy: policy(), sender, now })).sent).toBe(1);
-    upsertAttention(control, { ...first, expected_revision: first.revision, conclusion: "Same decision, rephrased" }, now + 1);
+    upsertAttention(control, { ...first, expected_revision: first.revision, trigger: "Same trigger, rephrased", evidence: { heartbeat: 2 } }, now + 1);
     expect((await runNotificationCycle({ ledger, control, policy: policy(), sender, now: now + 1 })).claimed).toBe(0);
     expect(sender.calls).toHaveLength(1);
+    control.close(); ledger.close();
+  });
+
+  test("urgent Attention is a new_now candidate without a decision-package fetch", () => {
+    const { control, ledger } = fixture();
+    const now = 1_700_000_000_000;
+    const item = attention(control, "native", now);
+    expect(control.query("SELECT generation FROM control_attention_material WHERE item_id=?").get(item.item_id)).toEqual({ generation: 1 });
+    expect(collectNotificationCandidates(ledger, control, now, 900_000)).toContainEqual(expect.objectContaining({
+      subject: "attention:native",
+      item_id: "native",
+      threshold: "new_now",
+    }));
     control.close(); ledger.close();
   });
 
@@ -104,20 +128,92 @@ describe("notification projection and durable claims", () => {
     expect(control.query("SELECT outcome,attempt_count FROM control_notifications WHERE item_id='unknown'").get()).toEqual({ outcome: "unknown", attempt_count: 1 });
     control.close(); ledger.close();
   });
+  test("A17 converges exact native and legacy identities while preserving unrelated sources", async () => {
+    const { control, ledger } = fixture();
+    const now = 1_700_000_000_000;
+    const approvalId = "stable#writer#tool";
+    attention(control, "native", now, "fp-native", 1, null, { approvalId });
+    pendingQ1(ledger, approvalId, "session-linked", { approval_id: approvalId });
+    pendingQ1(ledger, "unrelated", "session-unrelated", { approval_id: "other-approval" });
+    hung(ledger, "hung-linked", { approval_id: approvalId });
+    hung(ledger, "hung-unrelated", { approval_id: "different-approval" });
+
+    const projected = collectNotificationCandidates(ledger, control, now);
+    expect(projected.map(({ subject }) => subject).sort()).toEqual([
+      "attention:native",
+      "hung:hung-unrelated",
+      "q1:unrelated",
+    ]);
+    const sender = new Sender();
+    expect(await runNotificationCycle({ ledger, control, policy: policy("send", "cutover-linked"), sender, now })).toMatchObject({ claimed: 3, sent: 3 });
+    expect(sender.calls).toEqual([["attention:native", "q1:unrelated", "hung:hung-unrelated"]]);
+    expect(control.query("SELECT source_kind,approval_id FROM control_notifications WHERE subject='attention:native'").get()).toEqual({ source_kind: "attention", approval_id: approvalId });
+    control.close(); ledger.close();
+  });
+
+  test("A17 does not infer correlation from request, session, or prose without an authoritative binding", () => {
+    const { control, ledger } = fixture();
+    const now = 1_700_000_000_000;
+    attention(control, "native", now, "fp-native", 1, null, { approvalId: "native-approval" });
+    pendingQ1(ledger, "same-looking-request", "same-looking-session", { request_id: "same-looking-request", summary: "Choose" });
+    hung(ledger, "same-looking-session", { request_id: "same-looking-request", summary: "Choose" });
+    expect(collectNotificationCandidates(ledger, control, now).map(({ subject }) => subject).sort()).toEqual([
+      "attention:native",
+      "hung:same-looking-session",
+      "q1:same-looking-request",
+    ]);
+    control.close(); ledger.close();
+  });
+
+  test("A17 uses the registered approval target request/session binding without parsing IDs", () => {
+    const { control, ledger } = fixture();
+    const now = 1_700_000_000_000;
+    attention(control, "bound", now, "fp-bound", 1, null, { approvalId: "opaque-approval" });
+    control.exec(`CREATE TABLE approval_targets(
+      consumer_owner TEXT NOT NULL, approval_id TEXT NOT NULL, request_uid TEXT, stable_id TEXT,
+      PRIMARY KEY(consumer_owner, approval_id)
+    )`);
+    control.query("INSERT INTO approval_targets VALUES ('extension','opaque-approval','ledger-request','ledger-session')").run();
+    pendingQ1(ledger, "ledger-request", "q1-session");
+    hung(ledger, "ledger-session");
+    expect(collectNotificationCandidates(ledger, control, now).map(({ subject }) => subject)).toEqual(["attention:bound"]);
+    control.close(); ledger.close();
+  });
+
+  test("ack is seen-only: it neither suppresses new_now nor a later material_change", async () => {
+    const { control, ledger } = fixture();
+    const now = 1_700_000_000_000;
+    const item = attention(control, "acknowledged", now, "fp-one");
+    control.query("UPDATE control_attention SET acknowledged_at=? WHERE item_id=?").run(now + 1, item.item_id);
+    const sender = new Sender();
+    expect(await runNotificationCycle({ ledger, control, policy: policy("send", "ack-seen-only"), sender, now: now + 2 })).toMatchObject({ claimed: 1, sent: 1 });
+    control.query("UPDATE control_attention_material SET material_key=?,fingerprint=?,generation=2 WHERE item_id=?")
+      .run("attention:acknowledged:fp-two", "fp-two", item.item_id);
+    expect(await runNotificationCycle({ ledger, control, policy: policy("send", "ack-seen-only"), sender, now: now + 3 })).toMatchObject({ claimed: 1, sent: 1 });
+    expect(control.query("SELECT threshold FROM control_notifications WHERE item_id=? ORDER BY created_at").all(item.item_id)).toEqual([
+      { threshold: "new_now" },
+      { threshold: "material_change" },
+    ]);
+    control.close(); ledger.close();
+  });
+
 
   test("A17 shadow compares without sending; legacy Q1/hung and Attention share the owner claim table", async () => {
-    const { control, ledger } = fixture(); const now = 1_700_000_000_000; attention(control, "i1", now, "fp-one");
-    ledger.query("INSERT INTO sessions VALUES (?,?)").run("s1", "local");
-    ledger.query("INSERT INTO requests VALUES (?,?,?,?,?,?)").run("r1", "s1", "decision", "pending", now, "{}");
-    ledger.query("INSERT INTO current VALUES (?,?,?,?,?)").run("s2", "turn_hung", "working", now - 1000, now);
+    const { control, ledger } = fixture();
+    const now = 1_700_000_000_000;
+    attention(control, "i1", now, "fp-one");
+    pendingQ1(ledger, "r1", "s1");
+    hung(ledger, "s2");
     const sender = new Sender();
     const projected = collectNotificationCandidates(ledger, control, now);
     expect(projected.map((candidate) => candidate.subject).sort()).toEqual(["attention:i1", "hung:s2", "q1:r1"]);
     const shadow = await runNotificationCycle({ ledger, control, policy: policy("shadow", "shadow-v1"), sender, now });
-    expect(shadow).toMatchObject({ sent: 0, shadowed: 3 }); expect(sender.calls).toHaveLength(0);
+    expect(shadow).toMatchObject({ sent: 0, shadowed: 3 });
+    expect(sender.calls).toHaveLength(0);
     expect(control.query("SELECT count(*) count FROM control_notification_shadow").get()).toEqual({ count: 3 });
     const send = await runNotificationCycle({ ledger, control, policy: policy("send", "cutover-v2"), sender, now: now + 1 });
-    expect(send).toMatchObject({ claimed: 3, sent: 3 }); expect(sender.calls).toHaveLength(1);
+    expect(send).toMatchObject({ claimed: 3, sent: 3 });
+    expect(sender.calls).toHaveLength(1);
     const feishuSender = { channel: "feishu" as const, send: async () => ({ outcome: "sent" as const }) };
     await expect(runNotificationCycle({ ledger, control, policy: { ...policy("send", "cutover-v2"), primary_channel: "macos" }, sender: feishuSender, now: now + 2 })).rejects.toThrow("not primary");
     control.close(); ledger.close();
@@ -125,7 +221,37 @@ describe("notification projection and durable claims", () => {
 });
 
 describe("nudgeOnce compatibility and cutover policy", () => {
-  test("default shadow records comparison while legacy newline sender remains sole sender", async () => {
+  test("default shadow keeps legacy as sole sender and records linked native coverage", async () => {
+    const { control, ledger } = fixture();
+    const root = roots.at(-1)!;
+    attention(control, "shadow-linked", 1_700_000_000_000, "fp-shadow", 1, null, { approvalId: "r1" });
+    ledger.close();
+    control.close();
+    const ledgerPath = join(root, "ledger.db");
+    const fileLedger = new Database(ledgerPath);
+    fileLedger.exec(`CREATE TABLE requests(request_uid TEXT PRIMARY KEY,stable_id TEXT,kind TEXT,state TEXT,created_at INTEGER,detail TEXT);
+      CREATE TABLE sessions(stable_id TEXT PRIMARY KEY,host TEXT);
+      CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
+      CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
+      CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+      CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);
+      INSERT INTO sessions VALUES ('s1','local');
+      INSERT INTO requests VALUES ('r1','s1','decision','pending',1700000000000,'{"approval_id":"r1"}');`);
+    fileLedger.close();
+    const sent: string[] = [];
+    const deps = { ledgerPath, controlPath: join(root, "control.db"), statePath: join(root, "nudge.state"), notify: async (message: string) => { sent.push(message); }, env: {} satisfies NotificationEnvironment };
+    expect(await nudgeOnce(deps)).toEqual({ count: 1, notified: true });
+    expect(await nudgeOnce(deps)).toEqual({ count: 1, notified: false });
+    expect(sent).toHaveLength(1);
+    const recorded = openControl(deps.controlPath);
+    expect(recorded.query("SELECT outcome,owner_epoch,attempt_count,subject FROM control_notifications").all()).toEqual([
+      { outcome: "shadowed", owner_epoch: "phase-a-shadow-1", attempt_count: 0, subject: "attention:shadow-linked" },
+    ]);
+    expect(recorded.query("SELECT legacy_would_send,candidate_would_send FROM control_notification_shadow").get()).toEqual({ legacy_would_send: 1, candidate_would_send: 1 });
+    recorded.close();
+  });
+
+  test("default shadow records an unlinked coverage gap while legacy remains sole sender", async () => {
     const { control, ledger } = fixture();
     ledger.close();
     control.close();
@@ -142,19 +268,13 @@ describe("nudgeOnce compatibility and cutover policy", () => {
       INSERT INTO requests VALUES ('r1','s1','decision','pending',1700000000000,'{}');`);
     fileLedger.close();
     const sent: string[] = [];
-    const deps = {
-      ledgerPath,
-      controlPath: join(root, "control.db"),
-      statePath: join(root, "nudge.state"),
-      notify: async (message: string) => { sent.push(message); },
-      env: {} satisfies NotificationEnvironment,
-    };
+    const deps = { ledgerPath, controlPath: join(root, "control.db"), statePath: join(root, "nudge.state"), notify: async (message: string) => { sent.push(message); }, env: {} satisfies NotificationEnvironment };
     expect(await nudgeOnce(deps)).toEqual({ count: 1, notified: true });
     expect(await nudgeOnce(deps)).toEqual({ count: 1, notified: false });
     expect(sent).toHaveLength(1);
     const recorded = openControl(deps.controlPath);
-    expect(recorded.query("SELECT outcome,owner_epoch,attempt_count FROM control_notifications").all()).toEqual([
-      { outcome: "shadowed", owner_epoch: "phase-a-shadow-1", attempt_count: 0 },
+    expect(recorded.query("SELECT outcome,owner_epoch,attempt_count,subject FROM control_notifications").all()).toEqual([
+      { outcome: "shadowed", owner_epoch: "phase-a-shadow-1", attempt_count: 0, subject: "q1:r1" },
     ]);
     recorded.close();
   });
@@ -231,6 +351,46 @@ describe("nudgeOnce compatibility and cutover policy", () => {
       { channel: "feishu", owner_epoch: "cutover-config-v1", outcome: "failed", attempt_count: 1, next_attempt_at: null, threshold: "expires_soon" },
       { channel: "feishu", owner_epoch: "cutover-config-v1", outcome: "failed", attempt_count: 1, next_attempt_at: null, threshold: "new_now" },
       { channel: "feishu", owner_epoch: "cutover-config-v1", outcome: "failed", attempt_count: 1, next_attempt_at: null, threshold: "new_now" },
+    ]);
+    recorded.close();
+  });
+
+  test("send cutover delivers a correlated native/Q1 source once", async () => {
+    const { control, ledger } = fixture();
+    const root = roots.at(-1)!;
+    attention(control, "cutover-linked", 1_700_000_000_000, "fp-cutover", 1, null, { approvalId: "r-linked" });
+    ledger.close();
+    control.close();
+    const ledgerPath = join(root, "ledger.db");
+    const fileLedger = new Database(ledgerPath);
+    fileLedger.exec(`CREATE TABLE requests(request_uid TEXT PRIMARY KEY,stable_id TEXT,kind TEXT,state TEXT,created_at INTEGER,detail TEXT);
+      CREATE TABLE sessions(stable_id TEXT PRIMARY KEY,host TEXT);
+      CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
+      CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
+      CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+      CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);
+      INSERT INTO sessions VALUES ('s-linked','local');
+      INSERT INTO requests VALUES ('r-linked','s-linked','decision','pending',1700000000000,'{"approval_id":"r-linked"}');`);
+    fileLedger.close();
+    const sent: string[] = [];
+    const deps = {
+      ledgerPath,
+      controlPath: join(root, "control.db"),
+      statePath: join(root, "nudge.state"),
+      notify: async (message: string) => { sent.push(message); },
+      env: {
+        OVERLOAD_NOTIFICATION_MODE: "send",
+        OVERLOAD_NOTIFICATION_PRIMARY: "macos",
+        OVERLOAD_NOTIFICATION_OWNER: "maintenance",
+        OVERLOAD_NOTIFICATION_OWNER_EPOCH: "linked-cutover-v1",
+      } satisfies NotificationEnvironment,
+    };
+    expect(await nudgeOnce(deps)).toEqual({ count: 1, notified: true });
+    expect(await nudgeOnce(deps)).toEqual({ count: 1, notified: false });
+    expect(sent).toHaveLength(1);
+    const recorded = openControl(deps.controlPath);
+    expect(recorded.query("SELECT subject,source_kind,outcome FROM control_notifications").all()).toEqual([
+      { subject: "attention:cutover-linked", source_kind: "attention", outcome: "sent" },
     ]);
     recorded.close();
   });

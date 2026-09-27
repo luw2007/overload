@@ -82,10 +82,10 @@ CREATE TABLE IF NOT EXISTS attempt_signal_samples(
 CREATE INDEX IF NOT EXISTS idx_signal_samples_work ON attempt_signal_samples(work_id, window_at);
 CREATE INDEX IF NOT EXISTS idx_signal_samples_attempt ON attempt_signal_samples(attempt_id, window_at);
 
--- 逐项检查结果：保存每次检查的可恢复事实
+-- 逐项检查结果：durable identity = (work_id, result_set_version, check_id)；version 只在 Work 内单调。
 CREATE TABLE IF NOT EXISTS attempt_check_results(
   result_set_version INTEGER NOT NULL,
-  work_id TEXT,
+  work_id TEXT NOT NULL CHECK(work_id <> ''),
   task_id TEXT NOT NULL,
   attempt_id TEXT NOT NULL,
   observed_at INTEGER NOT NULL,
@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS attempt_check_results(
   fingerprint TEXT,
   check_def_version TEXT,
   evidence_ref TEXT,
-  PRIMARY KEY(result_set_version, check_id)
+  PRIMARY KEY(work_id, result_set_version, check_id)
 );
 CREATE INDEX IF NOT EXISTS idx_check_results_work ON attempt_check_results(work_id, observed_at);
 

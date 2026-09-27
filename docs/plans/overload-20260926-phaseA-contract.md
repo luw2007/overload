@@ -1,7 +1,7 @@
 # Overload Phase A implementation contract
 
 Date: 2026-09-26  
-Status: frozen implementation contract for Product A
+Status: Phase A implementation contract aligned to the delivered implementation; production release gate remains open
 
 This document is the copy-pasteable boundary between Phase A implementation slices. Terms marked **EXISTING** name current code. Terms marked **NEW** are the only new contracts authorized here.
 
@@ -30,26 +30,25 @@ Explicit non-goals:
 The following are **EXISTING** and are grounded in `local://phaseA-facts.md`:
 
 - `Contract`, `Work`, and `AttentionItem` are defined at `src/control/types.ts:8-65`; Attention state is `open | applying | resolved | superseded` and effect state is `not_started | applying | succeeded | failed | unknown` (`src/control/types.ts:45-46`). Do not duplicate these facts.
-- `listAttention` currently excludes `applying` from Now/Inbox/Done (`src/control/store.ts:314-315`). Phase A must fix presentation through the new follow-up read model, not change Done semantics.
-- resolve uses revision CAS and external-effect guards (`src/control/store.ts:534-614,617-633`). Ack and defer neither answer nor authorize.
-- schema ownership is `control_schema_meta` plus explicit `CONTROL_MIGRATIONS`; migrations run as immediate transactions and destructive ones receive a `VACUUM INTO` backup (`src/control/store.ts:141-177`).
-- `DecisionViewPackage` and `assembleDecisionView` exist at `src/control/context-assembler.ts:59-79,325-426`. Its current options are bare strings; generic option effects are validated in `src/control/store.ts:538-545,599-611`, while the Web consequence map is currently hard-coded (`src/web/static/app.js:52-54`).
-- context and resolve routes receive only the server-injected actor; request data cannot supply identity (`src/web/context-routes.ts:11-17,28-41,74-88`; `src/web/server.ts:121-139,319-321`).
-- stale Attention CAS already maps to HTTP 409 `{error:"conflict",message:"stale attention revision"}` (`src/control/store.ts:535,623`; `src/web/server.ts:85-88`).
-- the Web evidence paths currently render raw `item.evidence` instead of fetching the decision package (`src/web/static/app.js:58-60,605-613`).
-- mailbox targets, answers, receipts, and effect observations already exist (`src/decision-bot/mailbox.ts:8-12,21-42`). `consumeDecision` owns single consumption and `effect_observed` reconciliation (`src/decision-bot/mailbox.ts:68-81`; `src/extension/overload.ts:491-492`).
-- adapter dispatch already moves a card to applying and reopens dispatch rejection as `open/unknown` (`src/adapters/service.ts:896-990`).
-- control outbox identity/hash and ledger projection already exist (`src/control/outbox.ts:31-49,52-68,90-97`). State mutation and outbox insertion must remain one source transaction.
-- Feishu is an **existing writeback path**, not a mock: its card action emits `itemId`, `revision`, and `answer` (`src/adapters/feishu.ts:234-268`), and `AdapterService.accept` applies the same ownership/version/expiry rules before mailbox or generic resolve (`src/adapters/service.ts:132-231`).
-- the current nudge combines legacy Q1, hung, and Attention subjects but keeps only a newline set and supports only macOS (`src/notify/nudge.ts:24-65`).
+- `listAttention` excludes `applying` from Now/Inbox/Done; `listAttentionFollowUps` is the separate applying/failure responsibility read model (`src/control/store.ts:604-658`). Done semantics remain unchanged.
+- resolve uses revision/material CAS and external-effect guards; Ack and defer neither answer nor authorize (`src/control/store.ts:660-756,991-1031`).
+- schema ownership is `control_schema_meta` plus explicit `CONTROL_MIGRATIONS`; v6 schema creation and open-Attention baseline backfill run in one immediate migration transaction, and opening an already-v6 database idempotently repairs missing open rows (`src/control/store.ts:231-275`).
+- `DecisionViewPackage` and `assembleDecisionView` exist at `src/control/context-assembler.ts:59-79,329-364`. Options are derived by the shared store helper; generic option metadata and approval-target effects are authoritative, and unavailable semantics fail assembly with `needs_context` (`src/control/store.ts:417-495`; `src/control/context-assembler.ts:352-354`).
+- context routes receive only the server-injected actor. The Attention mutation route requires a trusted server actor for `resolve` before parsing the decision body; Ack/defer remain seen/presentation actions and do not consume a decision (`src/web/context-routes.ts:11-17,28-41,74-88`; `src/web/server.ts:304-364`).
+- stale Attention or material submissions map to HTTP 409 with `code:"stale_attention"`, current revision/state/effect state, and a decision-package refresh URL (`src/web/server.ts:93-104,327-371`).
+- the Web decision path fetches and renders the decision package; raw evidence remains outside the normal card/drawer path (`src/web/static/app.js:57-67,342-350,610-613`).
+- mailbox targets, answers, receipts, and effect observations remain authoritative (`src/decision-bot/mailbox.ts:8-12,21-42`). `consumeDecision` owns single consumption and `effect_observed` reconciliation (`src/decision-bot/mailbox.ts:68-81`; `src/extension/overload.ts:491-492`).
+- adapter dispatch moves a card to applying and reopens dispatch rejection as `open/unknown` (`src/adapters/service.ts:896-990`).
+- control outbox identity/hash and ledger projection already exist (`src/control/outbox.ts:31-49,52-68,90-97`). State mutation, material projection, and outbox insertion remain one source transaction.
+- Feishu is an existing writeback path, not proof of a configured real-channel production smoke: its card action emits `itemId`, `revision`, and `answer` (`src/adapters/feishu.ts:234-268`), and `AdapterService.accept` applies ownership/version/expiry rules before mailbox or generic resolve (`src/adapters/service.ts:132-231`).
+- notification shadow defaults preserve the legacy Q1/hung newline sender as the only sender while recording candidate comparisons; Attention is candidate-only until cutover (`src/notify/nudge.ts:303-405`).
 - `package.json:7-12` provides only `bun test`; there is no repository typecheck script.
 
 ## 3. Frozen persistence contract
 
-### 3.1 Migration strategy
+### 3.1 Migration and baseline strategy
 
-Raise `CONTROL_SCHEMA_VERSION` from 5 to 6 and append exactly one non-destructive **NEW** `CONTROL_MIGRATIONS` entry. The v6 migration creates the following tables and indexes with `CREATE TABLE/INDEX IF NOT EXISTS`, then updates `control_schema_meta` to 6 inside the existing immediate transaction. It does not alter, copy, or reinterpret existing Work, Attention revision/effect state, mailbox, or outbox rows. Existing Attention rows acquire material state lazily on first projection; no fabricated historical notification is sent during backfill.
-
+`CONTROL_SCHEMA_VERSION` is 6. The non-destructive v6 migration creates the following tables and indexes with `CREATE TABLE/INDEX IF NOT EXISTS`, projects generation-1 material for every existing open Attention row, and updates `control_schema_meta` to 6 in the same immediate transaction. Opening an already-v6 database performs the same missing-row scan in an idempotent immediate repair transaction. Historical open rows therefore receive a baseline but do not directly send: under the default shadow configuration the incumbent legacy Q1/hung sender remains the only sender, while the candidate path only records comparisons/outcomes. Upsert likewise derives and projects the current material baseline atomically with the Attention row, event, and outbox (`src/control/store.ts:246-275,403-412`).
 ```sql
 CREATE TABLE IF NOT EXISTS control_attention_material (
   item_id TEXT PRIMARY KEY,
@@ -111,9 +110,9 @@ CREATE TABLE IF NOT EXISTS control_notification_shadow (
 );
 ```
 
-`subject` is the stable responsibility identity: `attention:<item_id>`, `q1:<request_uid>`, or `hung:<stable_id>`. It deliberately excludes Attention revision. `material_key` is `<subject>:<fingerprint>` for Attention; legacy subjects use `<subject>:legacy-open` until they can be linked reliably. `owner_epoch` is the configured notification-owner epoch, changed only during an explicit cutover. The uniqueness constraint prevents both channels or retries from claiming the same interruption in one epoch. `channel` records the chosen primary delivery; non-primary channels may still update cards/status but must not insert a sending claim.
+`subject` is the stable responsibility identity: `attention:<item_id>`, `q1:<request_uid>`, or `hung:<stable_id>`. It deliberately excludes Attention revision. `material_key` is `<subject>:<fingerprint>` for Attention; unlinked legacy subjects use `<subject>:legacy-open`. Native Attention and legacy Q1/hung are treated as the same responsibility only when an explicit producer-recorded approval/request binding resolves unambiguously; titles, summaries, parsed IDs, and resemblance are never correlations. Unlinked legacy rows remain separate coverage gaps rather than being guessed away (`src/notify/nudge.ts:80-181`). `owner_epoch` changes only during explicit cutover. The uniqueness constraint prevents both channels or retries from claiming the same interruption in one epoch. `channel` records the chosen primary delivery; non-primary channels may still update cards/status but must not insert a sending claim.
 
-`approval_id`, `receipt_id`, and `outbox_event_id` are nullable audit correlations, not replacement authorities. Cross-database foreign keys are intentionally absent. When known, writers must record them; unknown legacy linkage remains null rather than guessed.
+`approval_id`, `receipt_id`, and `outbox_event_id` are nullable audit correlations, not replacement authorities. Cross-database foreign keys are intentionally absent. Writers record authoritative identities when known; missing or ambiguous legacy linkage remains null and separately represented.
 
 ### 3.2 Material fingerprint
 
@@ -137,9 +136,9 @@ Canonicalization is deterministic and local:
 3. serialize objects with lexicographically sorted keys, arrays in the order above, JSON primitives unchanged, and no insignificant whitespace—the same recursive canonical JSON behavior already used by `src/control/outbox.ts:8-14` and `src/decision-bot/mailbox.ts:14-19` should be extracted/reused rather than forked;
 4. `fingerprint = sha256(canonical(inputs))`; `material_key = subject + ":" + fingerprint`.
 
-Timestamps, card revision, updated time, prose summary, heartbeat, ordinary logs, and source-declared `material_change` are not inputs. `risk`, `decision`, and `consequence` are deterministic projections from current card/contract facts. `option_effects` comes only from server-known option semantics. `decisive_evidence` contains the pinned evidence conclusions used by `DecisionViewPackage`, not raw logs. Expiry contributes only exact `expires_at` and derived `expired`; threshold dedup remains separately keyed by `threshold`.
+Timestamps, card revision, updated time, prose summary, heartbeat, ordinary logs, and source-declared `material_change` are not inputs. `risk`, `decision`, and `consequence` are deterministic projections from current card/contract facts. `option_effects` comes only from server-known option semantics. `decisive_evidence` is the card's own pinned evidence object (`AttentionItem.evidence.{object_id,revision}` and its conclusion), not raw logs. `DecisionViewPackage.trigger_evidence` (pool facts linked to the Work) is display context only and is deliberately NOT a material input: linking a new fact does not change the fingerprint; a decision-relevant fact must be pinned by a card revision. Expiry contributes only exact `expires_at` and derived `expired`; threshold dedup remains separately keyed by `threshold`.
 
-On first observation, insert generation 1. On equal fingerprint, retain generation and only refresh `computed_at`. On a different fingerprint, increment generation in the same transaction as the Attention mutation and its outbox event. A source assertion can request recomputation but cannot choose the fingerprint, urgency, authorization, or notification.
+Every upsert derives material through `deriveAttentionMaterialInputs` and projects it in the same immediate transaction as the Attention row, Attention event, and outbox; the assembler calls that same derivation/projection path before returning a package (`src/control/store.ts:403-412,483-495`; `src/control/context-assembler.ts:352-360`). A missing historical open projection is inserted as generation 1 by migration/reopen repair. Equal fingerprints retain generation and refresh `computed_at`; a different fingerprint increments generation. A source assertion can request recomputation but cannot choose the fingerprint, urgency, authorization, or notification.
 
 ## 4. Frozen TypeScript seams
 
@@ -181,7 +180,7 @@ export function resolveAttention(
 ): AttentionItem;
 ```
 
-`listAttention` is the current function typed with the exported zone alias, not a new behavior. `resolveAttention` is the single public wrapper for the current generic decision resolver; Web and Feishu must call this seam rather than duplicate checks. Approval-linked items continue through mailbox write/consume and are rejected by this wrapper. `listAttentionFollowUps` derives fields from existing Attention plus mailbox receipt/effect observations; it does not persist a second status. It includes: answer recorded but unconsumed, every `state='applying'`, and any `effect_state IN ('failed','unknown')` with remaining responsibility. It excludes only rows with verified success and no remaining responsibility. The Web read response is `{items: AttentionFollowUp[]}`.
+`listAttention` retains the existing zone behavior. `resolveAttention` is the single public wrapper for generic decisions; it requires a non-empty trusted actor, while approval-linked items continue through mailbox write/consume and are rejected by this wrapper. Ack is seen-only (`acknowledged_at`) and defer only changes presentation timing; neither answers, authorizes, or resolves. `listAttentionFollowUps` derives fields from existing Attention plus mailbox receipt/effect observations and does not persist a second status. It includes answer-recorded-but-unconsumed, applying, verification-required, failed, and unknown responsibility, and excludes verified success with no remaining responsibility. Web exposes this exact model at `GET /api/control/attention?zone=follow_up` as `{items: AttentionFollowUp[]}` (`src/control/store.ts:604-756,991-1031`; `src/web/server.ts:237-242`).
 
 Unknown or failed effects must reopen the same item responsibility (`state='open'`, effect state retained as `unknown` or `failed`, revision incremented) or remain in follow-up if dispatch is still being reconciled. They must never silently enter Done or spawn a replacement Work solely to bypass a receipt.
 
@@ -228,7 +227,7 @@ export interface DecisionViewPackage {
 export function assembleDecisionView(db: Database, input: GetContextPackageInput): AssemblyResult;
 ```
 
-Option order equals `AttentionItem.options`; IDs are unchanged. Generic `stop`, `continue`, and `narrow` metadata is a typed server map beside the existing handlers. `narrow` requires both reason and replacement contract. Approval options use the registered target effect and explicitly say that choosing records an answer; it does not claim effect success. Unknown option IDs make assembly fail closed with `needs_context`; UI does not synthesize buttons. The Web drawer submits `attention_revision`, current contract revision, and affected-card snapshots where applicable; a changed package displays the new package while retaining an unsubmitted local draft only.
+Option order equals `AttentionItem.options`; IDs are unchanged. Generic `stop`, `continue`, and `narrow` metadata lives in the shared store derivation used by both material fingerprinting and assembly. `narrow` requires both reason and replacement contract. Approval options use the active registered target effect and state explicitly that choosing records an answer, not effect success. Any unknown option without authoritative active target semantics makes assembly fail closed with `needs_context`; neither material projection nor UI invents executable semantics or buttons (`src/control/store.ts:417-495`; `src/control/context-assembler.ts:352-354`). The Web drawer submits `attention_revision`, current contract revision, affected-card snapshots where applicable, and the material fingerprint; a changed package displays the new package while retaining only an unsubmitted local draft.
 
 ### 4.3 Mailbox, effects, audit, and outbox
 
@@ -326,11 +325,11 @@ export async function runNotificationCycle(input: {
 }): Promise<{ claimed: number; sent: number; failed: number; unknown: number; shadowed: number }>;
 ```
 
-Collection is side-effect free. Claim/outcome writes are durable. In `shadow` mode no sender is invoked: comparison rows and `shadowed` outcomes are recorded only. `failed` retries only while `attempt_count < max_attempts`; `unknown` is not blindly resent. A channel receipt means channel acceptance, not user read. macOS and Feishu share the same `control_notifications` claim, `owner_epoch`, and primary-channel policy; they cannot independently dedup.
+Collection is side-effect free. Claim/outcome writes are durable. Default `shadow` is legacy-only send: `nudgeOnce` runs the incumbent Q1/hung newline-state sender first, then records candidate comparison rows and `shadowed` outcomes without invoking the candidate sender; Attention is candidate-only until explicit cutover (`src/notify/nudge.ts:328-405`). `failed` retries only while `attempt_count < max_attempts`; `unknown` is not blindly resent. A channel receipt means channel acceptance, not user read. macOS and Feishu share the same `control_notifications` claim, `owner_epoch`, and primary-channel policy after cutover; they cannot independently dedup.
 
 ### 4.5 HTTP conflict body
 
-All stale package, Attention revision, target version, or material-fingerprint submissions return HTTP 409 with this **NEW superset** (the existing `error` and `message` values remain unchanged):
+Stale Attention revision or material-fingerprint submissions return HTTP 409 with this body; the route does not apply the submitted answer and gives the client the current state plus the package refresh URL (`src/web/server.ts:93-104,327-371`):
 
 ```ts
 export type StaleAttentionBody = {
@@ -346,7 +345,7 @@ export type StaleAttentionBody = {
 };
 ```
 
-No submitted answer is applied on 409. Feishu translates the same conflict into a refresh/current-state response and does not retry the answer.
+Target-version conflicts keep their mailbox/adapter conflict contract rather than pretending to be this Attention-CAS body. Feishu refreshes current state and does not retry the answer.
 
 ## 5. Ownership and invariants
 
@@ -358,8 +357,8 @@ No submitted answer is applied on 409. Feishu translates the same conflict into 
 6. **Failure/unknown reopens responsibility.** Unknown is never success, never authorizes replay, and never disappears because an attempt or Work ID changes.
 7. **No double consume or double notify.** Mailbox target-version uniqueness governs consumption; notification subject/material/threshold/epoch uniqueness governs interruption.
 8. **Expiry is independent of defer.** Deferring presentation cannot extend approval expiry, consume an expired answer, or reset retry/notification budgets.
-9. **Trusted identity only.** Actor remains server-injected locally and adapter-authenticated in Feishu. Sensitive package fields continue through visibility policy; notification text contains no raw evidence by default.
-10. **Feishu is projection/writeback, not authority.** Local control/mailbox facts win. Primary macOS and primary Feishu delivery use one claim table and exactly one configured owner.
+9. **Trusted identity for decisions.** Context access and resolve use server-injected local identity or adapter-authenticated Feishu identity; request bodies cannot self-assert the decision actor. Ack remains a non-authorizing seen marker. Sensitive package fields continue through visibility policy; notification text contains no raw evidence by default.
+10. **Feishu is projection/writeback, not authority.** Local control/mailbox facts win. A configured primary Feishu sender is a cutover option, not a verified production capability; primary macOS and Feishu delivery share one claim table and exactly one configured owner.
 
 ## 6. Defaults, shadow run, and switch procedure
 
@@ -374,16 +373,16 @@ OVERLOAD_NOTIFICATION_EXPIRES_SOON_MS=900000
 OVERLOAD_NOTIFICATION_MAX_ATTEMPTS=3
 ```
 
-`shadow` records candidate/legacy comparisons and notification rows only; it **must not call macOS or Feishu send**. Exactly one launchd/daemon process with `OVERLOAD_NOTIFICATION_OWNER=maintenance` may claim notifications. Feishu remains enabled for status/card synchronization and writeback but is not a second notification owner.
+Default `shadow` preserves the incumbent legacy Q1/hung newline-state sender as the only real sender. The candidate notification cycle records comparison rows and `shadowed` outcomes and must not call its macOS or Feishu sender; Attention has no legacy-send counterpart and is candidate-only. Exactly one launchd/daemon process with `OVERLOAD_NOTIFICATION_OWNER=maintenance` may run the candidate cycle. Feishu may synchronize status/cards and write back decisions, but it is not a second notification owner.
 
 Cutover is ordered and reversible:
 
-1. deploy v6 and run shadow mode over the same Attention/Q1/hung inputs while the legacy nudge remains the only sender;
-2. pass A01–A17 focused tests and inspect shadow false-negative/duplicate rows; unlinked legacy rows are reported as coverage gaps, never guessed;
+1. deploy v6; its transactional backfill/repair gives missing open Attention generation-1 material without directly sending, while default shadow keeps legacy Q1/hung as the only sender;
+2. run focused A01–A17 tests and inspect shadow false-negative/duplicate rows; this is not a claim that A17 has production shadow coverage, and unlinked legacy rows remain visible coverage gaps;
 3. stop the legacy newline-state sender path;
 4. atomically configure one primary channel, set a fresh owner epoch (for example `phase-a-send-1`), and set mode `send` for the single maintenance owner;
-5. restart only that owner, verify a pending claim becomes one durable terminal outcome, and confirm the other channel did not claim it;
-6. rollback by returning to `shadow`; this stops new sends without changing authorization, Attention, mailbox, or receipts. Never run legacy and new send paths concurrently.
+5. restart only that owner, verify a pending claim becomes one durable terminal outcome, and confirm the other channel did not claim it; a configured real-channel smoke requires credentials and explicit operator authorization and has not yet been claimed here;
+6. rollback by returning to `shadow`; this restores legacy-only sending and candidate comparison behavior without changing authorization, Attention, mailbox, or receipts. Never run legacy and candidate send paths concurrently.
 
 Switching primary channel requires stopping the owner, changing `PRIMARY` and `OWNER_EPOCH` together, then restarting one owner. Existing terminal outcomes are retained for audit.
 
@@ -407,7 +406,7 @@ Switching primary channel requires stopping the owner, changing `PRIMARY` and `O
 | A14 | succeeded plus no responsibility resolves once; ordinary completion sends none | effect projection + notification test |
 | A15 | CAS, receipt uniqueness, non-regressing projection, durable notification uniqueness | restart/replay/out-of-order SQLite test |
 | A16 | durable `failed/unknown`, bounded attempts, no blind unknown resend | notification sender failure/unknown test |
-| A17 | shared legacy subjects/claim table and single-owner cutoff | mixed Q1/hung/Attention shadow and send integration test |
+| A17 | explicit approval/request binding, preserved unlinked legacy subjects, shared claim table, and single-owner cutoff | focused mixed Q1/hung/Attention correlation, shadow, and send integration tests; production shadow coverage remains a release-gate item |
 
 ## 8. Verification commands
 
@@ -422,4 +421,4 @@ bun test src/web/server.test.ts src/web/context-ui.test.ts src/web/ui-regression
 bun test
 ```
 
-Browser acceptance must exercise the actual loopback surface for A06, A07, A10, A12, and A14. Channel acceptance must use the existing isolated Feishu adapter tests and one configured real-channel smoke only when credentials and explicit operator authorization are available; a mock receipt proves state rules, not external delivery.
+Browser acceptance must exercise the actual loopback surface for A06, A07, A10, A12, and A14. Channel acceptance uses isolated Feishu adapter tests; one configured real-channel smoke is still required by the production release gate when credentials and explicit operator authorization are available. A mock receipt proves state rules, not external delivery, and this document does not claim the Feishu real channel has been verified.

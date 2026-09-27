@@ -232,32 +232,39 @@ describe("web API", () => {
     });
   });
 
-  test("reports resume capability and launches pi and omp sessions through cmux", async () => {
+  test("Sessions resume capability and POST /api/resume-session share the conservative gate: unproven sessions never reach the executor", async () => {
     const calls: Array<{ command: string; args: string[] }> = [];
     const ledgerPath = seedLedger(); const root = join(ledgerPath, ".."); writeFileSync(join(root, "host"), "local\n");
+    const db = new Database(ledgerPath);
+    // local:omp:dead is authoritatively terminated (session_ended, pid gone); local:pi:crashed only has a dead pid.
+    db.run("INSERT INTO session_incarnations VALUES ('local:omp:dead', 'writer-omp', 'process', 5151, 'boot', 1, 1)");
+    db.run("INSERT INTO journal(host, emitter_id, seq, at, stable_id, writer_id, kind, detail) VALUES ('local', 'emitter-omp', 1, 2, 'local:omp:dead', 'writer-omp', 'session_ended', '{}')");
+    db.run("INSERT INTO sessions VALUES ('local:pi:crashed', 'local', 'pi', 'crashed-session', 'agent', '/repo/crashed', 'main', ?, ?)", [Date.now() - 3_600_000, Date.now() - 3_600_000]);
+    db.run("INSERT INTO session_incarnations VALUES ('local:pi:crashed', 'writer-crashed', 'process', 6161, 'boot', ?, ?)", [Date.now() - 3_600_000, Date.now() - 3_600_000]);
+    db.close();
     const server = startWebServer({ ledgerPath, orchestratorPath: join(root, "resume-orchestrator.db"), spoolRoot: root, publishIntervalMs: 60_000, port: 0, processAlive: (pid) => pid === 4242, resume: async (command, args) => {
       calls.push({ command, args });
       return { ok: true };
     } });
     servers.push(server);
 
-    const sessions = await (await fetch(`${server.url}api/sessions`)).json() as Array<{ stable_id: string; resume_capability: { resumable: boolean; runtime?: string; reason?: string } }>;
-    expect(sessions.find((row) => row.stable_id === "local:pi:dead")?.resume_capability).toEqual({ resumable: true, runtime: "pi" });
-    expect(sessions.find((row) => row.stable_id === "local:omp:dead")?.resume_capability).toEqual({ resumable: true, runtime: "omp" });
-    expect(sessions.find((row) => row.stable_id === "local:pi:live")?.resume_capability).toEqual({ resumable: false, reason: "process_alive" });
-    expect(sessions.find((row) => row.stable_id === "remote:pi:alpha")?.resume_capability).toEqual({ resumable: false, reason: "remote_host_unsupported" });
-
+    const expected: Record<string, { state: string; reason: string }> = {
+      "local:pi:dead": { state: "unknown", reason: "liveness_unknown" },
+      "local:pi:crashed": { state: "unknown", reason: "liveness_unknown" },
+      // Authoritative termination is not enough: the recorded omp session id has no session file behind it.
+      "local:omp:dead": { state: "unknown", reason: "no_session_file" },
+      "local:pi:live": { state: "unsupported", reason: "process_alive" },
+      "remote:pi:alpha": { state: "unsupported", reason: "remote_host_unsupported" },
+    };
+    const sessions = await (await fetch(`${server.url}api/sessions`)).json() as Array<{ stable_id: string; resume_capability: unknown }>;
     const origin = `http://127.0.0.1:${server.port}`;
-    expect(await (await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:pi:dead")}`, { method: "POST", headers: { origin } })).json()).toEqual({ resumed: true });
-    expect(await (await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:omp:dead")}`, { method: "POST", headers: { origin } })).json()).toEqual({ resumed: true });
-    expect(calls).toEqual([
-      { command: "cmux", args: ["new-workspace", "--cwd", "/repo/pi", "--command", "pi --resume='pi-session'", "--focus", "true"] },
-      { command: "cmux", args: ["new-workspace", "--cwd", "/repo/omp", "--command", "omp --resume='omp-session'", "--focus", "true"] },
-    ]);
-
-    const conflict = await fetch(`${server.url}api/resume-session/${encodeURIComponent("local:pi:live")}`, { method: "POST", headers: { origin } });
-    expect(conflict.status).toBe(409);
-    expect(await conflict.json()).toEqual({ resumed: false, reason: "process_alive" });
+    for (const [stableId, { state, reason }] of Object.entries(expected)) {
+      expect(sessions.find((row) => row.stable_id === stableId)?.resume_capability).toEqual({ resumable: false, state, reason });
+      const response = await fetch(`${server.url}api/resume-session/${encodeURIComponent(stableId)}`, { method: "POST", headers: { origin } });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ resumed: false, reason });
+    }
+    expect(calls).toEqual([]);
   });
 
   test("serves session detail and returns 404 for missing resources", async () => {
@@ -434,6 +441,41 @@ describe("web API", () => {
   });
 });
 
+test("follow-up attention API returns actionable effect stages newest first and excludes verified completion", async () => {
+  const root = mkdtempSync(join(tmpdir(), "overload-follow-up-web-")); roots.push(root);
+  const controlPath = join(root, "control.db");
+  const control = openMailbox(controlPath);
+  const work = createWork(control, { title: "release", source: "test", contract: { objective: "release", acceptance: [{ id: "verify", kind: "check", description: "verified", evidence: "passed" }], non_goals: [], scope: { cwd: "/tmp" }, budget: {}, stop_conditions: [], decision_owner: "operator" } }, 1);
+  const add = (item_id: string, state: "open" | "applying", effect_state: "not_started" | "applying" | "succeeded" | "failed", evidence: Record<string, unknown>, now: number) => upsertAttention(control, {
+    item_id, work_id: work.work_id, state, effect_state, urgency: "now", conclusion: `Follow ${item_id}`, trigger: "answer", impact: "release", recommendation: null,
+    options: ["continue"], owner: "operator", expires_at: null, source_link: null, approval_id: item_id, consumer_owner: "orchestrator",
+    contract_revision: work.revision, decision_mode: "human_only", evidence,
+  }, now);
+  add("answer-recorded", "open", "not_started", {}, 100);
+  add("applying", "applying", "applying", {}, 400);
+  add("failed", "open", "failed", { remaining_responsibility: "Review provider failure" }, 300);
+  add("verified-complete", "applying", "succeeded", { effect_verified_at: 250 }, 200);
+  for (const id of ["answer-recorded", "failed"]) registerTarget(control, { consumerOwner: "orchestrator", approvalId: id, question: "continue?", options: ["continue"], effect: "apply", scope: {}, evidence: {}, expiresAt: Date.now() + 60_000 });
+  control.query("INSERT INTO decision_receipts VALUES (?,?,?,?,?,?,?,?,?,?)").run("receipt-recorded", "orchestrator", "answer-recorded", "v1", "continue", "operator", null, 110, null, null);
+  control.query("INSERT INTO decision_receipts VALUES (?,?,?,?,?,?,?,?,?,?)").run("receipt-failed", "orchestrator", "failed", "v1", "continue", "operator", null, 310, 320, "failed");
+  control.query("INSERT INTO receipt_effect_observations VALUES (?,?,?,?,?,?)").run("receipt-failed", "deploy", null, "succeeded", JSON.stringify({ effect: "PR created" }), 315);
+  control.close();
+
+  const { base } = await runningServer(seedLedger(), { controlPath, actor: "operator" });
+  const response = await fetch(`${base}/api/control/attention?zone=follow_up`);
+  expect(response.status).toBe(200);
+  const body = await response.json() as { items: Array<Record<string, any>> };
+  expect(body.items.map((entry) => [entry.item.item_id, entry.stage])).toEqual([
+    ["applying", "applying"], ["failed", "failed"], ["answer-recorded", "answer_recorded"],
+  ]);
+  expect(body.items.find((entry) => entry.item.item_id === "failed")).toMatchObject({
+    occurred_effects: [{ kind: "deploy", evidence: { effect: "PR created", state: "succeeded", observed_at: 315 } }],
+    remaining_responsibility: "Review provider failure",
+    next_action: "Review the failure without creating replacement Work.",
+  });
+  expect(body.items.some((entry) => entry.item.item_id === "verified-complete")).toBe(false);
+});
+
 test("generic stop changes work state and stale decision conflicts", async () => {
   const root = mkdtempSync(join(tmpdir(), "overload-control-web-")); roots.push(root);
   const controlPath = join(root, "control.db");
@@ -485,7 +527,7 @@ test("hung and zombie API rows expose resume capability", async () => {
   const zombie = await (await fetch(`${base}/api/zombie`)).json();
   expect(zombie.groups[0].rows[0]).toMatchObject({
     stable_id: "local:pi:dead",
-    resume_capability: { resumable: true, runtime: "pi" },
+    resume_capability: { resumable: false, state: "unknown", reason: "liveness_unknown" },
   });
 });
 
@@ -496,14 +538,16 @@ test("POST resolve without server-side actor → 501, attention unchanged", asyn
   const control = openControl(controlPath);
   const work = createWork(control, { title: "w", source: "test", contract: { objective: "decide", acceptance: [{ id: "a1", kind: "human", description: "done" }], non_goals: [], scope: { cwd: "/tmp" }, budget: {}, stop_conditions: [], decision_owner: "operator" } }, 100);
   const item = upsertAttention(control, { item_id: "noactor-item", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "decide", trigger: "t", impact: "i", recommendation: null, options: ["continue", "stop"], owner: "operator", expires_at: null, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {} }, 100);
+  const materialBefore = control.query("SELECT fingerprint,generation,computed_at FROM control_attention_material WHERE item_id=?").get(item.item_id);
   control.close();
   const { base } = await runningServer(seedLedger(), { controlPath });
-  const res = await fetch(`${base}/api/attention/noactor-item/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "stop" }) });
+  const res = await fetch(`${base}/api/attention/noactor-item/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision + 99, material_fingerprint: "sensitive-stale-identity", selected_option: "stop" }) });
   expect(res.status).toBe(501);
   const body = await res.json();
   expect(body.error).toBe("not_implemented");
   const inspect = openControl(controlPath);
-  expect(getAttention(inspect, "noactor-item")?.state).toBe("open");
+  expect(getAttention(inspect, "noactor-item")).toMatchObject({ state: "open", effect_state: "not_started", revision: item.revision });
+  expect(inspect.query("SELECT fingerprint,generation,computed_at FROM control_attention_material WHERE item_id=?").get(item.item_id)).toEqual(materialBefore);
   inspect.close();
 });
 

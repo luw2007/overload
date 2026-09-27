@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { queryHung, queryQ1 } from "../shared/queries";
 import { enqueueControlEvent, listAttention, openControl } from "../control/store";
+import type { AttentionItem } from "../control/types";
 
 export type NotificationChannel = "macos" | "feishu";
 export type NotificationThreshold = "new_now" | "material_change" | "expires_soon" | "expired";
@@ -60,12 +61,41 @@ export function notificationCapability(platform: NodeJS.Platform = process.platf
 }
 
 type MaterialRow = { item_id: string; material_key: string; generation: number };
-function attentionCandidates(control: Database, now: number, expiresSoonMs: number): NotificationCandidate[] {
+type AttentionCorrelation = {
+  candidate: NotificationCandidate;
+  approvalIds: Set<string>;
+  requestUids: Set<string>;
+  stableIds: Set<string>;
+};
+type CandidateCollection = { candidates: NotificationCandidate[]; legacyEquivalentIdentities: Set<string> };
+
+function exactIdentity(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function candidateIdentity(candidate: NotificationCandidate): string {
+  return `${candidate.subject}\0${candidate.material_key}\0${candidate.threshold}`;
+}
+
+/**
+ * The mailbox target is the authoritative cross-projection binding. Evidence IDs are
+ * accepted only as explicit producer-recorded identities; titles, summaries, parsed
+ * item IDs, and request/session resemblance are deliberately never correlations.
+ */
+function approvalTargetBinding(control: Database, item: AttentionItem): { request_uid: string | null; stable_id: string | null } | null {
+  if (!item.approval_id || !item.consumer_owner) return null;
+  const table = control.query("SELECT 1 found FROM sqlite_master WHERE type='table' AND name='approval_targets'").get() as { found: number } | null;
+  if (!table) return null;
+  return control.query("SELECT request_uid,stable_id FROM approval_targets WHERE consumer_owner=? AND approval_id=?")
+    .get(item.consumer_owner, item.approval_id) as { request_uid: string | null; stable_id: string | null } | null;
+}
+
+function attentionCorrelations(control: Database, now: number, expiresSoonMs: number): AttentionCorrelation[] {
   const items = listAttention(control).filter((item) => item.state === "open"
     && (item.urgency === "now" || item.expires_at !== null && item.expires_at <= now)
     && (item.defer_until === null || item.defer_until <= now || item.expires_at !== null && item.expires_at <= now));
   const material = control.query("SELECT item_id,material_key,generation FROM control_attention_material WHERE item_id=?");
-  const result: NotificationCandidate[] = [];
+  const result: AttentionCorrelation[] = [];
   for (const item of items) {
     const row = material.get(item.item_id) as MaterialRow | null;
     if (!row) continue;
@@ -79,31 +109,81 @@ function attentionCandidates(control: Database, now: number, expiresSoonMs: numb
       item_revision: item.revision,
       ...(item.approval_id ? { approval_id: item.approval_id } : {}),
     };
-    result.push({ ...base, threshold: row.generation === 1 ? "new_now" : "material_change", reason: row.generation === 1 ? "new urgent decision" : "material decision basis changed" });
+    const binding = approvalTargetBinding(control, item);
+    const approvalIds = new Set<string>();
+    const requestUids = new Set<string>();
+    const stableIds = new Set<string>();
+    for (const value of [item.approval_id, item.evidence.approval_id]) {
+      const identity = exactIdentity(value);
+      if (identity) approvalIds.add(identity);
+    }
+    const bindings = item.evidence.notification_bindings;
+    if (bindings && typeof bindings === "object" && !Array.isArray(bindings)) {
+      const recorded = bindings as Record<string, unknown>;
+      const requestUid = exactIdentity(recorded.request_uid);
+      const stableId = exactIdentity(recorded.stable_id);
+      if (requestUid) requestUids.add(requestUid);
+      if (stableId) stableIds.add(stableId);
+    }
+    const boundRequestUid = exactIdentity(binding?.request_uid);
+    const boundStableId = exactIdentity(binding?.stable_id);
+    if (boundRequestUid) requestUids.add(boundRequestUid);
+    if (boundStableId) stableIds.add(boundStableId);
+    const add = (candidate: NotificationCandidate) => result.push({ candidate, approvalIds, requestUids, stableIds });
+    add({ ...base, threshold: row.generation === 1 ? "new_now" : "material_change", reason: row.generation === 1 ? "new urgent decision" : "material decision basis changed" });
     if (item.expires_at !== null) {
-      if (item.expires_at <= now) result.push({ ...base, threshold: "expired", reason: "decision validity expired" });
-      else if (item.expires_at - now <= expiresSoonMs) result.push({ ...base, threshold: "expires_soon", reason: "decision validity expires soon" });
+      if (item.expires_at <= now) add({ ...base, threshold: "expired", reason: "decision validity expired" });
+      else if (item.expires_at - now <= expiresSoonMs) add({ ...base, threshold: "expires_soon", reason: "decision validity expires soon" });
     }
   }
   return result;
 }
 
-function collectWithExpiryWindow(ledger: Database, control: Database, now: number, expiresSoonMs: number): NotificationCandidate[] {
-  const candidates = attentionCandidates(control, now, expiresSoonMs);
+/** Return one native candidate only when an explicit identity resolves unambiguously. */
+function correlatedAttention(
+  correlations: readonly AttentionCorrelation[],
+  detail: Record<string, unknown> | null,
+  authoritativeId: string,
+  kind: "q1" | "hung",
+): AttentionCorrelation | undefined {
+  const approvalId = exactIdentity(detail?.approval_id);
+  const matches = correlations.filter((entry) => (entry.candidate.threshold === "new_now" || entry.candidate.threshold === "material_change")
+    && (approvalId !== undefined && entry.approvalIds.has(approvalId)
+      || kind === "q1" && entry.requestUids.has(authoritativeId)
+      || kind === "hung" && entry.stableIds.has(authoritativeId)));
+  if (matches.length === 0) return undefined;
+  const identities = new Set(matches.map(({ candidate }) => candidateIdentity(candidate)));
+  return identities.size === 1 ? matches[0] : undefined;
+}
+
+function collectWithExpiryWindow(ledger: Database, control: Database, now: number, expiresSoonMs: number): CandidateCollection {
+  const correlations = attentionCorrelations(control, now, expiresSoonMs);
+  const candidates = correlations.map(({ candidate }) => candidate);
+  const legacyEquivalentIdentities = new Set<string>();
   for (const row of queryQ1(ledger)) {
+    const native = correlatedAttention(correlations, row.detail, row.request_uid, "q1");
+    if (native) {
+      legacyEquivalentIdentities.add(candidateIdentity(native.candidate));
+      continue;
+    }
     const subject = `q1:${row.request_uid}`;
     candidates.push({ subject, material_key: `${subject}:legacy-open`, threshold: "new_now", source_kind: "legacy_q1", source_id: row.request_uid, reason: "legacy pending decision" });
   }
   for (const row of queryHung(ledger, now)) {
+    const native = correlatedAttention(correlations, row.detail, row.stable_id, "hung");
+    if (native) {
+      legacyEquivalentIdentities.add(candidateIdentity(native.candidate));
+      continue;
+    }
     const subject = `hung:${row.stable_id}`;
     candidates.push({ subject, material_key: `${subject}:legacy-open`, threshold: "new_now", source_kind: "legacy_hung", source_id: row.stable_id, reason: "legacy hung turn" });
   }
-  return candidates;
+  return { candidates, legacyEquivalentIdentities };
 }
 
 /** Side-effect-free projection. Material rows must already be maintained by the control store. */
 export function collectNotificationCandidates(ledger: Database, control: Database, now = Date.now()): NotificationCandidate[] {
-  return collectWithExpiryWindow(ledger, control, now, 900_000);
+  return collectWithExpiryWindow(ledger, control, now, 900_000).candidates;
 }
 
 function validatePolicy(policy: NotificationPolicy, sender: NotificationSender): void {
@@ -133,9 +213,9 @@ export async function runNotificationCycle(input: {
 }): Promise<{ claimed: number; sent: number; failed: number; unknown: number; shadowed: number }> {
   const now = input.now ?? Date.now();
   validatePolicy(input.policy, input.sender);
-  const candidates = collectWithExpiryWindow(input.ledger, input.control, now, input.policy.expires_soon_ms);
+  const collection = collectWithExpiryWindow(input.ledger, input.control, now, input.policy.expires_soon_ms);
   // Dynamic insertion deduplicates candidates that project to the same durable notification identity.
-  const byIdentity = new Map(candidates.map((candidate) => [`${candidate.subject}\0${candidate.material_key}\0${candidate.threshold}`, candidate]));
+  const byIdentity = new Map(collection.candidates.map((candidate) => [candidateIdentity(candidate), candidate]));
   const claimed: Array<{ notification_id: string; attempt_count: number; candidate: NotificationCandidate }> = [];
   let shadowed = 0;
 
@@ -158,8 +238,11 @@ export async function runNotificationCycle(input: {
           comparison_id,subject,material_key,threshold,legacy_would_send,candidate_would_send,legacy_reason,candidate_reason,
           source_kind,source_id,item_id,item_revision,compared_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
             randomUUID(), candidate.subject, candidate.material_key, candidate.threshold,
-            candidate.source_kind === "attention" ? 0 : 1, 1,
-            candidate.source_kind === "attention" ? "legacy projection had no stable material identity" : "legacy source is open",
+            candidate.source_kind === "attention" && collection.legacyEquivalentIdentities.has(candidateIdentity(candidate)) ? 1 : candidate.source_kind === "attention" ? 0 : 1,
+            1,
+            candidate.source_kind === "attention" && collection.legacyEquivalentIdentities.has(candidateIdentity(candidate))
+              ? "authoritative legacy binding resolves to this Attention source"
+              : candidate.source_kind === "attention" ? "legacy projection had no authoritative source binding" : "legacy source is open",
             candidate.reason, candidate.source_kind, candidate.source_id, candidate.item_id ?? null, candidate.item_revision ?? null, now,
           );
         if (input.policy.mode === "shadow") {

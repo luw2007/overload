@@ -20,6 +20,9 @@ const WRITE_QUEUE_LIMIT = 1000
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_WEB_PORT = 4870
 const APPROVAL_POLL_INTERVAL_MS = 2_000
+// The terminal dialog waits indefinitely, so the Web target outlives any
+// realistic ask; expiry only bounds an abandoned mailbox row.
+const ASK_TARGET_TTL_MS = 24 * 60 * 60_000
 const procBootId = randomUUID()
 
 type Runtime = "pi" | "omp" | "prime"
@@ -45,7 +48,42 @@ type Envelope = {
 
 type ExtensionApi = {
   on: (event: string, handler: (event: any, ctx: any) => unknown) => void
+  registerTool?: (tool: Record<string, unknown>) => void
   exec?: (command: string, args: string[], options?: Record<string, unknown>) => Promise<{ stdout?: string; code?: number }>
+}
+
+type AskQuestion = { id?: string; question?: string; header?: string; options?: Array<string | { label?: string }>; multi?: boolean; recommended?: number }
+type AskTarget = { approvalId: string; targetVersion: string; expiresAt: number }
+type AskAnswer = { id: string; question: string; options: string[]; multi: boolean; selectedOptions: string[]; customInput?: string }
+
+// Reserved dialog rows, spelled as omp's built-in ask spells them.
+const ASK_OTHER_OPTION = "Other (type your own)"
+const ASK_DONE_OPTION = "Done selecting"
+const ASK_RECOMMENDED_SUFFIX = " (Recommended)"
+const ASK_CANCELLED = "Ask tool was cancelled by the user"
+type AskToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }
+
+const ASK_SCHEMA = {
+  type: "object",
+  properties: {
+    questions: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          question: { type: "string" },
+          header: { type: "string" },
+          options: { type: "array", items: { type: "object", properties: { label: { type: "string" }, description: { type: "string" } }, required: ["label"] } },
+          multi: { type: "boolean" },
+          recommended: { type: "number" },
+        },
+        required: ["question", "options"],
+      },
+    },
+  },
+  required: ["questions"],
 }
 
 type GateRule = { kind: "block" | "require"; rule: string }
@@ -88,7 +126,14 @@ function textFrom(value: unknown): string {
     .join("")
 }
 
-const scrub = (text: string): string => scrubText(text)
+// Installed as a single copied file (scripts/install-extension.sh), so it cannot
+// import ../shared/redact; these patterns mirror src/shared/redact.ts scrubText.
+function scrub(text: string): string {
+  return text
+    .replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{12,}\b/gi, "[REDACTED]")
+    .replace(/\b(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/\b(authorization|api[_-]?key|token|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+}
 
 function truncateUtf8(value: unknown, limit = 500): string {
   const source = scrub(typeof value === "string" ? value : String(value ?? ""))
@@ -142,6 +187,151 @@ function questionPayload(input: unknown): { summary?: string; options?: string[]
     }
   }
   return { ...(texts.length ? { summary: truncateUtf8(texts.join("; "), 500) } : {}), ...(options.length ? { options } : {}) }
+}
+
+function askLabels(question: AskQuestion): string[] {
+  return (question.options || []).map((option) => option && typeof option === "object" && typeof option.label === "string" ? option.label : "").filter(Boolean)
+}
+
+// Web-answerable asks are one single-choice question whose labels reach the
+// card verbatim (questionPayload truncates and scrubs labels): the option the
+// card posts back must be exactly a label the agent asked for. Every other
+// shape stays terminal-only and its card keeps inert option chips.
+function webAskQuestion(input: unknown): AskQuestion | undefined {
+  if (!input || typeof input !== "object" || !("questions" in input) || !Array.isArray(input.questions) || input.questions.length !== 1) return undefined
+  const question: unknown = input.questions[0]
+  if (!question || typeof question !== "object" || ("multi" in question && question.multi === true)) return undefined
+  const labels = askLabels(question as AskQuestion)
+  if (!labels.length || new Set(labels).size !== labels.length || labels.some((label) => truncateUtf8(label, 120) !== label)) return undefined
+  return question as AskQuestion
+}
+
+// Result text mirrors omp's built-in ask so an overridden ask reads the same
+// to the model: one question → "User selected: …", several → "User answers:".
+function askAnswerLine(answer: AskAnswer): string {
+  if (answer.customInput !== undefined) return `${answer.id}: "${answer.customInput}"`
+  if (answer.multi) return `${answer.id}: [${answer.selectedOptions.join(", ")}]`
+  return `${answer.id}: ${answer.selectedOptions[0] ?? "(cancelled)"}`
+}
+
+function askAnswerText(answer: AskAnswer): string {
+  const lines: string[] = []
+  if (answer.selectedOptions.length) lines.push(`User selected: ${answer.selectedOptions.join(", ")}`)
+  if (answer.customInput !== undefined) {
+    lines.push(answer.customInput.includes("\n")
+      ? `User provided custom input:\n${answer.customInput.split("\n").map((line) => `  ${line}`).join("\n")}`
+      : `User provided custom input: ${answer.customInput}`)
+  }
+  return lines.length ? lines.join("\n") : answer.multi ? "User did not select any options" : "User cancelled the selection"
+}
+
+// `selected` stays in details because the decision_resolved reducer path
+// (selectedOption) reads it.
+function askDetails(answer: AskAnswer): Record<string, unknown> {
+  const selected = answer.selectedOptions.length ? answer.selectedOptions.join(", ") : answer.customInput
+  return { ...answer, ...(selected !== undefined ? { selected } : {}) }
+}
+
+function askResult(answers: AskAnswer[], source: "terminal" | "overload-web"): AskToolResult {
+  if (answers.length === 1) {
+    const answer = answers[0]!
+    return { content: [{ type: "text", text: askAnswerText(answer) }], details: { source, ...askDetails(answer) } }
+  }
+  return { content: [{ type: "text", text: `User answers:\n${answers.map(askAnswerLine).join("\n")}` }], details: { source, answers: answers.map(askDetails) } }
+}
+
+type AskUi = {
+  select: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined>
+  input: (title: string, placeholder?: string, opts?: { signal?: AbortSignal }) => Promise<string | undefined>
+}
+
+function terminalUi(ctx: unknown): AskUi | undefined {
+  if (!ctx || typeof ctx !== "object" || !("hasUI" in ctx) || ctx.hasUI !== true || !("ui" in ctx)) return undefined
+  const ui: unknown = ctx.ui
+  if (!ui || typeof ui !== "object" || !("select" in ui) || typeof ui.select !== "function" || !("input" in ui) || typeof ui.input !== "function") return undefined
+  return ui as AskUi
+}
+
+// Throws (so the model re-asks) on inputs omp's built-in ask also refuses:
+// reserved dialog labels and duplicate labels within one question.
+function validateAskQuestions(questions: AskQuestion[]): void {
+  if (!questions.length) throw new Error("ask: questions must not be empty")
+  for (const question of questions) {
+    const labels = askLabels(question)
+    const reserved = labels.find((label) => label === ASK_OTHER_OPTION || (question.multi === true && label === ASK_DONE_OPTION))
+    if (reserved !== undefined) throw new Error(`ask: option labels must not collide with reserved runtime labels: ${JSON.stringify(reserved)}`)
+    const duplicate = labels.find((label, index) => labels.indexOf(label) !== index)
+    if (duplicate !== undefined) throw new Error(`ask: option labels must be unique within a question: ${JSON.stringify(duplicate)}`)
+  }
+}
+
+function askTitle(question: AskQuestion): string {
+  const text = String(question.question || "Decision required")
+  const header = typeof question.header === "string" ? question.header.trim() : ""
+  return header ? `[${header}] ${text}` : text
+}
+
+// One question through the host dialogs. Esc (select → undefined) cancels the
+// whole ask, as in omp's built-in; Esc inside "Other" returns to the list.
+async function askOneInTerminal(question: AskQuestion, index: number, ui: AskUi, signal: AbortSignal): Promise<AskAnswer | undefined> {
+  const title = askTitle(question)
+  const labels = askLabels(question)
+  const multi = question.multi === true
+  const answer: AskAnswer = { id: typeof question.id === "string" && question.id ? question.id : `q${index + 1}`, question: String(question.question || "Decision required"), options: labels, multi, selectedOptions: [] }
+  const readCustom = async (): Promise<string | undefined> => {
+    const text = await ui.input(title, undefined, { signal })
+    return signal.aborted ? undefined : text
+  }
+  if (!labels.length) {
+    const text = await readCustom()
+    return text === undefined ? undefined : { ...answer, customInput: text }
+  }
+  if (!multi) {
+    const recommended = typeof question.recommended === "number" && Number.isInteger(question.recommended) ? question.recommended : -1
+    const shown = labels.map((label, i) => i === recommended && !label.endsWith(ASK_RECOMMENDED_SUFFIX) ? label + ASK_RECOMMENDED_SUFFIX : label)
+    while (true) {
+      const choice = await ui.select(title, [...shown, ASK_OTHER_OPTION], { signal })
+      if (signal.aborted || choice === undefined) return undefined
+      if (choice === ASK_OTHER_OPTION) {
+        const text = await readCustom()
+        if (signal.aborted) return undefined
+        if (text === undefined) continue
+        return { ...answer, customInput: text }
+      }
+      const picked = shown.indexOf(choice)
+      return { ...answer, selectedOptions: [picked >= 0 ? labels[picked]! : choice] }
+    }
+  }
+  const checked = new Set<number>()
+  while (true) {
+    const shown = labels.map((label, i) => `${checked.has(i) ? "[x]" : "[ ]"} ${label}`)
+    const choice = await ui.select(checked.size ? `(${checked.size} selected) ${title}` : title, [...shown, ...(checked.size ? [ASK_DONE_OPTION] : []), ASK_OTHER_OPTION], { signal })
+    if (signal.aborted || choice === undefined) return undefined
+    if (choice === ASK_DONE_OPTION) break
+    if (choice === ASK_OTHER_OPTION) {
+      const text = await readCustom()
+      if (signal.aborted) return undefined
+      if (text === undefined) continue
+      answer.customInput = text
+      break
+    }
+    const picked = shown.indexOf(choice)
+    if (picked < 0) continue
+    if (checked.has(picked)) checked.delete(picked)
+    else checked.add(picked)
+  }
+  return { ...answer, selectedOptions: labels.filter((_label, i) => checked.has(i)) }
+}
+
+// Asks every question in order; undefined means the user cancelled.
+async function askInTerminal(questions: AskQuestion[], ui: AskUi, signal: AbortSignal): Promise<AskAnswer[] | undefined> {
+  const answers: AskAnswer[] = []
+  for (const [index, question] of questions.entries()) {
+    const answer = await askOneInTerminal(question, index, ui, signal)
+    if (!answer) return undefined
+    answers.push(answer)
+  }
+  return answers
 }
 
 function hostContext(): { host?: Record<string, string>; error?: string } {
@@ -360,7 +550,13 @@ export default function overload(pi: ExtensionApi): void {
   const runtime = detectRuntime()
   const spool = new SpoolWriter(runtime)
   const pendingAsk = new Set<string>()
+  // Web targets registered by tool_call for the answerable ask, keyed by
+  // toolCallId; execute takes ownership, tool_execution_end closes leftovers.
+  const askTargets = new Map<string, AskTarget>()
+  const askWebAnswers = new Map<string, { actor: string; receiptId: string }>()
   const isAskTool = (name: unknown) => name === "ask" || name === "ask_user"
+  let askToolRegistered = false
+  let controlPlanePort = DEFAULT_WEB_PORT
   const headByCwd = new Map<string, string>()
   let session = safeComponent(randomUUID(), "session")
   let stableId = ""
@@ -398,6 +594,8 @@ export default function overload(pi: ExtensionApi): void {
         throw error
       }
       const config = JSON.parse(raw)
+      // The answerable ask talks to the control plane even with the gate off.
+      if (Number.isSafeInteger(config?.web_port) && config.web_port > 0 && config.web_port <= 65535) controlPlanePort = config.web_port
       const gate = config?.approval_gate
       if (gate === undefined) return
       if (!gate || typeof gate !== "object" || typeof gate.enabled !== "boolean") {
@@ -489,7 +687,9 @@ export default function overload(pi: ExtensionApi): void {
 
   const receiptByToolCall = new Map<string,{receiptId:string;attemptId?:string;effect:string}>()
   function canonicalValue(value:unknown):string{if(value===null||typeof value!=="object")return JSON.stringify(value);if(Array.isArray(value))return `[${value.map(canonicalValue).join(",")}]`;const row=value as Record<string,unknown>;return `{${Object.keys(row).sort().map(key=>`${JSON.stringify(key)}:${canonicalValue(row[key])}`).join(",")}}`}
-  function emitEffect(payload:Record<string,unknown>):void{const receiptId=String(payload.receipt_id),toolCallId=String(payload.toolCallId),eventId=`extension:${receiptId}:${toolCallId}:effect_observed`;emit("control_event",{event_id:eventId,producer_id:`extension:${spool.emitterId}`,entity_id:receiptId,entity_version:1,event_kind:"effect_observed",payload,payload_hash:createHash("sha256").update(canonicalValue(payload)).digest("hex")})}
+  // The hash must cover exactly what ingest will decode from the spool line. JSON drops undefined members (an ask
+  // receipt has no attempt_id), so hash and emit the JSON wire form, never the in-memory object.
+  function emitEffect(effect:Record<string,unknown>):void{const payload=JSON.parse(JSON.stringify(effect)) as Record<string,unknown>,receiptId=String(payload.receipt_id),toolCallId=String(payload.toolCallId),eventId=`extension:${receiptId}:${toolCallId}:effect_observed`;emit("control_event",{event_id:eventId,producer_id:`extension:${spool.emitterId}`,entity_id:receiptId,entity_version:1,event_kind:"effect_observed",payload,payload_hash:createHash("sha256").update(canonicalValue(payload)).digest("hex")})}
 
   async function waitForApproval(event: { toolCallId: string; toolName: string; input?: Record<string, unknown> }, rule: GateRule, signal?: AbortSignal): Promise<{ block: true; reason: string } | undefined> {
     const gate = approvalGate
@@ -552,6 +752,121 @@ export default function overload(pi: ExtensionApi): void {
     if (signal?.aborted) return cancelApproval()
     emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "timed_out" })
     return { block: true, reason: "overload approval gate: timed out" }
+  }
+
+  const controlPlaneHeaders = { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" }
+
+  async function registerAskTarget(toolCallId: string, question: AskQuestion): Promise<AskTarget | undefined> {
+    const approvalId = `${stableId}#${spool.writerId}#${toolCallId}`
+    const expiresAt = Date.now() + ASK_TARGET_TTL_MS
+    const text = truncateUtf8(question.question || "", 500)
+    const options = askLabels(question)
+    try {
+      const response = await globalThis.fetch(`http://127.0.0.1:${controlPlanePort}/api/decision/target`, { method: "POST", signal: AbortSignal.timeout(2000), headers: controlPlaneHeaders, body: JSON.stringify({ consumerOwner: "extension", approvalId, stableId, requestUid: approvalId, question: text, options, effect: "ask_answer", scope: { gate: "ask", cwd: sessionCwd }, evidence: { tool: "ask", question: text, options, cwd: sessionCwd, toolCallId }, toolCallId, decisionMode: "human_only", expiresAt }) })
+      if (!response.ok) return undefined
+      const payload: unknown = await response.json()
+      if (payload && typeof payload === "object" && "targetVersion" in payload && typeof payload.targetVersion === "string") return { approvalId, targetVersion: payload.targetVersion, expiresAt }
+    } catch { /* Control plane unreachable: the ask stays terminal-only. */ }
+    return undefined
+  }
+
+  function cancelAskTarget(target: AskTarget): void {
+    // A consumed target refuses cancellation, so a late Web consume stays observable.
+    void globalThis.fetch(`http://127.0.0.1:${controlPlanePort}/api/decision/cancel/${encodeURIComponent(target.approvalId)}`, { method: "POST", signal: AbortSignal.timeout(2000), headers: controlPlaneHeaders, body: JSON.stringify({ consumer_owner: "extension", target_version: target.targetVersion }) }).catch(() => {})
+  }
+
+  // Polls the mailbox until the Web answer is consumed, the target expires, or
+  // `stop` fires because the terminal answered first. A consume request is
+  // never aborted client-side: the server may commit the receipt after any
+  // client timeout, and an abandoned response would lose the only copy of the
+  // answer. A late response after `stop` is recorded as undelivered instead.
+  async function awaitWebAnswer(toolCallId: string, target: AskTarget, stop: AbortSignal): Promise<{ answer: string; actor: string; receiptId: string } | undefined> {
+    while (!stop.aborted && Date.now() < target.expiresAt) {
+      try {
+        const response = await globalThis.fetch(`http://127.0.0.1:${controlPlanePort}/api/decision/consume/${encodeURIComponent(target.approvalId)}`, { method: "POST", headers: controlPlaneHeaders, body: JSON.stringify({ consumer_owner: "extension", target_version: target.targetVersion }) })
+        if (response.status === 200) {
+          const payload: unknown = await response.json()
+          const field = (key: string): string => payload && typeof payload === "object" && key in payload && typeof (payload as Record<string, unknown>)[key] === "string" ? String((payload as Record<string, unknown>)[key]) : ""
+          const receiptId = field("receiptId")
+          if (stop.aborted) {
+            // The terminal won while this consume was in flight: the receipt exists but its answer never reached the agent.
+            if (receiptId) emitEffect({ receipt_id: receiptId, toolCallId, effect: "ask_answer", effect_state: "failed", evidence: { reason: "answered_in_terminal_first" } })
+            return undefined
+          }
+          return { answer: field("answer"), actor: field("actor") || "unknown", receiptId }
+        }
+      } catch { /* Poll errors retry until expiry; the terminal can still answer. */ }
+      await new Promise<void>((resolve) => {
+        const finish = () => { clearTimeout(timer); stop.removeEventListener("abort", finish); resolve() }
+        const timer = setTimeout(finish, Math.min(APPROVAL_POLL_INTERVAL_MS, Math.max(1, target.expiresAt - Date.now())))
+        stop.addEventListener("abort", finish, { once: true })
+      })
+    }
+    return undefined
+  }
+
+  // Registered as `ask`: the terminal dialog races the Overload mailbox and the
+  // first answer wins. pi keeps its bundled ask_user beside it (same-name
+  // extension tools refuse to start); omp's built-in ask is overridden.
+  async function executeAsk(toolCallId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: unknown): Promise<AskToolResult> {
+    const questions = params && typeof params === "object" && "questions" in params && Array.isArray(params.questions) ? params.questions as AskQuestion[] : []
+    // Before claiming the target: an unclaimed target is cancelled at tool_execution_end.
+    validateAskQuestions(questions)
+    const target = askTargets.get(toolCallId)
+    askTargets.delete(toolCallId)
+    const ui = terminalUi(ctx)
+    if (!ui && !target) {
+      throw new Error("ask needs an interactive terminal or a reachable Overload control plane")
+    }
+    const dialog = new AbortController()
+    const poll = new AbortController()
+    const stop = () => { dialog.abort(); poll.abort() }
+    signal?.addEventListener("abort", stop, { once: true })
+    let webWon = false
+    try {
+      const contenders: Array<Promise<AskToolResult>> = [
+        new Promise<never>((_resolve, reject) => {
+          const cancel = () => reject(new Error(ASK_CANCELLED))
+          if (signal?.aborted) cancel()
+          else signal?.addEventListener("abort", cancel, { once: true })
+        }),
+      ]
+      if (ui) {
+        contenders.push(askInTerminal(questions, ui, dialog.signal).then((answers) => {
+          if (!answers) {
+            // Built-in parity: a terminal cancel also stops the agent turn.
+            if (!dialog.signal.aborted && ctx && typeof ctx === "object" && "abort" in ctx && typeof ctx.abort === "function") ctx.abort()
+            throw new Error(ASK_CANCELLED)
+          }
+          return askResult(answers, "terminal")
+        }))
+      }
+      if (target) {
+        contenders.push(awaitWebAnswer(toolCallId, target, poll.signal).then((web) => {
+          if (!web) {
+            if (ui) return new Promise<never>(() => {})
+            throw new Error("ask expired before an Overload answer arrived")
+          }
+          webWon = true
+          askWebAnswers.set(toolCallId, { actor: web.actor, receiptId: web.receiptId })
+          if (web.receiptId) receiptByToolCall.set(toolCallId, { receiptId: web.receiptId, effect: "ask_answer" })
+          const asked = questions[0]
+          return askResult([{ id: typeof asked?.id === "string" && asked.id ? asked.id : "q1", question: String(asked?.question || "Decision required"), options: asked ? askLabels(asked) : [], multi: false, selectedOptions: [web.answer] }], "overload-web")
+        }))
+      }
+      return await Promise.race(contenders)
+    } finally {
+      stop()
+      signal?.removeEventListener("abort", stop)
+      if (target && !webWon) cancelAskTarget(target)
+    }
+  }
+
+  if (typeof pi.registerTool === "function") {
+    try {
+      pi.registerTool({ name: "ask", label: "Ask", description: "Ask the user one or more questions and wait for an answer from the terminal or the Overload dashboard.", parameters: ASK_SCHEMA, execute: executeAsk })
+      askToolRegistered = true
+    } catch { /* Host refused the tool: asks stay observational. */ }
   }
 
   function shellCommand(command: string): string {
@@ -753,7 +1068,12 @@ export default function overload(pi: ExtensionApi): void {
     }
     if (isAskTool(event?.toolName) && typeof event.toolCallId === "string") {
       pendingAsk.add(event.toolCallId)
-      emit("decision_requested", { request_id: event.toolCallId, ...questionPayload(event.input) })
+      // Only this extension's own `ask` can consume a Web answer, so only it
+      // registers a mailbox target and advertises approval_id to the card.
+      const question = event.toolName === "ask" && askToolRegistered ? webAskQuestion(event.input) : undefined
+      const target = question ? await registerAskTarget(event.toolCallId, question) : undefined
+      if (target) askTargets.set(event.toolCallId, target)
+      emit("decision_requested", { request_id: event.toolCallId, ...questionPayload(event.input), ...(target ? { approval_id: target.approvalId, consumer_owner: "extension", target_version: target.targetVersion } : {}) })
     }
     const rule = gateRule(event)
     if (rule) {
@@ -777,6 +1097,12 @@ export default function overload(pi: ExtensionApi): void {
   })
   on("tool_execution_end", (event) => {
     if (!isAskTool(event?.toolName) || !pendingAsk.delete(event.toolCallId)) return
+    // A target execute never claimed (the call was blocked) must not stay answerable.
+    const unclaimed = askTargets.get(event.toolCallId)
+    askTargets.delete(event.toolCallId)
+    if (unclaimed) cancelAskTarget(unclaimed)
+    const web = askWebAnswers.get(event.toolCallId)
+    askWebAnswers.delete(event.toolCallId)
     const selected = selectedOption(event.result)
     emit("decision_resolved", {
       request_id: event.toolCallId,
@@ -784,6 +1110,7 @@ export default function overload(pi: ExtensionApi): void {
       // cancellation, never a successful resolution (review B1).
       state: event.isError ? "cancelled" : "resolved",
       ...(selected ? { selected } : {}),
+      ...(web ? { actor: web.actor, receipt_id: web.receiptId } : {}),
       ...(event.isError ? { error: true } : {}),
     })
   })
@@ -796,7 +1123,8 @@ export default function overload(pi: ExtensionApi): void {
       receiptByToolCall.delete(toolCallId)
       const isError=event?.isError===true
       const tool=String(event?.toolName||"unknown").toLowerCase()
-      const state:"succeeded"|"failed"|"unknown" = tool==="write"||tool==="edit"?(isError?"failed":"succeeded"):"unknown"
+      // A delivered ask answer is the whole effect: the agent received it iff the tool returned.
+      const state:"succeeded"|"failed"|"unknown" = tool==="write"||tool==="edit"||tool==="ask"?(isError?"failed":"succeeded"):"unknown"
       const evidence={tool,isError,output:truncateUtf8(textFrom(event),2000)}
       const observation={receipt_id:pending.receiptId,toolCallId,attempt_id:pending.attemptId,effect:pending.effect,effect_state:state,evidence};emitEffect(observation)
       void globalThis.fetch(`http://127.0.0.1:${approvalGate?.webPort??DEFAULT_WEB_PORT}/api/decision/effect`,{method:"POST",headers:{"Content-Type":"application/json","Origin":`http://127.0.0.1:${approvalGate?.webPort??DEFAULT_WEB_PORT}`},body:JSON.stringify(observation)}).catch(()=>{})
@@ -808,6 +1136,8 @@ export default function overload(pi: ExtensionApi): void {
     if (heartbeat) clearInterval(heartbeat)
     heartbeat = null
     for(const [toolCallId,pending] of receiptByToolCall){emitEffect({receipt_id:pending.receiptId,toolCallId,attempt_id:pending.attemptId,effect:pending.effect,effect_state:"unknown",evidence:{reason:"session_ended_before_tool_result"}})}
+    for(const target of askTargets.values())cancelAskTarget(target)
+    askTargets.clear()
     receiptByToolCall.clear()
     emit("session_ended", { reason: event?.reason || "quit" })
     await spool.flushAndSeal().catch(() => {})

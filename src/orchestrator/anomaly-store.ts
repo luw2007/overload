@@ -15,9 +15,11 @@ export type SignalSample = {
 };
 
 export type CheckStatus = "pass" | "fail" | "unknown" | "not_run";
+// Durable identity is (work_id, result_set_version, check_id): result_set_version is only
+// monotonic within one Work, so every result-set read must name the Work.
 export type CheckResult = {
   result_set_version: number;
-  work_id: string | null;
+  work_id: string;
   task_id: string;
   attempt_id: string;
   observed_at: number;
@@ -97,8 +99,9 @@ export function insertCheckResults(
   attempt_id: string,
   observed_at: number,
   items: CheckResultInput[],
-  work_id?: string | null,
+  work_id: string,
 ): void {
+  if (typeof work_id !== "string" || work_id === "") throw new Error("insertCheckResults: work_id is required");
   const stmt = db.prepare(
     "INSERT INTO attempt_check_results(result_set_version,work_id,task_id,attempt_id,observed_at,check_id,status,fingerprint,check_def_version,evidence_ref) VALUES(?,?,?,?,?,?,?,?,?,?)",
   );
@@ -106,7 +109,7 @@ export function insertCheckResults(
     for (const it of rows) {
       stmt.run([
         result_set_version,
-        work_id ?? null,
+        work_id,
         task_id,
         attempt_id,
         observed_at,
@@ -121,10 +124,10 @@ export function insertCheckResults(
   run(items);
 }
 
-export function getCheckResults(db: Database, result_set_version: number): CheckResult[] {
+export function getCheckResults(db: Database, workId: string, resultSetVersion: number): CheckResult[] {
   return db
-    .query("SELECT * FROM attempt_check_results WHERE result_set_version=? ORDER BY check_id")
-    .all(result_set_version) as CheckResult[];
+    .query("SELECT * FROM attempt_check_results WHERE work_id=? AND result_set_version=? ORDER BY check_id")
+    .all(workId, resultSetVersion) as CheckResult[];
 }
 
 export function getLatestCheckResults(db: Database, work_id: string): CheckResult[] | null {

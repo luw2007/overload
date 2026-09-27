@@ -1,7 +1,8 @@
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 import { CLASSIFIER_VERSION, classify, queueAfter, type ClassifiableCurrent, type ClassifierEvent } from "./classifier";
 import { PROGRESS_KINDS } from "../shared/types";
-import { applyControlEvent } from "../control/projection";
+import { applyControlEvent, ControlProjectionConflictError } from "../control/projection";
+import { ControlEventVerificationError } from "../control/outbox";
 
 const SOURCE_TERMINALS = new Set(["resolved", "cancelled", "timed_out"]);
 const SESSION_TERMINALS = new Set(["done", "failed", "vanished"]);
@@ -81,7 +82,7 @@ export function reduceJournal(db: Database, batchSize = 500): number {
 
 function applyEvent(db: Database, row: JournalRow): void {
   const detail = objectDetail(row.detail);
-  if (row.kind === "control_event") { applyControlEvent(db, detail, row.at); return; }
+  if (row.kind === "control_event") { applyOrQuarantineControlEvent(db, row, detail); return; }
   if (row.kind === "classifier_activated") {
     const version = typeof detail.version === "number" ? detail.version : CLASSIFIER_VERSION;
     db.query("INSERT OR IGNORE INTO classifier_activations(version, activated_at_journal_seq, activated_at) VALUES (?, ?, ?)").run(version, row.ingest_seq, row.at);
@@ -92,6 +93,40 @@ function applyEvent(db: Database, row: JournalRow): void {
   if (row.kind === "attachment_observed") applyAttachment(db, row, detail);
   const requestEffect = applyRequestEvent(db, row, detail);
   applySessionEvent(db, row, detail, requestEffect);
+}
+
+/** A control event that fails verification (hash, identity, envelope) or projection (typed snapshot conflict), or hits
+ *  a deterministic SQLite data error (constraint/type/size), can never apply: its projection writes roll back to a
+ *  savepoint, it is never recorded as applied, the journal row stays as evidence, and the verdict is made terminal in
+ *  rejected_control_events keyed by event_id (with the reason). The publisher reads that table to stop re-leasing,
+ *  and any republished copy with the same payload is skipped, so one rejected event yields exactly one coverage gap.
+ *  Every other error (storage, programming bugs) aborts the batch so a fix can replay the event. */
+function applyOrQuarantineControlEvent(db: Database, row: JournalRow, detail: Record<string, unknown>): void {
+  const eventId = typeof detail.event_id === "string" && detail.event_id ? detail.event_id : null;
+  const payloadHash = typeof detail.payload_hash === "string" ? detail.payload_hash : null;
+  if (eventId) {
+    const rejected = db.query("SELECT payload_hash FROM rejected_control_events WHERE event_id=?").get(eventId) as { payload_hash: string | null } | null;
+    if (rejected && rejected.payload_hash === payloadHash) return;
+  }
+  try {
+    db.transaction(() => applyControlEvent(db, detail, row.at))();
+  } catch (error) {
+    const deterministic = error instanceof ControlEventVerificationError || error instanceof ControlProjectionConflictError
+      || (error instanceof SQLiteError && /^SQLITE_(CONSTRAINT|MISMATCH|TOOBIG|RANGE)/.test(error.code ?? ""));
+    if (!deterministic || !(error instanceof Error)) throw error;
+    const reason = error.message;
+    const fresh = eventId
+      ? db.query(`INSERT INTO rejected_control_events(event_id, payload_hash, reason, ingest_seq, rejected_at) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(event_id) DO NOTHING`).run(eventId, payloadHash, reason, row.ingest_seq, row.at).changes > 0
+      : true;
+    if (!fresh) return;
+    const inserted = db.query(`INSERT INTO coverage_gaps(stable_id, emitter_id, from_seq, from_at, to_at, reason)
+      SELECT ?, ?, ?, ?, ?, 'control_event_rejected'
+      WHERE NOT EXISTS (SELECT 1 FROM coverage_gaps
+        WHERE stable_id=? AND emitter_id=? AND from_seq=? AND reason='control_event_rejected')`)
+      .run(row.stable_id, row.emitter_id, row.ingest_seq, row.at, row.at, row.stable_id, row.emitter_id, row.ingest_seq);
+    if (inserted.changes) console.error(`quarantined control_event ingest_seq=${row.ingest_seq} event_id=${String(eventId)}: ${reason}`);
+  }
 }
 
 function applyIncident(db: Database, row: JournalRow, detail: Record<string, unknown>): void {

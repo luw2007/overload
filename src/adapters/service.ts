@@ -508,7 +508,12 @@ export class AdapterService {
    if (!leased.changes) return;
    if (!handle) {
     if (c.session_reference) {
-     handle = await this.config.runtime.connect(reference);
+     try {
+      handle = await this.config.runtime.connect(reference);
+     } catch (error) {
+      if (!turn || waiting || !this.config.runtime.capabilities.restore || !this.config.runtime.restore || !(error instanceof Error) || error.message !== "runtime_not_live") throw error;
+      handle = await this.config.runtime.restore(reference);
+     }
     } else {
      const sessionId = reference.sessionId;
      bindSession(this.db, c.id, reference);
@@ -935,7 +940,7 @@ export class AdapterService {
   const conversations = this.db.query("SELECT id FROM conversations").all() as {
    id: string;
   }[];
-  for (const c of conversations) await this.pump(c.id);
+  await Promise.all(conversations.map((c) => this.pump(c.id)));
   await this.consumeAnswers();
   this.projectGateTargets();
   this.projectCards();

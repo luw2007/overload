@@ -99,7 +99,8 @@ describe("T5 context-assembler", () => {
     const db = fixture();
     const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
     const problem = rootProblem(db, work.work_id);
-    makeAttention(db, work.work_id, "item-1");
+    const item = makeAttention(db, work.work_id, "item-1");
+    const baseline = db.query("SELECT fingerprint,generation FROM control_attention_material WHERE item_id=?").get(item.item_id) as { fingerprint: string; generation: number };
 
     const fact = makeFact(db, work.work_id, "fact-1");
     linkProblemObject(db, { problem_id: problem.problem_id, object_id: fact.object_id, revision: 1, role: "fact" }, 3);
@@ -144,6 +145,8 @@ describe("T5 context-assembler", () => {
     expect(ok.package.artifacts[0].content_hash).toBe("h-art");
     expect(ok.package.scene_entry).not.toBeNull();
     expect(ok.package.scene_entry!.jump_target).toBe("session://jump/1");
+    expect(ok.package.material_fingerprint).toBe(baseline.fingerprint);
+    expect(db.query("SELECT generation FROM control_attention_material WHERE item_id=?").get(item.item_id)).toEqual({ generation: 1 });
     db.close();
   });
 
@@ -156,6 +159,29 @@ describe("T5 context-assembler", () => {
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.code).toBe("needs_context");
+    db.close();
+  });
+
+  test("decision package fails closed when non-generic options have no active server target", () => {
+    const db = fixture();
+    const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
+    const item = makeAttention(db, work.work_id, "unknown-option", { options: ["allow-once"], approval_id: null, consumer_owner: null });
+    const baseline = db.query("SELECT generation,inputs FROM control_attention_material WHERE item_id=?").get(item.item_id) as { generation: number; inputs: string };
+
+    const result = getContextPackage({
+      consumer_type: "decision_ui", consumer_id: item.item_id, work_id: work.work_id,
+      package_type: "decision_view", actor: "alice", db,
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("needs_context");
+      expect(result.reason).toBe("decision option semantics unavailable");
+    }
+    expect(baseline.generation).toBe(1);
+    expect(JSON.parse(baseline.inputs).option_effects).toEqual([
+      { option: "allow-once", effect: "records answer; execution semantics unavailable" },
+    ]);
     db.close();
   });
 

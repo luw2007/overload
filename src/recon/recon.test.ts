@@ -263,6 +263,60 @@ describe("ReconDaemon", () => {
     expect(output.filter((event) => event.detail?.source === "herdr").map((event) => event.kind)).toEqual(["source_outage", "source_recovered"]);
   });
 
+  test("preserves emitter clocks, end exclusion, and liveness filters in one reconciliation pass", async () => {
+    const f = await fixture();
+    const now = Date.now();
+    const sharedWriter = "pi-91000-shared00";
+    const noEventWriter = "pi-91003-noevent0";
+    const db = new Database(f.ledger);
+    const addSession = (stableId: string, host: string, session: string) => {
+      db.query("INSERT INTO sessions VALUES (?, ?, 'pi', ?, '/repo')").run(stableId, host, session);
+    };
+    const addIncarnation = (stableId: string, writerId: string, domain: string, pid: number,
+      startedAt: number, lastSeenAt: number | null) => {
+      db.query("INSERT INTO session_incarnations VALUES (?, ?, ?, ?, 'bootclock', ?, ?)")
+        .run(stableId, writerId, domain, pid, startedAt, lastSeenAt);
+    };
+    for (const [stableId, session] of [["devbox:pi:shared-a", "shared-a"], ["devbox:pi:shared-b", "shared-b"]]) {
+      addSession(stableId, "devbox", session);
+    }
+    addSession("devbox:pi:no-event", "devbox", "no-event");
+    addSession("devbox:pi:ended", "devbox", "ended");
+    addSession("devbox:pi:lifecycle", "devbox", "lifecycle");
+    addSession("devbox:pi:no-pid", "devbox", "no-pid");
+    addIncarnation("devbox:pi:shared-a", sharedWriter, "process", 91_001, now - 5_000, now - 5_000);
+    addIncarnation("devbox:pi:shared-b", sharedWriter, "process", 91_002, now - 5_000, now - 5_000);
+    addIncarnation("devbox:pi:no-event", noEventWriter, "process", 91_003, now - 4_000, null);
+    addIncarnation("devbox:pi:ended", "pi-91004-ended000", "process", 91_004, now - 5_000, now - 100);
+    addIncarnation("devbox:pi:lifecycle", "pi-91005-lifecycle", "lifecycle", 91_005, now - 5_000, now - 100);
+    addIncarnation("devbox:pi:no-pid", "pi-91006-nopid000", "process", 0, now - 5_000, now - 100);
+    db.query("INSERT INTO journal VALUES (1, 'devbox', ?, 1, ?, 'devbox:pi:shared-a', ?, 'heartbeat', '{}')")
+      .run(sharedWriter, now - 100, sharedWriter);
+    // Ingest order is deliberately opposite wall-clock order: MAX(at), not the
+    // last row, is the emitter heartbeat clock shared by duplicate writer IDs.
+    db.query("INSERT INTO journal VALUES (2, 'devbox', ?, 2, ?, 'devbox:pi:shared-b', ?, 'heartbeat', '{}')")
+      .run(sharedWriter, now - 8_000, sharedWriter);
+    db.query("INSERT INTO journal VALUES (3, 'devbox', 'pi-91004-ended000', 1, ?, 'devbox:pi:ended', 'pi-91004-ended000', 'session_ended', '{}')")
+      .run(now - 50);
+    for (const stableId of ["devbox:pi:shared-a", "devbox:pi:shared-b", "devbox:pi:no-event"])
+      db.query("INSERT INTO current VALUES (?, 'working', ?, ?)").run(stableId, now, now);
+    db.close();
+
+    const probed: number[] = [];
+    const summary = await new ReconDaemon(f.config, {
+      ...probes([]),
+      remoteProcess: async (_host, pid) => { probed.push(pid); return "alive"; },
+    }).runOnce(now);
+
+    expect(probed).toEqual([91_001, 91_002, 91_003]);
+    expect(summary.byKind.emitter_stalled).toBe(1);
+    const stalls = (await events(f.spool)).filter((event) => event.kind === "emitter_stalled");
+    expect(stalls).toHaveLength(1);
+    expect(stalls[0]?.detail).toMatchObject({
+      emitter_id: noEventWriter, stable_id: "devbox:pi:no-event", silent_ms: 4_000,
+    });
+  });
+
   test("ignores idle silence and reports a working stall once per silence episode", async () => {
     const f = await fixture();
     const emitter = `pi-${process.pid}-idlecafe`;

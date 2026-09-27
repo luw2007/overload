@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createWork, openControl, upsertAttention } from "../control/store";
+import { createConditionWait, createWork, openControl, upsertAttention } from "../control/store";
+import { openMailbox, registerTarget } from "../decision-bot/mailbox";
 import { startWebServer } from "./server";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -50,6 +51,17 @@ function seedAttention(root: string): string {
     approval_id: null, consumer_owner: null,
     contract_revision: work.revision, decision_mode: "human_only", evidence: {}
   });
+  upsertAttention(ctrl, {
+    item_id: "att-follow-up", work_id: work.work_id, state: "applying",
+    effect_state: "applying", urgency: "inbox",
+    conclusion: "Verify the accepted change", trigger: "answer recorded", impact: "change is applying",
+    recommendation: "wait", options: ["stop"], owner: "operator", expires_at: null, source_link: null,
+    approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only",
+    evidence: {
+      occurred_effects: [{ kind: "tool-run", evidence: { state: "succeeded", summary: "patch written" } }],
+      remaining_responsibility: "Operator verifies the deployed behavior",
+    },
+  });
   ctrl.close();
   return ctrlPath;
 }
@@ -62,6 +74,64 @@ async function boot(root: string, ledgerPath: string, controlPath?: string, jump
   });
   servers.push(server);
   return `http://127.0.0.1:${server.port}`;
+}
+
+async function browserProbe(base: string): Promise<Record<string, any>> {
+  const script = String.raw`
+import json, sys
+from playwright.sync_api import sync_playwright
+
+base = sys.argv[1]
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    package_revision = {"value": 1}
+
+    def route_package(route):
+        revision = package_revision["value"]
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+            "package_type": "decision_view", "item_id": "att-defer-1", "work_id": "probe-work",
+            "attention_revision": revision, "material_fingerprint": "fp-current",
+            "conclusion": "Needs decision", "trigger": "test trigger",
+            "trigger_evidence": [{"summary": "current evidence" if revision == 2 else "initial evidence", "reference": "test:probe"}],
+            "impact": "test impact", "recommendation": "continue", "owner": "operator",
+            "contract_revision": 1, "expires_at": None, "source_link": None,
+            "options": [{"id": "stop", "label": "Stop", "effect": "Stops work", "consequence": "No duplicate action"}]
+        }))
+
+    def route_resolve(route):
+        package_revision["value"] = 2
+        route.fulfill(status=409, content_type="application/json", body=json.dumps({
+            "error": "stale attention revision", "current_revision": 2,
+            "decision_package_url": "/api/context/decision-package?item_id=att-defer-1&work_id=probe-work"
+        }))
+
+    page.route("**/api/context/decision-package?*", route_package)
+    page.route("**/api/attention/att-defer-1/resolve", route_resolve)
+    page.goto(base + "/decide")
+    page.locator('button[data-action="resolve"][data-option="stop"]').click()
+    page.locator('#error button', has_text="Reload current decisions").wait_for()
+    page.get_by_text("Draft answer retained: stop", exact=False).wait_for()
+    follow_up = page.locator('[data-item-id="att-follow-up"]')
+    follow_up.wait_for()
+    result = {
+        "draft": page.get_by_text("Draft answer retained: stop", exact=False).inner_text(),
+        "error": page.locator("#error").inner_text(),
+        "reload_buttons": page.locator('#error button', has_text="Reload current decisions").count(),
+        "current_evidence": page.get_by_text("current evidence", exact=False).count(),
+        "follow_up": follow_up.inner_text(),
+        "follow_up_actions": follow_up.locator('button[data-action="resolve"]').count(),
+        "done_has_follow_up": "Verify the accepted change" in page.locator('button[data-done="all"]').inner_text(),
+    }
+    print(json.dumps(result))
+    browser.close()
+`;
+  const proc = Bun.spawn(["python3", "-c", script, base], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+  ]);
+  if (exitCode !== 0) throw new Error(`browser probe failed (${exitCode}): ${stderr}`);
+  return JSON.parse(stdout.trim());
 }
 
 describe("q1 jump route regression", () => {
@@ -190,17 +260,110 @@ describe("attention defer integration", () => {
   });
 });
 
-describe("generic attention option filtering", () => {
-  test("app.js renders only server-owned DecisionOption metadata", () => {
-    expect(APP_JS).toContain("const pkg=item.decision_package");
-    expect(APP_JS).toContain("pkg.options.map");
-    expect(APP_JS).toContain('data-option="${e(o.id)}"');
-    expect(APP_JS).not.toContain("item.options.filter");
-  });
 
-  test("app.js resolveItem sends defer to /api/attention/:id/defer with defer_until", () => {
-    expect(APP_JS).toContain("if(option==='defer')");
-    expect(APP_JS).toContain("/api/attention/${encodeURIComponent(id)}/defer");
-    expect(APP_JS).toContain("defer_until:Date.now()+3600000");
-  });
+describe("attention browser behavior", () => {
+  test("applying Work remains visible and stale conflict preserves the draft against the current package", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-attention-browser-"));
+    roots.push(root);
+    const ledgerPath = join(root, "ledger.db");
+    const db = new Database(ledgerPath);
+    db.exec(SCHEMA_SQL);
+    db.close();
+    const controlPath = seedAttention(root);
+    const base = await boot(root, ledgerPath, controlPath);
+
+    const dom = await browserProbe(base);
+    expect(dom.follow_up).toContain("Verify the accepted change");
+    expect(dom.follow_up).toContain("patch written");
+    expect(dom.follow_up).toContain("Operator verifies the deployed behavior");
+    expect(dom.follow_up_actions).toBe(0);
+    expect(dom.done_has_follow_up).toBe(false);
+    expect(dom.draft).toContain("Draft answer retained: stop");
+    expect(dom.draft).toContain("Refresh the current package before retrying");
+    expect(dom.error).toContain("No changes were applied");
+    expect(dom.reload_buttons).toBe(1);
+    expect(dom.current_evidence).toBeGreaterThan(0);
+  }, 20_000);
+});
+
+describe("B09 generic Resume shares the conservative wait-recovery gate", () => {
+  test("a wait-unknown session and every unproven session render no Resume in a real browser and never reach the executor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-resume-browser-"));
+    roots.push(root);
+    const ledgerPath = join(root, "ledger.db");
+    const db = new Database(ledgerPath);
+    db.exec(SCHEMA_SQL);
+    const now = Date.now();
+    for (const [stableId, runtime, writer, pid] of [["local:pi:crashed", "pi", "w-crashed", 7101], ["local:omp:ended", "omp", "w-ended", 7102], ["local:pi:bare", "pi", null, null]] as const) {
+      db.run("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)", [stableId, "local", runtime, `${runtime}-session`, "agent", "/repo", "main", now - 60_000, now - 60_000]);
+      if (writer) db.run("INSERT INTO session_incarnations VALUES (?,?,?,?,?,?,?)", [stableId, writer, "process", pid, "boot", now - 60_000, now - 60_000]);
+    }
+    db.run("INSERT INTO journal(host, emitter_id, seq, at, stable_id, writer_id, kind, detail) VALUES ('local','e-ended',1,?,'local:omp:ended','w-ended','session_ended','{}')", [now - 30_000]);
+    db.close();
+    // A watching wait whose original decision is linked to local:pi:crashed (dead pid, no session_ended).
+    const controlPath = join(root, "control.db");
+    const control = openControl(controlPath);
+    const work = createWork(control, { title: "resume gate", source: "test", contract: { objective: "ship", acceptance: [{ id: "ci", kind: "check", description: "ci green" }], non_goals: [], scope: { repo: "acme/app" }, budget: {}, stop_conditions: [], decision_owner: "owner" } });
+    const item = upsertAttention(control, { item_id: "resume-item", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "resume after merge?",
+      trigger: "pr", impact: "blocked", recommendation: null, options: [], owner: "owner", expires_at: null, source_link: null, approval_id: "ap-1", consumer_owner: "orchestrator",
+      contract_revision: work.revision, decision_mode: "human_only", evidence: {} });
+    const source = { provider: "github", host: "github.com", owner: "acme", repo: "app", number: 7 } as const;
+    const wait = createConditionWait(control, { work_id: work.work_id, item_id: item.item_id, deadline_at: now + 86_400_000, condition: { kind: "github_pr_merged", source } },
+      { actor: "owner", baseline: { baseline: { ...source, state: "OPEN", merged_at: null, updated_at: "2026-09-27T00:00:00Z", observed_at: now }, baseline_generation: now, fingerprint: "pr:OPEN", established_at: now }, now });
+    control.close();
+    const mailbox = openMailbox(controlPath);
+    registerTarget(mailbox, { consumerOwner: "orchestrator", approvalId: "ap-1", targetVersion: "tv-1", stableId: "local:pi:crashed", question: "resume after merge?", options: ["approve"],
+      effect: "resume_checkpoint", scope: {}, evidence: {}, expiresAt: now + 3_600_000, workId: work.work_id, contractRevision: work.revision });
+    mailbox.close();
+    writeFileSync(join(root, "host"), "local\n");
+    const calls: string[][] = [];
+    const server = startWebServer({ ledgerPath, controlPath, orchestratorPath: join(root, "orch.db"), spoolRoot: root, publishIntervalMs: 60_000, port: 0, actor: "owner", conditionWaits: true,
+      processAlive: () => false, resume: async (_command, args) => { calls.push(args); return { ok: true }; } });
+    servers.push(server);
+
+    const waits = await (await fetch(`http://127.0.0.1:${server.port}/api/waits`)).json() as { items: Array<{ wait: { wait_id: string }; recovery_capability: { state: string; reason: string }; actions: { resume: boolean } }> };
+    const waitRow = waits.items.find((row) => row.wait.wait_id === wait.wait_id)!;
+    expect(waitRow.recovery_capability).toMatchObject({ state: "unknown", reason: "liveness_unknown" });
+    expect(waitRow.actions.resume).toBe(false);
+
+    const script = String.raw`
+import json, sys
+from playwright.sync_api import sync_playwright
+
+base = sys.argv[1]
+ids = ["local:pi:crashed", "local:omp:ended", "local:pi:bare"]
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    page.goto(base + "/agents")
+    rows = {}
+    for stable_id in ids:
+        row = page.locator("tr", has_text=stable_id)
+        row.wait_for()
+        rows[stable_id] = row.inner_text()
+    posts = page.evaluate("""async (ids) => Promise.all(ids.map(async (id) => {
+        const response = await fetch('/api/resume-session/' + encodeURIComponent(id), { method: 'POST' });
+        return { status: response.status, body: await response.json() };
+    }))""", ids)
+    print(json.dumps({"resume_buttons": page.locator("button.resume").count(), "rows": rows, "posts": posts}))
+    browser.close()
+`;
+    const proc = Bun.spawn(["python3", "-c", script, `http://127.0.0.1:${server.port}`], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    if (exitCode !== 0) throw new Error(`browser probe failed (${exitCode}): ${stderr}`);
+    const dom = JSON.parse(stdout.trim());
+
+    expect(dom.resume_buttons).toBe(0);
+    expect(dom.rows["local:pi:crashed"]).toContain("Resume unknown (liveness_unknown)");
+    expect(dom.rows["local:pi:bare"]).toContain("Resume unknown (liveness_unknown)");
+    expect(dom.rows["local:omp:ended"]).toContain("Resume unknown (no_session_file)");
+    expect(dom.posts).toEqual([
+      { status: 409, body: { resumed: false, reason: "liveness_unknown" } },
+      { status: 409, body: { resumed: false, reason: "no_session_file" } },
+      { status: 409, body: { resumed: false, reason: "liveness_unknown" } },
+    ]);
+    // The wait's session reports exactly the wait's recovery class on the generic Sessions surface.
+    expect(dom.rows["local:pi:crashed"]).toContain(`Resume ${waitRow.recovery_capability.state} (${waitRow.recovery_capability.reason})`);
+    expect(calls).toEqual([]);
+  }, 20_000);
 });

@@ -148,6 +148,82 @@ test("new closes owned runtime and preserves turns", async () => {
   await h.close();
  }
 });
+test("queued turns restore a stopped runtime and submit only once", async () => {
+ const h = harness();
+ try {
+  await h.service.start();
+  await h.service.accept(h.event("first"));
+  await h.service.tick();
+  const c = h.db.query("SELECT id,session_reference FROM conversations").get() as { id: string; session_reference: string };
+  const reference = JSON.parse(c.session_reference) as SessionReference;
+  h.service.recordRuntimeEvent(c.id, {
+   eventId: "first-complete", sessionId: reference.sessionId,
+   turnId: h.submitted[0], kind: "completed", text: "done",
+  });
+  await h.service.accept(h.event("second"));
+  await h.service.stop();
+  const resumed = new AdapterService(h.db, {
+   runtime: h.runtime, channels: [h.channel], cwd: h.root,
+   authorize: (identity) => identity.userId === "owner" ? "operator" : null,
+  });
+  let restores = 0;
+  Object.assign(h.runtime, {
+   capabilities: { restore: true, answer: true, steer: false },
+   async connect() { throw new Error("runtime_not_live"); },
+   async restore() { restores++; return await this.start(reference); },
+  });
+  await resumed.start();
+  await resumed.tick();
+  expect(restores).toBe(1);
+  expect(h.submitted).toHaveLength(2);
+  expect(h.db.query("SELECT sequence,state FROM conversation_turns ORDER BY sequence").all()).toEqual([
+   { sequence: 1, state: "completed" },
+   { sequence: 2, state: "running" },
+  ]);
+  await resumed.stop();
+ } finally {
+  await h.close();
+ }
+});
+
+test("a slow thread does not block another thread in the same chat", async () => {
+ const h = harness();
+ const started = Promise.withResolvers<void>();
+ const release = Promise.withResolvers<void>();
+ const secondSubmitted = Promise.withResolvers<void>();
+ const originalStart = h.runtime.start.bind(h.runtime);
+ h.runtime.start = async (request) => {
+  const conversation = h.db.query("SELECT binding_key FROM conversations WHERE id=?").get(request.ownerId) as { binding_key: string };
+  if (JSON.parse(conversation.binding_key)[3] === "thread-one") {
+   started.resolve();
+   await release.promise;
+   return originalStart(request);
+  }
+  const handle = await originalStart(request);
+  const originalSubmit = handle.submit.bind(handle);
+  handle.submit = async (turn) => {
+   const receipt = await originalSubmit(turn);
+   secondSubmitted.resolve();
+   return receipt;
+  };
+  return handle;
+ };
+ try {
+  await h.service.accept({ ...h.event("first"), address: { ...h.event("first").address, threadId: "thread-one" } });
+  await h.service.accept({ ...h.event("second"), address: { ...h.event("second").address, threadId: "thread-two" } });
+  const tick = h.service.tick();
+  await started.promise;
+  await secondSubmitted.promise;
+  expect(h.submitted).toContain(h.db.query("SELECT id FROM conversation_turns WHERE source_message_id='second'").get()?.id);
+  release.resolve();
+  await tick;
+  expect(h.submitted).toHaveLength(2);
+ } finally {
+  release.resolve();
+  await h.close();
+ }
+});
+
 test("new rejects unresolved runtime states", async () => {
  const h = harness();
  try {

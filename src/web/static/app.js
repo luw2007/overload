@@ -10,7 +10,7 @@
     mgmtHtml: "",
     taskManifests: [],
     taskDrift: null,
-    attention: { now: [], inbox: [], done: [] },
+    attention: { now: [], inbox: [], done: [], followUps: [] },
     rules: null,
     ledger: null,
     works: [],
@@ -30,8 +30,18 @@
     conversationDrafts: {},
     conversationPosting: false,
     conversationPending: null,
+    waits: null,
+    waitsError: null,
+    waitsOpen: false,
+    waitsGate: null,
   };
-  let generation = 0;
+  // Refresh slices: each page section loads, applies and renders on its own as its fetch resolves, so one slow
+  // endpoint delays only its own section. A slice result is dropped only when a newer refresh already applied that
+  // slice or the view it was fetched for (page, range, session) is gone — never merely because a newer refresh started.
+  // Polls reuse a slice's still-pending request instead of stacking another one behind a slow endpoint.
+  let refreshSeq = 0, renderFrame = 0;
+  const applied = new Map(), failures = new Map(), inflight = new Map(), packages = new Map();
+  const PAGE_SLICES = {ledger:['ledger'],works:['works'],candidates:['works'],conversations:['conversations']};
   const formatTime = value => value == null ? '—' : new Date(value).toLocaleString();
   const humanDuration = ms => ms == null ? '—' : ms < 60000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`;
   function showError(error) {
@@ -49,22 +59,76 @@
   const duration = ms => {const hours=Math.max(0,ms||0)/3600000;return hours>=1?`${Number(hours.toFixed(1))}h`:`${Math.round(hours*60)}m`;};
   const stamp = value => value == null?'—':new Date(value).toLocaleTimeString('en-GB',{hour12:false});
   const dot = color => `<span class="dot ${color}"></span>`;
-  const expanded = new Set(), receipts = new Map(), decisionDrafts = new Map();
+  const expanded = new Set(), receipts = new Map(), decisionDrafts = new Map(), revealed = new Set(), openWorks = new Set();
   function spark(series) {const max=Math.max(1,...series);return `<svg class="sparkline" viewBox="0 0 100 28" aria-hidden="true"><polyline points="${series.map((v,i)=>`${i*100/Math.max(1,series.length-1)},${27-v/max*25}`).join(' ')}"/></svg>`;}
   function metric(label,value,detail,series){return `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-detail">${detail}</div>${spark(series)}</div>`;}
-  function decideTopLine(items,selfResolved) {const expiring=items.filter(x=>x.expires_at!=null),oldest=Math.max(0,...items.map(x=>Date.now()-x.created_at));return `${items.length} decisions owed · ${expiring.length?`${expiring.length} expires in ${duration(Math.min(...expiring.map(x=>x.expires_at))-Date.now())}`:'0 expiring'} · oldest waiting ${duration(oldest)} · <button class="text-button" data-done="automatic">agents self-resolved ${selfResolved} today</button> · ${state.today.rules.hits} answered by rules today`;}
+  function decideTopLine(items,selfResolved) {const expiring=items.filter(x=>x.expires_at!=null),oldest=Math.max(0,...items.map(x=>Date.now()-x.created_at));return `${items.length} decisions owed · ${expiring.length?`${expiring.length} expires in ${duration(Math.min(...expiring.map(x=>x.expires_at))-Date.now())}`:'0 expiring'} · oldest waiting ${duration(oldest)} · <button class="text-button" data-done="automatic">agents self-resolved ${selfResolved} today</button> · ${applied.has('today')?`${state.today.rules.hits} answered by rules today`:failures.has('today')?'rules today unavailable':'rules today loading…'}`;}
   function automationReason(item) {if(state.rules.bot_disabled)return 'bot disabled';if(item.decision_mode==='human_only')return 'human-only by contract';const r=state.rules.rules.find(r=>r.state==='observing' && (r.scope.includes(item.work_id)||(item.evidence?.repo && r.scope.includes(item.evidence.repo))));return r?`rule ${r.id} proposed · observing ${r.observed}/5`:'no enabled rule matches';}
   const effectNote={applying:'你已决定 · 执行中',succeeded:'你已决定 · 已生效',failed:'你已决定 · 执行失败',unknown:'你已决定 · 结果未知'};
   function decisionRow(item) {
     const pkg=item.decision_package;
-    if(!pkg)return `<div class="row"><div>${dot('red')}</div><div><div class="row-title">${e(item.conclusion)}</div><div class="row-note" role="status">Decision context is unavailable. Refresh before answering.</div></div></div>`;
+    if(!pkg)return `<div class="row" data-item-id="${e(item.item_id)}"><div>${dot(pkg===undefined?'yellow':'red')}</div><div><div class="row-title">${e(item.conclusion)}</div><div class="row-note" role="status">${pkg===undefined?'Loading decision context…':'Decision context is unavailable. Refresh before answering.'}</div>${waitNote(item)}</div></div>`;
     const red=item.decision_mode==='human_only'||(pkg.expires_at!=null&&pkg.expires_at<=Date.now()),decided=effectNote[item.effect_state];
     const options=pkg.options.map(o=>`<button data-action="resolve" data-id="${e(item.item_id)}" data-option="${e(o.id)}" title="${e(o.consequence)}">${e(o.label)}</button>`).join('');
     const draft=decisionDrafts.get(item.item_id);
-    return `<div class="row"><div>${dot(red?'red':'yellow')}</div><div><div class="row-title"><button class="text-button" data-action="expand" data-id="${e(item.item_id)}" aria-expanded="${expanded.has(item.item_id)}">${e(pkg.conclusion)}</button><span class="mono muted">${e(pkg.owner)} · r${pkg.contract_revision}</span></div><div class="row-note"><b>Trigger</b> ${e(pkg.trigger)} · <b>Evidence</b> ${e(pkg.trigger_evidence.map(x=>x.summary).join('; ')||'none')} · <b>Impact</b> ${e(pkg.impact)} · <b>Recommendation</b> ${e(pkg.recommendation)} · <b>Expires</b> ${e(formatTime(pkg.expires_at))}</div>${decided?`<div class="row-note mono">${e(decided)}${item.effect_detail?` · ${e(item.effect_detail)}`:''} · ${stamp(item.updated_at)}</div>`:''}${draft?`<div role="status">Draft answer retained: ${e(draft)}. Refresh the current package before retrying.</div>`:''}${expanded.has(item.item_id)?`<div class="facts"><b>Conclusion</b><span>${e(pkg.conclusion)}</span><b>Trigger evidence</b>${pkg.trigger_evidence.map(x=>`<span>${e(x.summary)} · <code>${e(x.reference)}</code>${x.stale?' · stale':''}</span>`).join('')||'<span>None</span>'}<b>Impact</b><span>${e(pkg.impact)}</span><b>Recommendation</b><span>${e(pkg.recommendation)}</span><b>Owner / expiry</b><span>${e(pkg.owner)} · ${e(formatTime(pkg.expires_at))}</span><b>Option effects</b><span>${pkg.options.map(o=>`<strong>${e(o.label)}</strong>: ${e(o.effect)} — ${e(o.consequence)}`).join('<br>')}</span>${sourceLink(pkg.source_link)}</div>`:''}</div><div class="actions">${options}${button('Details','attention-evidence',item.item_id)}</div></div>`;
+    return `<div class="row" data-item-id="${e(item.item_id)}"><div>${dot(red?'red':'yellow')}</div><div><div class="row-title"><button class="text-button" data-action="expand" data-id="${e(item.item_id)}" aria-expanded="${expanded.has(item.item_id)}">${e(pkg.conclusion)}</button><span class="mono muted">${e(pkg.owner)} · r${pkg.contract_revision}</span></div><div class="row-note"><b>Trigger</b> ${e(pkg.trigger)} · <b>Evidence</b> ${e(pkg.trigger_evidence.map(x=>x.summary).join('; ')||'none')} · <b>Impact</b> ${e(pkg.impact)} · <b>Recommendation</b> ${e(pkg.recommendation)} · <b>Expires</b> ${e(formatTime(pkg.expires_at))}</div>${decided?`<div class="row-note mono">${e(decided)}${item.effect_detail?` · ${e(item.effect_detail)}`:''} · ${stamp(item.updated_at)}</div>`:''}${draft?`<div role="status">Draft answer retained: ${e(draft)}. Refresh the current package before retrying.</div>`:''}${waitNote(item)}${expanded.has(item.item_id)?`<div class="facts"><b>Conclusion</b><span>${e(pkg.conclusion)}</span><b>Trigger evidence</b>${pkg.trigger_evidence.map(x=>`<span>${e(x.summary)} · <code>${e(x.reference)}</code>${x.stale?' · stale':''}</span>`).join('')||'<span>None</span>'}<b>Impact</b><span>${e(pkg.impact)}</span><b>Recommendation</b><span>${e(pkg.recommendation)}</span><b>Owner / expiry</b><span>${e(pkg.owner)} · ${e(formatTime(pkg.expires_at))}</span><b>Option effects</b><span>${pkg.options.map(o=>`<strong>${e(o.label)}</strong>: ${e(o.effect)} — ${e(o.consequence)}`).join('<br>')}</span>${sourceLink(pkg.source_link)}</div>`:''}</div><div class="actions">${options}${button('Details','attention-evidence',item.item_id)}${waitsSettled()&&state.waits&&item.state==='open'&&!watchingWait(item.item_id)?(waitsDisabled()?'<span class="muted wait-create-disabled" role="note">Condition waits are disabled on this server</span>':button('Wait for condition…','wait-create',item.item_id)):''}</div></div>`;
   }
   function receipt(item) {const verified=item.effect_state==='succeeded',failed=['failed','unknown'].includes(item.effect_state);return `<div class="row receipt"><div>${verified?'✓':failed?'!':'…'}</div><div><div class="row-title">${e(item.conclusion)}</div><span class="mono muted">${e(item.owner)} · ${stamp(item.updated_at)} · ${verified?'effect verified':failed?`effect ${e(item.effect_state)} — not successful`:'answer recorded · applying in Inbox'}</span></div></div>`;}
-  function renderDecide() {const items=[...state.attention.now,...state.attention.inbox],automatic=state.attention.done.filter(x=>x.decision_mode==='scoped_auto'&&x.state==='resolved'&&x.updated_at>=Date.now()-86400000);return `<h1>Decide</h1><div class="summary">${decideTopLine(items,automatic.length)}</div>${items.length||receipts.size?`<div class="section-heading"><h2>Owed to the system</h2><small>Now · ${items.length} decisions · expand for evidence</small></div><div class="list">${items.map(x=>receipts.get(x.item_id)||decisionRow(x)).join('')}${[...receipts].filter(([id])=>!items.some(x=>x.item_id===id)).map(([,html])=>html).join('')}</div>`:empty(`Nothing owed. Agents self-resolved ${automatic.length} decisions today.`)}<div class="section-heading"><h2>Within contract</h2><small>Automatic · no decision required</small></div><div class="list auto">${dot('blue')}<span><strong class="mono">${automatic.length}</strong> handled without you</span><button class="text-button" data-done="automatic">Inspect Done ↗</button></div><div class="section-heading"><h2>Done <span class="muted mono">${state.attention.done.length}</span></h2><button data-done="all">Show receipts</button></div>`;}
+  function followUpRow(entry) {const item=entry.item,effects=entry.occurred_effects.length?entry.occurred_effects.map(effect=>`${effect.kind}: ${JSON.stringify(effect.evidence)}`).join('; '):'None recorded yet';return `<div class="row follow-up" data-item-id="${e(item.item_id)}"><div>${dot(entry.stage==='failed'||entry.stage==='unknown'?'red':'yellow')}</div><div><div class="row-title">${e(item.conclusion)} <span class="mono muted">${e(entry.stage.replaceAll('_',' '))}</span></div><div class="row-note"><b>Occurred effects</b> ${e(effects)} · <b>Remaining responsibility</b> ${e(entry.remaining_responsibility)} · <b>Next action</b> ${e(entry.next_action)}</div></div></div>`;}
+  function renderDecide() {if(!applied.has('attention'))return `<h1>Decide</h1>${sliceView('attention')}${waitSection()}`;const waitsLoading=!waitsSettled(),nowIds=new Set(state.attention.now.map(x=>x.item_id)),items=[...state.attention.now,...state.attention.inbox].filter(x=>nowIds.has(x.item_id)||revealed.has(x.item_id)||!watchingWait(x.item_id)),followUps=state.attention.followUps,automatic=state.attention.done.filter(x=>x.decision_mode==='scoped_auto'&&x.state==='resolved'&&x.updated_at>=Date.now()-86400000);return `<h1>Decide</h1><div class="summary">${waitsLoading?'Loading decisions owed…':decideTopLine(items,automatic.length)}</div>${waitsLoading?`<div class="section-heading"><h2>Owed to the system</h2></div>${empty('Loading…')}`:items.length||receipts.size?`<div class="section-heading"><h2>Owed to the system</h2><small>Now · ${items.length} decisions · expand for evidence</small></div><div class="list">${items.map(x=>receipts.get(x.item_id)||decisionRow(x)).join('')}${[...receipts].filter(([id])=>!items.some(x=>x.item_id===id)&&!followUps.some(x=>x.item.item_id===id)).map(([,html])=>html).join('')}</div>`:empty(`Nothing owed. Agents self-resolved ${automatic.length} decisions today.`)}${followUps.length?`<div class="section-heading"><h2>Work</h2><small>Answers recorded · effects still applying or awaiting verification</small></div><div class="list">${followUps.map(followUpRow).join('')}</div>`:''}${waitSection()}<div class="section-heading"><h2>Within contract</h2><small>Automatic · no decision required</small></div><div class="list auto">${dot('blue')}<span><strong class="mono">${automatic.length}</strong> handled without you</span><button class="text-button" data-done="automatic">Inspect Done ↗</button></div><div class="section-heading"><h2>Done <span class="muted mono">${state.attention.done.length}</span></h2><button data-done="all">Show receipts</button></div>`;}
+  // Condition waits (Phase B §10.2). Every state, fact and action comes from the server read model; the page
+  // never infers Answer/Resume from runtime strings. Watching is quiet: one row per wait, updated in place.
+  const WAIT_STATE = {watching:['Watching','blue'],ready:['Condition met','green'],unavailable:['Source unavailable','red'],expired:['Stopped watching','red'],cancelled:['Cancelled','blue']};
+  const watchingWait = itemId => (state.waits||[]).find(m=>m.wait.item_id===itemId&&m.wait.state==='watching');
+  const findWait = waitId => (state.waits||[]).find(m=>m.wait.wait_id===waitId);
+  async function loadWaits() {try {const data=await fetchJson('/api/waits?limit=200');return {waits:data.items,waitsGate:data.gate||null,waitsError:null};} catch(error) {return {waits:null,waitsGate:null,waitsError:error.status===501?null:(error.message||String(error))};}}
+  // Until the waits slice settles, which Decide items a watching wait hides (and whether wait creation is offered) is
+  // unknown: the owed list, its counts and every wait affordance stay in a loading state rather than guess.
+  const waitsSettled = () => applied.has('waits')||failures.has('waits');
+  // §14.3: only the server's gate (list `gate`, row `observation`) says observation is paused; never guessed client-side.
+  const waitsDisabled = () => state.waitsGate?.enabled === false;
+  const PAUSED_OUTCOME = 'Observation paused · condition waits are disabled on this server, so the source is not being checked and nothing will change until they are re-enabled';
+  function waitOutcome(w, observation) {
+    if(observation?.state==='paused')return PAUSED_OUTCOME;
+    const returned=w.disposition_state==='redecision_recorded'?` · original decision returned to you ${formatTime(w.disposition_at)}`:w.disposition_state==='pending'?' · returning the original decision to you on the next check':'';
+    if(w.state==='watching')return `Watching quietly · no decision owed until the condition is met${w.unchanged_count?` · unchanged for ${w.unchanged_count} check${w.unchanged_count===1?'':'s'}`:''}`;
+    if(w.state==='ready')return `Condition met ${formatTime(w.ready_at)}${returned}. Being met grants no new permission.`;
+    if(w.state==='unavailable')return `Source can no longer be watched (${w.state_reason||w.last_error_kind||'unavailable'})${returned}`;
+    if(w.state==='expired')return `${w.state_reason==='transient_budget_exhausted'?'Source kept failing':'Deadline passed'}; the condition was not confirmed and the work has not failed${returned}`;
+    return `Cancelled ${formatTime(w.updated_at)}${w.state_reason?`: ${w.state_reason}`:''}`;
+  }
+  function waitRecovery(c) {
+    if(c.state==='available')return c.action==='answer_live_request'?'The original session is blocked on this question and its answer consumer is live':'Resume is not offered from this page';
+    return c.state==='unsupported'?`Not supported here (${c.reason}) — continue in the original session`:`Unknown (${c.reason}) — check the original session before acting`;
+  }
+  function waitJump(url) {const match=/^\/api\/(jump|jump-session)\/([^/]+)$/.exec(url||'');if(!match)return '';const id=decodeURIComponent(match[2]);return `<button class="btn jump" data-route="${match[1]}" data-id="${e(id)}" data-binding="${e(id)}">Jump to original session</button><span class="jump-status" aria-live="polite"></span>`;}
+  function waitRow(model) {
+    const w=model.wait,paused=model.observation?.state==='paused',[label,color]=paused?['Observation paused','yellow']:WAIT_STATE[w.state]||[w.state,'blue'],a=model.actions,err=model.error,itemOpen=model.attention&&['open','applying'].includes(model.attention.state);
+    const exit=w.state==='ready'?'Re-decide now':w.state==='unavailable'||w.state==='expired'?'Decide without this wait':'';
+    const buttons=[a.answer?button('Answer in original decision','wait-review',w.item_id):'',exit&&itemOpen?button(exit,'wait-review',w.item_id):'',waitJump(a.jump_url),a.cancel?button('Cancel wait','wait-cancel',w.wait_id):''].join('');
+    return `<div class="row wait" data-wait-id="${e(w.wait_id)}" data-wait-state="${e(w.state)}" data-version="${e(w.version)}"${paused?' data-observation="paused"':''}><div>${dot(color)}</div><div><div class="row-title"><span>${e(model.condition_summary)}</span><span class="badge">${e(label)}</span><span class="mono muted">v${e(w.version)}</span></div><div class="row-note"${paused?' role="status"':''}>${e(waitOutcome(w,model.observation))}</div><dl class="facts">`+
+      `<dt>Last confirmed</dt><dd>${e(model.latest_observation.summary)} · ${e(formatTime(model.latest_observation.confirmed_at))}</dd>`+
+      `<dt>Next check</dt><dd>${paused?'— paused, no check scheduled while condition waits are disabled':w.state==='watching'?e(formatTime(model.schedule.next_check_at)):'— not watching'}</dd>`+
+      `<dt>Deadline</dt><dd>${e(formatTime(model.schedule.deadline_at))}</dd>`+
+      `<dt>When met</dt><dd>${w.disposition==='authorized_resume'?'Continue only under the exact pre-authorized scope, re-verified first':'Return the original decision to you to re-decide'}</dd>`+
+      `<dt>Source errors</dt><dd>${err?`${e(err.kind)}${err.detail?`: ${e(err.detail)}`:''} · ${e(err.failures)}/${e(err.budget)} consecutive transient failures${err.retry_after_at?` · retry after ${e(formatTime(err.retry_after_at))}`:''}`:'None'}</dd>`+
+      `<dt>Recovery</dt><dd>${e(waitRecovery(model.recovery_capability))}</dd>`+
+      `<dt>History</dt><dd>created ${e(formatTime(w.created_at))}${w.ready_at?` · met ${e(formatTime(w.ready_at))}`:''}${w.disposition_at?` · returned ${e(formatTime(w.disposition_at))}`:''} · last change ${e(formatTime(w.updated_at))}</dd></dl>${buttons?`<div class="actions">${buttons}</div>`:''}</div></div>`;
+  }
+  function waitSection() {
+    if(!waitsSettled())return '';
+    if(state.waits===null)return state.waitsError?`<div class="section-heading"><h2>Waiting on conditions</h2><small role="alert">Unavailable: ${e(state.waitsError)}</small></div>`:'';
+    if(!state.waits.length)return '';
+    const watching=state.waits.filter(m=>m.wait.state==='watching'),history=state.waits.filter(m=>m.wait.state!=='watching').slice(0,20);
+    return `<div class="section-heading"><h2>Waiting on conditions</h2><button class="text-button" data-action="toggle-waits" aria-expanded="${state.waitsOpen}">${watching.length} watching${waitsDisabled()&&watching.length?' (observation paused)':''} · ${history.length} recent · ${state.waitsOpen?'hide':'show'}</button></div>${state.waitsOpen?`<div class="list waits">${watching.map(waitRow).join('')}${history.length?`<div class="row-note">Recent outcomes</div>${history.map(waitRow).join('')}`:''}</div>`:''}`;
+  }
+  function waitNote(item) {
+    const model=(state.waits||[]).find(m=>m.wait.item_id===item.item_id&&m.wait.state!=='cancelled');
+    if(!model)return '';
+    const w=model.wait;
+    return `<div class="row-note wait-note" role="status"><b>Condition wait</b> ${e(WAIT_STATE[w.state]?.[0]||w.state)} — ${e(model.condition_summary)} · ${e(waitOutcome(w,model.observation))}</div>`;
+  }
+  function workWaits(workId) {const rows=(state.waits||[]).filter(m=>m.wait.work_id===workId);return rows.length?`<h3>Condition waits <small class="muted">${rows.filter(m=>m.wait.state==='watching').length} watching · ${rows.length} total</small></h3><div class="list waits">${rows.map(waitRow).join('')}</div>`:'';}
   function taskBadge(v, fallback='—') { return `<span class="badge">${e(v||fallback)}</span>`; }
   function taskTable(headers, rows) { return `<div class="table-wrap"><table><thead><tr>${headers.map(h=>`<th>${e(h)}</th>`).join('')}</tr></thead><tbody>${rows||`<tr><td colspan="${headers.length}">暂无</td></tr>`}</tbody></table></div>`; }
   function acceptanceBadge(value) {
@@ -161,7 +225,7 @@
   function renderTasks() { return state.taskDetail ? taskDetail(state.taskDetail) : taskList(); }
   function renderLedger() {const m=state.ledger,pct=m.rework.total?Math.round(m.rework.caused/m.rework.total*100):0;return `<div class="toolbar"><h1>Ledger</h1><select id="period" aria-label="Ledger period"><option value="week" ${state.range==='week'?'selected':''}>This week</option><option value="day" ${state.range==='day'?'selected':''}>Today</option></select><button data-action="export">Export CSV</button></div><p class="summary">${state.range==='week'?'This week':'Today'} you were the bottleneck for ${duration(m.bottleneck.total_ms)} across ${m.bottleneck.work_count} works.${m.coverage<1?` · coverage ${Math.round(m.coverage*100)}%`:''}</p><div class="metrics">${metric('Waiting',duration(m.waiting.total_ms),`median ${duration(m.waiting.median_ms)}`,m.waiting.series)}${metric('Rework you caused',`${m.rework.caused} / ${m.rework.total}`,`${pct}%`,m.rework.series)}${metric('Redirects',`${m.redirects.count} (${m.redirects.unplanned} unplanned)`,`lost ${duration(m.redirects.lost_ms)}`,m.redirects.series)}${metric('Sunk to rules',`${m.rules.hits} ${m.rules.delta>=0?'↑':'↓'}${Math.abs(m.rules.delta)}`,`${m.rules.share.toFixed(0)}% of decisions`,m.rules.series)}${metric('Death delay',duration(m.death.median_ms),`oldest: &quot;${e(m.death.oldest?.title??'—')}&quot;`,m.death.series)}</div><h2>Slowest decisions</h2><p class="muted">Waiting = asked → decided, or now while still owed. Raw rows behind the median.</p><table><thead><tr><th>Work</th><th>Asked</th><th>Decided</th><th>Waited</th><th>Chose</th><th>Effect</th></tr></thead><tbody>${m.slowest.map(r=>`<tr><td>${e(r.title)}</td><td class="mono">${stamp(r.asked_at)}</td><td class="mono">${stamp(r.decided_at)}</td><td class="mono">${duration(r.waited_ms)}</td><td>${e(r.chose??'—')}</td><td>${e(r.effect_state??'—')}</td></tr>`).join('')}</tbody></table>`;}
   function contractFacts(w) {const c=w.contract;return `<div class="facts"><b>Objective</b><span>${e(c?.objective??'—')}</span><b>Acceptance</b><span>${(c?.acceptance||[]).map(x=>e(x.description)).join('<br>')||'—'}</span><b>Scope</b><span class="mono">${e(JSON.stringify(c?.scope??null))}</span><b>Budget</b><span class="mono">${e(JSON.stringify(c?.budget??null))}</span><b>Stop conditions</b><span>${(c?.stop_conditions||[]).map(x=>e(x.description)).join('<br>')||'—'}</span><b>Decision owner</b><span>${e(c?.decision_owner??'—')}</span></div><p class="mono muted">updated ${stamp(w.updated_at)}</p>`;}
-  function renderWorks() {return `<h1>Works</h1><p class="muted">Contracts, not agent transcripts.</p>${state.works.filter(w=>w.state!=='candidate').map(w=>`<details class="work"><summary>${e(w.title)} <span class="mono muted">${e(w.state)} · r${w.revision}</span></summary>${contractFacts(w)}</details>`).join('')}`;}
+  function renderWorks() {return `<h1>Works</h1><p class="muted">Contracts, not agent transcripts.</p>${state.works.filter(w=>w.state!=='candidate').map(w=>`<details class="work" data-work-id="${e(w.work_id)}"${openWorks.has(w.work_id)?' open':''}><summary>${e(w.title)} <span class="mono muted">${e(w.state)} · r${w.revision}</span></summary>${contractFacts(w)}${workWaits(w.work_id)}</details>`).join('')}`;}
   function renderCandidates() {const candidates=state.works.filter(w=>w.state==='candidate');
     // Active operator works created this week are the best available promotion signal; no promoted_at exists.
     const promoted=state.works.filter(w=>w.state==='active'&&w.source==='operator'&&w.created_at>=Date.now()-7*86400000).length;
@@ -185,7 +249,7 @@
 
   const ageChip = value => e(value == null ? '—' : humanDuration(Date.now()-value));
   const keyValueTable = rows => `<dl>${rows.map(([key,value])=>`<dt>${e(key)}</dt><dd>${value}</dd>`).join('')}</dl>`;
-  function resumeCapability(row) { const available=row.resume_capability?.resumable; const adapter=row.resume_capability?.runtime; return available ? `<button class="resume" data-id="${e(row.stable_id)}" data-adapter="${e(adapter)}">Resume</button>` : `<span class="meta">${e(row.resume_capability?.reason || 'Resume unavailable')}</span>`; }
+  function resumeCapability(row) { const capability=row.resume_capability; if(capability?.resumable) return `<button class="resume" data-id="${e(row.stable_id)}" data-adapter="${e(capability.runtime)}">Resume</button>`; return `<span class="meta">${e(!capability?'Resume unavailable':capability.state==='unknown'?`Resume unknown (${capability.reason}) — check the original session`:`Resume not supported (${capability.reason})`)}</span>`; }
   function rowCheckbox(id) {
     return `<input class="row-select" type="checkbox" data-id="${escapeHtml(id)}" ${state.selected.has(id) ? "checked" : ""} aria-label="选择 ${escapeHtml(id)}">`;
   }
@@ -209,10 +273,13 @@
 
   function decisionCard(row) {
     const isOrchestratorGate = row.detail && typeof row.detail.gate === "string";
-    const approvalId = row.detail?.approval_id ?? row.detail?.request_id;
-    const consumerOwner = row.detail?.consumer_owner ?? (row.detail?.gate === "action" ? "extension" : "orchestrator");
+    // A live ask advertises its mailbox target (approval_id + consumer_owner);
+    // legacy gate rows fall back to request_id and the gate's owner. Anything
+    // without a target stays inert chips — Ack is never an answer.
+    const approvalId = row.detail?.approval_id ?? (isOrchestratorGate ? row.detail.request_id : undefined);
+    const consumerOwner = row.detail?.consumer_owner ?? (isOrchestratorGate ? (row.detail.gate === "action" ? "extension" : "orchestrator") : undefined);
     const age = Date.now() - row.created_at;
-    const options = Array.isArray(row.options) && row.options.length ? `<div class="option-chips">${row.options.map((option) => isOrchestratorGate && approvalId ? `<button class="btn primary approve" data-approval-id="${escapeHtml(approvalId)}" data-consumer-owner="${escapeHtml(consumerOwner)}" data-answer="${escapeHtml(option)}">${escapeHtml(option)}</button>` : `<span class="option-chip">${escapeHtml(option)}</span>`).join("")}</div>` : "";
+    const options = Array.isArray(row.options) && row.options.length ? `<div class="option-chips">${row.options.map((option) => approvalId && consumerOwner ? `<button class="btn primary answer" data-approval-id="${escapeHtml(approvalId)}" data-consumer-owner="${escapeHtml(consumerOwner)}" data-answer="${escapeHtml(option)}">${escapeHtml(option)}</button>` : `<span class="option-chip">${escapeHtml(option)}</span>`).join("")}</div>` : "";
     const gate = isOrchestratorGate ? `<div class="meta">门禁：${escapeHtml(row.detail.gate)}${row.detail.class ? ` · 类别：${escapeHtml(row.detail.class)}` : ""}${row.detail.rule ? ` · 规则：${escapeHtml(row.detail.rule)}` : ""}${row.detail.command ? ` · 命令：${escapeHtml(row.detail.command)}` : ""}${row.detail.bot_status ? ` · 决策机器人：${escapeHtml(row.detail.bot_status)}${row.detail.bot_outcome ? ` (${escapeHtml(row.detail.bot_outcome)})` : ""}` : ""}</div>` : "";
     return `<article class="card decision-card">${rowCheckbox(row.request_uid)}<div class="card-main"><div class="headline"><span class="dot red"></span>${escapeHtml(row.summary || row.detail?.question || row.detail?.prompt || `${row.kind} 需要决策`)}</div><div class="meta">${sessionLink(row.stable_id)} · ${escapeHtml(row.host || "未知主机")} · <span class="age-chip${age >= AGE_WARN_MS ? " age-warn" : ""}" title="${escapeHtml(formatTime(row.created_at))}">等待 ${ageText(age)}</span></div>${gate}<div class="impact-line">${ASK_IMPACT}</div>${options}</div><div class="actions"><button class="btn danger ack" data-id="${escapeHtml(row.request_uid)}">确认并归档</button>${jumpActions(row, "request_uid", "jump")}</div></article>`;
   }
@@ -232,7 +299,7 @@
   function zombieCard(group) { return `<article class="card"><div class="card-main"><h3>${e(group.q5_reason)}</h3><p>${e(zombieHint[group.q5_reason] || 'Needs review.')}</p>${(group.rows||[]).map(row=>`<div class="inline">${sessionLink(row.stable_id)} · ${e(formatTime(row.last_event_at))}${resumeCapability(row)}${jumpActions(row,'stable_id','jump-session')}${handoffLine(row.handoff)}</div>`).join('')}</div></article>`; }
   function renderDetail() {
     const view = state.detail;
-    if (!view) { $("detail").innerHTML = "<p class='empty'>加载中…</p>"; return; }
+    if (!view) { $("detail").innerHTML = failures.has("detail") ? `<p class='empty'>不可用：${escapeHtml(failures.get("detail"))}</p>` : "<p class='empty'>加载中…</p>"; return; }
     const s = view.session;
     const clocks = `事件 ${formatTime(s.last_event_at)} · 进展 ${formatTime(s.last_progress_at)} · 心跳 ${formatTime(s.last_heartbeat_at)}`;
     const head = keyValueTable([
@@ -335,31 +402,73 @@
     throw new Error('Conversation response was not a list.');
   }
   function renderAgents() {
-    return head('Agents','Session diagnostics and legacy recovery actions.')+`<div id="agent-summary" class="meta">${e(state.health?.open_incidents?.length||0)} open incidents · ${e(state.health?.coverage_gaps||0)} coverage gaps · ${e(state.health?.telemetry_gaps||0)} telemetry gaps</div><div id="agent-status" role="status"></div><section id="detail"></section><section id="content"><h2>Decision requests</h2>${button('Acknowledge selected','bulk-ack')}${button('Clear selection','clear-selection')}${state.q1.map(decisionCard).join('')||empty('No decision requests.')}<h2>Hung sessions</h2>${state.hung.map(hungCard).join('')||empty('No hung sessions.')}<h2>Zombie / handoff</h2>${state.zombie.groups.map(zombieCard).join('')||empty('No zombie groups.')}<h3>Orphaned requests</h3>${state.zombie.orphaned_requests.map(r=>`<article class="card">${e(r.summary || r.request_uid)}${button('Acknowledge','orphan-ack',r.request_uid)}</article>`).join('')||empty('No orphaned requests.')}<h2>Sessions</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Agent</th><th>Host</th><th>State / queue</th><th>Last event</th></tr></thead><tbody>${state.sessions.map(r=>`<tr><td>${sessionLink(r.stable_id)} ${resumeCapability(r)} ${jumpActions(r, "stable_id", "jump-session")}</td><td>${e(r.agent)}</td><td>${e(r.host)}</td><td>${e(r.run_state)} · ${e(r.queue)}</td><td>${e(formatTime(r.last_event_at))}</td></tr>`).join('')}</tbody></table></div><h2>Archive</h2><div class="table-wrap"><table><thead><tr><th>Session</th><th>Kind</th><th>Status</th><th>Time</th><th>Summary</th></tr></thead><tbody>${state.archive.map(r=>`<tr><td>${sessionLink(r.stable_id)}</td><td>${e(r.origin)}</td><td>${r.closed_out?'Closed out':'Archived'}</td><td>${e(formatTime(r.last_event_at))}</td><td>${e(r.state || r.run_state)}</td></tr>`).join('')}</tbody></table></div><h2>Health</h2>${json(state.health)}</section>`;
+    return head('Agents','Session diagnostics and legacy recovery actions.')+`<div id="agent-summary" class="meta">${sliceView('health',()=>`${e(state.health?.open_incidents?.length||0)} open incidents · ${e(state.health?.coverage_gaps||0)} coverage gaps · ${e(state.health?.telemetry_gaps||0)} telemetry gaps`)}</div><div id="agent-status" role="status"></div><section id="detail"></section><section id="content"><h2>Decision requests</h2>${button('Acknowledge selected','bulk-ack')}${button('Clear selection','clear-selection')}${sliceView('q1',()=>state.q1.map(decisionCard).join('')||empty('No decision requests.'))}<h2>Hung sessions</h2>${sliceView('hung',()=>state.hung.map(hungCard).join('')||empty('No hung sessions.'))}<h2>Zombie / handoff</h2>${sliceView('zombie',()=>state.zombie.groups.map(zombieCard).join('')||empty('No zombie groups.'))}<h3>Orphaned requests</h3>${sliceView('zombie',()=>state.zombie.orphaned_requests.map(r=>`<article class="card">${e(r.summary || r.request_uid)}${button('Acknowledge','orphan-ack',r.request_uid)}</article>`).join('')||empty('No orphaned requests.'))}<h2>Sessions</h2>${sliceView('sessions',()=>`<div class="table-wrap"><table><thead><tr><th>Session</th><th>Agent</th><th>Host</th><th>State / queue</th><th>Last event</th></tr></thead><tbody>${state.sessions.map(r=>`<tr><td>${sessionLink(r.stable_id)} ${resumeCapability(r)} ${jumpActions(r, "stable_id", "jump-session")}</td><td>${e(r.agent)}</td><td>${e(r.host)}</td><td>${e(r.run_state)} · ${e(r.queue)}</td><td>${e(formatTime(r.last_event_at))}</td></tr>`).join('')}</tbody></table></div>`)}<h2>Archive</h2>${sliceView('archive',()=>`<div class="table-wrap"><table><thead><tr><th>Session</th><th>Kind</th><th>Status</th><th>Time</th><th>Summary</th></tr></thead><tbody>${state.archive.map(r=>`<tr><td>${sessionLink(r.stable_id)}</td><td>${e(r.origin)}</td><td>${r.closed_out?'Closed out':'Archived'}</td><td>${e(formatTime(r.last_event_at))}</td><td>${e(r.state || r.run_state)}</td></tr>`).join('')}</tbody></table></div>`)}<h2>Health</h2>${sliceView('health',()=>json(state.health))}</section>`;
   }
-  function render() {if(editor)return;document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.page));$('main').innerHTML=({decide:renderDecide,conversations:renderConversations,ledger:renderLedger,works:renderWorks,tasks:renderTasks,candidates:renderCandidates,agents:renderAgents})[state.page]();$('workspace-actions').hidden=state.page==='conversations';if(state.page!=='conversations')$('workspace-actions').innerHTML=`<div>Operator workspace<small>真实数据 · 需要你判断时才介入</small></div><span class="muted">选择工作项，审阅证据与影响</span>`;if(state.page==='agents'&&state.session){$('content').hidden=true;renderDetail();}}
-  async function refresh() {
-    const current=++generation, page=state.page;
-    if(page==='conversations'&&!state.conversationPosting){const text=$('conversation-text');if(text){state.conversationDraft=text.value;state.conversationDrafts[state.conversationId]=text.value;}}
-    const since=state.range==='all'?0:Date.now()-(state.range==='week'?7:1)*86400000;
+  function render() {if(editor)return;document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.page));const waiting=(PAGE_SLICES[state.page]||[]).find(key=>!applied.has(key));$('main').innerHTML=waiting?sliceView(waiting):({decide:renderDecide,conversations:renderConversations,ledger:renderLedger,works:renderWorks,tasks:renderTasks,candidates:renderCandidates,agents:renderAgents})[state.page]();$('workspace-actions').hidden=state.page==='conversations';if(state.page!=='conversations')$('workspace-actions').innerHTML=`<div>Operator workspace<small>真实数据 · 需要你判断时才介入</small></div><span class="muted">选择工作项，审阅证据与影响</span>`;if(state.page==='agents'&&state.session){$('content').hidden=true;renderDetail();}}
+  const sliceView=(key,html)=>applied.has(key)?html():failures.has(key)?empty(`Unavailable: ${failures.get(key)}`):empty('Loading…');
+  function scheduleRender() {if(!renderFrame)renderFrame=requestAnimationFrame(flushRender);}
+  function flushRender() {
+    if(renderFrame)cancelAnimationFrame(renderFrame);renderFrame=0;
+    // A refresh never re-renders over a message being composed; the draft is re-captured on the next refresh.
+    if(state.page==='conversations'&&(state.conversationPosting||document.activeElement?.id==='conversation-text'))return;
+    render();
+  }
+  /** The current view's sections. `scope` names the exact view (page, range, session) a result is fetched for. */
+  function slices() {
+    const page=state.page,list=[];
+    const slice=(key,load,{param='',after}={})=>list.push({key,scope:`${page}|${key}|${param}`,load,after});
+    const get=(key,path)=>()=>fetchJson(path).then(value=>({[key]:value}));
+    slice('rules',get('rules','/api/rules'));
+    if(page==='decide') {slice('attention',loadAttention,{after:loadPackages});slice('today',()=>fetchJson(`/api/ledger?since=${Date.now()-86400000}`).then(today=>({today})));slice('ledger',()=>fetchJson(`/api/ledger?since=${Date.now()-7*86400000}`).then(ledger=>({ledger})));slice('waits',loadWaits);}
+    if(page==='ledger') {const range=state.range,since=range==='all'?0:Date.now()-(range==='week'?7:1)*86400000;slice('ledger',get('ledger',`/api/ledger?since=${since}`),{param:range});}
+    if(page==='works') {slice('works',get('works','/api/works'));slice('waits',loadWaits);}
+    if(page==='candidates') slice('works',get('works','/api/works'));
+    if(page==='conversations') slice('conversations',()=>fetchJson('/api/conversations').then(data=>({conversations:conversationPayload(data)})),{after:settleConversationPending});
+    if(page==='agents') {for(const key of ['q1','hung','zombie','sessions','health','archive'])slice(key,get(key,`/api/${key}`));if(state.session)slice('detail',get('detail',`/api/sessions/${encodeURIComponent(state.session)}`),{param:state.session});}
+    return list;
+  }
+  async function loadAttention() {
+    const [now,inbox,done,followUpResponse]=await Promise.all(['now','inbox','done'].map(z=>fetchJson(`/api/attention/${z}`)).concat(fetchJson('/api/control/attention?zone=follow_up')));
+    const followUps=followUpResponse.items,followUpIds=new Set(followUps.map(entry=>entry.item.item_id));
+    return {attention:{now:now.filter(item=>!followUpIds.has(item.item_id)),inbox:inbox.filter(item=>!followUpIds.has(item.item_id)),done,followUps}};
+  }
+  // Decision packages load per displayed item revision once the lists have rendered. A row keeps the package it already
+  // showed for the same revision until the fresh one arrives; `undefined` means still loading, `null` unavailable.
+  const packageKey=item=>`${item.item_id}#${item.revision}`;
+  function decoratePackages() {for(const item of [...state.attention.now,...state.attention.inbox])item.decision_package=packages.get(packageKey(item))?.pkg;}
+  async function loadPackages(seq) {
+    const active=[...state.attention.now,...state.attention.inbox],shown=new Set(active.map(packageKey));
+    for(const key of packages.keys())if(!shown.has(key))packages.delete(key);
+    decoratePackages();
+    await Promise.all(active.map(async item=>{
+      let pkg=null;
+      try{pkg=await fetchJson(`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`);}catch{}
+      const key=packageKey(item);
+      if((packages.get(key)?.seq??0)>seq)return;
+      packages.set(key,{seq,pkg});decoratePackages();scheduleRender();
+    }));
+  }
+  function settleConversationPending() {if(!state.conversationPending)return;const selected=state.conversations.find(row=>String(row.id)===String(state.conversationPending.conversationId));if(selected?.turns?.some(turn=>String(turn.id)===String(state.conversationPending.turnId)))state.conversationPending=null;}
+  function resetSlices() {applied.clear();failures.clear();packages.clear();state.detail=null;}
+  async function runSlice(slice,seq,poll) {
+    const isCurrent=()=>seq>(applied.get(slice.key)??0)&&slices().find(live=>live.key===slice.key)?.scope===slice.scope;
     try {
-      let data={};
-      const rulesPromise=fetchJson('/api/rules');
-      const pagePromise=(async()=>{
-        if(page==='decide') { const [now,inbox,done,today,ledger]=await Promise.all(['now','inbox','done'].map(z=>fetchJson(`/api/attention/${z}`)).concat(fetchJson(`/api/ledger?since=${Date.now()-86400000}`),fetchJson(`/api/ledger?since=${Date.now()-7*86400000}`))); const active=[...now,...inbox],packages=await Promise.all(active.map(async item=>{try{return await fetchJson(`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`);}catch{return null;}}));active.forEach((item,index)=>item.decision_package=packages[index]);return {attention:{now,inbox,done},today,ledger}; }
-        if(page==='ledger') return {ledger:await fetchJson(`/api/ledger?since=${since}`)};
-        if(page==='works'||page==='candidates') return {works:await fetchJson('/api/works')};
-        if(page==='conversations') return {conversations:conversationPayload(await fetchJson('/api/conversations'))};
-        if(page==='agents') { const keys=['q1','hung','zombie','sessions','health','archive']; const rows=await Promise.all(keys.map(k=>fetchJson(`/api/${k}`))); const result=Object.fromEntries(keys.map((k,i)=>[k,rows[i]])); if(state.session)result.detail=await fetchJson(`/api/sessions/${encodeURIComponent(state.session)}`); return result; }
-        return {};
-      })();
-      const [rules,result]=await Promise.all([rulesPromise,pagePromise]); data={...result,rules};
-      if(current!==generation || page!==state.page)return;
-      Object.assign(state,data);
-      if(page==='conversations'&&state.conversationPending){const selected=state.conversations.find(row=>String(row.id)===String(state.conversationPending.conversationId));if(selected?.turns?.some(turn=>String(turn.id)===String(state.conversationPending.turnId)))state.conversationPending=null;}
-      if(page==='conversations'&&(state.conversationPosting||document.activeElement?.id==='conversation-text'))return;
-      render();
-    }catch(error){showError(error);}
+      let request=poll?inflight.get(slice.scope):null;
+      if(!request){request=slice.load();inflight.set(slice.scope,request);const settle=()=>{if(inflight.get(slice.scope)===request)inflight.delete(slice.scope);};request.then(settle,settle);}
+      const data=await request;
+      if(!isCurrent())return;
+      applied.set(slice.key,seq);failures.delete(slice.key);Object.assign(state,data);
+      const followUp=slice.after?.(seq);scheduleRender();await followUp;
+    } catch(error) {
+      if(!isCurrent())return;
+      failures.set(slice.key,error.message||String(error));showError(error);scheduleRender();
+    }
+  }
+  async function refresh({poll=false}={}) {
+    const seq=++refreshSeq;
+    if(state.page==='conversations'&&!state.conversationPosting){const text=$('conversation-text');if(text){state.conversationDraft=text.value;state.conversationDrafts[state.conversationId]=text.value;}}
+    await Promise.all(slices().map(slice=>runSlice(slice,seq,poll)));
+    if(renderFrame)flushRender();
   }
   async function submitConversationMessage(form) {
     if(state.conversationPosting) return;
@@ -425,6 +534,7 @@
         "",
         `/${state.page}${state.page === "conversations" && state.conversationId ? "/" + encodeURIComponent(state.conversationId) : state.session ? "/" + encodeURIComponent(state.session) : ""}`,
       );
+    resetSlices();
     $("main").innerHTML = empty("Loading…");
     await refresh();
     if (original === "done") showDone();
@@ -478,7 +588,7 @@
     editor.busy=true;document.querySelector('[data-action="apply-editor"]').disabled=true;const active=editor;
     try{const result=await post(`/api/attention/${encodeURIComponent(editor.item.item_id)}/resolve`,{expected_revision:editor.item.revision,expected_contract_revision:editor.revision,affected_cards:editor.preview.result.affected_cards.map(({item_id,revision})=>({item_id,revision})),selected_option:'narrow',replacement_contract:editor.preview.replacement,reason:editor.reason.trim()});if(editor!==active)return;editor.result=result;editor.stage='complete';renderEditor();window.scrollTo(0,0);}finally{active.busy=false;}
   }
-  async function resolveItem(id,option) {const item=findAttention(id),pkg=item.decision_package;decisionDrafts.set(id,option);if(option==='narrow')return openNarrow(item);if(option==='defer'){const result=await post(`/api/attention/${encodeURIComponent(id)}/defer`,{expected_revision:pkg.attention_revision,material_fingerprint:pkg.material_fingerprint,defer_until:Date.now()+3600000});decisionDrafts.delete(id);receipts.set(id,`<div class="row receipt">defer · you · ${stamp(Date.now())}</div>`);render();setTimeout(()=>{receipts.delete(id);refresh();},3000);return;}const result=await post(item.approval_id?`/api/orchestrator/answer/${encodeURIComponent(item.approval_id)}`:`/api/attention/${encodeURIComponent(id)}/resolve`,item.approval_id?{answer:option,consumer_owner:item.consumer_owner,expected_revision:pkg.attention_revision,material_fingerprint:pkg.material_fingerprint}:{expected_revision:pkg.attention_revision,material_fingerprint:pkg.material_fingerprint,selected_option:option});decisionDrafts.delete(id);receipts.set(id,`<div class="row receipt">${e(option)} · you · ${stamp(Date.now())} · ${result.effect_state==='succeeded'?'effect verified':`answer recorded · effect ${e(result.effect_state||'applying')}`}</div>`);render();setTimeout(()=>{receipts.delete(id);refresh();},3000);}
+  async function resolveItem(id,option) {const item=findAttention(id),pkg=item.decision_package;decisionDrafts.set(id,option);if(option==='narrow')return openNarrow(item);try{if(option==='defer'){const result=await post(`/api/attention/${encodeURIComponent(id)}/defer`,{expected_revision:pkg.attention_revision,material_fingerprint:pkg.material_fingerprint,defer_until:Date.now()+3600000});decisionDrafts.delete(id);receipts.set(id,`<div class="row receipt">defer · you · ${stamp(Date.now())}</div>`);render();setTimeout(()=>{receipts.delete(id);refresh();},3000);return;}const result=await post(item.approval_id?`/api/orchestrator/answer/${encodeURIComponent(item.approval_id)}`:`/api/attention/${encodeURIComponent(id)}/resolve`,item.approval_id?{answer:option,consumer_owner:item.consumer_owner}:{attention_revision:pkg.attention_revision,material_fingerprint:pkg.material_fingerprint,selected_option:option});decisionDrafts.delete(id);receipts.set(id,receipt({...item,...result}));render();setTimeout(()=>{receipts.delete(id);refresh();},3000);}catch(error){if(error.status===409){const packageUrl=error.data?.decision_package_url||`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`;try{item.decision_package=await fetchJson(packageUrl);render();}catch{} }throw error;}}
   async function resume(button) {
     const stableId=button.dataset.id;
     if(button.dataset.adapter==='claude-code') { dialog('modal','Confirm resume',`<p>Claude Code resume creates a new tmux window. Confirm that you want to restart this terminated session.</p>`,`${buttonHtmlResume(stableId)}${windowCancel()}`); return; }
@@ -612,6 +722,66 @@
       return dialog("drawer",pkg.conclusion,`<dl><dt>Trigger</dt><dd>${e(pkg.trigger)}</dd><dt>Impact</dt><dd>${e(pkg.impact)}</dd><dt>Recommendation</dt><dd>${e(pkg.recommendation)}</dd><dt>Owner</dt><dd>${e(pkg.owner)}</dd><dt>Expires</dt><dd>${e(formatTime(pkg.expires_at))}</dd></dl><h3>Decisive evidence</h3>${pkg.trigger_evidence.map(x=>`<p>${e(x.summary)} · <code>${e(x.reference)}</code></p>`).join('')||'<p>None</p>'}<h3>Options</h3>${pkg.options.map(x=>`<p><strong>${e(x.label)}</strong> — ${e(x.effect)}<br>${e(x.consequence)}</p>`).join('')}${sourceLink(pkg.source_link)}`);
     }
     if (action === "work") return openWork(id);
+    if (action === "toggle-waits") {
+      state.waitsOpen = !state.waitsOpen;
+      return render();
+    }
+    if (action === "wait-review") {
+      // Named human exit: bring the original decision (and its real answer consumer) into view; never a new path.
+      revealed.add(id);
+      expanded.add(id);
+      if (state.page === "decide") render();
+      else await navigate("decide");
+      document.querySelector(`.row[data-item-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: "center" });
+      return;
+    }
+    if (action === "wait-cancel") {
+      const model = findWait(id);
+      if (!model) return;
+      return dialog("modal", "Cancel condition wait", `<p>Stops watching <strong>${e(model.condition_summary)}</strong>. The original decision stays with you; effects that already happened are not undone.</p><label>Reason<input id="wait-cancel-reason" required></label>`, `<button data-action="wait-cancel-save" data-id="${e(id)}" data-version="${e(model.wait.version)}">Cancel wait</button>`);
+    }
+    if (action === "wait-cancel-save") {
+      const reason = $("wait-cancel-reason").value.trim();
+      if (!reason) throw new Error("Reason is required.");
+      try {
+        await post(`/api/waits/${encodeURIComponent(id)}/cancel`, { expected_version: Number(target.dataset.version), reason });
+      } catch (error) {
+        if (error.status !== 409 || !error.data?.current) throw error;
+        // Show the server's current row; never pretend the cancellation happened.
+        const current = error.data.current;
+        state.waits = (state.waits || []).map((m) => (m.wait.wait_id === id ? current : m));
+        $("modal").close();
+        render();
+        const stale = new Error(`This wait changed before it could be cancelled: it is now ${WAIT_STATE[current.wait.state]?.[0] || current.wait.state} (v${current.wait.version}). Nothing was cancelled.`);
+        stale.status = 409;
+        throw stale;
+      }
+      $("modal").close();
+      return refresh();
+    }
+    if (action === "wait-create") {
+      const item = findAttention(id);
+      if (!item) return;
+      const deadline = item.expires_at && item.expires_at > Date.now() ? new Date(item.expires_at - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : "";
+      return dialog(
+        "modal",
+        "Wait for a condition",
+        `<p>Stop owing this decision until an exact condition is met. When it is, the decision returns to you to re-decide; nothing runs automatically.</p><label>Condition<select id="wait-kind"><option value="github_pr_merged">GitHub pull request is merged</option><option value="work_completed">Prerequisite Work completes</option><option value="check_new_result">New check result is recorded</option></select></label><fieldset data-wait-kind="github_pr_merged"><label>Host<input id="wait-host" value="github.com"></label><label>Owner<input id="wait-owner"></label><label>Repository<input id="wait-repo"></label><label>Pull request number<input id="wait-number" type="number" min="1" step="1"></label></fieldset><fieldset data-wait-kind="work_completed" hidden><label>Prerequisite Work ID<input id="wait-prerequisite"></label><label>Dependency revision<input id="wait-dependency-revision" type="number" min="1" step="1" value="1"></label></fieldset><fieldset data-wait-kind="check_new_result" hidden><label>Work ID<input id="wait-check-work" value="${e(item.work_id)}"></label><label>Task ID<input id="wait-check-task"></label><label>Attempt ID<input id="wait-check-attempt"></label><label>Check ID<input id="wait-check-id"></label><label>Check definition version<input id="wait-check-def"></label></fieldset><label>Stop watching at<input id="wait-deadline" type="datetime-local" required value="${deadline}"></label>`,
+        button("Start watching", "wait-create-save", id),
+      );
+    }
+    if (action === "wait-create-save") {
+      const item = findAttention(id), kind = $("wait-kind").value, field = (name) => $(name).value.trim();
+      const source =
+        kind === "github_pr_merged" ? { provider: "github", host: field("wait-host"), owner: field("wait-owner"), repo: field("wait-repo"), number: Number(field("wait-number")) }
+        : kind === "work_completed" ? { prerequisite_work_id: field("wait-prerequisite"), dependency_revision: Number(field("wait-dependency-revision")) }
+        : { orchestrator_db: "local", work_id: field("wait-check-work"), task_id: field("wait-check-task"), attempt_id: field("wait-check-attempt"), check_id: field("wait-check-id"), check_def_version: field("wait-check-def") };
+      const deadline = new Date($("wait-deadline").value).getTime();
+      if (!Number.isFinite(deadline)) throw new Error("Choose when to stop watching.");
+      await post("/api/waits", { work_id: item.work_id, item_id: item.item_id, condition: { kind, source }, deadline_at: deadline });
+      $("modal").close();
+      return refresh();
+    }
     if (action === "preview-editor") return previewEditor();
     if (action === "apply-editor") return applyEditor();
     if (action === "exit-editor") {
@@ -695,7 +865,7 @@
       state.selected.delete(id);
       return refresh();
     }
-    if (target.classList.contains("approve")) {
+    if (target.classList.contains("answer")) {
       await post(
         `/api/orchestrator/answer/${encodeURIComponent(target.dataset.approvalId)}`,
         {
@@ -713,10 +883,11 @@
   document.addEventListener('submit',async event=>{const form=event.target;if(form.id!=='capture'&&!form.matches('form.promote'))return;event.preventDefault();const submit=form.querySelector('button');submit.disabled=true;try {if(form.id==='capture')await post('/api/works',{title:form.elements.idea.value.trim(),source:'operator',candidate:true});else {const work=state.works.find(w=>w.work_id===form.dataset.id);await post(`/api/works/${encodeURIComponent(work.work_id)}/promote`,{expected_revision:work.revision,reason:'promoted from candidates',contract:{objective:form.elements.objective.value.trim(),acceptance:[{id:'a1',kind:'human',description:form.elements.acceptance.value.trim()}],non_goals:[],scope:{cwd:'.'},budget:{},stop_conditions:[{id:'s1',kind:'judgment',description:'operator review'}],decision_owner:'operator'}});}await refresh();}catch(error){showError(error);}finally{submit.disabled=false;}});
   document.addEventListener('click',async event=>{const target=event.target.closest('button,a[data-nav],a.drill,[data-task-track]');if(!target)return;if(target.closest('form')&&target.dataset.action!=='task-preconditions')return;event.preventDefault();if(target.dataset.nav)return navigate(target.dataset.nav);if(target.dataset.taskTrack){history.pushState(null,'',`/tasks?track=${target.dataset.taskTrack}`);return restoreRoute();}if(target.dataset.taskId){history.pushState(null,'',`/tasks/${encodeURIComponent(target.dataset.taskId)}`);return restoreRoute();}target.disabled=true;try {await handleAction(target);}catch(error){showError(error);}finally{target.disabled=false;if(target.dataset.action==='apply-editor')validateEditor();}});
   document.addEventListener('input',event=>{if(['replacement','reason'].includes(event.target.id)&&editor)validateEditor();if(event.target.id==='approve-contract'){const b=document.querySelector('[data-action="apply-editor"]');b.disabled=!event.target.checked;}const form=event.target.closest('form.promote');if(form)form.querySelector('button').disabled=!(form.elements.objective.value.trim()&&form.elements.acceptance.value.trim());});
-  document.addEventListener('change',event=>{if(event.target.id==='period'){state.range=event.target.value;refresh();}if(event.target.matches('.row-select')) {if(event.target.checked)state.selected.add(event.target.dataset.id);else state.selected.delete(event.target.dataset.id);}});
+  document.addEventListener('toggle',event=>{const details=event.target;if(details.matches?.('details.work')){if(details.open)openWorks.add(details.dataset.workId);else openWorks.delete(details.dataset.workId);}},true);
+  document.addEventListener('change',event=>{if(event.target.id==='wait-kind')document.querySelectorAll('[data-wait-kind]').forEach(set=>{set.hidden=set.dataset.waitKind!==event.target.value;});if(event.target.id==='period'){state.range=event.target.value;refresh();}if(event.target.matches('.row-select')) {if(event.target.checked)state.selected.add(event.target.dataset.id);else state.selected.delete(event.target.dataset.id);}});
   window.addEventListener('popstate',()=>{editor=null;restoreRoute();});
-  document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh({poll:true});});
   document.addEventListener('keydown',event=>{if((event.metaKey||event.ctrlKey)&&event.key.toLowerCase()==='k'){event.preventDefault();dialog('modal','Navigate',pages.map(page=>`<a class="command-link" href="/${page}" data-nav="${page}">${e(page[0].toUpperCase()+page.slice(1))}</a>`).join(''));}});
-  setInterval(()=>{if(!document.hidden)refresh();},15000);
+  setInterval(()=>{if(!document.hidden)refresh({poll:true});},15000);
   restoreRoute();
 })();

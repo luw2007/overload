@@ -66,8 +66,8 @@ test("EXT-14(b): inline seal fires at 1MB and advances segment without path reus
   let sealedBig: string | undefined;
   // Enqueue in small batches with a real pause so the queue never reaches the
   // overflow limit (which would drop lines and corrupt the byte accounting).
-  for (let batch = 0; batch < 200 && !sealedBig; batch++) {
-    for (let i = 0; i < 150; i++) push(`seal-${n++}`);
+  for (let batch = 0; batch < 600 && !sealedBig; batch++) {
+    for (let i = 0; i < 50; i++) push(`seal-${n++}`);
     await Bun.sleep(25);
     sealedBig = listFiles().find((f) => f.startsWith("seg-") && statSync(join(emitterDir(), f)).size >= SEGMENT_MAX_BYTES);
   }
@@ -91,4 +91,4 @@ test("EXT-14(b): inline seal fires at 1MB and advances segment without path reus
   const segIndex = (name: string) => Number(name.match(/-(\d+)\.ndjson$/)?.[1]);
   expect(active).toBeDefined();
   expect(segIndex(active!)).toBeGreaterThan(segIndex(sealedBig!));
-});
+}, 20_000);

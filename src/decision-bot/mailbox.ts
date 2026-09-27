@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { ensureControlSchema } from "../control/store";
+import { controlPayloadHash } from "../control/outbox";
 
 export const defaultMailboxPath = join(homedir(), ".overload", "orchestrator-answers.db");
 export type ConsumerOwner = "extension" | "orchestrator";
@@ -106,7 +107,48 @@ export function observeReceiptEffect(db: Database, observation: EffectObservatio
   })();
 }
 export function reconcileOutstandingReceipts(db:Database,deadline:number,now=Date.now()):number{return db.run("UPDATE decision_receipts SET applied_at=?,outcome='unknown' WHERE applied_at IS NULL AND consumed_at<=?",[now,deadline]).changes;}
-export function reconcileEffectEvents(mailbox:Database,ledgerPath:string,now=Date.now()):void{const ledger=new Database(ledgerPath,{readonly:true});try{const cursor=(mailbox.query("SELECT ingest_seq FROM effect_reconcile_cursor WHERE id=1").get() as any)?.ingest_seq??0;const rows=ledger.query("SELECT ingest_seq,detail,at FROM journal_all WHERE kind='control_event' AND ingest_seq>? ORDER BY ingest_seq").all(cursor) as Array<{ingest_seq:number;detail:string;at:number}>;mailbox.transaction(()=>{let high=cursor;for(const row of rows){high=row.ingest_seq;let envelope:any;try{envelope=JSON.parse(row.detail);}catch{continue;}if(envelope?.event_kind!=="effect_observed")continue;const d=envelope.payload;if(!d||typeof d.receipt_id!=="string"||typeof d.toolCallId!=="string"||!["succeeded","failed","unknown"].includes(d.effect_state)||!d.evidence||typeof d.evidence!=="object")continue;observeReceiptEffect(mailbox,{receiptId:d.receipt_id,toolCallId:d.toolCallId,attemptId:typeof d.attempt_id==="string"?d.attempt_id:undefined,state:d.effect_state,evidence:d.evidence,observedAt:Number.isSafeInteger(row.at)?row.at:now});}mailbox.run("INSERT INTO effect_reconcile_cursor(id,ingest_seq) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET ingest_seq=excluded.ingest_seq",high);mailbox.run("UPDATE decision_receipts SET applied_at=?,outcome='unknown' WHERE applied_at IS NULL AND EXISTS(SELECT 1 FROM approval_targets t WHERE t.consumer_owner=decision_receipts.consumer_owner AND t.approval_id=decision_receipts.approval_id AND t.expires_at<=?)",[now,now]);})();}finally{ledger.close();}}
+/**
+ * Folds ledger-applied `effect_observed` control events into receipts. A journal row is consumed only once the
+ * reducer has passed it (ingest_seq <= reducer_cursor) and `applied_control_events` confirms the exact event_id and
+ * payload_hash it carries, recomputed from the payload. Rows the reducer quarantined, or that disagree with the
+ * applied identity, never touch receipts. The mailbox cursor never overtakes the reducer, so rows not yet reduced
+ * are revisited on the next pass.
+ */
+export function reconcileEffectEvents(mailbox:Database,ledgerPath:string,now=Date.now()):void{
+  const ledger=new Database(ledgerPath,{readonly:true});
+  try{
+    const cursor=(mailbox.query("SELECT ingest_seq FROM effect_reconcile_cursor WHERE id=1").get() as {ingest_seq:number}|null)?.ingest_seq??0;
+    const tables=new Set((ledger.query("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{name:string}>).map(row=>row.name));
+    const reduced=tables.has("reducer_cursor")&&tables.has("applied_control_events")
+      ?(ledger.query("SELECT journal_seq FROM reducer_cursor WHERE id=1").get() as {journal_seq:number}|null)?.journal_seq??0
+      :0;
+    const rows=reduced>cursor
+      ?ledger.query("SELECT ingest_seq,detail,at FROM journal_all WHERE kind='control_event' AND ingest_seq>? AND ingest_seq<=? ORDER BY ingest_seq").all(cursor,reduced) as Array<{ingest_seq:number;detail:string;at:number}>
+      :[];
+    const applied=rows.length?ledger.query("SELECT payload_hash FROM applied_control_events WHERE event_id=?"):null;
+    mailbox.transaction(()=>{
+      for(const row of rows){
+        let envelope:any;
+        try{envelope=JSON.parse(row.detail);}catch{continue;}
+        if(envelope?.event_kind!=="effect_observed")continue;
+        const d=envelope.payload;
+        if(typeof envelope.event_id!=="string"||typeof envelope.payload_hash!=="string"||!d||typeof d!=="object"||Array.isArray(d))continue;
+        const confirmed=applied!.get(envelope.event_id) as {payload_hash:string}|null;
+        if(!confirmed||confirmed.payload_hash!==envelope.payload_hash||controlPayloadHash(d)!==envelope.payload_hash)continue;
+        if(typeof d.receipt_id!=="string"||typeof d.toolCallId!=="string"||!["succeeded","failed","unknown"].includes(d.effect_state)||!d.evidence||typeof d.evidence!=="object")continue;
+        try{
+          observeReceiptEffect(mailbox,{receiptId:d.receipt_id,toolCallId:d.toolCallId,attemptId:typeof d.attempt_id==="string"?d.attempt_id:undefined,state:d.effect_state,evidence:d.evidence,observedAt:Number.isSafeInteger(row.at)?row.at:now});
+        }catch(error){
+          // A second applied event contradicting a recorded observation keeps the first; it must not wedge the cursor.
+          if(!(error instanceof Error)||error.message!=="conflicting_effect_observation")throw error;
+        }
+      }
+      const high=Math.max(cursor,reduced);
+      mailbox.run("INSERT INTO effect_reconcile_cursor(id,ingest_seq) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET ingest_seq=excluded.ingest_seq",[high]);
+      mailbox.run("UPDATE decision_receipts SET applied_at=?,outcome='unknown' WHERE applied_at IS NULL AND EXISTS(SELECT 1 FROM approval_targets t WHERE t.consumer_owner=decision_receipts.consumer_owner AND t.approval_id=decision_receipts.approval_id AND t.expires_at<=?)",[now,now]);
+    })();
+  }finally{ledger.close();}
+}
 export function markReceipt(db:Database,id:string,outcome:string,now=Date.now()):void{if(outcome==="applied")outcome="unknown";if(!["succeeded","failed","unknown"].includes(outcome))throw new Error("invalid receipt outcome");db.run("UPDATE decision_receipts SET applied_at=COALESCE(applied_at,?),outcome=? WHERE receipt_id=?",[now,outcome,id]);}
 export function closeTarget(db:Database,owner:ConsumerOwner,id:string,outcome:string):void{db.run("UPDATE approval_targets SET state=CASE WHEN state='consumed' THEN state ELSE 'closed' END,outcome=? WHERE consumer_owner=? AND approval_id=?",[outcome,owner,id]);}
 // 扫所有 owner（extension + orchestrator）已过期的 active target，幂等关闭为 expired。
@@ -114,3 +156,70 @@ export function closeTarget(db:Database,owner:ConsumerOwner,id:string,outcome:st
 export function expireActiveTargets(db:Database,now:number):number{return db.run("UPDATE approval_targets SET state='closed',outcome='expired' WHERE state='active' AND expires_at<=?",[now]).changes;}
 export function setBotDisabled(db:Database,disabled:boolean,reason:string,now=Date.now()):void{db.transaction(()=>{db.run("INSERT INTO bot_control(id,disabled,changed_at,reason) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET disabled=excluded.disabled,changed_at=excluded.changed_at,reason=excluded.reason",[disabled?1:0,now,reason]);if(disabled)db.run("UPDATE bot_proposals SET invalidated_at=? WHERE invalidated_at IS NULL",now);})();}
 export function botDisabled(db:Database):boolean{return !!(db.query("SELECT disabled FROM bot_control WHERE id=1").get() as any)?.disabled;}
+
+/**
+ * Frozen resume grant (Phase B §4.2 rule 5, §8.4): the exact runtime checkpoint, Attention revision, post-condition
+ * and execution owner a decision owner approved. Stored as `scope.resume_grant` on a `resume_checkpoint` target;
+ * `checkpointReference(scope)` is the wait authorization's `checkpoint_reference`.
+ */
+export type ResumeGrantScope = {
+  stable_id: string; runtime: "pi" | "omp"; session: string; cwd: string; file: string; last_entry_id: string | null; byte_len: number;
+  attention_revision: number; expires_at: number; item_id: string; execution_owner: string; condition: unknown;
+};
+export type CheckpointPin = Pick<ResumeGrantScope, "stable_id" | "runtime" | "session" | "cwd" | "file" | "last_entry_id" | "byte_len">;
+export const RESUME_GRANT_EFFECT = "resume_checkpoint";
+export const RESUME_GRANT_ANSWER = "approve";
+/** Grant effect steps are `resume_checkpoint:<dispatch_id>`, bound to the target by observeReceiptEffect's tool-call prefix rule. */
+export const RESUME_GRANT_TOOL = "resume_checkpoint";
+
+/** Content identity of a pinned checkpoint: any append, rewrite, move or re-home yields a different reference. */
+export function checkpointReference(pin: CheckpointPin): string {
+  const { stable_id, runtime, session, cwd, file, last_entry_id, byte_len } = pin;
+  return `checkpoint:${digest({ stable_id, runtime, session, cwd, file, last_entry_id, byte_len })}`;
+}
+
+/** Strictly parsed `scope.resume_grant`; null when the target does not pin a complete grant. */
+export function resumeGrantScope(target: ApprovalTarget): ResumeGrantScope | null {
+  const scope = (target.scope as { resume_grant?: unknown } | null)?.resume_grant;
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) return null;
+  const fields = scope as Record<string, unknown>;
+  const text = (key: string) => typeof fields[key] === "string" && fields[key] !== "";
+  const integer = (key: string) => Number.isSafeInteger(fields[key]) && (fields[key] as number) >= 0;
+  if (!["stable_id", "session", "cwd", "file", "item_id", "execution_owner"].every(text)) return null;
+  if (fields.runtime !== "pi" && fields.runtime !== "omp") return null;
+  if (fields.last_entry_id !== null && !text("last_entry_id")) return null;
+  if (!["byte_len", "attention_revision", "expires_at"].every(integer) || fields.condition === undefined) return null;
+  return fields as ResumeGrantScope;
+}
+
+/** The human answer pending on a target — the same row `consumeDecision` would consume; bot proposals never count. */
+export function grantApproval(db: Database, owner: ConsumerOwner, id: string): { answer: string; actor: string } | null {
+  return db.query(`SELECT a.answer,a.actor FROM answers a LEFT JOIN answer_metadata m ON m.approval_id=a.approval_id
+    WHERE a.approval_id=? AND (m.consumer_owner=? OR m.consumer_owner IS NULL) LIMIT 1`).get(id, owner) as { answer: string; actor: string } | null;
+}
+
+/**
+ * Registers a resume grant and records the decision owner's approval in one immediate transaction. The approval
+ * stays pending until the single authorized dispatch consumes it through `consumeDecision`. A slot already bound to
+ * another effect, or already consumed, is never repurposed.
+ */
+export function registerResumeGrant(db: Database, input: {
+  consumerOwner: ConsumerOwner; approvalId: string; workId: string; contractRevision: number; attemptId: string;
+  question: string; scope: ResumeGrantScope; actor: string; now: number;
+}): ApprovalTarget {
+  return db.transaction(() => {
+    const prior = getTarget(db, input.consumerOwner, input.approvalId);
+    if (prior && (prior.effect !== RESUME_GRANT_EFFECT || prior.state === "consumed")) {
+      throw new Error(`approval ${input.approvalId} is not an open resume grant slot`);
+    }
+    const target = registerTarget(db, {
+      consumerOwner: input.consumerOwner, approvalId: input.approvalId, stableId: input.scope.stable_id, question: input.question,
+      options: [RESUME_GRANT_ANSWER], effect: RESUME_GRANT_EFFECT, scope: { resume_grant: input.scope },
+      evidence: { checkpoint_reference: checkpointReference(input.scope) }, expiresAt: input.scope.expires_at,
+      workId: input.workId, contractRevision: input.contractRevision, toolCallId: RESUME_GRANT_TOOL, attemptId: input.attemptId,
+    });
+    const answered = writeHumanAnswer(db, input.consumerOwner, input.approvalId, RESUME_GRANT_ANSWER, input.actor, input.now);
+    if (!answered.ok) throw new Error(`resume grant approval not recorded: ${answered.reason}`);
+    return target;
+  }).immediate();
+}

@@ -34,6 +34,7 @@ test('reviewed narrow refuses newly arrived cards; fresh review applies and arch
 
 test('extension decision effect requires the consumed receipt and updates linked card only after real result',async()=>{
  const root=mkdtempSync(join(tmpdir(),'gate-effect-http-')),ledgerPath=join(root,'ledger.db'),controlPath=join(root,'control.db');const ledger=new Database(ledgerPath);ledger.exec(await Bun.file(new URL('../ingest/schema.sql',import.meta.url)).text());ledger.close();writeFileSync(join(root,'host'),'local\n');const db=openMailbox(controlPath);const work=createWork(db,{title:'gate',source:'test',contract:{objective:'gate',acceptance:[{id:'effect',kind:'artifact',description:'effect'}],non_goals:[],scope:{cwd:root,human_only_effects:['gated_tool']},budget:{},stop_conditions:[],decision_owner:'operator'}});const approvalId='gate-approval',toolCallId='tool-1';const {targetVersion}=registerTarget(db,{consumerOwner:'extension',approvalId,question:'approve?',options:['approve','deny'],effect:'gated_tool',scope:{cwd:root},evidence:{toolCallId},expiresAt:Date.now()+60000,workId:work.work_id,contractRevision:work.revision,decisionMode:'human_only',toolCallId});upsertAttention(db,{item_id:approvalId,work_id:work.work_id,state:'applying',effect_state:'applying',urgency:'now',conclusion:'approve?',trigger:'gate',impact:'blocked',recommendation:null,options:[],owner:'operator',expires_at:Date.now()+60000,source_link:null,approval_id:approvalId,consumer_owner:'extension',contract_revision:work.revision,decision_mode:'human_only',evidence:{toolCallId}});writeHumanAnswer(db,'extension',approvalId,'approve','operator');consumeDecision(db,{consumerOwner:'extension',approvalId,targetVersion,policyHash:'human',liveValid:()=>true,contractValid:()=>true,policyValid:()=>false});const server=startWebServer({ledgerPath,controlPath,orchestratorPath:join(root,'orch.db'),spoolRoot:root,port:0});const base=`http://127.0.0.1:${server.port}`;try{const bad=await fetch(base+'/api/decision/effect',{method:'POST',headers:{'Content-Type':'application/json','Sec-Fetch-Site':'same-origin'},body:JSON.stringify({receipt_id:'wrong',toolCallId,effect_state:'succeeded',evidence:{}})});expect(await bad.json()).toEqual({observed:false});expect(getAttention(db,approvalId)?.effect_state).toBe('applying');const receipt=db.query('SELECT receipt_id FROM decision_receipts WHERE approval_id=?').get(approvalId) as {receipt_id:string};const ok=await fetch(base+'/api/decision/effect',{method:'POST',headers:{'Content-Type':'application/json','Sec-Fetch-Site':'same-origin'},body:JSON.stringify({receipt_id:receipt.receipt_id,toolCallId,effect_state:'succeeded',evidence:{marker:'observed'}})});expect(await ok.json()).toEqual({observed:true});expect(getAttention(db,approvalId)?.effect_state).toBe('succeeded');}finally{server.stop(true);db.close();rmSync(root,{recursive:true,force:true});}
+});
 test('resolve with projected material enforces fingerprint CAS and returns a stale body on mismatch',async()=>{
  const root=mkdtempSync(join(tmpdir(),'contract-http-')),ledgerPath=join(root,'ledger.db'),controlPath=join(root,'control.db');
  const ledger=new Database(ledgerPath);ledger.exec(await Bun.file(new URL('../ingest/schema.sql',import.meta.url)).text());ledger.close();writeFileSync(join(root,'host'),'local\n');
@@ -45,6 +46,12 @@ test('resolve with projected material enforces fingerprint CAS and returns a sta
  process.env.OVERLOAD_ACTOR='operator'; const server=startWebServer({ledgerPath,controlPath,orchestratorPath:join(root,'orch.db'),spoolRoot:root,port:0});const base=`http://127.0.0.1:${server.port}`;
  const post=(path:string,body:unknown)=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify(body)});
  try{
+  // omitting the fingerprint must not downgrade a projected item to the legacy path
+  const omitted=await post(`/api/attention/${encodeURIComponent(item.item_id)}/resolve`,{attention_revision:item.revision,selected_option:'continue'});
+  expect(omitted.status).toBe(409);
+  const omittedBody=await omitted.json();
+  expect(omittedBody).toMatchObject({error:'conflict',code:'stale_attention',item_id:item.item_id,expected_revision:item.revision,current_revision:item.revision,current_state:'open',current_effect_state:'not_started'});
+  expect(getAttention(db,item.item_id)?.state).toBe('open');
   // fingerprint mismatch → 409 with the full stale body
   const bad=await post(`/api/attention/${encodeURIComponent(item.item_id)}/resolve`,{attention_revision:item.revision,selected_option:'continue',material_fingerprint:'rotated-fingerprint'});
   expect(bad.status).toBe(409);
@@ -62,6 +69,29 @@ test('resolve with projected material enforces fingerprint CAS and returns a sta
   // fresh fingerprint + fresh revision → decision succeeds
   const ok=await post(`/api/attention/${encodeURIComponent(item.item_id)}/resolve`,{attention_revision:item.revision,selected_option:'continue',material_fingerprint:material.fingerprint});
   expect(ok.status).toBe(200);
+  expect(getAttention(db,item.item_id)?.state).toBe('resolved');
+ }finally{server.stop(true);db.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test('historical open attention without projected material is repaired before resolve',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'contract-http-')),ledgerPath=join(root,'ledger.db'),controlPath=join(root,'control.db');
+ const ledger=new Database(ledgerPath);ledger.exec(await Bun.file(new URL('../ingest/schema.sql',import.meta.url)).text());ledger.close();writeFileSync(join(root,'host'),'local\n');
+ const db=openMailbox(controlPath);
+ const contract:Contract={objective:'ship',acceptance:[{id:'a',kind:'human',description:'review'}],non_goals:[],scope:{cwd:'.'},budget:{},stop_conditions:[{id:'one',kind:'judgment',description:'one'}],decision_owner:'operator'};
+ const work=createWork(db,{title:'historical review',source:'test',contract});const item=recordStopCondition(db,work.work_id,'one',{});
+ // Simulate a row persisted before either projection storage or its outbox event existed.
+ db.query("DELETE FROM control_outbox WHERE item_id=? AND kind='attention.material_projected'").run(item.item_id);
+ db.query('DELETE FROM control_attention_material WHERE item_id=?').run(item.item_id);
+ expect(db.query('SELECT 1 FROM control_attention_material WHERE item_id=?').get(item.item_id)).toBeNull();
+ process.env.OVERLOAD_ACTOR='operator'; const server=startWebServer({ledgerPath,controlPath,orchestratorPath:join(root,'orch.db'),spoolRoot:root,port:0});const base=`http://127.0.0.1:${server.port}`;
+ try{
+  const missingFingerprint=await fetch(base+`/api/attention/${encodeURIComponent(item.item_id)}/resolve`,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({attention_revision:item.revision,selected_option:'continue'})});
+  expect(missingFingerprint.status).toBe(409);
+  expect(getAttentionMaterial(db,item.item_id)).not.toBeNull();
+  expect(getAttention(db,item.item_id)?.state).toBe('open');
+  const pkg=await (await fetch(base+`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(work.work_id)}`)).json();
+  const resolved=await fetch(base+`/api/attention/${encodeURIComponent(item.item_id)}/resolve`,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({attention_revision:pkg.attention_revision,material_fingerprint:pkg.material_fingerprint,selected_option:'continue'})});
+  expect(resolved.status).toBe(200);
   expect(getAttention(db,item.item_id)?.state).toBe('resolved');
  }finally{server.stop(true);db.close();rmSync(root,{recursive:true,force:true});}
 });

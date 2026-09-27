@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { controlPayloadHash } from "../control/outbox";
 import { initializeLedger } from "./ingest";
 import { reduceJournal } from "./reducer";
 
@@ -132,6 +134,67 @@ describe("detail stable_id host authority", () => {
 
     expect(db.query("SELECT state FROM current WHERE stable_id='local:pi:x'").get()).toEqual({ state: "working" });
     expect(db.query("SELECT COUNT(*) AS count FROM coverage_gaps").get()).toEqual({ count: 1 });
+    db.close();
+  });
+});
+
+describe("poison control events", () => {
+  // Exact spool detail that crash-looped ingest (B07, 2026-09-28). The extension hashed the in-memory payload,
+  // which still held attempt_id: undefined; JSON dropped that member from the spool line ingest decodes.
+  const hashedPayload = { receipt_id: "8da12650-fd18-4a76-ba0c-acc140ea27e8", toolCallId: "call_0685bc71b6ed44efba42339a", attempt_id: undefined, effect: "ask_answer", effect_state: "succeeded", evidence: { tool: "ask", isError: false, output: "Selected: Green" } };
+  const spooled = {
+    event_id: "extension:8da12650-fd18-4a76-ba0c-acc140ea27e8:call_0685bc71b6ed44efba42339a:effect_observed",
+    producer_id: "extension:pi-68130-2febd318", entity_id: "8da12650-fd18-4a76-ba0c-acc140ea27e8", entity_version: 1, event_kind: "effect_observed",
+    payload: JSON.parse(JSON.stringify(hashedPayload)) as Record<string, unknown>,
+    payload_hash: "094462acd1a0824127107989975ecaf74fe24501234037eb855876b234f1d2a8",
+  };
+  function effectEvent(receiptId: string, output: string): Record<string, unknown> {
+    const payload = { receipt_id: receiptId, toolCallId: "call-2", effect: "ask_answer", effect_state: "succeeded", evidence: { tool: "ask", isError: false, output } };
+    return { event_id: `extension:${receiptId}:call-2:effect_observed`, producer_id: "extension:pi-1", entity_id: receiptId, entity_version: 1, event_kind: "effect_observed", payload, payload_hash: controlPayloadHash(payload) };
+  }
+  const applied = (db: Database) => db.query("SELECT event_id, payload_hash FROM applied_control_events ORDER BY event_id").all();
+  const gaps = (db: Database) => db.query("SELECT stable_id, emitter_id, from_seq, reason FROM coverage_gaps ORDER BY id").all();
+
+  test("the production hash covered legacy non-JSON text; the canonical hash now drops undefined like the spool did", () => {
+    const legacyText = '{"attempt_id":undefined,"effect":"ask_answer","effect_state":"succeeded","evidence":{"isError":false,"output":"Selected: Green","tool":"ask"},"receipt_id":"8da12650-fd18-4a76-ba0c-acc140ea27e8","toolCallId":"call_0685bc71b6ed44efba42339a"}';
+    expect(createHash("sha256").update(legacyText).digest("hex")).toBe(spooled.payload_hash);
+    expect(controlPayloadHash(hashedPayload)).toBe(controlPayloadHash(spooled.payload));
+    expect(controlPayloadHash(spooled.payload)).not.toBe(spooled.payload_hash);
+  });
+
+  test("a hash-mismatched event is quarantined as a coverage gap and every later event still reduces", () => {
+    const db = fixture();
+    const later = effectEvent("receipt-later", "Selected: Blue");
+    insertEvent(db, 1, "decision_requested", "local:pi:s", { request_id: "call-1" }, "local", "pi-1");
+    insertEvent(db, 2, "control_event", "local:pi:s", spooled, "local", "pi-1");
+    insertEvent(db, 3, "decision_resolved", "local:pi:s", { request_id: "call-1", state: "resolved" }, "local", "pi-1");
+    insertEvent(db, 4, "control_event", "local:pi:s", later, "local", "pi-1");
+
+    expect(reduceJournal(db)).toBe(4);
+
+    expect(db.query("SELECT state FROM requests WHERE request_id='call-1'").get()).toEqual({ state: "resolved" });
+    expect(applied(db)).toEqual([{ event_id: later.event_id, payload_hash: later.payload_hash }]);
+    expect(gaps(db)).toEqual([{ stable_id: "local:pi:s", emitter_id: "pi-1", from_seq: 2, reason: "control_event_rejected" }]);
+
+    // Replaying the whole journal byte-for-byte is idempotent: no second application, no second gap.
+    db.query("UPDATE reducer_cursor SET journal_seq=0 WHERE id=1").run();
+    expect(reduceJournal(db)).toBe(4);
+    expect(applied(db)).toEqual([{ event_id: later.event_id, payload_hash: later.payload_hash }]);
+    expect(gaps(db)).toEqual([{ stable_id: "local:pi:s", emitter_id: "pi-1", from_seq: 2, reason: "control_event_rejected" }]);
+    db.close();
+  });
+
+  test("a second payload under an applied identity is quarantined, never accepted over the first", () => {
+    const db = fixture();
+    const first = effectEvent("receipt-1", "Selected: Green");
+    const conflicting = { ...effectEvent("receipt-1", "Selected: Blue"), event_id: first.event_id };
+    insertEvent(db, 1, "control_event", "local:pi:s", first, "local", "pi-1");
+    insertEvent(db, 2, "control_event", "local:pi:s", conflicting, "local", "pi-1");
+
+    expect(reduceJournal(db)).toBe(2);
+
+    expect(applied(db)).toEqual([{ event_id: first.event_id, payload_hash: first.payload_hash }]);
+    expect(gaps(db)).toEqual([{ stable_id: "local:pi:s", emitter_id: "pi-1", from_seq: 2, reason: "control_event_rejected" }]);
     db.close();
   });
 });

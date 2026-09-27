@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, chmodSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -44,6 +44,19 @@ function metadataFor(root: string, sessionId: string): ReturnType<typeof readBro
 
 function sameReference(left: SessionReference, right: SessionReference): boolean {
   return left.runtimeKind === right.runtimeKind && left.sessionId === right.sessionId && left.ownerId === right.ownerId && left.cwd === right.cwd;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function safeUnlinkSocket(path: string): void {
+  try { unlinkSync(path); } catch { /* stale socket cleanup is best-effort */ }
 }
 
 export class PiSessionHandle implements SessionHandle {
@@ -173,6 +186,7 @@ export class PiRuntime implements AgentRuntime {
     const broker=metadata.brokerIdentity,child=metadata.childIdentity;
     if(broker&&child&&processLiveness(broker.pid,broker.startIdentity,broker.bootIdentity)==='dead'&&processLiveness(child.pid,child.startIdentity,child.bootIdentity)==='dead')return this.restore(reference);
     if (metadata.state !== "running" && metadata.state !== "starting") throw new Error("runtime_not_live");
+    if (!existsSync(metadata.socketPath) || !processAlive(metadata.pid)) throw new Error("runtime_not_live");
     return this.connectFromMetadata(metadata, reference.sessionId, reference);
   }
 
@@ -183,6 +197,7 @@ export class PiRuntime implements AgentRuntime {
       if (metadata.ownerId !== reference.ownerId || metadata.cwd !== reference.cwd) throw new Error("runtime_ownership_mismatch");
       const broker=metadata.brokerIdentity,child=metadata.childIdentity;
       if(!broker||!child||processLiveness(broker.pid,broker.startIdentity,broker.bootIdentity)!=='dead'||processLiveness(child.pid,child.startIdentity,child.bootIdentity)!=='dead'){if(existsSync(metadata.socketPath))return this.connectFromMetadata(metadata,reference.sessionId,reference);throw new Error('runtime_live_ambiguous');}
+      safeUnlinkSocket(metadata.socketPath);
     }
     const sessionFile = reference.sessionFile ?? metadata?.sessionFile;
     if(!metadata||metadata.ownerId!==reference.ownerId||metadata.cwd!==reference.cwd||sessionFile!==metadata.sessionFile)throw new Error('runtime_restore_ownership_mismatch');

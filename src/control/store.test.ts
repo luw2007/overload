@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { CONTROL_SCHEMA_VERSION, actOnAttention, previewContractRevision, promoteWork, ControlError, createWork, ensureControlSchema, getAttention, getWork, recordStopCondition, resolveAttentionDecision, reviseContract, upsertAttention } from "./store";
+import { CONTROL_SCHEMA_VERSION, actOnAttention, previewContractRevision, promoteWork, ControlError, createWork, ensureControlSchema, getAttention, getWork, listAttention, openControl, recordStopCondition, resolveAttentionDecision, reviseContract, upsertAttention } from "./store";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Contract } from "./types";
 
 const contract: Contract = { objective:"ship",acceptance:[{id:"human",kind:"human",description:"owner accepts"}],non_goals:[],scope:{allowed_effects:["write"]},budget:{retry_limit:1},stop_conditions:[{id:"risk",kind:"hard",description:"unexpected destructive effect"}],decision_owner:"owner" };
@@ -12,7 +15,7 @@ describe("control store CAS and attention semantics",()=>{
     const item=upsertAttention(db,{item_id:"i",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"decide",trigger:"risk",impact:"blocked",recommendation:"approve",options:["approve"],owner:"owner",expires_at:null,source_link:null,approval_id:"a",consumer_owner:"orchestrator",contract_revision:1,decision_mode:"human_only",evidence:{}},2);
     const revised=reviseContract(db,work.work_id,1,{...contract,objective:"ship v2"},"scope changed",3);
     expect(revised.revision).toBe(2);expect(getAttention(db,item.item_id)?.state).toBe("superseded");
-    expect((db.query("SELECT COUNT(*) n FROM control_outbox").get() as {n:number}).n).toBe(4);db.close();
+    expect((db.query("SELECT COUNT(*) n FROM control_outbox").get() as {n:number}).n).toBe(5);db.close();
   });
   test("schema version refuses newer databases and initialization records version",()=>{
     const db=fixture();expect(db.query("SELECT version FROM control_schema_meta WHERE id=1").get()).toEqual({version:CONTROL_SCHEMA_VERSION});db.query("UPDATE control_schema_meta SET version=99 WHERE id=1").run();expect(()=>ensureControlSchema(db)).toThrow(ControlError);db.close();
@@ -75,4 +78,21 @@ test("narrow preview cannot overwrite a sibling arriving after preview",()=>{
 test("stop refuses to change work while a sibling effect is applying",()=>{
   const db=fixture();const work=createWork(db,{title:"x",source:"test",contract},1);const selected=recordStopCondition(db,work.work_id,"risk",{},2,1);upsertAttention(db,{item_id:"applying",work_id:work.work_id,state:"applying",effect_state:"applying",urgency:"now",conclusion:"effect",trigger:"risk",impact:"held",recommendation:null,options:[],owner:"owner",expires_at:null,source_link:null,approval_id:null,consumer_owner:"orchestrator",contract_revision:1,decision_mode:"human_only",evidence:{}},2);
   expect(()=>resolveAttentionDecision(db,selected.item_id,selected.revision,{selected_option:"stop"},3)).toThrow(ControlError);expect(getWork(db,work.work_id)).toMatchObject({state:"active",revision:1});expect(getAttention(db,selected.item_id)).toMatchObject({state:"open",revision:selected.revision});db.close();
+});
+
+test("steady-state reads take no write lock: a read succeeds while another connection holds BEGIN IMMEDIATE",()=>{
+  const dir=mkdtempSync(join(tmpdir(),"overload-control-"));
+  try{
+    const path=join(dir,"control.db");const reader=openControl(path);const writer=openControl(path);
+    const work=createWork(reader,{title:"x",source:"test",contract},1);
+    upsertAttention(reader,{item_id:"i",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"decide",trigger:"risk",impact:"blocked",recommendation:"approve",options:["approve"],owner:"owner",expires_at:null,source_link:null,approval_id:"a",consumer_owner:"orchestrator",contract_revision:1,decision_mode:"human_only",evidence:{}},2);
+    reader.exec("PRAGMA busy_timeout=100");
+    writer.exec("BEGIN IMMEDIATE");
+    try{
+      expect(listAttention(reader).map(item=>item.item_id)).toEqual(["i"]);
+      expect(getAttention(reader,"i")?.state).toBe("open");
+      expect(getWork(reader,work.work_id)?.work_id).toBe(work.work_id);
+    }finally{writer.exec("ROLLBACK");}
+    reader.close();writer.close();
+  }finally{rmSync(dir,{recursive:true,force:true});}
 });

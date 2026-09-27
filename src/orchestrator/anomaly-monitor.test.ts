@@ -173,7 +173,7 @@ describe("anomaly-monitor sampleTask", () => {
     expect(samples[0].diff_added).toBe(10);
     expect(samples[0].diff_deleted).toBe(2);
     expect(samples[0].result_set_version).toBe(1);
-    const checks = getCheckResults(db, 1);
+    const checks = getCheckResults(db, WORK_ID, 1);
     expect(checks).toHaveLength(1);
     expect(checks[0].check_id).toBe("ci");
     expect(checks[0].fingerprint).toBe("fp1");
@@ -195,6 +195,50 @@ describe("anomaly-monitor sampleTask", () => {
     expect(getSignalSamples(h.db, WORK_ID)).toHaveLength(1);
     await h.monitor.sampleTask(task, 1000 + 60000);
     expect(getSignalSamples(h.db, WORK_ID)).toHaveLength(2);
+    h.cleanup();
+  });
+
+  test("a task without a Work records the signal sample but neither runs nor persists checks", async () => {
+    const calls: string[] = [];
+    const h = makeHarness(async (cmd, args) => {
+      calls.push(cmd);
+      if (cmd === "git" && args.includes("rev-list")) return { ok: true, stdout: "1\n", stderr: "" };
+      return { ok: true, stdout: JSON.stringify([{ id: "ci", status: "fail" }]), stderr: "" };
+    });
+    mkdirSync(h.worktree, { recursive: true });
+    writeFileSync(join(h.worktree, "orchestrator.check"), "exit 0");
+    const task = makeTask(h.db, { worktree: h.worktree });
+    h.db.run("UPDATE tasks SET work_id=NULL WHERE task_id=?", [task.task_id]);
+    await h.monitor.sampleTask(getTask(h.db, task.task_id)!, 1000);
+    expect(calls).toEqual(["git", "git"]);
+    expect(h.db.query("SELECT COUNT(*) AS n FROM attempt_signal_samples WHERE work_id IS NULL AND task_id=?").get(task.task_id)).toEqual({ n: 1 });
+    expect(h.db.query("SELECT COUNT(*) AS n FROM attempt_check_results").get()).toEqual({ n: 0 });
+    expect(h.db.query("SELECT COUNT(*) AS n FROM task_events WHERE event='anomaly_sample_failed'").get()).toEqual({ n: 0 });
+    h.cleanup();
+  });
+
+  test("two Works sampling the same version/check both persist and each reads only its own result", async () => {
+    const h = makeHarness(async (cmd, args) => {
+      if (cmd === "git") return { ok: true, stdout: args.includes("rev-list") ? "1\n" : "", stderr: "" };
+      const status = cmd.includes("wt-b") ? "pass" : "fail";
+      return { ok: true, stdout: JSON.stringify([{ id: "ci", status, fingerprint: `fp-${status}`, check_def_version: "v1" }]), stderr: "" };
+    });
+    const worktreeB = join(h.root, "wt-b");
+    for (const wt of [h.worktree, worktreeB]) {
+      mkdirSync(wt, { recursive: true });
+      writeFileSync(join(wt, "orchestrator.check"), "exit 0");
+    }
+    const taskA = makeTask(h.db, { worktree: h.worktree, attempt_id: "att-a" });
+    // Separate repo: tasks_repo_active allows one active task per repo.
+    h.db.run("UPDATE tasks SET repo='/repo-a' WHERE task_id=?", [taskA.task_id]);
+    const taskB = makeTask(h.db, { worktree: worktreeB, attempt_id: "att-b", work_id: "work-2" });
+    await h.monitor.sampleTask(taskA, 1000);
+    await h.monitor.sampleTask(taskB, 1000);
+    expect(getSignalSamples(h.db, WORK_ID).map((s) => s.result_set_version)).toEqual([1]);
+    expect(getSignalSamples(h.db, "work-2").map((s) => s.result_set_version)).toEqual([1]);
+    expect(getCheckResults(h.db, WORK_ID, 1).map((c) => [c.task_id, c.status])).toEqual([[taskA.task_id, "fail"]]);
+    expect(getCheckResults(h.db, "work-2", 1).map((c) => [c.task_id, c.status])).toEqual([[taskB.task_id, "pass"]]);
+    expect(h.db.query("SELECT COUNT(*) AS n FROM task_events WHERE event='anomaly_sample_failed'").get()).toEqual({ n: 0 });
     h.cleanup();
   });
 });
@@ -220,6 +264,27 @@ describe("anomaly-monitor evaluateAndFence", () => {
     const card = getAttention(answers, `anomaly:${WORK_ID}:fix_loop_exhausted:fp-same`);
     answers.close();
     expect(card!.urgency).toBe("now");
+    h.cleanup();
+  });
+
+  test("reads only its own Work's check results even when another Work fix-loops on the same versions", async () => {
+    const h = makeHarness(async () => ({ ok: true, stdout: "", stderr: "" }));
+    const task = makeTask(h.db);
+    for (let v = 1; v <= 5; v++) {
+      // This Work only has signal samples; work-2 fails the same (version, check_id) five times.
+      insertSignalSample(h.db, task.task_id, task.attempt_id!, v * 60000, v, 5, 1, v, WORK_ID);
+      insertSignalSample(h.db, "task-other", "att-other", v * 60000, v, 5, 1, v, "work-2");
+      insertCheckResults(h.db, v, "task-other", "att-other", v * 60000, [
+        { check_id: "ci", status: "fail", fingerprint: "fp-other", check_def_version: "v1" },
+      ], "work-2");
+    }
+    await h.monitor.evaluateAndFence(task, 1000);
+    expect(getTask(h.db, task.task_id)!.stop_state).toBeNull();
+    expect(h.db.query("SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND event='anomaly_triggered'").get(task.task_id)).toEqual({ n: 0 });
+    expect(getAnomalyBudget(h.db, WORK_ID)).toBeNull();
+    const answers = openMailbox(h.answersPath);
+    expect(getAttention(answers, `anomaly:${WORK_ID}:fix_loop_exhausted:fp-other`)).toBeNull();
+    answers.close();
     h.cleanup();
   });
 

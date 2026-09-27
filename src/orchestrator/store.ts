@@ -20,6 +20,65 @@ const rules: Record<TaskState, Record<string, TaskState>> = {
   blocked:{human_reopen:"starting",human_abandon:"abandoned"}, done:{}, failed:{}, abandoned:{}
 };
 
+// B-ORCH-CHECK-PK: attempt_check_results durable identity is (work_id,result_set_version,check_id).
+// schema.sql's CREATE TABLE IF NOT EXISTS never rebuilds an existing table, so openStore migrates a
+// legacy table before db.exec(schema) or any producer/reader touches the connection. The rebuilt
+// table and index use the exact schema.sql statements, so fresh and migrated stores share one DDL.
+const CHECK_RESULTS_KEY = "work_id,result_set_version,check_id";
+const CHECK_RESULTS_LEGACY = "attempt_check_results_legacy_pk";
+function schemaStatement(head:string):string{
+  const start=schema.indexOf(head);
+  if(start<0)throw new Error(`schema.sql is missing statement: ${head}`);
+  return schema.slice(start,schema.indexOf(";",start)+1);
+}
+const CHECK_RESULTS_TABLE_DDL = schemaStatement("CREATE TABLE IF NOT EXISTS attempt_check_results(");
+const CHECK_RESULTS_INDEX_DDL = schemaStatement("CREATE INDEX IF NOT EXISTS idx_check_results_work ");
+type TableColumn = { name:string; notnull:number; pk:number };
+function tableColumns(db:Database,table:string):TableColumn[]{
+  // PRAGMA table_xinfo rows always carry name/notnull/pk; bun:sqlite returns them untyped.
+  const columns=db.query(`PRAGMA table_xinfo(${table})`).all() as TableColumn[];
+  return columns;
+}
+function hasCheckResultsKey(columns:TableColumn[]):boolean{
+  const key=columns.filter(column=>column.pk>0).sort((a,b)=>a.pk-b.pk).map(column=>column.name).join(",");
+  return key===CHECK_RESULTS_KEY&&columns.some(column=>column.name==="work_id"&&column.notnull===1);
+}
+function migrateCheckResultsKey(db:Database):void{
+  const current=tableColumns(db,"attempt_check_results");
+  if(current.length===0||hasCheckResultsKey(current))return;
+  try{
+    db.transaction(()=>{
+      if(hasCheckResultsKey(tableColumns(db,"attempt_check_results")))return; // a concurrent opener migrated first
+      db.exec(`ALTER TABLE attempt_check_results RENAME TO ${CHECK_RESULTS_LEGACY}`);
+      db.exec(CHECK_RESULTS_TABLE_DDL);
+      const legacyNames=tableColumns(db,CHECK_RESULTS_LEGACY).map(column=>column.name);
+      const names=tableColumns(db,"attempt_check_results").map(column=>column.name);
+      if(legacyNames.length!==names.length||names.some(name=>!legacyNames.includes(name)))
+        throw new Error(`legacy columns [${legacyNames.join(",")}] do not match [${names.join(",")}]`);
+      // A missing (NULL/empty) Work ID is backfilled only from the exactly-one tasks row with the same
+      // task_id whose work_id is non-empty. Everything else stays NULL and fails closed below.
+      const taskColumns=db.query("PRAGMA table_info(tasks)").all() as {name:string}[];
+      const workId=taskColumns.some(column=>column.name==="work_id")
+        ?"COALESCE(NULLIF(r.work_id,''),(SELECT CASE WHEN COUNT(*)=1 THEN NULLIF(MAX(t.work_id),'') END FROM tasks t WHERE t.task_id=r.task_id))"
+        :"NULLIF(r.work_id,'')";
+      const legacyRows=`SELECT ${names.map(name=>name==="work_id"?`${workId} AS work_id`:`r.${name}`).join(",")} FROM ${CHECK_RESULTS_LEGACY} r`;
+      const unresolved=db.query(`SELECT r.task_id,r.result_set_version,r.check_id FROM ${CHECK_RESULTS_LEGACY} r WHERE (${workId}) IS NULL ORDER BY r.task_id,r.result_set_version,r.check_id`).all() as {task_id:string;result_set_version:number;check_id:string}[];
+      if(unresolved.length)throw new Error(`${unresolved.length} row(s) have no provable Work ID, first task_id=${unresolved[0].task_id} result_set_version=${unresolved[0].result_set_version} check_id=${unresolved[0].check_id}`);
+      const duplicates=db.query(`SELECT work_id,result_set_version,check_id FROM (${legacyRows}) GROUP BY work_id,result_set_version,check_id HAVING COUNT(*)>1 ORDER BY work_id,result_set_version,check_id`).all() as {work_id:string;result_set_version:number;check_id:string}[];
+      if(duplicates.length)throw new Error(`${duplicates.length} (${CHECK_RESULTS_KEY}) key(s) would be duplicated, first work_id=${duplicates[0].work_id} result_set_version=${duplicates[0].result_set_version} check_id=${duplicates[0].check_id}`);
+      db.run(`INSERT INTO attempt_check_results(${names.join(",")}) ${legacyRows}`);
+      const migratedRows=`SELECT ${names.join(",")} FROM attempt_check_results`;
+      const verify=db.query(`SELECT (SELECT COUNT(*) FROM ${CHECK_RESULTS_LEGACY}) AS legacy,(SELECT COUNT(*) FROM attempt_check_results) AS migrated,(SELECT COUNT(*) FROM (${legacyRows} EXCEPT ${migratedRows}))+(SELECT COUNT(*) FROM (${migratedRows} EXCEPT ${legacyRows})) AS mismatched`).get() as {legacy:number;migrated:number;mismatched:number};
+      if(verify.legacy!==verify.migrated||verify.mismatched!==0)throw new Error(`copy verification failed: legacy=${verify.legacy} migrated=${verify.migrated} mismatched=${verify.mismatched}`);
+      db.exec(`DROP TABLE ${CHECK_RESULTS_LEGACY}`);
+      db.exec(CHECK_RESULTS_INDEX_DDL);
+      if(!hasCheckResultsKey(tableColumns(db,"attempt_check_results")))throw new Error(`rebuilt table does not carry key (${CHECK_RESULTS_KEY})`);
+    }).immediate();
+  }catch(error){
+    throw new Error(`attempt_check_results migration to (${CHECK_RESULTS_KEY}) failed closed; legacy table left unchanged: ${error instanceof Error?error.message:String(error)}`,{cause:error});
+  }
+}
+
 export function openStore(path?: string | null): Database {
   // fail-fast：显式 null/空串/字面量 "undefined" 拒绝；仅 undefined（无参）才内部解析默认。
   if (path === null || path === "" || path === "undefined" || path === "null") throw new Error("openStore: path is required");
@@ -27,14 +86,19 @@ export function openStore(path?: string | null): Database {
   if (!resolved || resolved.trim() === "" || resolved === "undefined" || resolved === "null") resolved = join(homedir(), ".overload", "orchestrator.db");
   if (!resolved.trim()) throw new Error("openStore: path is required");
   mkdirSync(dirname(resolved), { recursive:true, mode:0o700 });
-  const db = new Database(resolved, { create:true }); db.exec(schema);
-  // Existing M0 databases predate contract/budget observability. SQLite does
-  // not support ADD COLUMN IF NOT EXISTS, so make this migration idempotent.
-  const columns=db.query("PRAGMA table_info(tasks)").all() as {name:string}[];
-  for(const [name,sql] of [["work_id","TEXT"],["contract_revision","INTEGER"],["budget_deadline_at","INTEGER"],["ci_observation_failures","INTEGER NOT NULL DEFAULT 0"],["stop_state","TEXT"],["stop_requested_at","INTEGER"],["stop_deadline_at","INTEGER"],["stop_reason","TEXT"]] as const)
-    if(!columns.some(column=>column.name===name))db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
-  chmodSync(resolved, 0o600);
-  db.run("INSERT OR IGNORE INTO spool_seq(id,seq,segment) VALUES(1,0,0)"); return db;
+  const db = new Database(resolved, { create:true });
+  try {
+    // busy_timeout (also set by schema.sql) must precede the migration's write lock so concurrent
+    // openers wait instead of failing; the migration must precede every schema write.
+    db.exec("PRAGMA busy_timeout = 5000"); migrateCheckResultsKey(db); db.exec(schema);
+    // Existing M0 databases predate contract/budget observability. SQLite does
+    // not support ADD COLUMN IF NOT EXISTS, so make this migration idempotent.
+    const columns=db.query("PRAGMA table_info(tasks)").all() as {name:string}[];
+    for(const [name,sql] of [["work_id","TEXT"],["contract_revision","INTEGER"],["budget_deadline_at","INTEGER"],["ci_observation_failures","INTEGER NOT NULL DEFAULT 0"],["stop_state","TEXT"],["stop_requested_at","INTEGER"],["stop_deadline_at","INTEGER"],["stop_reason","TEXT"]] as const)
+      if(!columns.some(column=>column.name===name))db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
+    chmodSync(resolved, 0o600);
+    db.run("INSERT OR IGNORE INTO spool_seq(id,seq,segment) VALUES(1,0,0)"); return db;
+  } catch (error) { db.close(); throw error; }
 }
 export function addTask(db:Database,title:string,repo:string,baseRef:string,now=Date.now(),binding?:{workId?:string;contractRevision?:number;deadlineAt?:number}): Task {
   const id=randomUUID(); db.run("INSERT INTO tasks(task_id,title,repo,base_ref,state,work_id,contract_revision,budget_deadline_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",[id,title,repo,baseRef,"queued",binding?.workId??null,binding?.contractRevision??null,binding?.deadlineAt??null,now,now]);

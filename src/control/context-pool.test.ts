@@ -37,7 +37,7 @@ const TABLES = [
 describe("T1 schema migration", () => {
   test("migration creates six context tables and leaves legacy tables intact", () => {
     const db = fixture();
-    expect(CONTROL_SCHEMA_VERSION).toBe(6);
+    expect(CONTROL_SCHEMA_VERSION).toBe(7);
     for (const table of TABLES) {
       const row = db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
       expect(row).toBeTruthy();

@@ -13,13 +13,23 @@ import { disablePolicyRule, enablePolicyRule, proposeRuleFromAttention } from ".
 import { DecisionBotService } from "../decision-bot/service";
 import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
-import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
+import { inspectResume, resumeSession, type CheckpointProbe, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
+import { listingSnapshotProbe } from "../shared/checkpoint";
+import type { LaunchLeases } from "../shared/launch-lease";
 import { mgmtRoute } from "./mgmt-routes";
 import { contextRoute } from "./context-routes";
 import { recordAcceptance } from "../manage/manifest";
-import { actOnAttention, ControlError, createWork, getAttention, getAttentionMaterial, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, resolveAttention, reviseContract, promoteWork } from "../control/store";
+import { actOnAttention, projectAttentionEffect, cancelConditionWait, ControlError, createWork, getAttention, getAttentionMaterial, getConditionWait, getWork, listAttention, listAttentionFollowUps, listConditionWaits, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, resolveAttention, reviseContract, promoteWork } from "../control/store";
 import { previewContractRevision } from "../control/store";
-import type { AttentionDecisionInput, AttentionItem, Contract, StaleAttentionBody } from "../control/types";
+import type { AttentionDecisionInput, AttentionItem, ConditionWait, Contract, CreateWaitInput, StaleAttentionBody, WaitBaseline, WaitCondition, WaitDispositionInput, WaitErrorKind, WaitSourceAdapters, WaitState } from "../control/types";
+import { cancelTarget } from "../decision-bot/mailbox";
+import { createWait } from "../waits/create";
+import { conditionWaitsEnabled } from "../waits/gate";
+import { createResumeGrant, inspectWaitRecovery, type WaitRecoveryCapability } from "../waits/recovery";
+import { createChildProcessRegistry, WAIT_SERVICE_ACTOR } from "../waits/runner";
+import { createCheckResultAdapter } from "../waits/sources/check-result";
+import { createGithubPrAdapter } from "../waits/sources/github-pr";
+import { createWorkCompleteAdapter } from "../waits/sources/work-complete";
 import { notificationCapability } from "../notify/nudge";
 import { initializeLedger } from "../ingest/ingest";
 import { publishControlEvents } from "../control/outbox";
@@ -74,6 +84,13 @@ function withReadonlyDb<T>(path: string, query: (db: Database) => T): T {
   try { return query(db); } finally { db.close(); }
 }
 
+/** Launch leases for read-only resume capability: a missing or unopenable control DB holds none. */
+function withReadonlyLeases<T>(controlPath: string, query: (leases: LaunchLeases | null) => T): T {
+  let db: Database | null = null;
+  try { db = new Database(controlPath, { readonly: true }); } catch { /* no control DB yet → no lease */ }
+  try { return query(db && { db, now: Date.now }); } finally { db?.close(); }
+}
+
 function routeParameter(value: string): string {
   try { return decodeURIComponent(value); } catch { return value; }
 }
@@ -118,6 +135,314 @@ function expectedRevision(value: unknown): number {
   return value;
 }
 
+// ── Phase B condition waits (docs/plans/overload-20260926-phaseB-contract.md §10) ──
+
+/**
+ * §10.1: `resume_grant` never leaves the server; only its presence is reported. Field-level redaction for a
+ * non-owner actor reduces the condition to its kind and drops the baseline.
+ */
+export type WebConditionWait = Omit<ConditionWait, "resume_grant" | "condition" | "baseline"> & {
+  condition: WaitCondition | { kind: WaitCondition["kind"] };
+  baseline: WaitBaseline | null;
+  has_resume_grant: boolean;
+};
+
+/** §10.1 read model. Every field is server-derived; the UI renders Answer/Resume only from `actions`. */
+export type ConditionWaitReadModel = {
+  wait: WebConditionWait;
+  condition_summary: string;
+  latest_observation: { summary: string; observed_at: number | null; confirmed_at: number | null };
+  /**
+   * `next_check_at` is null while observation is paused: a disabled observer promises no next check. The raw
+   * row value stays on `wait.next_check_at` as the persisted schedule that resumes once re-enabled (§14.3).
+   */
+  schedule: { next_check_at: number | null; deadline_at: number };
+  /** §14.3: `paused` only for a `watching` row on a server whose condition-wait gate is off. */
+  observation: { state: "active" | "paused" | "stopped"; reason: "condition_waits_disabled" | null };
+  error: { kind: WaitErrorKind; detail: string; failures: number; budget: number; retry_after_at: number | null } | null;
+  attention: { item_id: string; current_revision: number; state: AttentionItem["state"]; effect_state: AttentionItem["effect_state"] } | null;
+  recovery_capability: WaitRecoveryCapability;
+  actions: { cancel: boolean; jump_url: string | null; answer: boolean; resume: boolean };
+};
+
+/** `observing` is this server's resolved §14.1 gate (`OVERLOAD_CONDITION_WAITS`), never a request input. */
+type WaitReadContext = { control: Database; mailbox: Database; ledger: Database | null; actor: string; now: number; processAlive?: ProcessProbe; checkpointProbe?: CheckpointProbe; observing: boolean };
+
+const WAIT_ERROR_KINDS: Record<string, true> = {
+  transient: true, rate_limited: true, permission_denied: true, unsupported_provider: true, configuration: true,
+  invalid_response: true, identity_mismatch: true, source_missing: true, unknown: true,
+};
+/** Bounded, never a full stderr: source adapters already sanitize, the Web additionally caps what it returns. */
+const WAIT_TEXT_LIMIT = 500;
+/** One live baseline read per create; the adapter child is killed when this (or the client) aborts. */
+const WAIT_BASELINE_TIMEOUT_MS = 15_000;
+const WAIT_ROUTE = /^\/api\/waits(?:\/([^/]+)(?:\/([^/]+))?)?$/;
+/** Wait ids are UUIDs, so this literal segment never shadows `/api/waits/:wait_id`. */
+const WAIT_GRANT_ROUTE = "/api/waits/resume-grant";
+/**
+ * The only client-settable fields of a resume-grant wait. The checkpoint (runtime/session/cwd/file/last entry/bytes and
+ * its reference), the grant, its attempt and execution owner are all server-derived; anything else is rejected (§8.1 rule 4).
+ */
+const RESUME_GRANT_FIELDS: Record<string, true> = { work_id: true, item_id: true, condition: true, deadline_at: true, stable_id: true, transient_budget: true };
+const REDACTED_CONDITION: Record<WaitCondition["kind"], string> = {
+  github_pr_merged: "A GitHub pull request is merged",
+  check_new_result: "A new check result is recorded",
+  work_completed: "A prerequisite Work completes",
+};
+
+function boundedWaitText(value: string): string {
+  return value.length > WAIT_TEXT_LIMIT ? `${value.slice(0, WAIT_TEXT_LIMIT - 1)}…` : value;
+}
+
+function waitConditionSummary(condition: WaitCondition): string {
+  if (condition.kind === "github_pr_merged") {
+    const s = condition.source;
+    return `GitHub PR ${s.host === "github.com" ? "" : `${s.host}/`}${s.owner}/${s.repo}#${s.number} is merged`;
+  }
+  if (condition.kind === "check_new_result") {
+    const s = condition.source;
+    return `New ${s.check_id} result (definition ${s.check_def_version}) for attempt ${s.attempt_id}`;
+  }
+  return `Work ${condition.source.prerequisite_work_id} completes (dependency r${condition.source.dependency_revision})`;
+}
+
+/** Summarizes the last identity-verified source snapshot; errors never replace it (§3.3 `observed_json`). */
+function waitObservationSummary(wait: ConditionWait): string {
+  const observed = wait.observed ?? {};
+  const fact = (key: string): string | null => typeof observed[key] === "string" || typeof observed[key] === "number" ? String(observed[key]) : null;
+  let summary: string;
+  if (wait.condition.kind === "github_pr_merged") {
+    summary = fact("merged_at") ? `PR merged at ${fact("merged_at")}` : `PR ${(fact("state") ?? "state unknown").toLowerCase()} · updated ${fact("updated_at") ?? "unknown"}`;
+  } else if (wait.condition.kind === "check_new_result") {
+    summary = fact("status") ? `Result ${fact("status")} in result set v${fact("result_set_version")}` : `No new result after result set v${fact("result_set_version") ?? "?"}`;
+  } else {
+    summary = `Prerequisite is ${fact("state") ?? "in an unknown state"} at revision ${fact("work_revision") ?? "?"}`;
+  }
+  return wait.unchanged_count > 0 ? `${summary} · unchanged for ${wait.unchanged_count} check${wait.unchanged_count === 1 ? "" : "s"}` : summary;
+}
+
+/** Field-level visibility (§10.1): only the wait's or the Work's current decision owner sees source identity and raw facts. */
+function webConditionWait(wait: ConditionWait, visible: boolean): WebConditionWait {
+  const { resume_grant, ...rest } = wait;
+  const projected: WebConditionWait = {
+    ...rest, has_resume_grant: resume_grant !== null,
+    last_error_detail: rest.last_error_detail === null ? null : boundedWaitText(rest.last_error_detail),
+  };
+  if (visible) return projected;
+  return {
+    ...projected, condition: { kind: wait.condition.kind }, source_identity: {}, baseline: null,
+    observed: null, disposition_detail: null, last_error_detail: null,
+  };
+}
+
+function waitRecoveryCapability(ctx: WaitReadContext, wait: ConditionWait): WaitRecoveryCapability {
+  try {
+    return inspectWaitRecovery(ctx.control, ctx.mailbox, ctx.ledger, wait, { now: ctx.now, processAlive: ctx.processAlive, checkpointProbe: ctx.checkpointProbe });
+  } catch (error) {
+    // Recovery facts that cannot be read are unknown: never a guessed button.
+    console.error(`overload web: wait ${wait.wait_id} recovery inspection failed: ${(error as Error).message}`);
+    return { state: "unknown", reason: "recovery_inspection_failed", jump_url: null };
+  }
+}
+
+export function waitReadModel(ctx: WaitReadContext, wait: ConditionWait): ConditionWaitReadModel {
+  const owner = getWork(ctx.control, wait.work_id)?.contract?.decision_owner ?? null;
+  const visible = ctx.actor === wait.decision_owner || ctx.actor === owner;
+  const item = getAttention(ctx.control, wait.item_id);
+  const capability = waitRecoveryCapability(ctx, wait);
+  // A cancelled wait is history only; everything else keeps the original item's exits.
+  const live = visible && wait.state !== "cancelled";
+  const paused = wait.state === "watching" && !ctx.observing;
+  return {
+    wait: webConditionWait(wait, visible),
+    condition_summary: visible ? waitConditionSummary(wait.condition) : REDACTED_CONDITION[wait.condition.kind],
+    latest_observation: {
+      summary: visible ? waitObservationSummary(wait) : "Source facts are visible to the decision owner only.",
+      observed_at: wait.last_observed_at, confirmed_at: wait.last_confirmed_at,
+    },
+    schedule: { next_check_at: paused ? null : wait.next_check_at, deadline_at: wait.deadline_at },
+    observation: { state: wait.state !== "watching" ? "stopped" : paused ? "paused" : "active", reason: paused ? "condition_waits_disabled" : null },
+    error: wait.last_error_kind === null ? null : {
+      kind: wait.last_error_kind, detail: visible ? boundedWaitText(wait.last_error_detail ?? "") : "", failures: wait.transient_failures,
+      budget: wait.transient_budget, retry_after_at: wait.retry_after_at,
+    },
+    attention: item ? { item_id: item.item_id, current_revision: item.revision, state: item.state, effect_state: item.effect_state } : null,
+    recovery_capability: visible || capability.state === "available" ? capability : { ...capability, jump_url: null },
+    actions: {
+      cancel: wait.state === "watching" && owner !== null && ctx.actor === owner,
+      jump_url: live && capability.state !== "available" ? capability.jump_url : null,
+      answer: live && capability.state === "available" && capability.action === "answer_live_request",
+      // Never a Web button: an authorized resume is dispatched only by the maintenance runner (dispatchAuthorizedRecovery,
+      // effect proof by observeRecoveryEffect) once the condition holds; the Web only pins the grant (POST WAIT_GRANT_ROUTE).
+      resume: false,
+    },
+  };
+}
+
+/** Source adapters (github-pr, check-result, work-complete) throw typed errors carrying the §7.2 classification. */
+function sourceError(error: unknown): { kind: WaitErrorKind; message: string; retry_after_at: number | null } | null {
+  if (!(error instanceof Error) || !("error_kind" in error) || typeof error.error_kind !== "string" || !Object.hasOwn(WAIT_ERROR_KINDS, error.error_kind)) return null;
+  const retryAfter = "retry_after_at" in error && typeof error.retry_after_at === "number" ? error.retry_after_at : null;
+  return { kind: error.error_kind as WaitErrorKind, message: boundedWaitText(error.message), retry_after_at: retryAfter };
+}
+
+/** 409 for a wait that exists but cannot take the requested change; always carries the current row (§10.2). */
+function waitConflict(ctx: WaitReadContext, error: ControlError, waitId: string | null, extra: Record<string, unknown> = {}): Response {
+  const details = error.details && "wait_id" in error.details ? error.details : null;
+  const current = getConditionWait(ctx.control, details?.wait_id ?? waitId ?? "");
+  return json({
+    error: "conflict",
+    code: details?.code ?? "stale_wait",
+    message: error.message,
+    ...extra,
+    ...(current ? { wait_id: current.wait_id, version: current.version, state: current.state, disposition_state: current.disposition_state } : {}),
+    current: current ? waitReadModel(ctx, current) : null,
+  }, { status: 409 });
+}
+
+function waitCreateError(ctx: WaitReadContext, error: unknown, signal: AbortSignal): Response {
+  if (error instanceof ControlError) {
+    if (error.code === "forbidden") return json({ error: "forbidden", message: error.message }, { status: 403 });
+    if (error.code === "invalid") return json({ error: "invalid", message: error.message }, { status: 400 });
+    if (error.details && "wait_id" in error.details) return waitConflict(ctx, error, null);
+    const stale = !/authorization/.test(error.message);
+    return json({ error: "conflict", code: stale ? "stale_work_item" : "invalid_authorization", message: error.message }, { status: 409 });
+  }
+  const source = sourceError(error);
+  if (source?.kind === "unsupported_provider") {
+    return json({ error: "unsupported_source", error_kind: source.kind, message: source.message }, { status: 422 });
+  }
+  if (source || signal.aborted) {
+    return json({
+      error: "conflict", code: "baseline_unbindable", error_kind: source?.kind ?? "transient",
+      message: source?.message ?? "live baseline read did not finish before the deadline",
+      ...(source?.retry_after_at ? { retry_after_at: source.retry_after_at } : {}),
+    }, { status: 409 });
+  }
+  throw error;
+}
+
+/**
+ * `/api/waits` routes (§10.1). The trusted actor comes only from `startWebServer` options/env, never from the
+ * request; baseline reads use server-owned adapters. There is intentionally no ready/observe/resume route:
+ * `POST /api/waits/resume-grant` only pins the owner's consent to a future resume, which maintenance dispatches.
+ */
+async function waitRoute(request: Request, url: URL, deps: {
+  controlPath: string; ledgerPath: string; actor: string | undefined; adapters: WaitSourceAdapters; processAlive?: ProcessProbe; checkpointProbe?: CheckpointProbe; conditionWaits: boolean;
+}): Promise<Response> {
+  const match = url.pathname.match(WAIT_ROUTE);
+  const waitId = match?.[1] === undefined ? null : routeParameter(match[1]);
+  const operation = match?.[2];
+  const grantRoute = url.pathname === WAIT_GRANT_ROUTE;
+  const known = grantRoute ? request.method === "POST" : !!match && (request.method === "GET" ? operation === undefined
+    : request.method === "POST" && (waitId === null || operation === "cancel"));
+  if (!known) return json({ error: "not_found" }, { status: 404 });
+  // §14.1 gate: creation is refused before any body parse, DB open, or baseline adapter read. Reads and
+  // cancels of existing rows stay available so a disabled deployment can still inspect and withdraw them.
+  if (request.method === "POST" && (waitId === null || grantRoute) && !deps.conditionWaits) {
+    return json({ error: "disabled", code: "condition_waits_disabled", message: "condition waits are disabled on this server (set OVERLOAD_CONDITION_WAITS=1 to enable)" }, { status: 503 });
+  }
+  const actor = deps.actor?.trim();
+  if (!actor) return json({ error: "not_implemented", message: "condition waits require a server-side actor identity" }, { status: 501 });
+  let input: Record<string, unknown> = {};
+  if (request.method === "POST") {
+    try { input = await bodyObject(request); } catch { return json({ error: "invalid", message: "JSON object required" }, { status: 400 }); }
+  }
+  const control = openControl(deps.controlPath);
+  const mailbox = openAnswersDb(deps.controlPath);
+  let ledger: Database | null = null;
+  try { ledger = new Database(deps.ledgerPath, { readonly: true }); } catch { /* recovery reports ledger_unavailable */ }
+  const ctx: WaitReadContext = { control, mailbox, ledger, actor, now: Date.now(), processAlive: deps.processAlive, checkpointProbe: deps.checkpointProbe, observing: deps.conditionWaits };
+  try {
+    if (grantRoute) return await createResumeGrantWait(ctx, input, request.signal, deps.adapters);
+    if (request.method === "GET" && waitId === null) {
+      const [workId, itemId, state, limit] = ["work_id", "item_id", "state", "limit"].map((key) => url.searchParams.get(key));
+      const filter = {
+        ...(workId ? { work_id: workId } : {}),
+        ...(itemId ? { item_id: itemId } : {}),
+        // Validated by listConditionWaits against the closed WaitState set.
+        ...(state ? { state: state as WaitState } : {}),
+        ...(limit ? { limit: Number(limit) } : {}),
+      };
+      // The gate is server-resolved; the UI shows create/observation state only from this field.
+      const gate = { enabled: deps.conditionWaits, reason: deps.conditionWaits ? null : "condition_waits_disabled" };
+      return json({ items: listConditionWaits(control, filter).map((wait) => waitReadModel(ctx, wait)), gate });
+    }
+    if (request.method === "GET") {
+      const wait = getConditionWait(control, waitId!);
+      return wait ? json(waitReadModel(ctx, wait)) : json({ error: "not_found" }, { status: 404 });
+    }
+    if (waitId === null) {
+      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(WAIT_BASELINE_TIMEOUT_MS)]);
+      try {
+        const wait = await createWait(control, input as CreateWaitInput, { actor, adapters: deps.adapters, mailbox, signal });
+        const model = waitReadModel({ ...ctx, now: Date.now() }, wait);
+        return json({ wait: model.wait, recovery_capability: model.recovery_capability }, { status: 201 });
+      } catch (error) { return waitCreateError(ctx, error, signal); }
+    }
+    const extra = Object.keys(input).find((key) => key !== "expected_version" && key !== "reason");
+    if (extra !== undefined) return json({ error: "invalid", message: `unexpected field ${extra}` }, { status: 400 });
+    try {
+      const wait = cancelConditionWait(control, waitId!, input.expected_version as number, { actor, reason: input.reason as string });
+      return json({ wait: webConditionWait(wait, true) });
+    } catch (error) {
+      if (!(error instanceof ControlError)) throw error;
+      if (error.code === "not_found") return json({ error: "not_found", message: error.message }, { status: 404 });
+      if (error.code === "forbidden") return json({ error: "forbidden", message: error.message }, { status: 403 });
+      if (error.code === "invalid") return json({ error: "invalid", message: error.message }, { status: 400 });
+      return waitConflict(ctx, error, waitId, { expected_version: input.expected_version });
+    }
+  } catch (error) {
+    if (error instanceof ControlError && error.code === "invalid") return json({ error: "invalid", message: error.message }, { status: 400 });
+    throw error;
+  } finally {
+    ledger?.close(); mailbox.close(); control.close();
+  }
+}
+
+/**
+ * Creates an `authorized_resume` wait for the decision owner (§4.2 rule 5, §8.4): pins the resume grant for the
+ * server-probed checkpoint of `stable_id` (`createResumeGrant`, owner-checked like wait creation), then creates the
+ * wait bound to it. A wait that cannot be created closes the just-pinned grant so no consent outlives its wait —
+ * unless a concurrent request already bound an unsettled wait to that exact target version.
+ */
+async function createResumeGrantWait(ctx: WaitReadContext, input: Record<string, unknown>, requestSignal: AbortSignal, adapters: WaitSourceAdapters): Promise<Response> {
+  const extra = Object.keys(input).find((key) => !Object.hasOwn(RESUME_GRANT_FIELDS, key));
+  if (extra !== undefined) {
+    return json({ error: "invalid", code: "server_derived_field", message: `unexpected field ${extra}: the checkpoint, grant and execution identity are server-derived` }, { status: 400 });
+  }
+  const signal = AbortSignal.any([requestSignal, AbortSignal.timeout(WAIT_BASELINE_TIMEOUT_MS)]);
+  let disposition: Extract<WaitDispositionInput, { kind: "authorized_resume" }>;
+  try {
+    disposition = createResumeGrant(ctx.control, ctx.mailbox, ctx.ledger, {
+      work_id: input.work_id as string, item_id: input.item_id as string, condition: input.condition as WaitCondition,
+      stable_id: input.stable_id as string, attempt_id: `resume-grant:${randomUUID()}`, execution_owner: WAIT_SERVICE_ACTOR,
+      expires_at: input.deadline_at as number,
+    }, { actor: ctx.actor, actor_source: "server", now: Date.now(), processAlive: ctx.processAlive, checkpointProbe: ctx.checkpointProbe });
+  } catch (error) {
+    if (error instanceof ControlError && error.code === "blocked" && error.message.startsWith("checkpoint_unavailable")) {
+      return json({ error: "conflict", code: "checkpoint_unavailable", message: error.message }, { status: 409 });
+    }
+    return waitCreateError(ctx, error, signal);
+  }
+  const { consumer_owner: owner, approval_id: approvalId, target_version: version } = disposition.authorization;
+  try {
+    const wait = await createWait(ctx.control, {
+      work_id: input.work_id as string, item_id: input.item_id as string, condition: input.condition as WaitCondition,
+      deadline_at: input.deadline_at as number, disposition,
+      ...(input.transient_budget === undefined ? {} : { transient_budget: input.transient_budget as number }),
+    }, { actor: ctx.actor, adapters, mailbox: ctx.mailbox, signal });
+    const model = waitReadModel({ ...ctx, now: Date.now() }, wait);
+    return json({ wait: model.wait, recovery_capability: model.recovery_capability }, { status: 201 });
+  } catch (error) {
+    const bound = listConditionWaits(ctx.control, { work_id: input.work_id as string, item_id: input.item_id as string })
+      .some((wait) => (wait.state === "watching" || wait.state === "ready")
+        && wait.resume_grant?.approval_id === approvalId && wait.resume_grant.target_version === version);
+    if (!bound) cancelTarget(ctx.mailbox, owner, approvalId, version);
+    return waitCreateError(ctx, error, signal);
+  }
+}
+
 function trustedTargetBinding(db: Database, approvalId: string, effect: string): { workId?: string; contractRevision?: number; humanOnly: boolean } {
   const row = db.query("SELECT work_id,contract_revision FROM control_attention WHERE consumer_owner='extension' AND approval_id=? ORDER BY updated_at DESC LIMIT 1").get(approvalId) as { work_id:string; contract_revision:number } | null;
   if (!row) return { humanOnly: false };
@@ -141,7 +466,7 @@ function checkOrigin(request: Request, port: number): Response | null {
 // is a transition-state minimal trusted injection: production must bind actor to
 // an authenticated session/token instead of an env var. Do NOT read actor from
 // request headers / body / query.
-export function startWebServer(options: { ledgerPath?: string; controlPath?: string; policyPath?: string; orchestratorPath?: string; spoolRoot?: string; publishIntervalMs?: number; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe; actor?: string } = {}) {
+export function startWebServer(options: { ledgerPath?: string; controlPath?: string; policyPath?: string; orchestratorPath?: string; spoolRoot?: string; publishIntervalMs?: number; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe; checkpointProbe?: CheckpointProbe; actor?: string; waitAdapters?: WaitSourceAdapters; conditionWaits?: boolean } = {}) {
   // 在创建任何 DB/SpoolWriter 之前显式解析全部路径：不允许把 undefined 传到 open*
   // （Bun 会据 undefined 在 CWD 创建名为 "undefined" 的文件）。
   const ledgerPath = options.ledgerPath ?? process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
@@ -162,6 +487,14 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
   } finally {
     ledger.close();
   }
+  // §14.1: wait creation is default-off; resolved once at startup (OVERLOAD_CONDITION_WAITS="1" enables).
+  const conditionWaits = options.conditionWaits ?? conditionWaitsEnabled();
+  // Server-owned source adapters for wait baselines (§4.2); a request can never choose or replace them.
+  const waitAdapters: WaitSourceAdapters = options.waitAdapters ?? {
+    github_pr_merged: createGithubPrAdapter(createChildProcessRegistry().executor),
+    check_new_result: createCheckResultAdapter({ orchestratorPath }),
+    work_completed: createWorkCompleteAdapter({ controlPath }),
+  };
   ensureCloseouts(ledgerPath);
   let publishing = false;
   const publish = () => {
@@ -249,6 +582,12 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
           const control = openControl(controlPath); try { return json(listAttention(control, url.pathname.slice("/api/attention/".length) as
                   | "now" | "inbox" | "done")); } finally { control.close(); }
         }
+        if (request.method === "GET" && url.pathname === "/api/control/attention" && url.searchParams.get("zone") === "follow_up") {
+          const control = openControl(controlPath); try { return json({ items: listAttentionFollowUps(control, Date.now()) }); } finally { control.close(); }
+        }
+        if (url.pathname === "/api/waits" || url.pathname.startsWith("/api/waits/")) {
+          return await waitRoute(request, url, { controlPath, ledgerPath, actor, adapters: waitAdapters, processAlive: options.processAlive, checkpointProbe: options.checkpointProbe, conditionWaits });
+        }
         if (request.method === "GET" && url.pathname === "/api/capabilities") return json({ notifications: notificationCapability(), web: { available: true, bind: "127.0.0.1", port: server.port } });
         if(request.method==='GET'&&url.pathname==='/api/conversations'){const db=openControl(controlPath);try{ensureAdapterSchema(db);const rows=db.query('SELECT * FROM conversations ORDER BY created_at DESC').all() as Conversation[];return json(rows.map(c=>({...c,address:JSON.parse(c.address),session_reference:c.session_reference?JSON.parse(c.session_reference):null,turns:db.query('SELECT * FROM conversation_turns WHERE conversation_id=? ORDER BY sequence').all(c.id)})));}finally{db.close();}}
         const conversationMessage=url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
@@ -315,6 +654,11 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (request.method === "POST" && attentionRoute) {
           const itemId = routeParameter(attentionRoute[1]!);
           const action = attentionRoute[2]!;
+          // Resolve consumes a human decision. Reject servers without a trusted
+          // actor before parsing the decision body or loading its material identity.
+          if (action === "resolve" && (!actor || !actor.trim())) {
+            return json({ error: "not_implemented", message: "decision action requires server-side actor identity" }, { status: 501 });
+          }
           const control = openControl(controlPath);
           let revision: number | null = null;
           try {
@@ -331,11 +675,9 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
             }
             const current = getAttention(control, itemId);
             const suppliedFingerprint = typeof input.material_fingerprint === "string" ? input.material_fingerprint : "";
-            if (current && suppliedFingerprint) {
-              const material = getAttentionMaterial(control, itemId);
-              if (!material || material.fingerprint !== suppliedFingerprint) {
-                return json(staleAttentionBody(current, revision), { status: 409 });
-              }
+            const material = action === "resolve" && current ? getAttentionMaterial(control, itemId) : null;
+            if (current && material && (current.revision !== revision || material.fingerprint !== suppliedFingerprint)) {
+              return json(staleAttentionBody(current, revision), { status: 409 });
             }
             if (itemId.startsWith("mgmt:accept:") && action === "resolve") {
               if (current && current.revision !== revision) return json(staleAttentionBody(current, revision), { status: 409 });
@@ -353,7 +695,6 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
                 Date.now(),
               ));
             }
-            // Decision consumption requires a trusted server-injected actor. Never accept identity from request data.
             if (action === "resolve") {
               if (!actor || !actor.trim()) return json({ error: "not_implemented", message: "decision action requires server-side actor identity" }, { status: 501 });
               if (current?.evidence.kind === "coordinator_delivery") {
@@ -369,17 +710,6 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
                   tasks.close();
                 }
               }
-              if (!suppliedFingerprint) {
-                // No material token supplied → legacy resolve path for historical
-                // attention items that never got a context-assembler projection.
-                return json(actOnAttention(control, itemId, revision!, "resolve", {
-                  reason: typeof input.reason === "string" ? input.reason : undefined,
-                  selected_option: typeof input.selected_option === "string" ? input.selected_option : undefined,
-                  replacement_contract: input.replacement_contract as Contract | undefined,
-                  expected_contract_revision: input.expected_contract_revision as number | undefined,
-                  affected_cards: input.affected_cards as Array<{ item_id: string; revision: number }> | undefined,
-                }, actor));
-              }
               const decision: AttentionDecisionInput = {
                 attention_revision: revision,
                 material_fingerprint: suppliedFingerprint,
@@ -389,7 +719,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
                 expected_contract_revision: input.expected_contract_revision as number | undefined,
                 affected_cards: input.affected_cards as Array<{ item_id: string; revision: number }> | undefined,
               };
-              return json(resolveAttention(control, itemId, decision, actor));
+              return json(resolveAttention(control, itemId, decision, actor!));
             }
             return json(actOnAttention(control, itemId, revision, action as "ack" | "defer", {
               defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined,
@@ -404,14 +734,15 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
             return controlError(error);
           } finally { control.close(); }
         }
-        if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive) }))));
+        // List endpoints probe every row's checkpoint, so each request shares one listing of the session roots.
+        if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyLeases(controlPath, (leases) => withReadonlyDb(ledgerPath, (db) => { const probe = listingSnapshotProbe(); return querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive, probe, leases) })); })));
         if (request.method === "GET" && url.pathname === "/api/q1") return json(withReadonlyDb(ledgerPath, queryQ1).map(({ platform: _platform, ...row }) => row));
         if (request.method === "GET" && url.pathname === "/api/archive") return json(withReadonlyDb(ledgerPath, queryArchive));
-        if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyDb(ledgerPath, (db) => {
-          const view = queryZombie(db);
-          return { ...view, groups: view.groups.map((group) => ({ ...group, rows: group.rows.map((row) => ({ ...row, resume_capability: inspectResume(db, row.stable_id, options.processAlive) })) })) };
-        }));
-        if (request.method === "GET" && url.pathname === "/api/hung") return json(withReadonlyDb(ledgerPath, (db) => queryHung(db).map((row) => ({ ...row, resume_capability: inspectResume(db, row.stable_id, options.processAlive) }))));
+        if (request.method === "GET" && url.pathname === "/api/zombie") return json(withReadonlyLeases(controlPath, (leases) => withReadonlyDb(ledgerPath, (db) => {
+          const view = queryZombie(db), probe = listingSnapshotProbe();
+          return { ...view, groups: view.groups.map((group) => ({ ...group, rows: group.rows.map((row) => ({ ...row, resume_capability: inspectResume(db, row.stable_id, options.processAlive, probe, leases) })) })) };
+        })));
+        if (request.method === "GET" && url.pathname === "/api/hung") return json(withReadonlyLeases(controlPath, (leases) => withReadonlyDb(ledgerPath, (db) => { const probe = listingSnapshotProbe(); return queryHung(db).map((row) => ({ ...row, resume_capability: inspectResume(db, row.stable_id, options.processAlive, probe, leases) })); })));
         if (request.method === "GET" && url.pathname === "/api/health") return json(withReadonlyDb(ledgerPath, queryHealth));
         if (request.method === "GET" && url.pathname.startsWith("/api/sessions/")) {
           const stableId = routeParameter(url.pathname.slice("/api/sessions/".length));
@@ -434,10 +765,12 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (request.method === "POST" && url.pathname.startsWith("/api/resume-session/")) {
           const stableId = routeParameter(url.pathname.slice("/api/resume-session/".length));
           const db = new Database(ledgerPath, { readonly: true });
+          let control: Database | null = null;
           try {
-            const result = await resumeSession(db, stableId, options.resume, options.processAlive);
+            control = openControl(controlPath);
+            const result = await resumeSession(db, stableId, { db: control, now: Date.now }, options.resume, options.processAlive);
             return result ? json(result, { status: result.resumed ? 200 : 409 }) : json({ error: "session not found" }, { status: 404 });
-          } finally { db.close(); }
+          } finally { control?.close(); db.close(); }
         }
         if (request.method === "POST" && url.pathname.startsWith("/api/closeout/")) {
           const stableId = routeParameter(url.pathname.slice("/api/closeout/".length));
@@ -471,7 +804,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
                   : "",
               toolCallId =
                 typeof body.toolCallId === "string" ? body.toolCallId : "",
-              channelClaim = !!sessionId || !!toolCallId;
+              // Only a channel runtime stamps session_id; a bare toolCallId (e.g. a terminal ask) claims no channel turn.
+              channelClaim = !!sessionId;
             const turn =
               sessionId && toolCallId
                 ? (mailbox
@@ -550,19 +884,37 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
             return json({ error: "invalid effect" }, { status: 400 });
           const mailbox = openAnswersDb(controlPath);
           try {
-            return json({
-              observed: observeReceiptEffect(mailbox, {
-                receiptId: body.receipt_id,
-                toolCallId: body.toolCallId,
-                attemptId:
-                  typeof body.attempt_id === "string"
-                    ? body.attempt_id
-                    : undefined,
-                state: body.effect_state,
-                evidence: body.evidence ?? {},
-                observedAt: Date.now(),
-              }),
-            });
+            const observation = {
+              receiptId: body.receipt_id as string,
+              toolCallId: body.toolCallId as string,
+              attemptId:
+                typeof body.attempt_id === "string"
+                  ? body.attempt_id
+                  : undefined,
+              state: body.effect_state as "succeeded" | "failed" | "unknown",
+              evidence: body.evidence ?? {},
+              observedAt: Date.now(),
+            };
+            if (!observeReceiptEffect(mailbox, observation)) return json({ observed: false });
+            // Close the loop: the accepted observation is projected onto the card that asked for the decision.
+            const linked = mailbox.query(`SELECT a.item_id FROM decision_receipts r JOIN control_attention a
+              ON a.approval_id=r.approval_id AND a.consumer_owner=r.consumer_owner WHERE r.receipt_id=?`).get(observation.receiptId) as { item_id: string } | null;
+            const item = linked ? getAttention(mailbox, linked.item_id) : null;
+            if (item && item.effect_state !== "succeeded" && item.effect_state !== "failed") {
+              const source = mailbox.query(`SELECT event_id FROM control_outbox
+                WHERE item_id=? AND entity_version<=? AND kind IN ('attention.created','attention.updated')
+                ORDER BY entity_version DESC LIMIT 1`).get(item.item_id, item.revision) as { event_id: string } | null;
+              if (!source?.event_id) throw new Error(`effect source event missing: ${item.item_id}`);
+              projectAttentionEffect(mailbox, {
+                work_id: item.work_id,
+                item_id: item.item_id,
+                item_revision: item.revision,
+                approval_id: item.approval_id,
+                receipt_id: observation.receiptId,
+                outbox_event_id: source.event_id,
+              }, observation, observation.observedAt);
+            }
+            return json({ observed: true });
           } finally {
             mailbox.close();
           }
