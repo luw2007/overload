@@ -8,6 +8,7 @@ import { runDoctor, defaultDoctorDeps } from "./doctor";
 import { audit, parseSince, printAudit } from "./audit";
 import { runCli as runOrchestratorCli } from "../orchestrator/cli";
 import { runMgmtCli } from "./mgmt";
+import { runManagerCli } from "./manager";
 import { openMailbox, setBotDisabled, writeHumanAnswer } from "../decision-bot/mailbox";
 import { DecisionBotService } from "../decision-bot/service";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate } from "../decision-bot/policy";
@@ -29,7 +30,7 @@ const note: Output = (line) => console.error(line);
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload now|inbox|done | attention <id> [ack|defer|resolve|feedback <json>] | works | candidates | candidate <id> approve|enable <json> | work <id> | work create|revise|redirect|stop <json> | mgmt scan|works|show|track | context purge --actor <id> | sessions (recent 30d, OVERLOAD_SESSION_WINDOW_DAYS to change) | show <stable_id> | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot takeover <owner> <id> <answer> | orch ...\n       diagnostics: q1 | q4 | hung | zombie | health"); process.exit(2); }
+function usage(): never { console.error("usage: overload now|inbox|done | attention <id> [ack|defer|resolve|feedback <json>] | works | candidates | candidate <id> approve|enable <json> | work <id> | work create|revise|redirect|stop <json> | mgmt scan|works|show|track | manager ask|turns|context|read | context purge --actor <id> | sessions (recent 30d, OVERLOAD_SESSION_WINDOW_DAYS to change) | show <stable_id> | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot takeover <owner> <id> <answer> | orch ...\n       diagnostics: q1 | q4 | hung | zombie | health"); process.exit(2); }
 
 function jsonArg(value: string | undefined): Record<string, unknown> {
   if (!value) usage();
@@ -276,6 +277,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (!command) usage();
   if (command === "orch") { await runOrchestratorCli(rest); return; }
   if (command === "mgmt") { await runMgmtCli(rest); return; }
+  if (command === "manager") { process.exitCode = await runManagerCli(rest); return; }
   if (command === "decision-bot") { const mailbox=openMailbox();const bot=new DecisionBotService(mailbox);try{if(rest[0]==="status"&&rest.length===1)console.log(JSON.stringify(bot.status(),null,2));else if(rest[0]==="once"&&rest.length===1)await bot.tick();else if(rest[0]==="disable"&&rest.length===1)setBotDisabled(mailbox,true,"cli");else if(rest[0]==="enable"&&rest.length===1)setBotDisabled(mailbox,false,"cli");else if(rest[0]==="takeover"&&rest.length===4){const owner=rest[1];if(owner!=="extension"&&owner!=="orchestrator")usage();const result=writeHumanAnswer(mailbox,owner,rest[2]!,rest[3]!,"cli");if(!result.ok){console.error(result.reason);process.exitCode=1;}}else if(rest[0]==="run"&&rest.length===1){for(;;){await bot.tick();await Bun.sleep(2000);}}else usage();}finally{mailbox.close();}return; }
   if (simple.has(command)) { if (rest.length) usage(); } else if (!arity[command]?.(rest.length)) usage();
   if (command === "ack") {

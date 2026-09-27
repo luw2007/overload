@@ -49,6 +49,30 @@ Remote pull settings are command-line flags to `src/pull/pull.ts`: `--remote`, `
 
 The host identity is a separate file: `~/.overload/host`, containing exactly `local` or `devbox`. It is an operator topology label, not a hostname. Most public single-machine installations need no host file.
 
+## Manager (read-only attention steward)
+
+`/manager`, `POST /api/manager/ask` and `overload manager ask "<question>"` answer "what should I decide first, why, and what can wait" from a bounded, redacted evidence snapshot. The manager runs through the same restricted `pi --no-tools` runner as the decision bot: no shell, no writes, no repository reads. It never approves, executes or reprioritizes anything.
+
+```json
+{
+  "manager": {
+    "model": "provider/model-name",
+    "timeout_ms": 90000,
+    "max_output_bytes": 262144,
+    "stale_after_ms": 86400000
+  }
+}
+```
+
+`OVERLOAD_MANAGER_MODEL` overrides `manager.model`. Without a model every ask is stored as `unavailable` (`manager_model_not_configured`); no answer is fabricated. Only one turn runs at a time (a second ask returns `409 manager_busy` until the running turn finishes or exceeds `timeout_ms`). A failed turn is recorded as `本轮未完成：<reason>。不会自动重放。` and is never retried automatically.
+
+```sh
+bun src/cli/overload.ts manager ask "现在我该先决什么？"
+bun src/cli/overload.ts manager turns [limit]
+bun src/cli/overload.ts manager context
+bun src/cli/overload.ts manager read attention|follow_up|works|waits|sessions|done|targets [cursor]
+```
+
 ## Advanced: Restricted Decision Bot (default frozen)
 
 The automatic Decision Bot is frozen out of the default product entry and main UI. The settings below exist only for operators who explicitly enable advanced automatic decisions. The human mailbox, human answers, and `decision-bot takeover` work without enabling the bot at all.
