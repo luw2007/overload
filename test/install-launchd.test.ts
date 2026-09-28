@@ -93,6 +93,19 @@ describe("portable launchd installer", () => {
     for (const name of names) expect(existsSync(join(agents, `app.overload.${name}.plist`))).toBe(false);
   });
 
+  test("--dry-run previews without launchctl or bun on PATH", async () => {
+    const { root, project } = fixture();
+    // Drop the shimmed launchctl/bun so PATH looks like a non-macOS host.
+    rmSync(join(root, "bin", "launchctl"));
+    rmSync(join(root, "bin", "bun"));
+    const out = await run(root, ["--install", "--dry-run", "--project-dir", project]);
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toContain("install app.overload.ingest");
+    expect(out.stderr).toContain("launchctl not found");
+    expect(out.stderr).toContain("bun not found");
+    expect(existsSync(join(root, "launchctl.log"))).toBe(false);
+  });
+
   test("stops before bootstrap when plutil rejects plist", async () => {
     const { root, project } = fixture();
     script(join(root, "bin", "plutil"), 'case "$2" in\n  *orchestrator.plist) exit 1;;\nesac\nexit 0');

@@ -39,9 +39,17 @@ fi
 
 [ -f "$project_dir/src/ingest/ingest.ts" ] || { printf 'not an Overload checkout: %s\n' "$project_dir" >&2; exit 2; }
 [ -f "$project_dir/scripts/maintenance.sh" ] || { printf 'not an Overload checkout: %s\n' "$project_dir" >&2; exit 2; }
-command -v launchctl >/dev/null 2>&1 || { printf 'launchctl is required (macOS only)\n' >&2; exit 1; }
-bun_path=$(command -v bun) || { printf 'bun is required; install it before running this script\n' >&2; exit 1; }
-bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- "$bun_path")
+# A dry run only prints the labels and paths it would touch, so it needs
+# neither launchctl nor bun; keep the preview usable off macOS and report the
+# missing tools as notes instead of failing.
+if [ "$dry_run" -eq 1 ]; then
+  command -v launchctl >/dev/null 2>&1 || printf 'note: launchctl not found; the real run requires macOS\n' >&2
+  command -v bun >/dev/null 2>&1 || printf 'note: bun not found; install it before the real run\n' >&2
+else
+  command -v launchctl >/dev/null 2>&1 || { printf 'launchctl is required (macOS only)\n' >&2; exit 1; }
+  bun_path=$(command -v bun) || { printf 'bun is required; install it before running this script\n' >&2; exit 1; }
+  bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- "$bun_path")
+fi
 
 agents_dir=$HOME/Library/LaunchAgents
 logs_dir=$HOME/.overload/logs
