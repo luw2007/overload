@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
 import { openMailbox } from "../decision-bot/mailbox";
 import { createWork, getAttention, projectAttentionMaterial, upsertAttention } from "../control/store";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AdapterService } from "./service";
 import { createWork, upsertAttention } from "../control/store";
+import { Database } from "bun:sqlite";
+import { startWebServer } from "../web/server";
 import type {
  AgentRuntime,
  SessionHandle,
@@ -786,3 +788,124 @@ test('decision callback restores a missing thread only from its exact persisted 
 test('routes work only to its explicitly authorized conversation',async()=>{const f=harness();const service=new AdapterService(f.db,{runtime:f.runtime,channels:[f.channel],cwd:f.root,authorize:(_identity,address)=>({ownerId:'operator',workId:address.chatId==='coordinator'?'work-1':null})});try{await service.accept(f.event('private','production'));await new Promise(resolve=>setTimeout(resolve,1));await service.accept(f.event('group','coordinator'));expect(f.db.query('SELECT binding_key,work_id,coordinator_work_id FROM conversations ORDER BY binding_key').all()).toEqual([{binding_key:'["channel-one","tenant","coordinator",null]',work_id:'work-1',coordinator_work_id:'work-1'},{binding_key:'["channel-one","tenant","production",null]',work_id:null,coordinator_work_id:null}]);}finally{await service.stop();await f.close();}});
 test('rejects changing the work bound to an existing conversation',async()=>{const f=harness();let workId:string|null='work-1';const service=new AdapterService(f.db,{runtime:f.runtime,channels:[f.channel],cwd:f.root,authorize:()=>({ownerId:'operator',workId})});try{await service.accept(f.event('one'));workId='work-2';expect(service.accept(f.event('two'))).rejects.toThrow('conversation_work_mismatch');}finally{await service.stop();await f.close();}});
 test('one decision updates its original card without acknowledgement noise or duplicate applying text',async()=>{const f=harness();try{await f.service.accept(f.event('one'));const conversation=f.db.query('SELECT id,address FROM conversations').get() as {id:string;address:string};const work=createWork(f.db,{title:'fixture',source:'test',source_id:'fixture',contract:{objective:'test',acceptance:[{id:'done',kind:'human',description:'done'}],non_goals:[],scope:{cwd:f.root},budget:{},stop_conditions:[],decision_owner:'operator'}});f.db.run('UPDATE conversations SET work_id=? WHERE id=?',[work.work_id,conversation.id]);upsertAttention(f.db,{item_id:'approval',work_id:work.work_id,state:'applying',effect_state:'applying',urgency:'now',conclusion:'Approve fixture execution?',trigger:'test',impact:'test',recommendation:null,options:['approve'],owner:'operator',expires_at:null,source_link:null,approval_id:null,consumer_owner:null,contract_revision:work.revision,decision_mode:'human_only',evidence:{kind:'test'}});f.db.run('INSERT INTO channel_card_bindings(item_id,conversation_id,message_id) VALUES(?,?,?)',['approval',conversation.id,'original-card']);await f.service.tick();const payloads=(f.db.query('SELECT payload FROM channel_deliveries').all() as {payload:string}[]).map(row=>JSON.parse(row.payload) as ChannelMessage);expect(payloads).toHaveLength(1);expect(payloads[0]?.replaceMessageId).toBe('original-card');expect(payloads[0]?.decision?.state).toBe('Applying');expect(payloads.some(payload=>payload.text.includes('决定已接收'))).toBe(false);await f.service.tick();expect(f.db.query('SELECT COUNT(*) n FROM channel_deliveries').get()).toEqual({n:1});}finally{await f.close();}});
+
+// A09: the Web consume route and the channel entry share one mailbox target. Whoever loses the race
+// must be told it lost — and be given the current state — rather than the "not written yet" 404 that
+// a bare null consume used to produce.
+async function racedApproval(f: ReturnType<typeof harness>) {
+ const ledgerPath = join(f.root, "ledger.db");
+ const ledger = new Database(ledgerPath);
+ ledger.exec(await Bun.file(new URL("../ingest/schema.sql", import.meta.url)).text());
+ ledger.close();
+ // The web server's publish path opens a SpoolWriter against spoolRoot, which needs a host marker.
+ writeFileSync(join(f.root, "host"), "local\n");
+ await f.service.start();
+ await f.service.accept(f.event("one"));
+ await f.service.tick();
+ const conversation = f.db.query("SELECT id,session_reference FROM conversations").get() as {
+  id: string;
+  session_reference: string;
+ };
+ const reference = JSON.parse(conversation.session_reference) as SessionReference;
+ f.service.recordRuntimeEvent(conversation.id, {
+  eventId: "blocked",
+  sessionId: reference.sessionId,
+  turnId: f.submitted[0],
+  kind: "blocked",
+  requestId: "q",
+  requestMethod: "confirm",
+  options: ["yes", "no"],
+  text: "Proceed?",
+ });
+ await f.service.tick();
+ const card = f.sent.find((message) => message.decision);
+ if (!card?.decision) throw new Error("missing decision card");
+ const itemId = card.decision.itemId;
+ const cardMessage = (f.db.query("SELECT message_id FROM channel_card_bindings WHERE item_id=?")
+  .get(itemId) as { message_id: string }).message_id;
+ const targetVersion = (f.db.query("SELECT target_version FROM approval_targets WHERE approval_id=?")
+  .get(itemId) as { target_version: string }).target_version;
+ const server = startWebServer({
+  ledgerPath,
+  controlPath: join(f.root, "control.db"),
+  orchestratorPath: join(f.root, "orch.db"),
+  spoolRoot: f.root,
+  port: 0,
+ });
+ const decide = () => f.service.accept({
+  ...f.event("approve"),
+  messageId: cardMessage,
+  kind: "decision" as const,
+  itemId,
+  revision: card.decision!.revision,
+  answer: "yes",
+ });
+ const webConsume = () => fetch(`http://127.0.0.1:${server.port}/api/decision/consume/${encodeURIComponent(itemId)}`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin" },
+  body: JSON.stringify({ consumer_owner: "extension", target_version: targetVersion }),
+ });
+ const receipts = () => f.db.query("SELECT COUNT(*) n FROM decision_receipts").get() as { n: number };
+ return { itemId, targetVersion, server, decide, webConsume, receipts };
+}
+
+test("A09 channel and web entries racing one approval consume it exactly once", async () => {
+ const f = harness();
+ let raced: Awaited<ReturnType<typeof racedApproval>> | undefined;
+ try {
+  raced = await racedApproval(f);
+  // The channel entry records the human answer; both entries now hold a usable credential.
+  await raced.decide();
+  const [response] = await Promise.all([raced.webConsume(), f.service.tick()]);
+  // Whoever won, the unique receipt is the boundary: never two consumptions.
+  expect(raced.receipts()).toEqual({ n: 1 });
+  const body = await response.json();
+  if (response.status === 200) {
+   expect(body).toMatchObject({ approvalId: raced.itemId, consumerOwner: "extension" });
+  } else {
+   expect(response.status).toBe(409);
+   expect(body).toMatchObject({ error: "conflict", code: "already_consumed", retry: false, current_target_state: "consumed" });
+  }
+ } finally {
+  raced?.server.stop(true);
+  await f.close();
+ }
+});
+
+test("A09 the web entry that loses the race gets 409 carrying current state and no second receipt", async () => {
+ const f = harness();
+ let raced: Awaited<ReturnType<typeof racedApproval>> | undefined;
+ try {
+  raced = await racedApproval(f);
+  // Channel entry wins outright: answer written and consumed before the web entry submits.
+  await raced.decide();
+  await f.service.tick();
+  expect(raced.receipts()).toEqual({ n: 1 });
+  const winner = f.db.query("SELECT receipt_id FROM decision_receipts").get() as { receipt_id: string };
+  const workId = (f.db.query("SELECT work_id FROM control_attention WHERE item_id=?")
+   .get(raced.itemId) as { work_id: string }).work_id;
+
+  const response = await raced.webConsume();
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({
+   error: "conflict",
+   message: "decision already consumed by another entry",
+   code: "already_consumed",
+   retry: false,
+   approval_id: raced.itemId,
+   consumer_owner: "extension",
+   expected_target_version: raced.targetVersion,
+   current_target_version: raced.targetVersion,
+   current_target_state: "consumed",
+   current_state: "applying",
+   current_effect_state: "applying",
+   receipt_id: winner.receipt_id,
+   decision_package_url: `/api/context/decision-package?item_id=${encodeURIComponent(raced.itemId)}&work_id=${encodeURIComponent(workId)}`,
+  });
+  // Losing the race consumed nothing.
+  expect(raced.receipts()).toEqual({ n: 1 });
+ } finally {
+  raced?.server.stop(true);
+  await f.close();
+ }
+});

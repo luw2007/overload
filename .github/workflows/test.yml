@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      # Dependencies must be installed before `bun test`. Without this step
+      # src/adapters/feishu.test.ts cannot resolve @larksuiteoapi/node-sdk and the whole
+      # file fails at module load, which reports as one setup-looking error instead of the
+      # Feishu owner-check tests it actually hides.
+      - run: bun install --frozen-lockfile
+
+      # Fail loudly if the dependency that silently disables the Feishu suite is missing,
+      # rather than letting `bun test` report it as an unhandled module error.
+      - name: Verify runtime dependencies resolve
+        run: bun -e 'require.resolve("@larksuiteoapi/node-sdk")'
+
+      - run: bun test

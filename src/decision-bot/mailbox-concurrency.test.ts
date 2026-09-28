@@ -11,6 +11,12 @@ import {
   registerTarget,
   writeHumanAnswer,
 } from "./mailbox";
+import {
+  createWork,
+  listAttentionFollowUps,
+  projectAttentionEffect,
+  upsertAttention,
+} from "../control/store";
 
 function register(db: Database) {
   return registerTarget(db, {
@@ -134,6 +140,71 @@ test("A12 distinct effect steps retain partial evidence without claiming aggrega
     ]);
     expect(JSON.parse(rows[0]!.evidence)).toEqual({ effect: "pr_created", pr: 42 });
     expect(receipt(db, "extension", "approval-1")?.outcome).toBe("failed");
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("A12 multi-observation follow-up separates occurred effects from remaining responsibility", () => {
+  const root = mkdtempSync(join(tmpdir(), "mailbox-followup-"));
+  const db = openMailbox(join(root, "answers.db"));
+  try {
+    // A verified check plus a still-unevidenced human acceptance: remaining responsibility must come
+    // from the human criterion, so neither effect outcome can author or clear it.
+    const work = createWork(db, {
+      title: "ship",
+      source: "test",
+      contract: {
+        objective: "ship the change",
+        acceptance: [
+          { id: "checks", kind: "check", description: "CI is green", evidence: "passed" },
+          { id: "owner", kind: "human", description: "Operator accepts the deployed behaviour" },
+        ],
+        non_goals: [],
+        scope: { cwd: root },
+        budget: {},
+        stop_conditions: [],
+        decision_owner: "owner",
+      },
+    }, 1);
+    const target = register(db);
+    const item = upsertAttention(db, {
+      item_id: "approval-1", work_id: work.work_id, state: "applying", effect_state: "applying",
+      urgency: "now", conclusion: "Proceed?", trigger: "risk", impact: "impact", recommendation: null,
+      options: ["approve", "reject"], owner: "owner", expires_at: null, source_link: null,
+      approval_id: "approval-1", consumer_owner: "extension", contract_revision: work.revision,
+      decision_mode: "human_only", evidence: {},
+    }, 1);
+    writeHumanAnswer(db, "extension", "approval-1", "approve", "web", 1);
+    const consumed = consume(db, target.targetVersion, 2)!;
+
+    const observe = (tool: string, state: "succeeded" | "failed", at: number, evidence: Record<string, unknown>) => {
+      const observation = { receiptId: consumed.receiptId, toolCallId: tool, attemptId: "attempt-1", state, evidence, observedAt: at };
+      expect(observeReceiptEffect(db, observation)).toBe(true);
+      return observation;
+    };
+    const link = {
+      work_id: work.work_id, item_id: item.item_id, approval_id: "approval-1",
+      receipt_id: consumed.receiptId, outbox_event_id: "source-event",
+    };
+    const first = projectAttentionEffect(db, { ...link, item_revision: item.revision },
+      observe("tool-1", "succeeded", 3, { effect: "pr_created", pr: 42 }), 3);
+    const second = projectAttentionEffect(db, { ...link, item_revision: first.revision },
+      observe("tool-1:next-step", "failed", 4, { effect: "review_requested", error: "permission denied" }), 4);
+    expect(second.effect_state).toBe("failed");
+
+    const followUp = listAttentionFollowUps(db, 10).find((entry) => entry.item.item_id === item.item_id);
+    if (!followUp) throw new Error("follow-up entry missing");
+    // Both steps survive in observed_at order, each keeping its own state: the succeeded step is not
+    // erased by the later failure, and the item is not presented as if it never executed.
+    expect(followUp.occurred_effects).toEqual([
+      { kind: "tool-1", evidence: { effect: "pr_created", pr: 42, state: "succeeded", observed_at: 3 } },
+      { kind: "tool-1:next-step", evidence: { effect: "review_requested", error: "permission denied", state: "failed", observed_at: 4 } },
+    ]);
+    // Independent of both outcomes: derived from the pending human acceptance criterion.
+    expect(followUp.remaining_responsibility).toBe("Operator accepts the deployed behaviour");
+    expect(followUp.stage).toBe("failed");
   } finally {
     db.close();
     rmSync(root, { recursive: true, force: true });

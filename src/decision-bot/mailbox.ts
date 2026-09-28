@@ -3,7 +3,8 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { ensureControlSchema } from "../control/store";
+import { ensureControlSchema, getAttention } from "../control/store";
+import type { AttentionItem } from "../control/types";
 import { controlPayloadHash } from "../control/outbox";
 
 export const defaultMailboxPath = join(homedir(), ".overload", "orchestrator-answers.db");
@@ -67,14 +68,77 @@ export function writeHumanAnswer(db:Database, owner:ConsumerOwner,id:string,answ
   return db.transaction(()=>{const target=getTarget(db,owner,id);if(!target||target.state!=="active")return {ok:false,reason:target?.state==="consumed"?"already_consumed":"unknown_target"} as const;if(now>=target.expiresAt){closeTarget(db,owner,id,"expired");return {ok:false,reason:"expired"} as const;}if(!target.options.includes(answer))return {ok:false,reason:"invalid_option"} as const;const prior=db.query("SELECT consumer_owner FROM answer_metadata WHERE approval_id=?").get(id) as any;if(prior&&prior.consumer_owner&&prior.consumer_owner!==owner)return {ok:false,reason:"owner_conflict"} as const;db.run("INSERT INTO answers(approval_id,answer,actor,at) VALUES(?,?,?,?) ON CONFLICT(approval_id) DO UPDATE SET answer=excluded.answer,actor=excluded.actor,at=excluded.at",[id,answer,actor,now]);db.run("INSERT INTO answer_metadata(approval_id,consumer_owner,provenance) VALUES(?,?,'human') ON CONFLICT(approval_id) DO UPDATE SET consumer_owner=excluded.consumer_owner,provenance='human'",[id,owner]);db.run("UPDATE bot_proposals SET invalidated_at=? WHERE consumer_owner=? AND approval_id=? AND invalidated_at IS NULL",[now,owner,id]);return {ok:true} as const;}).immediate();
 }
 export type ConsumeInput={consumerOwner:ConsumerOwner;approvalId:string;targetVersion:string;policyHash:string;now?:number;liveValid:()=>boolean;contractValid?:(target:ApprovalTarget)=>boolean;policyValid:(target:ApprovalTarget,proposal:{answer:string;policyHash:string}|null)=>boolean};
-export function consumeDecision(db:Database,input:ConsumeInput):Receipt|null { const now=input.now??Date.now(); return db.transaction(()=>{
-  const target=getTarget(db,input.consumerOwner,input.approvalId); if(!target||target.state!=="active"||target.targetVersion!==input.targetVersion||now>=target.expiresAt||!input.liveValid()||input.contractValid?.(target)===false)return null;
-  if(target.workId&&target.contractRevision!==undefined){const work=db.query("SELECT revision,contract FROM control_works WHERE work_id=?").get(target.workId) as any;if(!work||work.revision!==target.contractRevision)return null;const contract=JSON.parse(work.contract??"null");if(contract?.scope?.human_only_effects?.includes(target.effect))target.decisionMode="human_only";}
+/** Why a consume attempt produced no receipt. `not_ready` is the only retryable reason: the answer is
+ *  simply not consumable yet. Every other reason is terminal for this submission — the credential can
+ *  never consume this target again, so an entry that sees one must refresh state instead of retrying. */
+export type ConsumeRejection="unknown_target"|"already_consumed"|"target_closed"|"target_version_mismatch"|"expired"|"not_live"|"contract_invalid"|"not_ready";
+export type ConsumeOutcome={ok:true;receipt:Receipt}|{ok:false;reason:ConsumeRejection};
+export function consumeDecisionResult(db:Database,input:ConsumeInput):ConsumeOutcome { const now=input.now??Date.now(); const reject=(reason:ConsumeRejection):ConsumeOutcome=>({ok:false,reason}); return db.transaction(()=>{
+  const target=getTarget(db,input.consumerOwner,input.approvalId);
+  if(!target)return reject("unknown_target");
+  if(target.state==="consumed")return reject("already_consumed");
+  if(target.state!=="active")return reject("target_closed");
+  if(target.targetVersion!==input.targetVersion)return reject("target_version_mismatch");
+  if(now>=target.expiresAt)return reject("expired");
+  if(!input.liveValid())return reject("not_live");
+  if(input.contractValid?.(target)===false)return reject("contract_invalid");
+  if(target.workId&&target.contractRevision!==undefined){const work=db.query("SELECT revision,contract FROM control_works WHERE work_id=?").get(target.workId) as any;if(!work||work.revision!==target.contractRevision)return reject("contract_invalid");const contract=JSON.parse(work.contract??"null");if(contract?.scope?.human_only_effects?.includes(target.effect))target.decisionMode="human_only";}
   const human=db.query("SELECT a.answer,a.actor FROM answers a LEFT JOIN answer_metadata m ON m.approval_id=a.approval_id WHERE a.approval_id=? AND (m.consumer_owner=? OR m.consumer_owner IS NULL) LIMIT 1").get(input.approvalId,input.consumerOwner) as any;
   const p=db.query("SELECT p.answer,p.policy_hash,p.attempt_id FROM bot_proposals p JOIN bot_attempts a ON a.attempt_id=p.attempt_id LEFT JOIN bot_control c ON c.id=1 WHERE p.consumer_owner=? AND p.approval_id=? AND p.target_version=? AND p.action='answer' AND p.invalidated_at IS NULL AND a.state='proposed' AND COALESCE(c.disabled,0)=0 AND NOT EXISTS (SELECT 1 FROM policy_rule_state s WHERE s.disabled=1 AND (s.operation_id=COALESCE(p.operation_id,p.rule_id) OR (s.source IN ('config','candidate') AND s.rule_id=p.rule_id))) ORDER BY p.created_at LIMIT 1").get(input.consumerOwner,input.approvalId,input.targetVersion) as any;
-  const proposal=p?{answer:p.answer,policyHash:p.policy_hash}:null; const answer=human?.answer ?? proposal?.answer; const actor=human?.actor ?? (p?"decision-bot":null); if(!answer||!target.options.includes(answer)||(!human&&(target.decisionMode==="human_only"||!input.policyValid(target,proposal))))return null;
-  const receiptId=randomUUID(); db.run("INSERT INTO decision_receipts(receipt_id,consumer_owner,approval_id,target_version,answer,actor,attempt_id,consumed_at) VALUES(?,?,?,?,?,?,?,?)",[receiptId,input.consumerOwner,input.approvalId,input.targetVersion,answer,actor,p?.attempt_id??null,now]); db.run("UPDATE approval_targets SET state='consumed',consumed_at=? WHERE consumer_owner=? AND approval_id=? AND state='active'",[now,input.consumerOwner,input.approvalId]); db.run("UPDATE bot_proposals SET invalidated_at=? WHERE consumer_owner=? AND approval_id=? AND invalidated_at IS NULL",[now,input.consumerOwner,input.approvalId]); if(human){db.run("DELETE FROM answers WHERE approval_id=?",input.approvalId);db.run("DELETE FROM answer_metadata WHERE approval_id=?",input.approvalId);} return {receiptId,consumerOwner:input.consumerOwner,approvalId:input.approvalId,targetVersion:input.targetVersion,answer,actor,attemptId:p?.attempt_id??null,consumedAt:now,appliedAt:null,outcome:null};
+  const proposal=p?{answer:p.answer,policyHash:p.policy_hash}:null; const answer=human?.answer ?? proposal?.answer; const actor=human?.actor ?? (p?"decision-bot":null); if(!answer||!target.options.includes(answer)||(!human&&(target.decisionMode==="human_only"||!input.policyValid(target,proposal))))return reject("not_ready");
+  const receiptId=randomUUID(); db.run("INSERT INTO decision_receipts(receipt_id,consumer_owner,approval_id,target_version,answer,actor,attempt_id,consumed_at) VALUES(?,?,?,?,?,?,?,?)",[receiptId,input.consumerOwner,input.approvalId,input.targetVersion,answer,actor,p?.attempt_id??null,now]); db.run("UPDATE approval_targets SET state='consumed',consumed_at=? WHERE consumer_owner=? AND approval_id=? AND state='active'",[now,input.consumerOwner,input.approvalId]); db.run("UPDATE bot_proposals SET invalidated_at=? WHERE consumer_owner=? AND approval_id=? AND invalidated_at IS NULL",[now,input.consumerOwner,input.approvalId]); if(human){db.run("DELETE FROM answers WHERE approval_id=?",input.approvalId);db.run("DELETE FROM answer_metadata WHERE approval_id=?",input.approvalId);} return {ok:true,receipt:{receiptId,consumerOwner:input.consumerOwner,approvalId:input.approvalId,targetVersion:input.targetVersion,answer,actor,attemptId:p?.attempt_id??null,consumedAt:now,appliedAt:null,outcome:null}};
   }).immediate(); }
+/** Frozen contract §4.3 seam; signature unchanged. Callers that must tell a lost race from
+ *  "not answered yet" use consumeDecisionResult instead. */
+export function consumeDecision(db:Database,input:ConsumeInput):Receipt|null { const outcome=consumeDecisionResult(db,input); return outcome.ok?outcome.receipt:null; }
+
+/** Terminal consume rejections: the submission can never be applied, so an entry that sees one
+ *  refreshes state rather than retrying the answer (plan §4.5). `not_ready` is excluded — it is the
+ *  only "come back later" case. */
+export type ConsumeConflictCode=Exclude<ConsumeRejection,"not_ready"|"unknown_target"|"not_live">;
+export const consumeConflictCodes:readonly ConsumeConflictCode[]=["already_consumed","target_closed","target_version_mismatch","expired","contract_invalid"];
+export function isConsumeConflict(reason:ConsumeRejection):reason is ConsumeConflictCode { return (consumeConflictCodes as readonly string[]).includes(reason); }
+const consumeConflictMessage:Record<ConsumeConflictCode,string>={
+  already_consumed:"decision already consumed by another entry",
+  target_closed:"decision target is closed",
+  target_version_mismatch:"stale decision target version",
+  expired:"decision target expired",
+  contract_invalid:"work contract moved under this decision",
+};
+/** The mailbox/adapter conflict contract of plan §4.5. Deliberately *not* the Attention-CAS
+ *  `stale_attention` body — a target-version conflict keeps its own code — but it carries the same
+ *  kind of current state so the losing entry can show where the decision actually stands. */
+export type ConsumeConflictBody={
+  error:"conflict"; message:string; code:ConsumeConflictCode; retry:false;
+  approval_id:string; consumer_owner:ConsumerOwner;
+  expected_target_version:string; current_target_version:string|null;
+  current_target_state:ApprovalTarget["state"]|null;
+  current_state:AttentionItem["state"]|null;
+  current_effect_state:AttentionItem["effect_state"]|null;
+  current_revision:number|null; receipt_id:string|null;
+  decision_package_url:string|null;
+};
+/** Builds the §4.5 conflict body from whatever current state exists: the mailbox target always, the
+ *  consuming receipt and the Attention row when the approval is linked to one. */
+export function consumeConflictBody(db:Database,owner:ConsumerOwner,approvalId:string,expectedTargetVersion:string,code:ConsumeConflictCode):ConsumeConflictBody {
+  const target=getTarget(db,owner,approvalId);
+  const consumed=receipt(db,owner,approvalId);
+  let item:AttentionItem|null=null;
+  // The mailbox and control share one database, but an approval need not have an Attention row.
+  try { item=getAttention(db,approvalId); } catch { item=null; }
+  return {
+    error:"conflict", message:consumeConflictMessage[code], code, retry:false,
+    approval_id:approvalId, consumer_owner:owner,
+    expected_target_version:expectedTargetVersion,
+    current_target_version:target?.targetVersion??null,
+    current_target_state:target?.state??null,
+    current_state:item?.state??null,
+    current_effect_state:item?.effect_state??null,
+    current_revision:item?.revision??null,
+    receipt_id:consumed?.receiptId??null,
+    decision_package_url:item?`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`:null,
+  };
+}
 export function receipt(db:Database,owner:ConsumerOwner,id:string):Receipt|null { const r=db.query("SELECT * FROM decision_receipts WHERE consumer_owner=? AND approval_id=?").get(owner,id) as any; return r?{receiptId:r.receipt_id,consumerOwner:r.consumer_owner,approvalId:r.approval_id,targetVersion:r.target_version,answer:r.answer,actor:r.actor,attemptId:r.attempt_id,consumedAt:r.consumed_at,appliedAt:r.applied_at,outcome:r.outcome}:null; }
 export function observeReceiptEffect(db: Database, observation: EffectObservation): boolean {
   return db.transaction(() => {
