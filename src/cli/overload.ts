@@ -13,6 +13,9 @@ import { DecisionBotService } from "../decision-bot/service";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate } from "../decision-bot/policy";
 import { actOnAttention, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract } from "../control/store";
 import type { Contract } from "../control/types";
+import { getContextPackage } from "../control/context-assembler";
+import { purgeObjectContent } from "../control/context-pin";
+import { fetchOnDemand } from "../control/on-demand-fetcher";
 import { publishControlEvents } from "../control/outbox";
 import { openStore } from "../orchestrator/store";
 import { SpoolWriter } from "../orchestrator/spool";
@@ -26,7 +29,7 @@ const note: Output = (line) => console.error(line);
 
 function time(value: number | null): string { return value == null ? "-" : new Date(value).toISOString(); }
 function detail(value: Record<string, unknown> | null): string { if (!value || !Object.keys(value).length) return ""; return ` ${JSON.stringify(value)}`; }
-function usage(): never { console.error("usage: overload now|inbox|done | attention <id> [ack|defer|resolve|feedback <json>] | works|candidates|candidate <id> approve|enable <json> | work <id> | work create|revise|redirect|stop <json> | sessions | show <stable_id> | q1 | q4 | hung | zombie | health | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot run|once|status|disable|enable|takeover <owner> <id> <answer> | orch ..."); process.exit(2); }
+function usage(): never { console.error("usage: overload now|inbox|done | attention <id> [ack|defer|resolve|feedback <json>] | works | candidates | candidate <id> approve|enable <json> | work <id> | work create|revise|redirect|stop <json> | mgmt scan|works|show|track | context purge --actor <id> | sessions | show <stable_id> | doctor | audit [--sample N] [--since 7d|24h|<ms>] | ack <request_uid>... | jump <stable_id|request_uid> | decision-bot takeover <owner> <id> <answer> | orch ...\n       diagnostics: q1 | q4 | hung | zombie | health"); process.exit(2); }
 
 function jsonArg(value: string | undefined): Record<string, unknown> {
   if (!value) usage();
@@ -59,14 +62,59 @@ function controlCommand(args: string[]): boolean {
     try { if (action === "approve") { if (!approvePolicyCandidate(control, id, String(input.actor ?? ""), Number(input.observation_until))) throw new Error("candidate cannot be approved"); } else if (action === "enable") { if (!enablePolicyCandidate(control, id)) throw new Error("candidate observation incomplete or already enabled"); } else usage(); console.log(JSON.stringify(getPolicyCandidate(control, id))); return true; } finally { control.close(); }
   }
   if (command === "attention") {
-    const itemId = args[1]; if (!itemId) usage(); const action = args[2]; const input = jsonArg(args[3] ?? "{}"); const control = openControl();
+    const verbose = args.includes("--verbose");
+    const clean = args.filter((x) => x !== "--verbose");
+    const actorIdx = clean.indexOf("--actor");
+    const actorFlag = actorIdx >= 0 ? clean[actorIdx + 1] : undefined;
+    if (actorIdx >= 0 && (!actorFlag || actorFlag.startsWith("--"))) usage();
+    const drop = actorIdx >= 0 ? new Set([actorIdx, actorIdx + 1]) : new Set<number>();
+    const a = clean.filter((_, i) => !drop.has(i));
+    const itemId = a[1]; if (!itemId) usage(); const action = a[2]; const input = jsonArg(a[3] ?? "{}"); const control = openControl();
     try {
-      if (!action) { const item = getAttention(control, itemId); if (!item) throw new Error(`attention not found: ${itemId}`); console.log(JSON.stringify(item)); return true; }
+      if (!action) { if (verbose) { console.log(renderDecisionCard(control, itemId)); return true; } const item = getAttention(control, itemId); if (!item) throw new Error(`attention not found: ${itemId}`); console.log(JSON.stringify(item)); return true; }
       const revision = Number(input.expected_revision); if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("expected_revision must be a positive integer");
       if (action === "feedback") { recordAttentionFeedback(control, itemId, revision, input.useful === true, typeof input.reason === "string" ? input.reason : undefined); publishControl(control); console.log(JSON.stringify(getAttention(control, itemId))); return true; }
       if (action !== "ack" && action !== "defer" && action !== "resolve") usage();
-      const result = actOnAttention(control, itemId, revision, action, { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined }); publishControl(control); console.log(JSON.stringify(result)); return true;
+      // Context decisions must carry a real identity: --actor takes precedence over
+      // OVERLOAD_ACTOR, and neither may fall back to a hardcoded pseudo-user. Legacy
+      // ack/defer and non-context resolves tolerate an absent actor.
+      const actor: string | undefined = actorFlag ?? (process.env.OVERLOAD_ACTOR || undefined);
+      if (action === "resolve") {
+        const item = getAttention(control, itemId);
+        if (item) {
+          const work = getWork(control, item.work_id);
+          const hasContextEvidence = typeof item.evidence?.object_id === "string" && !!item.evidence.object_id;
+          const hasDecisionOwner = !!work?.contract?.decision_owner?.trim();
+          if ((hasContextEvidence || hasDecisionOwner) && !actor) {
+            console.error("error: context decision requires --actor or OVERLOAD_ACTOR");
+            process.exit(1);
+          }
+        }
+      }
+      const result = actOnAttention(control, itemId, revision, action, { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined }, actor); publishControl(control); console.log(JSON.stringify(result)); return true;
     } finally { control.close(); }
+  }
+  if (command === "context") {
+    const sub = args[1]; if (!sub) usage();
+    if (sub === "purge") {
+      const actorIdx = args.indexOf("--actor");
+      const actorFlag = actorIdx >= 0 ? args[actorIdx + 1] : undefined;
+      if (actorIdx >= 0 && (!actorFlag || actorFlag.startsWith("--"))) usage();
+      const purgeDrop = actorIdx >= 0 ? new Set([actorIdx, actorIdx + 1]) : new Set<number>();
+      const purgeArgs = args.filter((_, i) => !purgeDrop.has(i));
+      const objectId = purgeArgs[2]; if (!objectId) usage();
+      const reasonIdx = purgeArgs.indexOf("--reason");
+      const reason = reasonIdx >= 0 ? purgeArgs[reasonIdx + 1] : "manual";
+      if (!["expired", "revoked", "retention_policy", "manual"].includes(reason)) usage();
+      // Purge mutates context evidence and is a write operation: require a real actor,
+      // fail closed rather than stamping a system identity onto the tombstone.
+      const actor: string | undefined = actorFlag ?? (process.env.OVERLOAD_ACTOR || undefined);
+      if (!actor) { console.error("error: context purge requires --actor or OVERLOAD_ACTOR"); process.exit(1); }
+      const control = openControl();
+      try { purgeObjectContent(control, objectId, reason as "expired" | "revoked" | "retention_policy" | "manual"); publishControl(control); console.log(JSON.stringify({ purged: objectId, reason })); return true; }
+      finally { control.close(); }
+    }
+    usage();
   }
   if (command !== "work") return false;
   const action = args[1]; if (!action) usage(); const control = openControl();
@@ -156,6 +204,51 @@ export function ackAll(db: Database, uids: string[]): void {
   }
   if (missed) process.exitCode = 1;
 }
+/** 决策卡：默认 short（summary + reference）；--verbose 展开 long（summary_long，仅读池内摘要，不取源，避免阻塞）。
+ *  full 级别 CLI 不取原文，只展示 reference 供用户自行查看。blocked(needs_context) 时不占位、不造值。 */
+export function renderDecisionCard(db: Database, itemId: string, opts: { verbose?: boolean; actor?: string } = {}): string {
+  const item = getAttention(db, itemId);
+  if (!item) throw new Error(`attention not found: ${itemId}`);
+  const actor = opts.actor ?? item.owner;
+  const result = getContextPackage({
+    consumer_type: "decision_ui", consumer_id: itemId, work_id: item.work_id,
+    package_type: "decision_view", actor, db,
+  });
+  const lines: string[] = [];
+  if (!result.ok) {
+    lines.push("⚠️ 上下文不足：无法装配决策视图");
+    lines.push(`原因：${result.reason}`);
+    lines.push("必需字段缺失，无法继续。请检查数据源权限或采集状态。");
+    return lines.join("\n");
+  }
+  const pkg = result.package;
+  if (pkg.package_type !== "decision_view") return "";
+  lines.push(`结论: ${pkg.conclusion}`);
+  lines.push(`触发: ${pkg.trigger}`);
+  lines.push(`影响: ${pkg.impact}`);
+  lines.push(`建议: ${pkg.recommendation ?? "-"}`);
+  lines.push(`选项: ${pkg.options.join(" | ")}`);
+  lines.push(`责任人: ${pkg.owner}${pkg.expires_at ? `（有效期至 ${time(pkg.expires_at)}）` : ""}`);
+  lines.push(`状态: ${pkg.effect_state} (contract rev ${pkg.contract_revision})`);
+  if (pkg.scene_entry?.jump_target) lines.push(`现场: ${pkg.scene_entry.jump_target}`);
+  lines.push("");
+  lines.push("触发证据:");
+  if (!pkg.trigger_evidence.length) lines.push("  （无）");
+  for (const ev of pkg.trigger_evidence) {
+    lines.push(`  - ${ev.summary}  [${ev.reference}]${ev.stale ? "  ⚠ stale：该证据已有新版本，决策依据可能过期" : ""}`);
+    if (opts.verbose) {
+      const long = fetchOnDemand({
+        reference: ev.reference, visibility: "long", actor, work_id: pkg.work_id,
+        purpose: "decision_view", version_pin: { object_id: ev.object_id, revision: ev.revision }, db,
+      });
+      if (!("blocked" in long) && long.payload) lines.push(`    详情: ${long.payload}`);
+      else lines.push(`    详情: (不可用${"blocked" in long ? `：${long.reason}` : ""})`);
+    }
+  }
+  if (pkg.stale_objects.length) lines.push(`过期对象: ${pkg.stale_objects.length}（决策依据可能过期）`);
+  return lines.join("\n");
+}
+
 function runAudit(db: Database, args: string[]): void {
   let sample = 5;
   let sinceMs = 7 * 24 * 60 * 60_000;

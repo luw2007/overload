@@ -12,7 +12,7 @@ Installs (or removes) src/extension/overload.ts as
 ~/.pi/agent/extensions/overload.ts and ~/.omp/agent/extensions/overload.ts.
 Restart pi/omp after installing for the extension to load. Prime is
 intentionally excluded: its extension-directory convention is unverified
-(see docs/integrations.md).
+(see docs/guides/integrations.md).
 EOF
 }
 

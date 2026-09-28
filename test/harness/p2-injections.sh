@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test/harness/p2-injections.sh — P2 four-injection acceptance (N8).
 #
-# The scenarios from docs/contracts/p2-freeze.md "验收（六注入）" that survived
+# The scenarios from docs/history/contracts/p2-freeze.md "验收（六注入）" that survived
 # the removal of the notification outbox (scenarios 5 and 6 were its delivery
 # and backoff cases):
 #   1. synthetic decision_requested without resolve

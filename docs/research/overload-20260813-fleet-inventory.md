@@ -6,9 +6,9 @@
 
 | CLI | 本机 | devbox | 运行时血统 | 会话存储 |
 |---|---|---|---|---|
-| pi | 0.84.1，177 会话 | `~/.ai-devbox/bin/pi`，114 会话 | `@earendil-works/pi-coding-agent` | `~/.pi/agent/sessions/<cwd>/` |
+| pi | 0.84.1，177 会话 | `~/.ai-devbox/bin/pi`，114 会话 | `pi-coding-agent` | `~/.pi/agent/sessions/<cwd>/` |
 | omp | `~/.bun/bin/omp`，170 会话 | 有，67 会话 | pi 同源（扩展 API 相同，cmux 文档证实） | `~/.omp/agent/sessions/` |
-| prime-agent | 0.7.2，`~/.prime/agent` | 有，1 活跃 lease + 会话 | **依赖 `@earendil-works/pi-agent-core/pi-ai/pi-tui`**，`-e --extension` 可加载扩展 | `~/.prime/agent/sessions/*.jsonl` |
+| prime-agent | 0.7.2，`~/.prime/agent` | 有，1 活跃 lease + 会话 | **依赖 `pi-agent-core/pi-ai/pi-tui`**，`-e --extension` 可加载扩展 | `~/.prime/agent/sessions/*.jsonl` |
 | claude | **cmux shim 包壳**（`/T/cmux-cli-shims/.../claude`），72 项目 | `~/.ai-devbox/bin/claude`，11 项目 | Anthropic 独立 | `~/.claude/projects/` |
 
 关键比例：pi 系（pi+omp+prime）会话数 ≈ 530（本机 347 + devbox 182+），claude ≈ 83。**pi 系占舰队 ~86%，且三个运行时共享一套扩展 API**。
@@ -30,7 +30,7 @@
 - devbox 的 claude（`~/.ai-devbox/bin/`）无 cmux → 盲区。选项：devbox 装 herdr integration（`~/.claude/hooks/herdr-agent-state.sh`）或直接给 claude settings 加自有 hook 指向 collector。claude hooks 是官方稳定 API（`agent_needs_input`/`agent_completed`），无需 cmux 也能接。
 
 ### devbox——orca 布局复制但 runtime 独立
-- devbox 上存在 `/data00/home/operator/orca-workspaces/feishu_ai_workflow-*` worktree 群 + `repos/`，与本机同构。
+- devbox 上存在 `<remote-workspace-root>/feishu_ai_workflow-*` worktree 群 + `repos/`，与本机同构。
 - 本机 `orca worktree ps` 实测 91 行全部 `hostId=local`——**devbox 的 orca worktree 不在本机 orca 视野内**（federation capability 存在但当前未联通/未启用）。ledger 不能假设 orca 单点全知。
 
 ## 3. 提交考古（近 7 天，"检查最近的提交"）

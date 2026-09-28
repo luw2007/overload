@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { inspectResume } from "./resume";
+import { inspectResume, resumeSession } from "./resume";
 
 function ledger(): Database {
   const db = new Database(":memory:");
@@ -59,6 +59,39 @@ describe("inspectResume orchestrator_owned guard (plan §3.10)", () => {
     const db = ledger();
     insertSession(db, { stable_id: "remote:pi:agent", host: "remote", origin: "agent" });
     expect(inspectResume(db, "remote:pi:agent", dead)).toEqual({ resumable: false, reason: "remote_host_unsupported" });
+    db.close();
+  });
+});
+
+describe("resumeSession launch", () => {
+  test("launches cmux new-workspace with the quoted session and returns resumed", async () => {
+    const db = ledger();
+    insertSession(db, { stable_id: "local:pi:ok", runtime: "pi", session: "sess'quote", cwd: "/repo" });
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const fakeExec = async (command: string, args: string[]) => { calls.push({ command, args }); return { ok: true }; };
+
+    const result = await resumeSession(db, "local:pi:ok", fakeExec, dead);
+    expect(result).toEqual({ resumed: true });
+    expect(calls[0].command).toBe("cmux");
+    expect(calls[0].args).toEqual(["new-workspace", "--cwd", "/repo", "--command", "pi --resume='sess'\\''quote'", "--focus", "true"]);
+    db.close();
+  });
+
+  test("refuses to launch when the process is still alive", async () => {
+    const db = ledger();
+    insertSession(db, { stable_id: "local:pi:alive", runtime: "pi", session: "sess", pid: 4242 });
+    let called = 0;
+    const fakeExec = async () => { called++; return { ok: true }; };
+
+    const result = await resumeSession(db, "local:pi:alive", fakeExec, alive);
+    expect(result).toEqual({ resumed: false, reason: "process_alive" });
+    expect(called).toBe(0);
+    db.close();
+  });
+
+  test("returns null for an unknown stable id", async () => {
+    const db = ledger();
+    expect(await resumeSession(db, "local:pi:nope", async () => ({ ok: true }), dead)).toBeNull();
     db.close();
   });
 });

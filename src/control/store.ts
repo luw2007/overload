@@ -54,6 +54,88 @@ CREATE TABLE IF NOT EXISTS control_redirects(
   action TEXT NOT NULL,evidence TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(work_id,revision)
 );`;
 
+// 上下文对象池（T1）：建表顺序按外键依赖 problems → objects → versions → problem_objects → pins → shares。
+// 全部 CREATE TABLE IF NOT EXISTS，不 ALTER 旧表；外键需 PRAGMA foreign_keys=ON。
+export const CONTEXT_SCHEMA = `
+CREATE TABLE IF NOT EXISTS control_context_problems(
+  problem_id         TEXT PRIMARY KEY,
+  work_id            TEXT NOT NULL,
+  parent_problem_id  TEXT,
+  root_problem_id    TEXT NOT NULL,
+  title              TEXT NOT NULL,
+  state              TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','resolved','superseded')),
+  revision           INTEGER NOT NULL DEFAULT 1,
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL,
+  CHECK (parent_problem_id IS NULL OR parent_problem_id != problem_id),
+  FOREIGN KEY (parent_problem_id) REFERENCES control_context_problems(problem_id)
+);
+CREATE INDEX IF NOT EXISTS idx_context_problems_work ON control_context_problems(work_id, root_problem_id);
+CREATE TABLE IF NOT EXISTS control_context_objects(
+  object_id              TEXT PRIMARY KEY,
+  work_id                TEXT NOT NULL,
+  primary_problem_id     TEXT,
+  ctype                  TEXT NOT NULL CHECK (ctype IN ('objective','constraints','fact','decision','artifact','scene')),
+  fact_subtype           TEXT CHECK (fact_subtype IS NULL OR fact_subtype IN ('code_state','test_result','external_state','observation_evidence')),
+  revision               INTEGER NOT NULL DEFAULT 1,
+  purged_at              TEXT,
+  tombstone_reason       TEXT,
+  created_at             INTEGER NOT NULL,
+  updated_at             INTEGER NOT NULL,
+  CHECK (ctype != 'fact' OR fact_subtype IS NOT NULL),
+  CHECK (ctype = 'fact' OR fact_subtype IS NULL),
+  CHECK (purged_at IS NULL OR tombstone_reason IS NOT NULL),
+  FOREIGN KEY (primary_problem_id) REFERENCES control_context_problems(problem_id)
+);
+CREATE TABLE IF NOT EXISTS control_context_object_versions(
+  object_id              TEXT NOT NULL,
+  revision               INTEGER NOT NULL,
+  reference              TEXT NOT NULL,
+  source_type            TEXT NOT NULL,
+  sensitivity            TEXT NOT NULL DEFAULT 'unknown' CHECK (sensitivity IN ('unknown','clean','suspected','confirmed_secret')),
+  shareable              INTEGER NOT NULL DEFAULT 0,
+  expires_at             INTEGER,
+  staleness_ms           INTEGER,
+  collected_at           INTEGER,
+  derived_from           TEXT,
+  summary_short          TEXT,
+  summary_long           TEXT,
+  content_hash           TEXT NOT NULL,
+  created_at             INTEGER NOT NULL,
+  PRIMARY KEY (object_id, revision),
+  FOREIGN KEY (object_id) REFERENCES control_context_objects(object_id)
+);
+CREATE TABLE IF NOT EXISTS control_context_problem_objects(
+  problem_id         TEXT NOT NULL,
+  object_id          TEXT NOT NULL,
+  revision           INTEGER NOT NULL,
+  role               TEXT NOT NULL,
+  created_at         INTEGER NOT NULL,
+  PRIMARY KEY (problem_id, object_id, role),
+  FOREIGN KEY (problem_id) REFERENCES control_context_problems(problem_id),
+  FOREIGN KEY (object_id, revision) REFERENCES control_context_object_versions(object_id, revision)
+);
+CREATE TABLE IF NOT EXISTS control_context_pins(
+  pin_id             TEXT PRIMARY KEY,
+  object_id          TEXT NOT NULL,
+  revision           INTEGER NOT NULL,
+  pinned_by          TEXT NOT NULL,
+  purpose            TEXT NOT NULL CHECK (purpose IN ('decision_evidence','recovery_checkpoint','other')),
+  expires_at         INTEGER,
+  created_at         INTEGER NOT NULL,
+  FOREIGN KEY (object_id, revision) REFERENCES control_context_object_versions(object_id, revision)
+);
+CREATE TABLE IF NOT EXISTS control_context_shares(
+  share_id           TEXT PRIMARY KEY,
+  object_id          TEXT NOT NULL,
+  revision           INTEGER NOT NULL,
+  shared_with_work   TEXT NOT NULL,
+  granted_by         TEXT NOT NULL,
+  granted_at         INTEGER NOT NULL,
+  UNIQUE (object_id, revision, shared_with_work),
+  FOREIGN KEY (object_id, revision) REFERENCES control_context_object_versions(object_id, revision)
+);`;
+
 function controlSchemaVersion(db:Database):number {
   const exists=db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_schema_meta'").get();
   if(!exists)return 0;
@@ -73,8 +155,9 @@ type ControlMigration={to:number;destructive:boolean;apply(db:Database):void};
 const CONTROL_MIGRATIONS:ControlMigration[]=[
   {to:1,destructive:false,apply(db){db.exec(CONTROL_SCHEMA);ensureOutbox(db);db.query("INSERT INTO control_schema_meta(id,version,migrated_at) VALUES (1,?,?)").run(1,Date.now());}},
   {to:2,destructive:false,apply(db){ensureMgmtSchema(db);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(2,Date.now());}},
-  // v3 carries why an effect ended the way it did, so a decided card can say more than "failed".
-  {to:3,destructive:false,apply(db){if(!(db.query("PRAGMA table_info(control_attention)").all() as Array<{name:string}>).some(column=>column.name==="effect_detail"))db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(3,Date.now());}},
+  // v3 is the context schema; it also carries effect_detail (why an effect ended the way it did) so both
+  // lineages' v3 shapes converge. Both steps are idempotent.
+  {to:3,destructive:false,apply(db){db.exec(CONTEXT_SCHEMA);if(!(db.query("PRAGMA table_info(control_attention)").all() as Array<{name:string}>).some(column=>column.name==="effect_detail"))db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(3,Date.now());}},
 ];
 export function ensureControlSchema(db: Database): void {
   const version=controlSchemaVersion(db);
@@ -86,12 +169,19 @@ export function ensureControlSchema(db: Database): void {
   }
 }
 
-export function openControl(path = process.env.OVERLOAD_ANSWERS_PATH ?? join(homedir(), ".overload", "orchestrator-answers.db")): Database {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const db = new Database(path, { create: true });
+export function openControl(path?: string | null): Database {
+  // fail-fast：显式传入 null/空串/字面量 "undefined" 一律拒绝，不落到 new Database
+  // （Bun 会据此在 CWD 创建名为 "undefined" 的文件）。仅当参数为 undefined（无参调用）
+  // 时才在函数内部显式解析 env/默认路径，不依赖 Bun 对 undefined 路径的隐式行为。
+  if (path === null || path === "" || path === "undefined" || path === "null") throw new Error("openControl: path is required");
+  let resolved = path ?? process.env.OVERLOAD_ANSWERS_PATH ?? "";
+  if (!resolved || resolved.trim() === "" || resolved === "undefined" || resolved === "null") resolved = join(homedir(), ".overload", "orchestrator-answers.db");
+  if (!resolved.trim()) throw new Error("openControl: path is required");
+  mkdirSync(dirname(resolved), { recursive: true, mode: 0o700 });
+  const db = new Database(resolved, { create: true });
   db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON");
   ensureControlSchema(db);
-  try { chmodSync(path, 0o600); } catch { db.close(); throw new ControlError("blocked", `cannot secure control database: ${path}`); }
+  try { chmodSync(resolved, 0o600); } catch { db.close(); throw new ControlError("blocked", `cannot secure control database: ${resolved}`); }
   return db;
 }
 
@@ -273,7 +363,7 @@ function persistAttention(db: Database, old: AttentionItem, item: AttentionItem,
   db.query("INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES (?,?,?,?,?)").run(item.item_id, item.revision, kind, JSON.stringify(detail), now); emitAttention(db, item, `attention.${kind}`);
 }
 
-export function resolveAttentionDecision(db: Database, itemId: string, expectedRevision: number, input: AttentionDecisionInput, now = Date.now()): AttentionItem {
+export function resolveAttentionDecision(db: Database, itemId: string, expectedRevision: number, input: AttentionDecisionInput, now = Date.now(), actor?: string): AttentionItem {
   ensureControlSchema(db);
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || !input || typeof input !== "object" || typeof input.selected_option !== "string" || !input.selected_option.trim()) throw new ControlError("invalid", "selected_option is required");
   if (input.expected_contract_revision !== undefined && (!Number.isSafeInteger(input.expected_contract_revision) || input.expected_contract_revision < 1)) throw new ControlError("invalid", "expected contract revision must be a positive integer");
@@ -289,13 +379,57 @@ export function resolveAttentionDecision(db: Database, itemId: string, expectedR
     if (input.selected_option === "narrow") {
       if (!input.replacement_contract || typeof input.reason !== "string" || !input.reason.trim()) throw new ControlError("invalid", "narrow requires replacement_contract and reason");
       validateContract(input.replacement_contract);
-    } else if (input.replacement_contract !== undefined || input.expected_contract_revision !== undefined || snapshot !== undefined) {
+    } else if (input.replacement_contract !== undefined || snapshot !== undefined) {
       throw new ControlError("invalid", "contract revision fields are only valid for narrow");
     }
     const work = getWork(db, old.work_id);
     if (!work) throw new ControlError("not_found", "work not found");
     if (work.revision !== old.contract_revision) throw new ControlError("conflict", "attention contract revision is stale");
-    if (input.expected_contract_revision !== undefined && input.expected_contract_revision !== work.revision) throw new ControlError("conflict", "stale contract revision");
+    // 三入口同步复验（内联，避免循环导入 context-propagation.ts）。
+    // 读-检查-消费绑定在同一 immediate 事务内，避免"检查后变化"竞态。
+    // context 域判定：attention 带 context 证据对象，或 work 在 context-pool 中登记了问题。
+    // 纯 legacy（无 contract/decision_owner 且无 context 对象）保持兼容；其余一律 fail-closed。
+    const evidenceObjId = typeof old.evidence.object_id === "string" ? (old.evidence.object_id as string) : null;
+    const evidenceRev = typeof old.evidence.revision === "number" ? old.evidence.revision : null;
+    const workHasContext = !!db.query("SELECT 1 FROM control_context_problems WHERE work_id=? LIMIT 1").get(old.work_id);
+    const isContextDecision = !!evidenceObjId || workHasContext;
+    const decisionOwner = work.contract?.decision_owner;
+
+    // 3a. 权限复验 fail-closed。
+    if (actor !== undefined && actor !== null && actor.trim()) {
+      // actor 已提供。仅当 work 有 decision_owner 或涉及 context 时才强制授权；
+      // 纯 legacy（无 contract/decision_owner 且无 context）保持兼容。
+      const needsAuth = !!decisionOwner || isContextDecision;
+      if (needsAuth) {
+        const trimmedActor = actor.trim();
+        // shares 是对象级跨 work 引用授权（无 actor 列），不能充当 work 级决策入口授权。
+        // 决策 resolve 仅 decision_owner 本人可执行，与 context-assembler.assertWorkAccess 一致；非 owner 一律 fail-closed。
+        if (!(decisionOwner && decisionOwner === trimmedActor)) {
+          throw new ControlError("blocked", "permission_denied: actor not authorized for this work");
+        }
+      }
+    } else if (isContextDecision) {
+      // actor 为空却消费 context 决策 → 拒绝（不得 fail-open 静默放行）。
+      throw new ControlError("blocked", "permission_denied: actor identity required");
+    }
+    // context 决策必须有 decision_owner；无 owner 却访问 context 对象 → 拒绝。
+    if (isContextDecision && !decisionOwner) {
+      throw new ControlError("blocked", "permission_denied: work has no decision_owner but context access required");
+    }
+
+    // 3b. contract 版本复验 fail-closed。
+    // staleness 已由上方无条件的 work.revision === old.contract_revision 绑定兜底
+    // （attention 创建时即记录 contract_revision，漂移即拒）。客户端如额外携带
+    // expected_contract_revision，必须与当前 work.revision 一致，否则拒绝。
+    if (input.expected_contract_revision !== undefined && input.expected_contract_revision !== work.revision) {
+      throw new ControlError("blocked", "stale_or_revoked: contract revision mismatch");
+    }
+
+    // 3c. 证据复验：context 证据对象未被 purged。
+    if (evidenceObjId && typeof evidenceRev === "number") {
+      const purgedRow = db.query("SELECT purged_at FROM control_context_objects WHERE object_id=? AND purged_at IS NOT NULL").get(evidenceObjId) as { purged_at: string } | null;
+      if (purgedRow) throw new ControlError("blocked", "evidence_mismatch: evidence has been purged");
+    }
     if (work.state !== "active") throw new ControlError("blocked", "work is not active");
     const workRevision = work.revision + 1;
     assertNoInFlightAttention(db, work.work_id, workRevision);
@@ -319,8 +453,8 @@ export function resolveAttentionDecision(db: Database, itemId: string, expectedR
   return tx.immediate() as AttentionItem;
 }
 
-export function actOnAttention(db: Database, itemId: string, expectedRevision: number, action: "ack" | "defer" | "resolve", input: { defer_until?: number; reason?: string; selected_option?: string; replacement_contract?: Contract; expected_contract_revision?: number; affected_cards?: AttentionCardSnapshot[] } = {}, now = Date.now()): AttentionItem {
-  if (action === "resolve" && input.selected_option !== undefined) return resolveAttentionDecision(db, itemId, expectedRevision, input as AttentionDecisionInput, now);
+export function actOnAttention(db: Database, itemId: string, expectedRevision: number, action: "ack" | "defer" | "resolve", input: { defer_until?: number; reason?: string; selected_option?: string; replacement_contract?: Contract; expected_contract_revision?: number; affected_cards?: AttentionCardSnapshot[] } = {}, actor?: string, now = Date.now()): AttentionItem {
+  if (action === "resolve" && input.selected_option !== undefined) return resolveAttentionDecision(db, itemId, expectedRevision, input as AttentionDecisionInput, now, actor);
   ensureControlSchema(db);
   const tx = db.transaction(() => {
     const old = getAttention(db, itemId);

@@ -11,6 +11,9 @@ import { collectEvidence, evidenceReady } from "./evidence";
 import { submitTask } from "./submit";
 import { checkPr } from "./pr";
 import { consumeAnswers, expireApprovals, openAnswersDb, requestApproval, repairApprovalIntents, reconcileApprovalEffects } from "./approval";
+import { buildAgentTaskContext } from "./agent-task-context";
+import { collectAndSpool, spoolContextEnvelope } from "./context-collector";
+import { determineRecoveryOutcome } from "./recovery-context";
 import type { Database } from "bun:sqlite";
 import {coordinatorChild,coordinatorChildPrompt} from './coordinator';
 import {existsSync,readFileSync} from 'node:fs';
@@ -146,6 +149,7 @@ export class Orchestrator {
           if(task.state==="starting") await this.startRunner(task);
           else if(task.state==="running") await this.pollRunning(task,now);
           else if(task.state==="submitted") await this.pollSubmitted(task,now);
+          else if(["done","failed","abandoned","awaiting_human","blocked"].includes(task.state)) this.attemptRecovery(task.task_id);
         } catch(error) {
           const state=getTask(this.db,task.task_id)?.state??task.state;
           this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,now,state,state,"tick_error",JSON.stringify({error:error instanceof Error?error.message:String(error)})]);
@@ -155,6 +159,7 @@ export class Orchestrator {
         const answers=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);try{
           repairApprovalIntents(this.db,answers,now);consumeAnswers(this.db,answers,this.spool,now);expireApprovals(this.db,this.spool,now,answers);reconcileApprovalEffects(this.db,answers,now);
           publishControlEvents(answers,this.ledgerPath,detail=>this.spool.emit("control", "control_event", detail),now);
+          this.collectContextFacts();
         }finally{answers.close();}
         renewLeases(this.db,this.owner,now);
         await this.collectWorktrees(now);
@@ -191,10 +196,43 @@ export class Orchestrator {
     let dir:string;
     try { ({dir}=await ensureWorktree(task.repo,task.task_id,branch,task.base_ref,this.worktreesDir,this.worktreeExec)); }
     catch(error){ this.casTransition(task.task_id,"worktree_fail",{reason:"repo_gone",detail:String((error as Error).message??error)},Date.now()); return; }
-    setRecovery(this.db,task.task_id,attemptId,"intent");
+    // T6: assemble agent task context package; inject hard constraints into system prompt.
+    // If blocked(needs_context), record event and wait — do not spawn with placeholder context.
     // The worktree exists by now, so the brief can name the real branch instead of "(pending)".
-    const control=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);let prompt:string;try{prompt=coordinatorChildPrompt(this.db,control,{...task,worktree:dir,branch});}finally{control.close();}
-    const spawned=this.managedRunner?.owns(task)?await this.managedRunner.start(task,dir,attemptId,prompt):await spawnRunner(task,dir,attemptId,prompt,this.runnerExec,this.artifactsDir);setRecovery(this.db,task.task_id,attemptId,spawned.ok?"spawned":"failed");
+    const briefDb=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);let brief:string;try{brief=coordinatorChildPrompt(this.db,briefDb,{...task,worktree:dir,branch});}finally{briefDb.close();}
+    let promptText=brief;
+    if(task.work_id){
+      let control:Database|null=null;
+      try{
+        control=openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);
+        const ctxResult=buildAgentTaskContext({db:control,orchestratorDb:this.db,work_id:task.work_id,task_id:task.task_id,actor:"orchestrator",scope_filter:{repo:task.repo}});
+        if(!ctxResult.ok){
+          if(ctxResult.code==="forbidden"){this.casTransition(task.task_id,"spawn_fail",{reason:"context_forbidden",detail:ctxResult.reason},Date.now());return;}
+          // 显式兼容模式：开关关闭 → 走 base prompt 旧路径，不中断 spawn。
+          if(ctxResult.code==="disabled"){promptText=brief;}
+          else{
+            const reason=ctxResult.reason, code=ctxResult.code;
+            this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,Date.now(),task.state,task.state,"context_pending",JSON.stringify({reason,code})]);
+            let owner:string|null=null;
+            try{const wrow=control.query("SELECT contract FROM control_works WHERE work_id=?").get(task.work_id) as {contract:string|null}|null;if(wrow?.contract){try{const c=JSON.parse(wrow.contract) as {decision_owner?:string};owner=typeof c.decision_owner==="string"&&c.decision_owner?c.decision_owner:null;}catch{}}}catch{}
+            this.emitContextSpool("context.pending",{work_id:task.work_id,task_id:task.task_id,reason,required_context:code,owner:owner??"unknown",deep_link:this.deepLink(task.work_id,task.task_id)});
+            return;
+          }
+        }else{
+          promptText=ctxResult.system_prompt_injection+"\n\n"+brief;
+        }
+      }catch(error){
+        // 必需上下文不可读不得静默回退：记录 context_pending，等下一 tick 重试，不 spawn。
+        const reason=error instanceof Error?error.message:String(error);
+        this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[task.task_id,Date.now(),task.state,task.state,"context_pending",JSON.stringify({reason,code:"exception"})]);
+        const owner=this.readDecisionOwner(task.work_id);
+        this.emitContextSpool("context.pending",{work_id:task.work_id,task_id:task.task_id,reason,required_context:"exception",owner:owner??"unknown",deep_link:this.deepLink(task.work_id,task.task_id)});
+        return;
+      }
+      finally{control?.close();}
+    }
+    setRecovery(this.db,task.task_id,attemptId,"intent");
+    const spawned=this.managedRunner?.owns(task)?await this.managedRunner.start(task,dir,attemptId,promptText):await spawnRunner(task,dir,attemptId,promptText,this.runnerExec,this.artifactsDir);setRecovery(this.db,task.task_id,attemptId,spawned.ok?"spawned":"failed");
     if(!spawned.ok){ this.casTransition(task.task_id,"spawn_fail",{worktree:dir,branch,reason:"tool_missing",detail:spawned.error},Date.now()); return; }
     this.casTransition(task.task_id,"spawn_ok",{worktree:dir,branch},Date.now());
     this.bindAttempts.set(task.task_id,0);
@@ -253,6 +291,187 @@ export class Orchestrator {
       this.db.run("UPDATE tasks SET ci_observation_failures=0,updated_at=? WHERE task_id=?",[now,task.task_id]);
     }
   }
+  /**
+   * T2b/T10: 采集所有 active work 的 context facts 并写入 spool。
+   * collector 只写 NDJSON 文件；web server 的 ingest loop 读文件投影到 control DB。
+   * 本方法不直写 control DB（架构红线）。
+   */
+  private collectContextFacts(): void {
+    try {
+      const rows = this.db.query(
+        "SELECT DISTINCT work_id FROM tasks WHERE work_id IS NOT NULL"
+      ).all() as { work_id: string }[];
+      for (const row of rows) {
+        collectAndSpool(
+          { orchestratorDb: this.db, work_id: row.work_id, actor: "orchestrator", runtime_id: this.owner },
+          this.spool.dir,
+        );
+      }
+    } catch (error) {
+      console.error("context collect failed:", error);
+    }
+  }
+
+  /**
+   * Fix 5: 读 control_works.contract.decision_owner（只读 control DB）。
+   * orchestrator 红线：不写 control DB，只读 contract。读失败返回 null（调用方 fail-closed 处理）。
+   */
+  private readDecisionOwner(workId: string): string | null {
+    let control: Database | null = null;
+    try {
+      control = openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);
+      const row = control.query("SELECT contract FROM control_works WHERE work_id=?").get(workId) as { contract: string | null } | null;
+      if (!row?.contract) return null;
+      try {
+        const c = JSON.parse(row.contract) as { decision_owner?: string };
+        return typeof c.decision_owner === "string" && c.decision_owner ? c.decision_owner : null;
+      } catch { return null; }
+    } catch {
+      return null;
+    } finally {
+      control?.close();
+    }
+  }
+
+  private deepLink(workId: string, taskId: string): string {
+    return `cmux://work/${workId}/task/${taskId}`;
+  }
+
+  /**
+   * Fix 5: 把 context.pending / recovery_* 事件写入 collector 同款 spool。
+   * 与 fact_observed 共用 seg 文件机制（spoolContextEnvelope 分配全局序号 + 原子 rename）。
+   * ingest 侧按 kind 分发。写 spool 失败不阻断主流程（task_events 已落库），但记录错误事件。
+   */
+  private emitContextSpool(kind: string, detail: Record<string, unknown>): void {
+    try {
+      spoolContextEnvelope(this.db, this.spool.dir, kind, detail, Date.now());
+    } catch (error) {
+      console.error(`context spool ${kind} failed:`, error);
+    }
+  }
+
+  /**
+   * T7: 对单个 task 尝试恢复决策。调用 determineRecoveryOutcome，将结果记录为 task_events。
+   * 不自动 spawn——恢复包/跳转/对账结果供人或上层决策。
+   * 幂等：已记录过 recovery_* 事件的 task 跳过。
+   *
+   * Fix 2: liveness 必须证据驱动。删除"有未消费 approval → 直接 jump"的短路。
+   * awaiting_human 不再自己判 jump，统一交给 determineRecoveryOutcome，由它依据
+   * task.state + pid/stable_id + task_events 的 runner_exit|runner_dead 判定：
+   *   live（进程在跑 + 有未消费 approval）→ recovery_jump
+   *   terminated（有 runner_exit/runner_dead）→ checkpoint 恢复评估（不 jump）
+   *   unknown（无 pid 无终止事件）→ recovery_reconcile
+   *
+   * Fix 5: recovery_jump / recovery_package / recovery_reconcile 同时写入 collector spool，
+   * Core/Surface 可见。
+   */
+  attemptRecovery(taskId: string): void {
+    const task = getTask(this.db, taskId);
+    if (!task || !task.work_id || !task.attempt_id) return;
+    // 幂等：已处理过 recovery_* 事件的 task 跳过。
+    const done = this.db.query(
+      "SELECT 1 FROM task_events WHERE task_id=? AND event IN ('recovery_package_ready','recovery_jump','recovery_reconcile','recovery_blocked') LIMIT 1"
+    ).get(taskId);
+    if (done) return;
+
+    // done 正常完成：不产恢复噪声。
+    if (task.state === "done") return;
+
+    // terminated 判定必须基于事件证据：runner_exit 或 runner_dead。
+    const hasExitEvent = !!this.db.query(
+      "SELECT 1 FROM task_events WHERE task_id=? AND event IN ('runner_exit','runner_dead') LIMIT 1"
+    ).get(taskId);
+
+    // failed/abandoned：必须有 runner_exit/runner_dead 事件才评估恢复包。
+    // 仅凭 state 字符串不足以证明 runner 已终止（可能是编排错误标记的终态）。
+    if ((task.state === "failed" || task.state === "abandoned") && !hasExitEvent) return;
+
+    // awaiting_human / running / blocked / submitted：统一交给 determineRecoveryOutcome
+    // 做证据驱动的 runtime state 判定（live/terminated/unknown），不再短路 jump。
+    let control: Database | null = null;
+    try {
+      control = openAnswersDb(process.env.OVERLOAD_ANSWERS_PATH);
+      // actor 必须是 work contract 的 decision_owner（assembleRecovery 入口校验）。
+      let actor = "orchestrator";
+      let owner = "unknown";
+      const workRow = control.query("SELECT contract FROM control_works WHERE work_id=?").get(task.work_id) as { contract: string | null } | null;
+      if (workRow?.contract) {
+        try {
+          const c = JSON.parse(workRow.contract) as { decision_owner?: string };
+          if (typeof c.decision_owner === "string" && c.decision_owner) { actor = c.decision_owner; owner = c.decision_owner; }
+        } catch { /* fall through */ }
+      }
+      const outcome = determineRecoveryOutcome({
+        controlDb: control,
+        orchestratorDb: this.db,
+        work_id: task.work_id,
+        task_id: task.task_id,
+        attempt_id: task.attempt_id,
+        actor,
+      });
+      const evNow = Date.now();
+      const deepLink = this.deepLink(task.work_id, task.task_id);
+      if (outcome.type === "recovery_package") {
+        this.db.run(
+          "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
+          [taskId, evNow, task.state, task.state, "recovery_package_ready", JSON.stringify({
+            checkpoint_reference: outcome.package.checkpoint_reference,
+            session_reference: outcome.package.session_reference,
+            recommended_action: outcome.package.recommended_action,
+          })]
+        );
+        // Fix 5: spool 给 Core/Surface。
+        this.emitContextSpool("context.recovery_package", {
+          work_id: task.work_id,
+          task_id: task.task_id,
+          checkpoint_reference: outcome.package.checkpoint_reference,
+          incomplete_steps: outcome.package.incomplete_steps,
+          owner,
+          deep_link: deepLink,
+        });
+      } else if (outcome.type === "jump") {
+        this.db.run(
+          "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
+          [taskId, evNow, task.state, task.state, "recovery_jump", JSON.stringify({
+            reason: outcome.reason,
+            jump_target: outcome.jump_target,
+          })]
+        );
+        this.emitContextSpool("context.recovery_jump", {
+          work_id: task.work_id,
+          task_id: task.task_id,
+          jump_target: outcome.jump_target,
+          owner,
+          deep_link: deepLink,
+        });
+      } else if (outcome.type === "reconcile") {
+        this.db.run(
+          "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
+          [taskId, evNow, task.state, task.state, "recovery_reconcile", JSON.stringify({ reason: outcome.reason })]
+        );
+        this.emitContextSpool("context.recovery_reconcile", {
+          work_id: task.work_id,
+          task_id: task.task_id,
+          reason: outcome.reason,
+          owner,
+          deep_link: deepLink,
+        });
+      } else {
+        this.db.run(
+          "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
+          [taskId, evNow, task.state, task.state, "recovery_blocked", JSON.stringify({ reason: outcome.reason, code: outcome.code })]
+        );
+      }
+    } catch (error) {
+      this.db.run(
+        "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
+        [taskId, Date.now(), task.state, task.state, "recovery_error", JSON.stringify({ error: error instanceof Error ? error.message : String(error) })]
+      );
+    } finally {
+      control?.close();
+    }
+  }
+
 }
 export async function main(argv=Bun.argv.slice(2)):Promise<void>{const i=argv.indexOf("--concurrency");const concurrency=i<0?2:Number(argv[i+1]);const db=openStore();const spool=new SpoolWriter(db);const orch=new Orchestrator(db,spool,concurrency);const stop=()=>{spool.close();db.close();process.exit(0)};process.on("SIGINT",stop);process.on("SIGTERM",stop);await orch.tick();setInterval(()=>orch.tick(),5000);}
 if(import.meta.main)await main();

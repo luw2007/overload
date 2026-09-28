@@ -1,5 +1,5 @@
 /**
- * Frozen ledger DDL — transcribed verbatim from docs/contracts/p1-freeze.md.
+ * Frozen ledger DDL — transcribed verbatim from docs/history/contracts/p1-freeze.md.
  * Field names and UNIQUE constraints are frozen; N2 must implement an identical
  * schema. N3 tests assert against THIS shape (the contract), not against N2 code.
  *

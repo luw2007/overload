@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ackRequest, queryHealth, queryHung, queryJumpTarget, querySession } from "./queries";
+import { ackRequest, queryHealth, queryHung, queryJumpTarget, querySession, querySessions, queryQ1, requestSession, queryQ2, queryArchive, queryZombie } from "./queries";
 
 const NOW = 1_755_000_000_000;
 const HOUR = 3_600_000;
@@ -164,4 +164,72 @@ test("HungRow declares the complete hung payload including resume capability", (
   const source = readFileSync(join(import.meta.dir, "queries.ts"), "utf8");
   const declaration = source.match(/export type HungRow = \{[^}]+\}/s)?.[0];
   expect(declaration).toContain("resume_capability?: ResumeCapability | null");
+});
+
+describe("session list / inbox / archive surfaces", () => {
+  test("querySessions orders by last event and attaches the latest settled handoff", () => {
+    const db = sessionFixture();
+    db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", ["local:pi:a", NOW, NOW]);
+    db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", ["local:pi:b", NOW + 1000, NOW + 1000]);
+    db.run("INSERT INTO current VALUES (?, 'idle', 'q3', NULL, ?, ?, ?)", ["local:pi:a", NOW, NOW, NOW]);
+    db.run("INSERT INTO current VALUES (?, 'idle', 'q3', NULL, ?, ?, ?)", ["local:pi:b", NOW + 1000, NOW + 1000, NOW + 1000]);
+    db.run("INSERT INTO journal VALUES (1, 'local:pi:a', ?, 'pi', 'w', 'settled', ?)", [NOW, JSON.stringify({ handoff: { path: "/h", status: "complete", uncertainties: 0 } })]);
+
+    const rows = querySessions(db);
+    expect(rows.map((r) => r.stable_id)).toEqual(["local:pi:b", "local:pi:a"]);
+    expect(rows.find((r) => r.stable_id === "local:pi:a")?.handoff).toEqual({ path: "/h", status: "complete", uncertainties: 0 });
+    expect(rows.find((r) => r.stable_id === "local:pi:b")?.handoff).toBeNull();
+    db.close();
+  });
+
+  test("queryQ1 returns pending requests with parsed summary/options and jump binding", () => {
+    const db = sessionFixture();
+    db.run("ALTER TABLE sessions ADD COLUMN host TEXT");
+    db.run("ALTER TABLE attachments ADD COLUMN platform TEXT");
+    db.run("INSERT INTO sessions(stable_id, origin, runtime, created_at, cwd, branch, first_seen_at, host) VALUES ('local:pi:a', 'local', 'pi', ?, '/repo', 'main', ?, 'local')", [NOW, NOW]);
+    db.run("INSERT INTO requests(request_uid, stable_id, kind, created_at, detail, state) VALUES ('r1', 'local:pi:a', 'ask', ?, ?, 'pending')",
+      [NOW, JSON.stringify({ summary: "Pick a runtime", options: ["pi", "omp"] })]);
+    db.run("INSERT INTO session_hosts VALUES ('local:pi:a', 'cmux', 'surface-1')");
+
+    const rows = queryQ1(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ request_uid: "r1", summary: "Pick a runtime", options: ["pi", "omp"], platform: "cmux", binding: "surface-1" });
+    db.close();
+  });
+
+  test("requestSession resolves a request uid to its stable id and null when absent", () => {
+    const db = sessionFixture();
+    db.run("INSERT INTO requests(request_uid, stable_id, kind, created_at, detail, state) VALUES ('r1', 'local:pi:a', 'ask', ?, '{}', 'pending')", [NOW]);
+    expect(requestSession(db, "r1")).toBe("local:pi:a");
+    expect(requestSession(db, "missing")).toBeNull();
+    db.close();
+  });
+
+  test("queryQ2 lists ended inbox rows and queryArchive lists terminal rows without closeouts table", () => {
+    const db = sessionFixture();
+    db.run("ALTER TABLE current ADD COLUMN origin TEXT");
+    db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", ["local:pi:a", NOW, NOW]);
+    db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", ["local:pi:b", NOW, NOW]);
+    db.run("INSERT INTO current VALUES ('local:pi:a', 'idle', 'q2', NULL, ?, ?, ?, 'agent')", [NOW, NOW, NOW]);
+    db.run("INSERT INTO current VALUES ('local:pi:b', 'idle', 'q4', NULL, ?, ?, ?, 'agent')", [NOW, NOW, NOW]);
+
+    expect(queryQ2(db).map((r) => r.stable_id)).toEqual(["local:pi:a"]);
+    expect(queryArchive(db).map((r) => r.stable_id)).toEqual(["local:pi:b"]);
+    db.close();
+  });
+
+  test("queryZombie groups q5 rows, drops hung from groups, and lists orphaned requests", () => {
+    const db = sessionFixture();
+    db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", ["local:pi:a", NOW, NOW]);
+    db.run("INSERT INTO sessions VALUES (?, 'local', 'pi', ?, '/repo', 'main', ?)", ["local:pi:b", NOW, NOW]);
+    db.run("INSERT INTO current VALUES (?, 'idle', 'q5', 'stalled', ?, ?, ?)", ["local:pi:a", NOW, NOW, NOW]);
+    db.run("INSERT INTO current VALUES (?, 'working', 'q5', 'turn_hung', ?, ?, ?)", ["local:pi:b", NOW, NOW, NOW]);
+    db.run("INSERT INTO requests(request_uid, stable_id, kind, created_at, detail, state, resolved_at) VALUES ('o1', 'local:pi:a', 'ask', ?, '{}', 'orphaned', ?)", [NOW, NOW]);
+
+    const view = queryZombie(db);
+    expect(view.groups.map((g) => g.q5_reason)).toEqual(["stalled"]);
+    expect(view.groups[0].rows.map((r) => r.stable_id)).toEqual(["local:pi:a"]);
+    expect(view.orphaned_requests.map((r) => r.request_uid)).toEqual(["o1"]);
+    db.close();
+  });
 });

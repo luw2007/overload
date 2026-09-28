@@ -51,3 +51,14 @@ CREATE TABLE IF NOT EXISTS approval_intents(
   question TEXT NOT NULL, options TEXT NOT NULL, expires_at INTEGER NOT NULL,
   evidence TEXT NOT NULL, created_at INTEGER NOT NULL, repaired_at INTEGER,
   control_event_id TEXT);
+
+-- Context collector 持久化去重 cursor（替代进程重启即丢失的内存 Map）。
+-- key = source_event_id；记录已发出的 observation_revision 与 content_hash。
+-- 同 source_event_id + 同 content_hash → 跳过（不重复发）。
+-- 同 source_event_id + 异 content_hash → revision+1。
+CREATE TABLE IF NOT EXISTS context_collector_cursor(
+  source_event_id TEXT PRIMARY KEY,
+  observation_revision INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  last_collected_at INTEGER NOT NULL
+);

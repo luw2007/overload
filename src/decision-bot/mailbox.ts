@@ -18,8 +18,13 @@ export function canonical(value:unknown):string {
 }
 export function digest(value:unknown):string { return createHash("sha256").update(canonical(value)).digest("hex"); }
 function columns(db:Database, table:string):Set<string>{return new Set((db.query(`PRAGMA table_info(${table})`).all() as Array<{name:string}>).map(x=>x.name));}
-export function openMailbox(path=process.env.OVERLOAD_ANSWERS_PATH ?? defaultMailboxPath):Database {
-  mkdirSync(dirname(path),{recursive:true,mode:0o700}); const db=new Database(path,{create:true}); db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL");
+export function openMailbox(path?: string | null):Database {
+  // fail-fast：显式 null/空串/字面量 "undefined" 拒绝；仅 undefined（无参）才内部解析默认。
+  if (path === null || path === "" || path === "undefined" || path === "null") throw new Error("openMailbox: path is required");
+  let resolved = path ?? process.env.OVERLOAD_ANSWERS_PATH ?? "";
+  if (!resolved || resolved.trim() === "" || resolved === "undefined" || resolved === "null") resolved = defaultMailboxPath;
+  if (!resolved.trim()) throw new Error("openMailbox: path is required");
+  mkdirSync(dirname(resolved),{recursive:true,mode:0o700}); const db=new Database(resolved,{create:true}); db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL");
   db.exec(`CREATE TABLE IF NOT EXISTS answers(approval_id TEXT PRIMARY KEY, answer TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS approval_targets(consumer_owner TEXT NOT NULL, approval_id TEXT NOT NULL, stable_id TEXT, request_uid TEXT, target_version TEXT NOT NULL, question TEXT NOT NULL, options TEXT NOT NULL, effect TEXT NOT NULL, scope TEXT NOT NULL, evidence TEXT NOT NULL, evidence_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'active', consumed_at INTEGER, outcome TEXT, PRIMARY KEY(consumer_owner,approval_id));
 CREATE TABLE IF NOT EXISTS answer_metadata(approval_id TEXT PRIMARY KEY, consumer_owner TEXT, provenance TEXT);
@@ -39,7 +44,7 @@ CREATE TABLE IF NOT EXISTS effect_reconcile_cursor(id INTEGER PRIMARY KEY CHECK(
   for(const [name,definition] of [["operation_id","TEXT"],["rule_id","TEXT"]] as const)if(!columns(db,"bot_proposals").has(name))db.exec(`ALTER TABLE bot_proposals ADD COLUMN ${name} ${definition}`);
   const c=columns(db,"answers");if(c.has("consumer_owner")){db.exec("INSERT OR IGNORE INTO answer_metadata(approval_id,consumer_owner,provenance) SELECT approval_id,consumer_owner,provenance FROM answers");}
   ensureControlSchema(db);
-  chmodSync(path,0o600); return db;
+  chmodSync(resolved,0o600); return db;
 }
 export function registerTarget(db:Database,input:Omit<ApprovalTarget,"targetVersion"|"evidenceHash"|"state"> & {targetVersion?:string,evidenceHash?:string}):ApprovalTarget {
   const targetVersion=input.targetVersion ?? digest({owner:input.consumerOwner,id:input.approvalId,question:input.question,options:input.options,effect:input.effect,scope:input.scope,evidence:input.evidence,expiresAt:input.expiresAt});

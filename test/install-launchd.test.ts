@@ -39,7 +39,7 @@ function fixture() {
   writeFileSync(join(project, "scripts", "maintenance.sh"), "");
   const agents = join(root, "home", "Library", "LaunchAgents");
   mkdirSync(agents, { recursive: true });
-  writeFileSync(join(agents, "works.earendil.overload.notifier.plist"), "legacy notifier");
+  writeFileSync(join(agents, "works.example.overload.notifier.plist"), "legacy notifier");
   return { root, project, agents };
 }
 
@@ -48,7 +48,7 @@ function bootstrappedNames(root: string): string[] {
   if (!log) return [];
   return log.split("\n")
     .filter((line) => line.startsWith("bootstrap "))
-    .map((line) => line.match(/works\.earendil\.overload\.([^.]+)\.plist$/)?.[1] ?? "");
+    .map((line) => line.match(/app\.overload\.([^.]+)\.plist$/)?.[1] ?? "");
 }
 
 describe("portable launchd installer", () => {
@@ -60,7 +60,7 @@ describe("portable launchd installer", () => {
     const names = ["ingest", "maintenance", "pull", "web"];
     expect(bootstrappedNames(root)).toEqual(names);
     for (const name of names) {
-      const path = join(agents, `works.earendil.overload.${name}.plist`);
+      const path = join(agents, `app.overload.${name}.plist`);
       expect(existsSync(path)).toBe(true);
       const value = readFileSync(path, "utf8");
       expect(value).toContain(project);
@@ -68,12 +68,12 @@ describe("portable launchd installer", () => {
       // Whoever runs this: the plist must name the checkout, never the operator.
       expect(value).not.toContain(userInfo().username);
     }
-    expect(existsSync(join(agents, "works.earendil.overload.orchestrator.plist"))).toBe(false);
-    expect(existsSync(join(agents, "works.earendil.overload.notifier.plist"))).toBe(false);
+    expect(existsSync(join(agents, "app.overload.orchestrator.plist"))).toBe(false);
+    expect(existsSync(join(agents, "works.example.overload.notifier.plist"))).toBe(false);
 
     const removed = await run(root, ["--uninstall", "--project-dir", project]);
     expect(removed).toMatchObject({ exitCode: 0, stderr: "" });
-    for (const name of names) expect(existsSync(join(agents, `works.earendil.overload.${name}.plist`))).toBe(false);
+    for (const name of names) expect(existsSync(join(agents, `app.overload.${name}.plist`))).toBe(false);
   });
 
   test("installs orchestrator only with --with-orchestrator and uninstall removes all five", async () => {
@@ -82,15 +82,15 @@ describe("portable launchd installer", () => {
     const installed = await run(root, ["--install", "--with-orchestrator", "--project-dir", project]);
     expect(installed).toMatchObject({ exitCode: 0, stderr: "" });
     expect(bootstrappedNames(root)).toEqual(names);
-    for (const name of names) expect(existsSync(join(agents, `works.earendil.overload.${name}.plist`))).toBe(true);
+    for (const name of names) expect(existsSync(join(agents, `app.overload.${name}.plist`))).toBe(true);
 
-    const orchestrator = readFileSync(join(agents, "works.earendil.overload.orchestrator.plist"), "utf8");
+    const orchestrator = readFileSync(join(agents, "app.overload.orchestrator.plist"), "utf8");
     expect(orchestrator).toContain(`${project}/src/orchestrator/orchestrator.ts`);
     expect(orchestrator).toContain("<key>KeepAlive</key><true/>");
 
     const removed = await run(root, ["--uninstall", "--project-dir", project]);
     expect(removed).toMatchObject({ exitCode: 0, stderr: "" });
-    for (const name of names) expect(existsSync(join(agents, `works.earendil.overload.${name}.plist`))).toBe(false);
+    for (const name of names) expect(existsSync(join(agents, `app.overload.${name}.plist`))).toBe(false);
   });
 
   test("stops before bootstrap when plutil rejects plist", async () => {

@@ -1,6 +1,6 @@
 /**
  * §2.4b/§2.4c classifier — N8 reference implementation of the FROZEN P2
- * contract (p2-freeze.md protocol 2 + docs/plans/…-tech-solution.md §2.4).
+ * contract (p2-freeze.md protocol 2 + docs/architecture/tech-solution.md §2.4).
  *
  * Queue predicates (frozen):
  *   Q1 = requests.pending (sole source)

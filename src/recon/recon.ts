@@ -535,17 +535,47 @@ function commMatchesRuntime(comm: string, runtime: string | null): boolean {
   return (allowed[runtime ?? ""] ?? [runtime ?? ""]).some((part) => part && name.includes(part));
 }
 
-async function commandSnapshot(command: string, timeoutMs: number,
+export async function killGroup(proc: { pid: number }, signal: "TERM" | "KILL"): Promise<void> {
+  try {
+    const child = Bun.spawn(["/bin/kill", "-s", signal, `-${proc.pid}`], { stdout: "ignore", stderr: "ignore" });
+    const rc = await child.exited;
+    if (rc === 0) return;
+  } catch { /* fall through to direct-child fallback */ }
+  try { (proc as unknown as { kill: (s: string) => void }).kill(`SIG${signal}`); } catch { /* gone */ }
+}
+
+type GroupKiller = (proc: { pid: number }, signal: "TERM" | "KILL") => Promise<void>;
+let groupKiller: GroupKiller = killGroup;
+export function __setKillGroupForTesting(fn: GroupKiller): void {
+  groupKiller = fn;
+}
+
+export async function commandSnapshot(command: string, timeoutMs: number,
   parse: (value: unknown) => SourceSnapshot): Promise<SourceSnapshot> {
-  const proc = Bun.spawn(["sh", "-c", command], { stdout: "pipe", stderr: "pipe" });
-  const timer = setTimeout(() => proc.kill(), timeoutMs);
+  const proc = Bun.spawn(["sh", "-c", command], { stdout: "pipe", stderr: "pipe", detached: true });
+  let timedOut = false;
+  // Inner KILL escalation timer: armed only after the outer timer fires, cleared
+  // in finally which runs only after the pipes reach EOF (Promise.all), so a
+  // grandchild holding a pipe keeps escalation armed until the group is dead.
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    void (async () => {
+      await groupKiller(proc, "TERM");
+      killTimer = setTimeout(() => { void groupKiller(proc, "KILL"); }, 800);
+    })();
+  }, timeoutMs);
   try {
     const [stdout, stderr, rc] = await Promise.all([
       new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
     ]);
+    if (timedOut) throw new Error(`command timed out after ${timeoutMs}ms`);
     if (rc !== 0) throw new Error(`command failed (${rc}): ${stderr.trim()}`);
     return parse(JSON.parse(stdout));
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
+  }
 }
 
 /** Peels an optional {result: {...}} envelope; a JSON error response (result
@@ -583,7 +613,7 @@ function parseOrca(value: unknown): SourceSnapshot {
   }) };
 }
 
-async function cmuxSnapshot(pattern: string): Promise<SourceSnapshot> {
+export async function cmuxSnapshot(pattern: string): Promise<SourceSnapshot> {
   const paths = await resolveCmuxFiles(pattern);
   const sessions: NativeSession[] = [];
   for (const path of paths) {
@@ -606,7 +636,7 @@ async function resolveCmuxFiles(pattern: string): Promise<string[]> {
   return Array.fromAsync(glob.scan({ cwd: directory, absolute: true, onlyFiles: true }));
 }
 
-function collectCmux(root: Record<string, unknown>, output: NativeSession[]): void {
+export function collectCmux(root: Record<string, unknown>, output: NativeSession[]): void {
   const container = record(root.sessions ?? root);
   for (const [key, value] of Object.entries(container)) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;

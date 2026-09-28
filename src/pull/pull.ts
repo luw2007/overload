@@ -131,10 +131,48 @@ function remainingTimeout(deadline: number): number {
   return remaining;
 }
 
-async function runCommand(command: string[], args: string[], timeoutMs: number): Promise<string> {
-  const proc = Bun.spawn([...command, ...args], { stdout: "pipe", stderr: "pipe" });
+/** Signals the whole process group. The child is spawned as its own group
+ *  leader (detached), so a hung ssh/rsync — and any shell wrapping a hung
+ *  grandchild — is reaped instead of deferring SIGTERM until the child exits
+ *  naturally, which would let a hung transfer blow past the time budget.
+ *
+ *  Awaits /bin/kill and checks its exit code: when the group is already gone
+ *  (rc != 0) we fall back to killing the direct child. Never fire-and-forget,
+ *  so a failed escalation is visible and reaped. */
+export async function killProcessTree(proc: { pid: number }, signal: "TERM" | "KILL"): Promise<void> {
+  try {
+    const child = Bun.spawn(["/bin/kill", "-s", signal, `-${proc.pid}`], { stdout: "ignore", stderr: "ignore" });
+    const rc = await child.exited;
+    if (rc === 0) return;
+  } catch { /* fall through to direct-child fallback */ }
+  try { (proc as unknown as { kill: (s: string) => void }).kill(`SIG${signal}`); } catch { /* already gone */ }
+}
+
+type TreeKiller = (proc: { pid: number }, signal: "TERM" | "KILL") => Promise<void>;
+// Test seam: defaults to the real process-group killer. Tests can wrap it to
+// count escalation calls while still terminating the isolated child group.
+let treeKiller: TreeKiller = killProcessTree;
+export function __setKillProcessTreeForTesting(fn: TreeKiller): void {
+  treeKiller = fn;
+}
+
+export async function runCommand(command: string[], args: string[], timeoutMs: number): Promise<string> {
+  const proc = Bun.spawn([...command, ...args], { stdout: "pipe", stderr: "pipe", detached: true });
   let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
+  // Inner KILL escalation timer. It is only scheduled after the outer timer
+  // fires, and it must be cleared in finally. Critically, finally runs only
+  // after Promise.all resolves — which waits for stdout/stderr EOF. A surviving
+  // grandchild holding a pipe keeps Promise.all pending, so the KILL timer
+  // deliberately stays armed until the group (and its pipe holders) is dead.
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    void (async () => {
+      await treeKiller(proc, "TERM");
+      // Escalate to SIGKILL shortly after if the group did not tear down.
+      killTimer = setTimeout(() => { void treeKiller(proc, "KILL"); }, 800);
+    })();
+  }, timeoutMs);
   try {
     const [stdout, stderr, rc] = await Promise.all([
       new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
@@ -142,7 +180,10 @@ async function runCommand(command: string[], args: string[], timeoutMs: number):
     if (timedOut) throw new Error(`command timed out after ${timeoutMs}ms`);
     if (rc !== 0) throw new Error(`${basename(command[0]!)} failed (${rc}): ${stderr.trim()}`);
     return stdout;
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
+  }
 }
 
 function parseTransferOutput(output: string): { files: number; bytes: number } {
@@ -215,7 +256,7 @@ export async function loadConfig(args: string[]): Promise<{ config: PullConfig; 
   } };
 }
 
-async function underSingleFlight(config: PullConfig, originalArgs: string[]): Promise<number> {
+export async function underSingleFlight(config: PullConfig, originalArgs: string[]): Promise<number> {
   await secureDirectory(dirname(config.lock));
   const flock = Bun.which("flock");
   if (flock) {

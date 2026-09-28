@@ -25,7 +25,7 @@ function seededLedger(events: Array<{ at: number; kind: string }> = [{ at: NOW -
 function launchctlOf(states: Record<string, { state?: string; lastExit?: number }>): Executor {
   return async (command, args) => {
     if (command !== "launchctl" || args[0] !== "print") return { ok: false, error: "unexpected command" };
-    const label = args[1]!.split("/").pop()!.replace("works.earendil.overload.", "");
+    const label = args[1]!.split("/").pop()!.replace("app.overload.", "");
     const entry = states[label];
     if (!entry) return { ok: false, error: "Could not find service" };
     const exitLine = entry.lastExit == null ? "" : `\tlast exit code = ${entry.lastExit}\n`;

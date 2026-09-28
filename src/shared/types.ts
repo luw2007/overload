@@ -1,7 +1,7 @@
 /**
  * Overload P1 frozen contract — owner-authored, workers consume READ-ONLY.
  * Any change requires owner re-planning; do not edit in worker branches.
- * Source of truth: docs/plans/overload-20260813-tech-solution.md §2.1/§2.2.
+ * Source of truth: docs/architecture/tech-solution.md §2.1/§2.2.
  */
 
 export const ENVELOPE_VERSION = 1;
@@ -54,7 +54,12 @@ export type EventKind =
   | "attachment_observed"  // {stable_id, platform, binding, parent?} — jump-target binding refresh; parent = platform lineage (e.g. "orca:<parentWorktreeId>")
   | "turn_hung"            // {emitter_id, stable_id, hung_ms} — state=working ∧ progress silence ∧ heartbeat still fresh
   | "dead_connection"      // {emitter_id, stable_id, hung_ms, local, peer} — an in-flight socket bound to an address the host no longer owns
-  | "network_changed";     // admin only: {previous, current} — host address set changed; every in-flight request on a dropped address is doomed
+  | "network_changed"       // admin only: {previous, current} — host address set changed; every in-flight request on a dropped address is doomed
+  | "context.updated"       // 上下文对象版本更新（control outbox）
+  | "context.invalidated"   // 对象被判定无效
+  | "context.stale"         // 同源新版，旧版 stale
+  | "context.conflict"      // 多源矛盾
+  | "context.fact_observed"; // orchestrator collector → Core reducer 的事实观测事件
 
 // ── P2 state vocabulary (frozen) ──
 export type SessionState = "working" | "idle" | "awaiting_human" | "done" | "failed" | "vanished";

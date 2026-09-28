@@ -48,7 +48,7 @@ export function defaultDoctorDeps(): DoctorDeps {
   };
 }
 
-const LAUNCHD_LABEL_PREFIX = "works.earendil.overload.";
+const LAUNCHD_LABEL_PREFIX = "app.overload.";
 const KEEPALIVE_LABELS = ["ingest", "web"];
 const INGEST_HEARTBEAT_MAX_AGE_MS = 30_000;
 const PULL_HEARTBEAT_MAX_AGE_MS = 90_000; // pull.plist runs every 60s; allow one missed tick

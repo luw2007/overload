@@ -45,10 +45,13 @@ bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- 
 
 agents_dir=$HOME/Library/LaunchAgents
 logs_dir=$HOME/.overload/logs
+prefix=app.overload
+# Older installs used a reverse-DNS prefix ending in .overload; any leftover
+# plist matching this glob is unloaded and removed on install/uninstall.
+legacy_glob='works.*.overload.*.plist'
 labels='ingest maintenance pull web'
 all_labels='ingest maintenance pull web orchestrator'
 if [ "$with_orchestrator" -eq 1 ]; then labels="$labels orchestrator"; fi
-retired_labels='notifier'
 uid=$(id -u)
 xml_escape() {
   printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&apos;/g'
@@ -56,7 +59,7 @@ xml_escape() {
 
 write_plist() {
   name=$1
-  target=$agents_dir/works.earendil.overload.$name.plist
+  target=$agents_dir/$prefix.$name.plist
   case "$name" in
     ingest) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/ingest/ingest.ts")</string>"; schedule='<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>' ;;
     maintenance) arguments="<string>$(xml_escape "$project_dir/scripts/maintenance.sh")</string>"; schedule='<key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>' ;;
@@ -68,7 +71,7 @@ write_plist() {
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>works.earendil.overload.$name</string>
+  <key>Label</key><string>$prefix.$name</string>
   <key>ProgramArguments</key><array>$arguments</array>
   <key>EnvironmentVariables</key><dict><key>OVERLOAD_ROOT</key><string>$(xml_escape "$project_dir")</string><key>OVERLOAD_BUN</key><string>$(xml_escape "$bun_path")</string></dict>
   $schedule
@@ -83,20 +86,24 @@ EOF
 if [ "$dry_run" -eq 1 ]; then
   dry_labels=$labels
   if [ "$mode" = uninstall ]; then dry_labels=$all_labels; fi
-  for name in $dry_labels; do printf '%s %s %s\n' "$mode" "works.earendil.overload.$name" "$agents_dir/works.earendil.overload.$name.plist"; done
-  for name in $retired_labels; do printf 'remove %s %s\n' "works.earendil.overload.$name" "$agents_dir/works.earendil.overload.$name.plist"; done
+  for name in $dry_labels; do printf '%s %s %s\n' "$mode" "$prefix.$name" "$agents_dir/$prefix.$name.plist"; done
+  for target in "$agents_dir"/$legacy_glob; do
+    [ -e "$target" ] || continue
+    printf 'remove-legacy %s %s\n' "$(basename "$target" .plist)" "$target"
+  done
   exit 0
 fi
 
 mkdir -p "$agents_dir" "$logs_dir"
-for name in $retired_labels; do
-  target=$agents_dir/works.earendil.overload.$name.plist
+# Remove any leftover jobs from older reverse-DNS prefixes.
+for target in "$agents_dir"/$legacy_glob; do
+  [ -e "$target" ] || continue
   launchctl bootout "gui/$uid" "$target" >/dev/null 2>&1 || true
   rm -f "$target"
 done
 if [ "$mode" = install ]; then
   for name in $labels; do
-    target=$agents_dir/works.earendil.overload.$name.plist
+    target=$agents_dir/$prefix.$name.plist
     launchctl bootout "gui/$uid" "$target" >/dev/null 2>&1 || true
     write_plist "$name"
     launchctl bootstrap "gui/$uid" "$target"
@@ -104,7 +111,7 @@ if [ "$mode" = install ]; then
   printf 'Installed Overload LaunchAgents from %s\n' "$project_dir"
 else
   for name in $all_labels; do
-    target=$agents_dir/works.earendil.overload.$name.plist
+    target=$agents_dir/$prefix.$name.plist
     if [ -f "$target" ]; then launchctl bootout "gui/$uid" "$target" >/dev/null 2>&1 || true; fi
     rm -f "$target"
   done

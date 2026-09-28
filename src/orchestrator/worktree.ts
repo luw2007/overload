@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { realpathSync } from "node:fs";
 import type { Database } from "bun:sqlite";
 import { getTask, listTasks, type Task } from "./store";
 
@@ -31,7 +32,19 @@ export async function ensureWorktree(repo: string, taskId: string, branch: strin
 }
 
 function porcelainHasWorktree(output: string, dir: string): boolean {
-  return output.split("\n\n").some((block) => block.split("\n")[0] === `worktree ${dir}`);
+  const resolvedDir = resolvePath(dir);
+  return output.split("\n\n").some((block) => {
+    const line = block.split("\n")[0];
+    if (!line.startsWith("worktree ")) return false;
+    const listed = line.slice("worktree ".length);
+    return resolvePath(listed) === resolvedDir;
+  });
+}
+
+/** Resolve symlinks so /var/... and /private/var/... compare equal.
+ *  Falls back to the original path when the target does not exist yet. */
+function resolvePath(p: string): string {
+  try { return realpathSync(p); } catch { return p; }
 }
 
 export type PidAlive = (pid: number) => boolean;

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes are made on the latest commit on `main` and the latest tagged release.
+Security fixes are made on the latest commit on `main`. Only the `main` branch is currently supported.
 
 ## Reporting a vulnerability
 

@@ -1,12 +1,12 @@
 #!/bin/sh
-# The ingest loop (owned by N5) must touch this heartbeat; this watchdog only reads it.
+# The ingest loop must touch this heartbeat; this watchdog only reads it.
 set -u
 
 HEARTBEAT=${OVERLOAD_HEARTBEAT:-"${HOME}/.overload/ingest.heartbeat"}
 STATE=${OVERLOAD_WATCHDOG_STATE:-"${HOME}/.overload/watchdog.state"}
 MAX_AGE=${OVERLOAD_HEARTBEAT_MAX_AGE_SEC:-30}
 SLEEP_SKEW=${OVERLOAD_SLEEP_SKEW_SEC:-60}
-INGEST_LABEL=${OVERLOAD_INGEST_LABEL:-works.earendil.overload.ingest}
+INGEST_LABEL=${OVERLOAD_INGEST_LABEL:-app.overload.ingest}
 
 wall_now=$(date +%s) || exit 1
 boot_raw=$(sysctl -n kern.boottime 2>/dev/null || printf '')

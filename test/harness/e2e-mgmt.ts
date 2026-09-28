@@ -199,7 +199,7 @@ async function main() {
   OVERLOAD_HOME: join(home, ".overload"),
   OVERLOAD_LEDGER_PATH: join(home, ".overload/ledger.db"),
   OVERLOAD_ANSWERS_PATH: join(home, ".overload/orchestrator-answers.db"),
-  PI_CODING_AGENT_DIR: "/home/luwei.will/.overload/pi-agent",
+  PI_CODING_AGENT_DIR: join(home, ".overload", "pi-agent"),
  };
  await run(
   [

@@ -1,6 +1,6 @@
 # Overload
 
-Overload is a local-first macOS attention control plane for agent work. It turns agent lifecycle noise into a small set of timely, actionable human decisions, preserves the original context, and lets work resume after a decision. Append-only SQLite telemetry, classification, stale-session detection, and the loopback dashboard serve that goal.
+Overload is a local-first macOS attention control plane for agent work. It compresses agent lifecycle noise into a small set of timely, actionable human decisions. The unit of user work is an Attention item, split into **Now** (act now), **Inbox** (batch later), and **Done** (decided or archived). The Feishu channel projects the same Attention items as cards, and card decisions write back to the local authoritative state — Feishu is an I/O channel, not the source of truth. Append-only SQLite telemetry, classification, stale-session detection, and the loopback dashboard serve that goal.
 
 It is designed for a single operator managing local and SSH-reachable agent sessions. It is not a hosted service or a multi-user control plane. The ingest path is one-way: telemetry only, never a channel back into an agent. Two opt-in paths do write back, and both are disabled until you turn them on. The pi-family extension's `approval_gate` pauses a matching bash/write/edit call in any session that installed the extension and waits for a human answer from the loopback answers mailbox. The optional `src/orchestrator/` module launches its own `pi` children and gates them the same way. Both surface as ordinary Now decisions. These gates are a **workflow** boundary, not a security boundary: on a single-UID machine any same-UID process can bypass them. Product and engineering decisions follow [AGENTS.md](AGENTS.md).
 
@@ -8,7 +8,7 @@ On runtimes exposing an abort signal to extensions, cancelling an approval wait 
 
 ## Status
 
-The supported v0 surface is the Bun/SQLite ingest pipeline, CLI, recon, pull, and loopback dashboard. Pending decisions are read from the dashboard; when the Now zone goes from empty to non-empty, the maintenance job emits one aggregated macOS notification (`osascript`), never per-event.
+The supported v0 surface is the Bun/SQLite ingest pipeline, CLI, recon, pull, and loopback dashboard. The operator works Now / Inbox / Done Attention items. Pending decisions are read from the dashboard; when the Now zone goes from empty to non-empty, the maintenance job emits one aggregated macOS notification (`osascript`), never per-event. The automatic Decision Bot and the Orchestrator are optional advanced features, off by default.
 ## Requirements
 
 - macOS 13+ for the supported launchd workflow
@@ -38,7 +38,7 @@ The optional orchestrator LaunchAgent (`src/orchestrator/`) is installed only
 with `scripts/install-launchd.sh --install --with-orchestrator`.
 
 No installer sets up a prime-agent extension (its extension-directory
-convention is unverified; see docs/integrations.md).
+convention is unverified; see docs/guides/integrations.md).
 
 Confirm the install at any time, including after a `bun` upgrade or moved
 checkout:
@@ -47,28 +47,35 @@ checkout:
 bun src/cli/overload.ts doctor
 ```
 
-See [docs/integrations.md](docs/integrations.md) for adapter-specific behavior and [docs/operations.md](docs/operations.md) for lifecycle management.
+See [docs/guides/integrations.md](docs/guides/integrations.md) for adapter-specific behavior and [docs/guides/operations.md](docs/guides/operations.md) for lifecycle management.
 
 ## Commands
 
+The user-facing commands operate on Attention items (Now / Inbox / Done):
+
 ```sh
+bun src/cli/overload.ts now                 # items needing a decision now
+bun src/cli/overload.ts inbox               # items that can wait; batch later
+bun src/cli/overload.ts done                # decided or archived
+bun src/cli/overload.ts attention <id>                 # inspect one card
+bun src/cli/overload.ts attention <id> ack|defer|resolve
+bun src/cli/overload.ts works
+bun src/cli/overload.ts candidates|candidate <id>
+bun src/cli/overload.ts work create|revise|redirect|stop
+bun src/cli/overload.ts mgmt scan|works|show|track
+bun src/cli/overload.ts context purge --actor <id>
 bun src/cli/overload.ts sessions
-bun src/cli/overload.ts q1
-bun src/cli/overload.ts hung
 bun src/cli/overload.ts jump <stable_id|request_uid>
 bun src/cli/overload.ts ack <request_uid>...
 bun src/cli/overload.ts doctor
 bun src/cli/overload.ts audit
-bun src/cli/overload.ts audit --sample 20 --since 24h
-bun src/cli/overload.ts decision-bot status
-bun src/cli/overload.ts decision-bot once   # bounded operational tick
-bun src/cli/overload.ts decision-bot run    # optional foreground daemon
-bun src/cli/overload.ts decision-bot disable
-bun src/cli/overload.ts decision-bot enable
-bun src/cli/overload.ts decision-bot takeover extension <approval_id> <answer>
+
+# 诊断命令（内部分类）：q1 | q4 | hung | zombie | health
 ```
 
-The restricted decision bot is disabled by default. Enable it only with an explicit `decision_bot` object in `~/.overload/config.json` containing a model and exact rules; each rule must bind `consumer_owner`, gate, effect, allowed answers, and exact repo/cwd plus command or path scope. It runs `pi` ephemerally with no tools, extensions, skills, prompt templates, context files, or saved session, treats output as an untrusted proposal, and revalidates policy and source state at consume time. Human answers committed before consume win; after a receipt is consumed the API returns a conflict rather than claiming retroactive cancellation. This is a same-UID workflow boundary, not an OS sandbox.
+Lower-level queue diagnostics (`q1`, `q4`, `hung`, `zombie`, `health`) are internal classifications for maintenance, not the primary interface. The shell equivalent of the dashboard's multi-select Ack is `q1 2>/dev/null | cut -f1 | xargs ... ack`.
+
+Q1 **Ack** changes only Overload's local request state to `acked`; it never answers or unblocks the originating agent. Decisions that carry an answer (approve/deny on a registered gate) submit through the card button or a human takeover (below). Plain asks without an answer consumer remain jump/deep-link-only.
 
 `audit` is a read-only, deterministic report over recent journal evidence. It
 shows gated decisions, consequential tool classes, captured `HANDOFF.md`
@@ -79,17 +86,15 @@ Settled handoffs with `partial` or `blocked` status, or non-zero
 `uncertainties`, remain in the Inbox for human follow-up; complete,
 zero-uncertainty handoffs are archived normally.
 
-The CLI and dashboard both list pending work and support local close-out. Rows go
-to stdout and headings to stderr, so
-`q1 2>/dev/null | cut -f1 | xargs ... ack` is the shell equivalent of the
-dashboard's multi-select 批量 Ack.
+To record a human answer to a gated target without enabling any bot:
 
-Q1 **Ack** changes only Overload's local request state to `acked`; it never
-answers or unblocks the originating agent. Separately, cards for supported
-registered gates expose their existing approve/deny choices, and
-`decision-bot takeover` writes a human answer to that gate. Plain asks without
-an answer consumer remain jump/deep-link-only. See
-[decision bot configuration](docs/configuration.md#restricted-decision-bot).
+```sh
+bun src/cli/overload.ts decision-bot takeover extension <approval_id> <answer>
+```
+
+The automatic decision bot itself is a frozen advanced feature. See
+[Advanced / optional features](#advanced--optional-features) and
+[decision bot configuration](docs/guides/configuration.md#advanced-restricted-decision-bot-default-frozen).
 
 ## Data and privacy
 
@@ -110,10 +115,10 @@ agent extensions / cmux workstream / recon
                          │
                ┌─────────┴───────────┐
                ▼                     ▼
-              CLI            loopback dashboard
+              CLI      loopback dashboard (Now / Inbox / Done Attention)
 ```
 
-The ledger is append-only at the source-event layer; current queues are derived projections.
+The ledger is append-only at the source-event layer; current queues are derived projections. The loopback dashboard and CLI read the same Attention data. The Feishu channel projects the same Attention items as cards and posts card answers back; it is an input/output channel, never authoritative state — the local control DB is. The Orchestrator (`src/orchestrator/`) is an optional producer of Now decisions, installed only with `--with-orchestrator`.
 
 ## Uninstall
 
@@ -123,6 +128,20 @@ scripts/install-extension.sh --uninstall
 ```
 
 Uninstalling services preserves `~/.overload/`. Remove that directory manually only when you intend to discard local history.
+
+## Advanced / optional features
+
+These are not part of the default product surface. They exist, are kept compatible with existing data, but are off until explicitly configured.
+
+### Automatic Decision Bot (frozen by default)
+
+The automatic Decision Bot is frozen out of the default product entry and main UI. It only runs after an explicit `decision_bot` object in `~/.overload/config.json` contains a model and exact rules; each rule must bind `consumer_owner`, gate, effect, allowed answers, and exact repo/cwd plus command or path scope. It runs `pi` ephemerally with no tools, extensions, skills, prompt templates, context files, or saved session, treats output as an untrusted proposal, and revalidates policy and source state at consume time. Human answers committed before consume win; after a receipt is consumed the API returns a conflict rather than claiming retroactive cancellation. This is a same-UID workflow boundary, not an OS sandbox.
+
+The human mailbox, human answers, and `decision-bot takeover` work without enabling the bot. The bot's own lifecycle commands (`run`, `once`, `status`, `enable`, `disable`) are diagnostic/maintenance only. See [configuration](docs/guides/configuration.md#advanced-restricted-decision-bot-default-frozen).
+
+### Orchestrator
+
+`src/orchestrator/` launches its own `pi` children and gates them as ordinary Now decisions. It ships in source but is not installed, run, or depended on by default; the optional LaunchAgent is written only with `scripts/install-launchd.sh --install --with-orchestrator`.
 
 ## License
 

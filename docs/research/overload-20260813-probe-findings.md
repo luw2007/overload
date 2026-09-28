@@ -1,6 +1,6 @@
 # 本地平台真值探测报告
 
-日期：2026-08-13。全部数据来自本机实测命令输出，无推测。对应 plan（`docs/plans/overload-20260813-ledger-design.md`）的 probe 清单 P-1~P-4。
+日期：2026-08-13。全部数据来自本机实测命令输出，无推测。对应 plan（`docs/architecture/ledger-design.md`）的 probe 清单 P-1~P-4。
 
 ## 结论速览
 
@@ -57,7 +57,7 @@
   - cmux 的 `cmux-session.ts`（文档证实）：session restore + tool telemetry。
 - 三个先例证明：**pi 扩展可截获 agent 生命周期、工具调用、消息内容全事件流**，且同一扩展 API 兼容 pi/OMP 双运行时。
 - 注意：`pi` 在 POSIX shell 下是 fish 包装函数（`__pi_export_keys` 报错），探测需经 `fish -c`。
-- **SDK 事件全集（源码证实，`@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts:874-899`）**：`session_start/compact/shutdown/tree`、`context`、`before_provider_request/headers`、`after_provider_response`、`before_agent_start`、`agent_start/end/settled`、`turn_start/end`、`message_start/update/end`、`tool_execution_start/update/end`、`model_select`、`tool_call`、`tool_result`、`user_bash`、`input`；另有 `registerTool/registerCommand/registerShortcut` 与 UI 控制面。
+- **SDK 事件全集（源码证实，`pi-coding-agent/dist/core/extensions/types.d.ts:874-899`）**：`session_start/compact/shutdown/tree`、`context`、`before_provider_request/headers`、`after_provider_response`、`before_agent_start`、`agent_start/end/settled`、`turn_start/end`、`message_start/update/end`、`tool_execution_start/update/end`、`model_select`、`tool_call`、`tool_result`、`user_bash`、`input`；另有 `registerTool/registerCommand/registerShortcut` 与 UI 控制面。
 - **`tool_call` 在工具执行前触发且可拦截**（types.d.ts:685 "Fired before a tool executes. Can block."；`ToolCallEventResult = { block?, reason?, terminate? }`，`event.input` 可原地改参）。含义：扩展可实现完整审批门——按规则放行 / 阻塞等远程决策 / 终止本轮。
 - **pi 本体无逐工具原生审批 UI**（`trust.json` 只管扩展信任）。即 pi 系 worker 当前根本没有 approval 环节；"审批"对 pi 舰队是扩展可引入的策略层，而非需要桥接的既有事件。P-3 的问法因此改写：不是"session 文件里有没有 pending 状态"（没有），而是"审批门由谁实现"。
 

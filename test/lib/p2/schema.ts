@@ -1,5 +1,5 @@
 /**
- * Frozen P2 ledger DDL — transcribed verbatim from docs/contracts/p2-freeze.md
+ * Frozen P2 ledger DDL — transcribed verbatim from docs/history/contracts/p2-freeze.md
  * "Schema 增量" (field names + CHECK/UNIQUE constraints frozen; N5 must append
  * identical DDL to src/ingest/schema.sql).
  *

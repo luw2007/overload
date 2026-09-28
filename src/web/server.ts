@@ -13,8 +13,10 @@ import { DecisionBotService } from "../decision-bot/service";
 import { ackRequest, queryArchive, queryHealth, queryHung, queryJumpTarget, queryQ1, queryQ2, querySession, querySessions, queryZombie, requestSession, type JumpTarget } from "../shared/queries";
 import { performJump, type JumpResult } from "../shared/jump";
 import { inspectResume, resumeSession, type ProcessProbe, type ResumeExecutor } from "../shared/resume";
-import {
-  actOnAttention, ControlError, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract, promoteWork } from "../control/store";
+import { mgmtRoute } from "./mgmt-routes";
+import { contextRoute } from "./context-routes";
+import { recordAcceptance } from "../manage/manifest";
+import { actOnAttention, ControlError, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract, promoteWork } from "../control/store";
 import { previewContractRevision } from "../control/store";
 import type { Contract } from "../control/types";
 import { notificationCapability } from "../notify/nudge";
@@ -22,11 +24,10 @@ import { initializeLedger } from "../ingest/ingest";
 import { publishControlEvents } from "../control/outbox";
 import { openStore } from "../orchestrator/store";
 import { Coordinator } from "../orchestrator/coordinator";
+import { ingestContextSpool } from "../control/context-ingest";
 import {ensureAdapterSchema,type Conversation,type StoredTurn} from '../adapters/store';
 import {randomUUID} from 'node:crypto';
 import { SpoolWriter } from "../orchestrator/spool";
-import { mgmtRoute } from "./mgmt-routes";
-import { recordAcceptance } from "../manage/manifest";
 
 import { ledgerReport } from "./ledger";
 
@@ -119,9 +120,25 @@ function checkOrigin(request: Request, port: number): Response | null {
   return null;
 }
 
-export function startWebServer(options: { ledgerPath?: string; controlPath?: string; policyPath?: string; orchestratorPath?: string; spoolRoot?: string; publishIntervalMs?: number; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe } = {}) {
+// Loopback is the v1 trust boundary for host/origin (CSRF), but NOT for caller
+// identity. Context routes (plan §4.2) require a server-injected actor; the
+// loopback bind only proves "same machine", not "trusted model". The actor below
+// is a transition-state minimal trusted injection: production must bind actor to
+// an authenticated session/token instead of an env var. Do NOT read actor from
+// request headers / body / query.
+export function startWebServer(options: { ledgerPath?: string; controlPath?: string; policyPath?: string; orchestratorPath?: string; spoolRoot?: string; publishIntervalMs?: number; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe; actor?: string } = {}) {
+  // 在创建任何 DB/SpoolWriter 之前显式解析全部路径：不允许把 undefined 传到 open*
+  // （Bun 会据 undefined 在 CWD 创建名为 "undefined" 的文件）。
   const ledgerPath = options.ledgerPath ?? process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
-  const controlPath = options.controlPath;
+  const controlPath = options.controlPath ?? process.env.OVERLOAD_ANSWERS_PATH ?? join(homedir(), ".overload", "orchestrator-answers.db");
+  const orchestratorPath = options.orchestratorPath ?? process.env.OVERLOAD_ORCHESTRATOR_PATH ?? join(homedir(), ".overload", "orchestrator.db");
+  // 问题 9：publish 的 SpoolWriter、context ingest、orchestrator collector 写入必须共用同一根目录，
+  // 否则 publish 走默认 ~/.overload 而 ingest 不启动，collector 事件被静默丢弃。
+  // 此处是 startWebServer 内唯一的 spoolRoot 解析点；host 标记缺失时 web server 仍可独立运行。
+  const spoolRoot = options.spoolRoot ?? process.env.OVERLOAD_SPOOL_ROOT ?? join(homedir(), ".overload");
+  // Trusted actor injected server-side; falls back to env. When absent/empty,
+  // context routes and decision POSTs return 501 (no caller-supplied actor is ever accepted).
+  const actor = options.actor ?? process.env.OVERLOAD_ACTOR ?? undefined;
   const port = options.port ?? DEFAULT_WEB_PORT;
   const ledger = new Database(ledgerPath, { create: true });
   try {
@@ -135,11 +152,50 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
   const publish = () => {
     if (publishing) return;
     publishing = true;
-    const control = openAnswersDb(controlPath); const orchestrator = openStore(options.orchestratorPath); const spool = new SpoolWriter(orchestrator, options.spoolRoot);
+    const control = openAnswersDb(controlPath); const orchestrator = openStore(orchestratorPath); const spool = new SpoolWriter(orchestrator, spoolRoot);
     try { reconcileEffectEvents(control, ledgerPath); publishControlEvents(control, ledgerPath, (detail) => spool.emit(`control:${String(detail.event_id)}`, "control_event", detail)); }
     finally { spool.close(); orchestrator.close(); control.close(); publishing = false; }
   };
   publish();
+  let ingestTimer: ReturnType<typeof setInterval> | null = null;
+  // context ingest：读 collector 写入 spoolRoot/<host>/orchestrator/*.ndjson，投影到 control context-pool。
+  // 与 publish 共用同一 spoolRoot（问题 9）。SpoolWriter 构造需 <spoolRoot>/host 标记；标记缺失
+  // （web server 独立运行、无 orchestrator）时只告警不启动 ingest，不 crash。
+  let spoolReady = false;
+  try {
+    const probeOrch = openStore(orchestratorPath);
+    try {
+      new SpoolWriter(probeOrch, spoolRoot).close();
+      spoolReady = true;
+    } finally {
+      probeOrch.close();
+    }
+  } catch (error) {
+    console.error(`overload web: context ingest disabled (no usable spool at ${spoolRoot}): ${(error as Error).message}`);
+  }
+  if (spoolReady) {
+    const ingest = () => {
+      let control: Database | null = null;
+      try {
+        control = openAnswersDb(controlPath);
+        const orchestrator = openStore(orchestratorPath);
+        try {
+          const spool = new SpoolWriter(orchestrator, spoolRoot);
+          try {
+            const stats = ingestContextSpool(control, spool.dir);
+            if (stats.read > 0) {
+              console.error(`overload web: context ingest read=${stats.read} created=${stats.created} idempotent=${stats.idempotent} quarantined=${stats.quarantined} failed=${stats.failed}`);
+            }
+          } finally { spool.close(); }
+        } finally { orchestrator.close(); }
+      } catch (error) {
+        console.error(`overload web: context ingest failed: ${(error as Error).message}`);
+      } finally { control?.close(); }
+    };
+    ingest();
+    ingestTimer = setInterval(ingest, options.publishIntervalMs ?? 1_000);
+    ingestTimer.unref?.();
+  }
   const timer = setInterval(publish, options.publishIntervalMs ?? 1_000);
   timer.unref?.();
   const server = Bun.serve({
@@ -163,6 +219,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (originError) return originError;
         const management = await mgmtRoute(request, url, { controlPath, ledgerPath, overloadHome: join(homedir(), ".overload") });
         if (management) return management;
+        const context = await contextRoute(request, url, { controlPath, actor });
+        if (context) return context;
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
           const control = openControl(controlPath);
@@ -267,6 +325,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
                 ),
               );
             }
+            // 决策消费必须有服务端注入的可信 actor；缺身份 → 501，不得伪造 "web-server" 默认值。
+            if (action === "resolve" && (!actor || !actor.trim())) return json({ error: "not_implemented", message: "decision action requires server-side actor identity" }, { status: 501 });
             if (
               action === "resolve" &&
               attention?.evidence.kind === "coordinator_delivery"
@@ -302,7 +362,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
             }
             return json(actOnAttention(control, itemId, revision, action as "ack" | "defer" | "resolve", { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined, selected_option: typeof input.selected_option === "string" ? input.selected_option : undefined, replacement_contract: input.replacement_contract as
                     | Contract | undefined, expected_contract_revision: input.expected_contract_revision as number | undefined, affected_cards: input.affected_cards as
-                    | Array<{item_id:string;revision:number}> | undefined }));
+                    | Array<{item_id:string;revision:number}> | undefined }, actor));
           } catch (error) { return controlError(error); } finally { control.close(); }
         }
         if (request.method === "GET" && url.pathname === "/api/sessions") return json(withReadonlyDb(ledgerPath, (db) => querySessions(db, SESSION_LIST_LIMIT).map((session) => ({ ...session, resume_capability: inspectResume(db, session.stable_id, options.processAlive) }))));
@@ -496,7 +556,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
     },
   });
   const originalStop = server.stop.bind(server);
-  server.stop = ((closeActiveConnections?: boolean) => { clearInterval(timer); return originalStop(closeActiveConnections); }) as typeof server.stop;
+  server.stop = ((closeActiveConnections?: boolean) => { clearInterval(timer); if (ingestTimer) clearInterval(ingestTimer); return originalStop(closeActiveConnections); }) as typeof server.stop;
   return server;
 }
 

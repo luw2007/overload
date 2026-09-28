@@ -12,7 +12,7 @@ import { collectExecution } from "./collect";
 import { deriveCloseoutAndArchive } from "./archive";
 import { canonicalWorkId, workScope, refreshWorkHints } from "./relations";
 
-export type ManageConfig={enabled:boolean;agents:("pi"|"omp"|"claude")[];hosts:SourceHost[];lookback_ms:number;follow_new:boolean;snapshot:{file_max_bytes:number;work_max_bytes:number;retain_ms:number};archive_grace_ms:number;snapshot_root:string};
+export type ManageConfig={enabled:boolean;agents:("pi"|"omp"|"claude")[];hosts:SourceHost[];lookback_ms:number;follow_new:boolean;snapshot:{file_max_bytes:number;work_max_bytes:number;retain_ms:number};archive_grace_ms:number;snapshot_root:string;home_root:string};
 export type ScanReport={hosts:{host:string;state:"ok"|"unavailable";error?:string}[];discovered:number;executions:number;versions:number;links:number;archived:number;skipped:number;inputs?:number;artifacts?:number};
 export type WorkSummary=Record<string,unknown>;
 export type WorkDetail=Record<string,unknown>;
@@ -20,7 +20,7 @@ const DAY=86_400_000;
 export function loadManageConfig(overloadHome=join(homedir(),".overload")):ManageConfig{
   let raw:any={};try{raw=JSON.parse(readFileSync(join(overloadHome,"config.json"),"utf8")).manage??{};}catch{}
   let host="local";try{host=readFileSync(join(overloadHome,"host"),"utf8").trim()||"local";}catch{}
-  return {enabled:raw.enabled??false,agents:raw.agents??["pi","omp","claude"],hosts:raw.hosts??[{host,kind:"local"}],lookback_ms:raw.lookback_ms??7*DAY,follow_new:raw.follow_new??true,snapshot:{file_max_bytes:raw.snapshot?.file_max_bytes??2*1024*1024,work_max_bytes:raw.snapshot?.work_max_bytes??64*1024*1024,retain_ms:raw.snapshot?.retain_ms??30*DAY},archive_grace_ms:raw.archive_grace_ms??30*60_000,snapshot_root:raw.snapshot_root??join(overloadHome,"artifacts/mgmt")};
+  return {enabled:raw.enabled??false,agents:raw.agents??["pi","omp","claude"],hosts:raw.hosts??[{host,kind:"local"}],lookback_ms:raw.lookback_ms??7*DAY,follow_new:raw.follow_new??true,snapshot:{file_max_bytes:raw.snapshot?.file_max_bytes??2*1024*1024,work_max_bytes:raw.snapshot?.work_max_bytes??64*1024*1024,retain_ms:raw.snapshot?.retain_ms??30*DAY},archive_grace_ms:raw.archive_grace_ms??30*60_000,snapshot_root:raw.snapshot_root??join(overloadHome,"artifacts/mgmt"),home_root:process.env.OVERLOAD_HOME_ROOT??homedir()};
 }
 function parser(runtime:string,text:string,opts:{lineOffset?:number;pendingCalls?:PendingCall[]}={}):SessionRecord|null{const lines=text.replace(/\r?\n$/,"").split(/\r?\n/);return runtime==="pi"?parsePiSession(lines,opts):runtime==="omp"?parseOmpSession(lines,opts):parseClaudeSession(lines,opts);}
 function generationKey(g:string){return g.includes(":")?g.slice(0,g.lastIndexOf(":")):g;}
@@ -34,11 +34,11 @@ function strongWork(db:Database,ledger:Database|null,sid:string):string|null{
   }
   return null;
 }
-async function hostHome(fs:SourceFs,h:SourceHost){if(h.kind==="local")return homedir();const r=await fs.exec("/",["sh","-c","printf %s \"$HOME\""],5000);if(r.code!==0||!r.stdout.trim())throw new Error(r.stderr.trim()||"remote home unavailable");return r.stdout.trim();}
+async function hostHome(fs:SourceFs,h:SourceHost,localHomeRoot:string){if(h.kind==="local")return localHomeRoot;const r=await fs.exec("/",["sh","-c","printf %s \"$HOME\""],5000);if(r.code!==0||!r.stdout.trim())throw new Error(r.stderr.trim()||"remote home unavailable");return r.stdout.trim();}
 export async function scanOnce(db:Database,ledger:Database|null,cfg:ManageConfig,opts:{now?:number;fsFor?:(h:SourceHost)=>SourceFs}={}):Promise<ScanReport>{
   ensureControlSchema(db);ensureMgmtSchema(db);const now=opts.now??Date.now();const report:ScanReport={hosts:[],discovered:0,executions:0,versions:0,links:0,archived:0,skipped:0,inputs:0,artifacts:0};
   for(const h of cfg.hosts){const fs=opts.fsFor?.(h)??(h.kind==="local"?localSourceFs(h):sshSourceFs(h));try{
-    const home=await hostHome(fs,h);const files=new Map<string,{path:string;mtimeMs:number;size:number;runtime:"pi"|"omp"|"claude"}>();
+    const home=await hostHome(fs,h,cfg.home_root);const files=new Map<string,{path:string;mtimeMs:number;size:number;runtime:"pi"|"omp"|"claude"}>();
     for(const agent of cfg.agents)for(const dir of sessionDirs(agent,home))for(const f of await fs.listFiles(dir,{sinceMs:now-cfg.lookback_ms,suffix:".jsonl"}))files.set(f.path,{...f,runtime:detectRuntimeFromPath(f.path)??agent});
     for(const file of files.values()){
       const runtime=file.runtime;if(!cfg.agents.includes(runtime)){report.skipped++;continue;}

@@ -1,6 +1,6 @@
 /**
  * §3 reconciliation findings — N8 reference implementation of the FROZEN P2
- * contract (p2-freeze.md protocol 6 + 3; docs/plans/…-tech-solution.md §3).
+ * contract (p2-freeze.md protocol 6 + 3; docs/architecture/tech-solution.md §3).
  *
  * This reference models the recon daemon's DECISION core so the frozen rules
  * are directly testable with fake platform CLIs (tiny scripts echoing captured

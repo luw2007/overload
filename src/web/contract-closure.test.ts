@@ -14,7 +14,7 @@ test('reviewed narrow refuses newly arrived cards; fresh review applies and arch
  const db=openMailbox(controlPath);
  const contract:Contract={objective:'ship',acceptance:[{id:'a',kind:'human',description:'review'}],non_goals:[],scope:{cwd:'.'},budget:{},stop_conditions:[{id:'one',kind:'judgment',description:'one'},{id:'two',kind:'judgment',description:'two'}],decision_owner:'operator'};
  const work=createWork(db,{title:'review',source:'test',contract});const item=recordStopCondition(db,work.work_id,'one',{});
- const server=startWebServer({ledgerPath,controlPath,orchestratorPath:join(root,'orch.db'),spoolRoot:root,port:0});const base=`http://127.0.0.1:${server.port}`;
+ process.env.OVERLOAD_ACTOR='operator'; const server=startWebServer({ledgerPath,controlPath,orchestratorPath:join(root,'orch.db'),spoolRoot:root,port:0});const base=`http://127.0.0.1:${server.port}`;
  const post=(path:string,body:unknown)=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json','Sec-Fetch-Site':'same-origin'},body:JSON.stringify(body)});
  try{
   const replacement={...contract,objective:'narrowed'};

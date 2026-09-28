@@ -35,9 +35,9 @@ describe("control store CAS and attention semantics",()=>{
   test("stale mutation conflicts, ack does not resolve, unresolved external effect blocks resolve",()=>{
     const db=fixture();const work=createWork(db,{title:"x",source:"test",contract},1);
     const item=upsertAttention(db,{item_id:"i",work_id:work.work_id,state:"open",effect_state:"unknown",urgency:"inbox",conclusion:"decide",trigger:"risk",impact:"blocked",recommendation:null,options:[],owner:"owner",expires_at:null,source_link:null,approval_id:"a",consumer_owner:"extension",contract_revision:1,decision_mode:"human_only",evidence:{}},2);
-    expect(actOnAttention(db,"i",1,"ack",{},3).state).toBe("open");
-    expect(()=>actOnAttention(db,"i",1,"defer",{defer_until:10},4)).toThrow(ControlError);
-    expect(()=>actOnAttention(db,"i",2,"resolve",{},4)).toThrow(ControlError);db.close();
+    expect(actOnAttention(db,"i",1,"ack",{},"test-actor",3).state).toBe("open");
+    expect(()=>actOnAttention(db,"i",1,"defer",{defer_until:10},"test-actor",4)).toThrow(ControlError);
+    expect(()=>actOnAttention(db,"i",2,"resolve",{},"test-actor",4)).toThrow(ControlError);db.close();
   });
 });
 
@@ -56,7 +56,7 @@ test("continue supersedes stale sibling attention and preserves the selected rec
   const db=fixture();const work=createWork(db,{title:"x",source:"test",contract},1);const selected=recordStopCondition(db,work.work_id,"risk",{},2,1);
   const sibling=upsertAttention(db,{item_id:"sibling",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"sibling decision",trigger:"risk",impact:"blocked",recommendation:"stop",options:["stop"],owner:"owner",expires_at:null,source_link:null,approval_id:null,consumer_owner:null,contract_revision:1,decision_mode:"human_only",evidence:{}},2);
   const resolved=resolveAttentionDecision(db,selected.item_id,selected.revision,{selected_option:"continue"},3);
-  expect(resolved).toMatchObject({state:"resolved",effect_state:"succeeded",contract_revision:2});expect(getAttention(db,sibling.item_id)).toMatchObject({state:"superseded",revision:2,effect_state:"not_started"});expect(()=>actOnAttention(db,sibling.item_id,sibling.revision,"ack",{},4)).toThrow(ControlError);db.close();
+  expect(resolved).toMatchObject({state:"resolved",effect_state:"succeeded",contract_revision:2});expect(getAttention(db,sibling.item_id)).toMatchObject({state:"superseded",revision:2,effect_state:"not_started"});expect(()=>actOnAttention(db,sibling.item_id,sibling.revision,"ack",{},"test-actor",4)).toThrow(ControlError);db.close();
 });
 
 test("narrow applies the previewed card snapshot transactionally",()=>{

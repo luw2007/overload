@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addTask, openStore, transition } from "./store";
@@ -182,7 +182,7 @@ describe("ensureWorktree (real git, scratch repo)", () => {
     expect(second).toEqual({ dir: join(root, "real-task"), created: false });
 
     const listed = Bun.spawnSync(["git", "-C", repo, "worktree", "list", "--porcelain"]);
-    expect(listed.stdout.toString()).toContain(`worktree ${join(root, "real-task")}`);
+    expect(listed.stdout.toString()).toContain(`worktree ${realpathSync(join(root, "real-task"))}`);
   });
 
   test("reuses an existing branch across two different task ids (real repo)", async () => {

@@ -50,7 +50,7 @@ function seedLedger(): string {
   return path;
 }
 
-async function runningServer(path: string, jumpOrOptions?: ((target: { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null }) => Promise<{ opened: boolean }>) | { controlPath: string; policyPath?: string }) {
+async function runningServer(path: string, jumpOrOptions?: ((target: { source: "host" | "attachment"; platform: string | null; binding: string | null; tty: string | null; host: string | null }) => Promise<{ opened: boolean }>) | { controlPath: string; policyPath?: string; actor?: string }) {
   const options = typeof jumpOrOptions === "function" ? { jump: jumpOrOptions } : jumpOrOptions ?? {};
   const root = join(path, ".."); writeFileSync(join(root, "host"), "local\n");
   const server = startWebServer({ ledgerPath: path, orchestratorPath: join(root, "web-orchestrator.db"), spoolRoot: root, publishIntervalMs: 60_000, port: 0, ...options });
@@ -439,7 +439,7 @@ test("generic stop changes work state and stale decision conflicts", async () =>
   const work = createWork(control, { title: "release", source: "test" }, 100);
   const item = upsertAttention(control, { item_id: "item-1", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "Choose release", trigger: "gate", impact: "deployment waits", recommendation: "approve", options: ["continue", "narrow", "stop"], owner: "operator", expires_at: Date.now() + 10000, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: { check: "passed" } }, 100);
   control.close();
-  const { base } = await runningServer(seedLedger(), { controlPath });
+  const { base } = await runningServer(seedLedger(), { controlPath, actor: "operator" });
   const inbox = await (await fetch(`${base}/api/attention/inbox`)).json();
   expect(inbox).toHaveLength(1);
   const selected = await fetch(`${base}/api/attention/item-1/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "stop" }) });
@@ -450,7 +450,7 @@ test("generic stop changes work state and stale decision conflicts", async () =>
 });
 
 test("generic narrow without replacement contract stays open", async () => {
-  const root=mkdtempSync(join(tmpdir(),"overload-narrow-web-"));roots.push(root);const controlPath=join(root,"control.db"),control=openControl(controlPath);const work=createWork(control,{title:"scope",source:"test"});const item=upsertAttention(control,{item_id:"narrow-item",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"scope",trigger:"change",impact:"work",recommendation:"narrow",options:["continue","narrow","stop"],owner:"operator",expires_at:null,source_link:null,approval_id:null,consumer_owner:null,contract_revision:work.revision,decision_mode:"human_only",evidence:{} });control.close();const {base}=await runningServer(seedLedger(),{controlPath});const response=await fetch(`${base}/api/attention/narrow-item/resolve`,{method:"POST",headers:{origin:base,"content-type":"application/json"},body:JSON.stringify({expected_revision:item.revision,selected_option:"narrow"})});expect(response.status).toBe(400);const inspect=openControl(controlPath);expect(getAttention(inspect,"narrow-item")?.state).toBe("open");inspect.close();
+  const root=mkdtempSync(join(tmpdir(),"overload-narrow-web-"));roots.push(root);const controlPath=join(root,"control.db"),control=openControl(controlPath);const work=createWork(control,{title:"scope",source:"test"});const item=upsertAttention(control,{item_id:"narrow-item",work_id:work.work_id,state:"open",effect_state:"not_started",urgency:"inbox",conclusion:"scope",trigger:"change",impact:"work",recommendation:"narrow",options:["continue","narrow","stop"],owner:"operator",expires_at:null,source_link:null,approval_id:null,consumer_owner:null,contract_revision:work.revision,decision_mode:"human_only",evidence:{} });control.close();const {base}=await runningServer(seedLedger(),{controlPath,actor:"operator"});const response=await fetch(`${base}/api/attention/narrow-item/resolve`,{method:"POST",headers:{origin:base,"content-type":"application/json"},body:JSON.stringify({expected_revision:item.revision,selected_option:"narrow"})});expect(response.status).toBe(400);const inspect=openControl(controlPath);expect(getAttention(inspect,"narrow-item")?.state).toBe("open");inspect.close();
 });
 
 test("approval-linked option writes human answer and leaves attention open", async () => {
@@ -472,4 +472,34 @@ test("hung and zombie API rows expose resume capability", async () => {
     stable_id: "local:pi:dead",
     resume_capability: { resumable: true, runtime: "pi" },
   });
+});
+
+test("POST resolve without server-side actor → 501, attention unchanged", async () => {
+  delete process.env.OVERLOAD_ACTOR;
+  const root = mkdtempSync(join(tmpdir(), "overload-noactor-")); roots.push(root);
+  const controlPath = join(root, "control.db");
+  const control = openControl(controlPath);
+  const work = createWork(control, { title: "w", source: "test" }, 100);
+  const item = upsertAttention(control, { item_id: "noactor-item", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "decide", trigger: "t", impact: "i", recommendation: null, options: ["continue", "stop"], owner: "operator", expires_at: null, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {} }, 100);
+  control.close();
+  const { base } = await runningServer(seedLedger(), { controlPath });
+  const res = await fetch(`${base}/api/attention/noactor-item/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "stop" }) });
+  expect(res.status).toBe(501);
+  const body = await res.json();
+  expect(body.error).toBe("not_implemented");
+  const inspect = openControl(controlPath);
+  expect(getAttention(inspect, "noactor-item")?.state).toBe("open");
+  inspect.close();
+});
+
+test("POST resolve with server-side actor → 200", async () => {
+  const root = mkdtempSync(join(tmpdir(), "overload-actor-ok-")); roots.push(root);
+  const controlPath = join(root, "control.db");
+  const control = openControl(controlPath);
+  const work = createWork(control, { title: "w", source: "test" }, 100);
+  const item = upsertAttention(control, { item_id: "actorok-item", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "inbox", conclusion: "decide", trigger: "t", impact: "i", recommendation: null, options: ["continue", "stop"], owner: "operator", expires_at: null, source_link: null, approval_id: null, consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {} }, 100);
+  control.close();
+  const { base } = await runningServer(seedLedger(), { controlPath, actor: "operator" });
+  const res = await fetch(`${base}/api/attention/actorok-item/resolve`, { method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ expected_revision: item.revision, selected_option: "stop" }) });
+  expect(res.status).toBe(200);
 });

@@ -20,15 +20,20 @@ const rules: Record<TaskState, Record<string, TaskState>> = {
   blocked:{human_reopen:"starting",human_abandon:"abandoned"}, done:{}, failed:{}, abandoned:{}
 };
 
-export function openStore(path = process.env.OVERLOAD_ORCHESTRATOR_PATH ?? join(homedir(), ".overload", "orchestrator.db")): Database {
-  mkdirSync(dirname(path), { recursive:true, mode:0o700 });
-  const db = new Database(path, { create:true }); db.exec(schema);
+export function openStore(path?: string | null): Database {
+  // fail-fast：显式 null/空串/字面量 "undefined" 拒绝；仅 undefined（无参）才内部解析默认。
+  if (path === null || path === "" || path === "undefined" || path === "null") throw new Error("openStore: path is required");
+  let resolved = path ?? process.env.OVERLOAD_ORCHESTRATOR_PATH ?? "";
+  if (!resolved || resolved.trim() === "" || resolved === "undefined" || resolved === "null") resolved = join(homedir(), ".overload", "orchestrator.db");
+  if (!resolved.trim()) throw new Error("openStore: path is required");
+  mkdirSync(dirname(resolved), { recursive:true, mode:0o700 });
+  const db = new Database(resolved, { create:true }); db.exec(schema);
   // Existing M0 databases predate contract/budget observability. SQLite does
   // not support ADD COLUMN IF NOT EXISTS, so make this migration idempotent.
   const columns=db.query("PRAGMA table_info(tasks)").all() as {name:string}[];
   for(const [name,sql] of [["work_id","TEXT"],["contract_revision","INTEGER"],["budget_deadline_at","INTEGER"],["ci_observation_failures","INTEGER NOT NULL DEFAULT 0"]] as const)
     if(!columns.some(column=>column.name===name))db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
-  chmodSync(path, 0o600);
+  chmodSync(resolved, 0o600);
   db.run("INSERT OR IGNORE INTO spool_seq(id,seq,segment) VALUES(1,0,0)"); return db;
 }
 export function addTask(db:Database,title:string,repo:string,baseRef:string,now=Date.now(),binding?:{workId?:string;contractRevision?:number;deadlineAt?:number}): Task {

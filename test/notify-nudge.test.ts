@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 async function run() {
-  return nudgeOnce({ ledgerPath, statePath, notify: async (message) => { sent.push(message); } });
+  return nudgeOnce({ ledgerPath, controlPath: join(dir, "control.db"), statePath, notify: async (message) => { sent.push(message); } });
 }
 
 function addPendingRequest(uid: string): void {
