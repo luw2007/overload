@@ -19,6 +19,7 @@
 - [configuration.md](guides/configuration.md) — 配置项
 - [operations.md](guides/operations.md) — 生命周期运维
 - [integrations.md](guides/integrations.md) — adapter 集成
+- [macos-deployment-runbook.md](guides/macos-deployment-runbook.md) — 首次部署到 Mac：前置条件、命令序列、验证、回滚
 
 ### decisions/ — 仍生效决策
 
