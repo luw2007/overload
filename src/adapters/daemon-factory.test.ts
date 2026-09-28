@@ -40,7 +40,7 @@ class FakeRuntime implements AgentRuntime {
   async connect(_ref: SessionReference): Promise<SessionHandle> { throw new Error("not used"); }
 }
 
-const FAKE_CHANNEL_KEYS = ["OVERLOAD_CHANNEL", "OVERLOAD_RUNTIME", "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_INSTANCE_ID", "OVERLOAD_CHANNEL_AUTH_FILE", "OVERLOAD_RUNTIME_CWD", "OVERLOAD_ANSWERS_PATH", "OVERLOAD_WEB_PORT", "HOME"];
+const FAKE_CHANNEL_KEYS = ["OVERLOAD_CHANNEL", "OVERLOAD_RUNTIME", "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_INSTANCE_ID", "OVERLOAD_CHANNEL_AUTH_FILE", "OVERLOAD_RUNTIME_CWD", "OVERLOAD_ANSWERS_PATH", "OVERLOAD_WEB_PORT", "HOME", "OVERLOAD_LEDGER_PATH", "OVERLOAD_ORCHESTRATOR_PATH", "OVERLOAD_SPOOL_ROOT"];
 
 function setupEnv(): { root: string; channel: FakeChannel } {
   saveEnv(FAKE_CHANNEL_KEYS);
@@ -63,7 +63,12 @@ function setupEnv(): { root: string; channel: FakeChannel } {
   process.env.OVERLOAD_CHANNEL = "fake";
   process.env.OVERLOAD_RUNTIME = "fake";
   process.env.OVERLOAD_WEB_PORT = "0"; // the daemon hosts its own dashboard; never collide with a live one
-  process.env.HOME = root; // ...nor read the operator's real ledger
+  // ...nor touch the operator's real ledger/spool (homedir() may also be mocked by another test file).
+  process.env.HOME = root;
+  process.env.OVERLOAD_LEDGER_PATH = join(root, "ledger.db");
+  process.env.OVERLOAD_ORCHESTRATOR_PATH = join(root, "orchestrator.db");
+  process.env.OVERLOAD_SPOOL_ROOT = root;
+  writeFileSync(join(root, "host"), "local\n");
 
   const channel = new FakeChannel();
   return { root, channel };
