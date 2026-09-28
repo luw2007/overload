@@ -102,7 +102,7 @@ export function compactWait(wait: ConditionWait): CompactWait {
 type SessionMeta = { host: string | null; cwd: string | null; branch: string | null; ended: number };
 function sessionMeta(ledger: Database, stableId: string): SessionMeta {
   return (ledger.query(`SELECT host, cwd, branch,
-    EXISTS(SELECT 1 FROM journal WHERE stable_id=?1 AND kind='session_ended') ended
+    EXISTS(SELECT 1 FROM journal_all WHERE stable_id=?1 AND kind='session_ended') ended
     FROM sessions WHERE stable_id=?1`).get(stableId) as SessionMeta | null) ?? { host: null, cwd: null, branch: null, ended: 0 };
 }
 
@@ -115,7 +115,7 @@ export type ManagerReadModel = {
 };
 
 function latestAt(ledger: Database, kinds: string[]): number | null {
-  const row = ledger.query(`SELECT MAX(at) at FROM journal WHERE kind IN (${kinds.map(() => "?").join(",")})`).get(...kinds) as { at: number | null };
+  const row = ledger.query(`SELECT MAX(at) at FROM journal_all WHERE kind IN (${kinds.map(() => "?").join(",")})`).get(...kinds) as { at: number | null };
   return row.at;
 }
 

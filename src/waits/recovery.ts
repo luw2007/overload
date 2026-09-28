@@ -535,7 +535,7 @@ export async function observeRecoveryEffect(
   const target = grant ? getTarget(deps.mailbox, grant.consumer_owner, grant.approval_id) : null;
   const scope = target && target.targetVersion === grant?.target_version ? resumeGrantScope(target) : null;
   if (!scope) return { state: "unknown", evidence: { dispatch_id: dispatchId, reason: "the grant scope is no longer readable" }, observed_at: observedAt };
-  const started = (deps.ledger?.query(`SELECT j.stable_id, j.writer_id, j.ingest_seq, j.at FROM journal j JOIN sessions s ON s.stable_id=j.stable_id
+  const started = (deps.ledger?.query(`SELECT j.stable_id, j.writer_id, j.ingest_seq, j.at FROM journal_all j JOIN sessions s ON s.stable_id=j.stable_id
     WHERE j.kind='session_started' AND s.host='local' AND s.runtime=? AND s.session=? AND j.at>=? AND j.at<=?
     ORDER BY j.at, j.ingest_seq LIMIT 1`).get(scope.runtime, scope.session, acceptedAt, deadline) ?? null) as
     { stable_id: string; writer_id: string; ingest_seq: number; at: number } | null;

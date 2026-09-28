@@ -161,8 +161,8 @@ function fetchFromSource(
           .map((c) => c.name);
         const hasWorkCol = cols.includes("work_id");
         const sql = hasWorkCol
-          ? "SELECT detail FROM journal WHERE ingest_seq=? AND work_id=?"
-          : "SELECT detail FROM journal WHERE ingest_seq=?";
+          ? "SELECT detail FROM journal_all WHERE ingest_seq=? AND work_id=?"
+          : "SELECT detail FROM journal_all WHERE ingest_seq=?";
         const row = hasWorkCol
           ? ledgerDb.query(sql).get(parseInt(seqStr, 10), work_id) as { detail: string | null } | null
           : ledgerDb.query(sql).get(parseInt(seqStr, 10)) as { detail: string | null } | null;
