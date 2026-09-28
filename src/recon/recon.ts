@@ -537,7 +537,7 @@ function commMatchesRuntime(comm: string, runtime: string | null): boolean {
 
 export async function killGroup(proc: { pid: number }, signal: "TERM" | "KILL"): Promise<void> {
   try {
-    const child = Bun.spawn(["/bin/kill", "-s", signal, `-${proc.pid}`], { stdout: "ignore", stderr: "ignore" });
+    const child = Bun.spawn(["/bin/kill", "-s", signal, "--", `-${proc.pid}`], { stdout: "ignore", stderr: "ignore" });
     const rc = await child.exited;
     if (rc === 0) return;
   } catch { /* fall through to direct-child fallback */ }

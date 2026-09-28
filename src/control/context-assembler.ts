@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { deriveAttentionDecisionOptions, deriveAttentionMaterialInputs, ensureControlSchema, getAttention, getWork, projectAttentionMaterial } from "./store";
 import type { AttentionItem, DecisionOption, Work } from "./types";
+import { listSemanticAssessments, type SemanticAssessment } from "./semantic-assessments";
 import {
   getProblemTree,
   listObjectsByProblem,
@@ -79,6 +80,8 @@ export interface DecisionViewPackage {
   artifacts: ArtifactRef[];
   effect_state: AttentionItem["effect_state"];
   budget_limited?: boolean;
+  /** Advisory-only shadow assessment receipts; never decision options or authority. */
+  semantic_assessments?: SemanticAssessment[];
 }
 
 export interface ObjectiveEntry {
@@ -352,6 +355,8 @@ export function assembleDecisionView(db: Database, input: GetContextPackageInput
   const options = deriveAttentionDecisionOptions(db, item);
   if (!options) return blocked("decision option semantics unavailable", "needs_context");
   const fingerprint = projectAttentionMaterial(db, item.item_id, deriveAttentionMaterialInputs(db, item)).fingerprint;
+  const semanticAssessments = listSemanticAssessments(db, item.item_id)
+    .filter((assessment) => assessment.attention_revision === item.revision && assessment.material_fingerprint === fingerprint);
   const pkg: DecisionViewPackage = {
     package_type: "decision_view", consumer_id: item.item_id, work_id: item.work_id,
     contract_revision: item.contract_revision, attention_revision: item.revision, material_fingerprint: fingerprint,
@@ -359,6 +364,7 @@ export function assembleDecisionView(db: Database, input: GetContextPackageInput
     recommendation: item.recommendation, owner: item.owner, expires_at: item.expires_at,
     options, stale_objects: [...staleMap.values()], source_link: item.source_link,
     scene_entry, prior_decisions, artifacts, effect_state: item.effect_state,
+    ...(semanticAssessments.length ? { semantic_assessments: semanticAssessments } : {}),
   };
   if (budget.max_bytes !== undefined && estimatePackageSize(pkg) > budget.max_bytes) pkg.budget_limited = true;
   return { ok: true, package: pkg, ...(pkg.budget_limited ? { budget_limited: true } : {}) };

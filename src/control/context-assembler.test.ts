@@ -11,19 +11,20 @@ import {
   updateObject,
   type ContextObject,
 } from "./context-pool";
+import { shareObject } from "./context-pin";
+import { ensureContextReducerSchema, ingestFactObserved } from "./context-reducer";
+import { claimSemanticAssessments, scheduleSemanticAssessment, settleSemanticAssessment } from "./semantic-assessments";
+import {
+  getContextPackage,
+  estimatePackageSize,
+  type AssemblyResult,
+} from "./context-assembler";
 
 // createWork(active) 已在同事务幂等建立根 problem（title="root"，id=rootProblemId）。
 // 测试不再手动 createProblem(title:"root")，直接取回自动建好的根 problem。
 function rootProblem(db: Database, workId: string) {
   return getProblem(db, rootProblemId(workId))!;
 }
-import { shareObject } from "./context-pin";
-import { ensureContextReducerSchema, ingestFactObserved } from "./context-reducer";
-import {
-  getContextPackage,
-  estimatePackageSize,
-  type AssemblyResult,
-} from "./context-assembler";
 
 function fixture() {
   const db = new Database(":memory:");
@@ -517,6 +518,30 @@ describe("T5 context-assembler", () => {
     expect(ok.package.trigger_evidence[0].fact_subtype).toBe("test_result");
     expect(ok.package.trigger_evidence[0].reference).toBe("orchestrator:submit_result:attempt-9");
     db.close();
+  });
+});
+
+describe("semantic assessment DecisionView receipts", () => {
+  test("fresh completed receipt is visible as advisory evidence without changing options", () => {
+    const previous = process.env.OVERLOAD_SEMANTIC_ASSESSMENTS;
+    process.env.OVERLOAD_SEMANTIC_ASSESSMENTS = "1";
+    try {
+      const db = fixture();
+      const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
+      const item = makeAttention(db, work.work_id, "semantic-view");
+      const scheduled = scheduleSemanticAssessment(db, item.item_id, "jev-fast", 10)!;
+      const claim = claimSemanticAssessments(db, { model: "jev-fast" }, 20)[0]!;
+      settleSemanticAssessment(db, { assessment_id: scheduled.assessment_id, lease_token: claim.assessment.lease_token!, result: { verdict: "uncertain", rationale: "shadow-only uncertainty", confidence: 0.4 } }, 30);
+      const result = getContextPackage({ consumer_type: "decision_ui", consumer_id: item.item_id, work_id: work.work_id, package_type: "decision_view", actor: "alice", db });
+      const ok = expectOk(result);
+      if (ok.package.package_type !== "decision_view") throw new Error("type");
+      expect(ok.package.options.map((option) => option.id)).toEqual(["stop", "continue"]);
+      expect(ok.package.semantic_assessments).toMatchObject([{ state: "completed", verdict: "uncertain", rationale: "shadow-only uncertainty" }]);
+      db.close();
+    } finally {
+      if (previous === undefined) delete process.env.OVERLOAD_SEMANTIC_ASSESSMENTS;
+      else process.env.OVERLOAD_SEMANTIC_ASSESSMENTS = previous;
+    }
   });
 });
 

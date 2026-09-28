@@ -1,4 +1,4 @@
-import {expect,test} from 'bun:test';
+import {afterEach,expect,test} from 'bun:test';
 import {Database} from 'bun:sqlite';
 import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
@@ -7,6 +7,8 @@ import {consumeDecision,openMailbox,registerTarget,writeHumanAnswer} from '../de
 import {createWork,recordStopCondition,getAttention,getAttentionMaterial,projectAttentionMaterial,getWork,upsertAttention} from '../control/store';
 import type {Contract} from '../control/types';
 import {startWebServer} from './server';
+
+afterEach(() => { delete process.env.OVERLOAD_ACTOR; });
 
 test('reviewed narrow refuses newly arrived cards; fresh review applies and archives siblings',async()=>{
  const root=mkdtempSync(join(tmpdir(),'contract-http-')),ledgerPath=join(root,'ledger.db'),controlPath=join(root,'control.db');

@@ -8,6 +8,8 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+const PLUTIL = "/usr/bin/plutil";
+const HAS_PLUTIL = existsSync(PLUTIL);
 const LAUNCHD = join(import.meta.dir, "../launchd");
 const JOBS = ["ingest", "maintenance", "pull", "web", "orchestrator"];
 
@@ -16,7 +18,7 @@ function plist(name: string): string {
 }
 
 async function lint(name: string): Promise<number> {
-  const proc = Bun.spawn(["/usr/bin/plutil", "-lint", join(LAUNCHD, `app.overload.${name}.plist`)],
+  const proc = Bun.spawn([PLUTIL, "-lint", join(LAUNCHD, `app.overload.${name}.plist`)],
     { stdout: "pipe", stderr: "pipe" });
   const [, , exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   return exitCode;
@@ -24,9 +26,13 @@ async function lint(name: string): Promise<number> {
 
 describe("plist parse + scheduling (OPS-05)", () => {
   for (const name of JOBS) {
-    test(`${name}.plist lints OK`, async () => {
-      expect(await lint(name)).toBe(0);
-    });
+    if (!HAS_PLUTIL) {
+      test.skip(`${name}.plist lints OK (requires macOS plutil)`, () => {});
+    } else {
+      test(`${name}.plist lints OK`, async () => {
+        expect(await lint(name)).toBe(0);
+      });
+    }
   }
   test("ingest and web are KeepAlive; maintenance and pull run every 60s", () => {
     expect(plist("ingest")).toContain("<key>KeepAlive</key><true/>");

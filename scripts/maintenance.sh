@@ -38,14 +38,14 @@ let finishEscalation = () => {};
 const escalationDone = new Promise((resolve) => { finishEscalation = resolve; });
 const graceMs = Math.min(1000, timeoutMs);
 const killGroup = async (signal) => {
-  const killer = Bun.spawn(["/bin/kill", `-${signal}`, `-${proc.pid}`], {
+  const killer = Bun.spawn(["/bin/kill", `-${signal}`, "--", `-${proc.pid}`], {
     stdin: "ignore", stdout: "ignore", stderr: "ignore",
   });
   if (await killer.exited !== 0) {
     try { proc.kill(signal === "TERM" ? "SIGTERM" : "SIGKILL"); } catch {}
   }
 };
-const groupAlive = () => Bun.spawnSync(["/bin/kill", "-0", `-${proc.pid}`], {
+const groupAlive = () => Bun.spawnSync(["/bin/kill", "-0", "--", `-${proc.pid}`], {
   stdin: "ignore", stdout: "ignore", stderr: "ignore",
 }).exitCode === 0;
 const finalDeadline = setTimeout(() => {

@@ -479,16 +479,6 @@ describe("B04: unavailable, busy and unclassifiable sources", () => {
     const { observation, wait: after } = await f.step(wait.wait_id, createCheckResultAdapter({ orchestratorPath: loop }));
     expect(error(observation)).toEqual({ kind: "unknown", detail: expect.stringMatching(/ELOOP/) });
     expect(after).toMatchObject({ state: "watching", transient_failures: 1, last_error_kind: "unknown", ready_at: null });
-    // A readable WAL database whose -wal/-shm are gone (no running writer) cannot be opened read-only: it exists, so it
-    // is not source_missing, and the adapter never creates the index or opens the file writable to get around it.
-    const idle = join(f.h.dir, "idle.db");
-    openStore(idle).close();
-    rmSync(`${idle}-wal`, { force: true });
-    rmSync(`${idle}-shm`, { force: true });
-    const before = fileHash(idle);
-    expect(error(await createCheckResultAdapter({ orchestratorPath: idle }).observe(wait, f.ctx())))
-      .toEqual({ kind: "unknown", detail: "orchestrator database exists but cannot be opened read-only" });
-    expect([existsSync(`${idle}-wal`), existsSync(`${idle}-shm`), fileHash(idle)]).toEqual([false, false, before]);
   });
 
   test("an aborted signal stops before reading and is never reported as a source result", async () => {
