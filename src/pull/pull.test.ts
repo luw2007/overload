@@ -23,6 +23,7 @@ async function fixture(failing = false) {
   await writeFile(ssh, `#!/bin/sh\nexit ${failing ? 9 : 0}\n`, { mode: 0o700 });
   const db = new Database(ledger);
   db.exec("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, kind TEXT, detail TEXT)");
+  db.exec("CREATE VIEW journal_all AS SELECT * FROM journal");
   db.close();
   const config: PullConfig = {
     remote: "local", remote_spool: remoteSpool, dest, ssh_cmd: ssh, rsync_cmd: "rsync",

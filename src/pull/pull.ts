@@ -74,7 +74,7 @@ export class Puller {
     let db: Database | undefined;
     try {
       db = new Database(this.config.ledger, { readonly: true, create: false });
-      const row = db.query(`SELECT kind FROM journal
+      const row = db.query(`SELECT kind FROM journal_all
         WHERE kind IN ('source_outage','source_recovered')
           AND json_extract(detail, '$.source')='devbox'
         ORDER BY ingest_seq DESC LIMIT 1`).get() as { kind: string } | null;

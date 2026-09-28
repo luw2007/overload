@@ -15,7 +15,7 @@ const supportedRuntime = (runtime: string | null): runtime is "pi" | "omp" => ru
 function resumeRow(db: Database, stableId: string): ResumeRow | null {
   return db.query(`SELECT s.host, s.runtime, s.session, s.cwd, s.origin,
     (SELECT i.pid FROM session_incarnations i WHERE i.stable_id=s.stable_id AND i.liveness_domain='process'
-      AND NOT EXISTS (SELECT 1 FROM journal j WHERE j.stable_id=i.stable_id AND j.writer_id=i.writer_id AND j.kind='session_ended')
+      AND NOT EXISTS (SELECT 1 FROM journal_all j WHERE j.stable_id=i.stable_id AND j.writer_id=i.writer_id AND j.kind='session_ended')
       ORDER BY i.last_seen_at DESC LIMIT 1) pid
     FROM sessions s WHERE s.stable_id=?`).get(stableId) as ResumeRow | null;
 }

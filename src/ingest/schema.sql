@@ -9,6 +9,18 @@ CREATE TABLE IF NOT EXISTS journal(
   kind TEXT NOT NULL, detail TEXT, spool_ref TEXT,
   UNIQUE(host, emitter_id, seq)
 );
+CREATE TABLE IF NOT EXISTS journal_7d(
+  ingest_seq INTEGER PRIMARY KEY, host TEXT NOT NULL, emitter_id TEXT NOT NULL, seq INTEGER NOT NULL,
+  at INTEGER NOT NULL, stable_id TEXT NOT NULL, writer_id TEXT NOT NULL,
+  kind TEXT NOT NULL, detail TEXT, spool_ref TEXT, UNIQUE(host, emitter_id, seq)
+);
+CREATE TABLE IF NOT EXISTS journal_30d(
+  ingest_seq INTEGER PRIMARY KEY, host TEXT NOT NULL, emitter_id TEXT NOT NULL, seq INTEGER NOT NULL,
+  at INTEGER NOT NULL, stable_id TEXT NOT NULL, writer_id TEXT NOT NULL,
+  kind TEXT NOT NULL, detail TEXT, spool_ref TEXT, UNIQUE(host, emitter_id, seq)
+);
+CREATE VIEW IF NOT EXISTS journal_all AS
+  SELECT * FROM journal UNION ALL SELECT * FROM journal_7d UNION ALL SELECT * FROM journal_30d;
 CREATE TABLE IF NOT EXISTS cursors(file_name TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(stable_id TEXT PRIMARY KEY, host TEXT, runtime TEXT,
   session TEXT, origin TEXT DEFAULT 'unknown', cwd TEXT, branch TEXT,
@@ -43,6 +55,20 @@ CREATE TABLE IF NOT EXISTS control_attention_feedback(
 );
 
 CREATE INDEX IF NOT EXISTS journal_stable_id_ingest_seq ON journal(stable_id, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_7d_stable_id_ingest_seq ON journal_7d(stable_id, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_30d_stable_id_ingest_seq ON journal_30d(stable_id, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_at_seq ON journal(at, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_7d_at_seq ON journal_7d(at, ingest_seq);
+CREATE INDEX IF NOT EXISTS journal_emitter_at ON journal(emitter_id, at);
+CREATE INDEX IF NOT EXISTS journal_7d_emitter_at ON journal_7d(emitter_id, at);
+CREATE INDEX IF NOT EXISTS journal_30d_emitter_at ON journal_30d(emitter_id, at);
+CREATE INDEX IF NOT EXISTS journal_host_at ON journal(host, at);
+CREATE INDEX IF NOT EXISTS journal_stable_writer_kind ON journal(stable_id, writer_id, kind);
+CREATE INDEX IF NOT EXISTS journal_7d_stable_writer_kind ON journal_7d(stable_id, writer_id, kind);
+CREATE INDEX IF NOT EXISTS journal_30d_stable_writer_kind ON journal_30d(stable_id, writer_id, kind);
+CREATE INDEX IF NOT EXISTS journal_finding ON journal(kind, json_extract(detail, '$.emitter_id'), at);
+CREATE INDEX IF NOT EXISTS journal_7d_finding ON journal_7d(kind, json_extract(detail, '$.emitter_id'), at);
+CREATE INDEX IF NOT EXISTS journal_30d_finding ON journal_30d(kind, json_extract(detail, '$.emitter_id'), at);
 CREATE INDEX IF NOT EXISTS requests_stable_id_state ON requests(stable_id, state);
 CREATE INDEX IF NOT EXISTS incarnations_stable_id_started_at ON session_incarnations(stable_id, started_at);
 

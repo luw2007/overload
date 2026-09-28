@@ -85,7 +85,7 @@ function detailHandoff(detail: Record<string, unknown> | null): Handoff | null {
 }
 
 function latestSettledHandoff(db: Database, stableId: string): Handoff | null {
-  const row = db.query("SELECT detail FROM journal WHERE stable_id=? AND kind='settled' ORDER BY ingest_seq DESC LIMIT 1").get(stableId) as JsonRow | null;
+  const row = db.query("SELECT detail FROM journal_all WHERE stable_id=? AND kind='settled' ORDER BY ingest_seq DESC LIMIT 1").get(stableId) as JsonRow | null;
   return row ? detailHandoff(parseDetail(row.detail)) : null;
 }
 
@@ -104,7 +104,7 @@ export function querySession(db: Database, stableId: string, eventLimit = 200): 
       (SELECT binding FROM attachments a WHERE a.stable_id=s.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding,
     CASE WHEN COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=s.stable_id AND h.session_id IS NOT NULL),
       (SELECT binding FROM attachments a WHERE a.stable_id=s.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) IS NULL
-      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal j
+      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal_all j
         WHERE j.stable_id=s.stable_id AND j.kind='session_started' ORDER BY j.ingest_seq DESC LIMIT 1) END host_probe_error
     FROM sessions s LEFT JOIN current c ON c.stable_id=s.stable_id
     LEFT JOIN session_hosts h ON h.stable_id=s.stable_id AND h.session_id IS NOT NULL
@@ -115,7 +115,7 @@ export function querySession(db: Database, stableId: string, eventLimit = 200): 
   const pending = db.query(`SELECT request_uid, kind, created_at, detail FROM requests WHERE stable_id=? AND state='pending' ORDER BY created_at DESC, request_uid DESC`).all(stableId) as Array<PendingRequestRow & JsonRow>;
   // Heartbeats are liveness, not history: 900 of them would bury the one
   // tool_activity that says where the turn actually stopped.
-  const events = db.query(`SELECT ingest_seq, at, emitter_id, writer_id, kind, detail FROM journal
+  const events = db.query(`SELECT ingest_seq, at, emitter_id, writer_id, kind, detail FROM journal_all
     WHERE kind<>'heartbeat' AND (stable_id=? OR
       (kind IN ('turn_hung','dead_connection') AND json_extract(detail, '$.stable_id')=?))
     ORDER BY ingest_seq DESC LIMIT ?`).all(stableId, stableId, eventLimit) as Array<EventRow & JsonRow>;
@@ -144,7 +144,7 @@ export function queryQ1(db: Database): Q1Row[] {
       (SELECT platform FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) platform,
     CASE WHEN NOT EXISTS (SELECT 1 FROM session_hosts h WHERE h.stable_id=r.stable_id AND h.session_id IS NOT NULL)
       AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.stable_id=r.stable_id AND a.valid=1)
-      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal j
+      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal_all j
         WHERE j.stable_id=r.stable_id AND j.kind='session_started' ORDER BY j.ingest_seq DESC LIMIT 1) END host_probe_error
     FROM requests r LEFT JOIN sessions s ON s.stable_id=r.stable_id
     WHERE r.state='pending' ORDER BY r.created_at DESC, r.request_uid DESC`).all() as Array<Omit<Q1Row, "detail" | "summary" | "options"> & JsonRow>;
@@ -162,7 +162,7 @@ export function queryJumpTarget(db: Database, stableId: string): JumpTarget | nu
     COALESCE(h.session_id, h.tty, a.binding) binding,
     h.tty,
     CASE WHEN COALESCE(h.session_id, h.tty, a.binding) IS NULL THEN
-      (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal j
+      (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal_all j
        WHERE j.stable_id=s.stable_id AND j.kind='session_started' ORDER BY j.ingest_seq DESC LIMIT 1)
     END host_probe_error
     FROM sessions s
@@ -181,13 +181,13 @@ export function requestSession(db: Database, requestUid: string): string | null 
 export function queryHung(db: Database, now = Date.now()): HungRow[] {
   const rows = db.query(`SELECT c.stable_id, c.q5_reason, c.state, s.host,
     COALESCE(c.last_progress_at, c.last_event_at) since,
-    (SELECT j.detail FROM journal j WHERE j.kind=c.q5_reason
+    (SELECT j.detail FROM journal_all j WHERE j.kind=c.q5_reason
        AND json_extract(j.detail, '$.stable_id')=c.stable_id ORDER BY j.ingest_seq DESC LIMIT 1) detail,
     COALESCE((SELECT session_id FROM session_hosts h WHERE h.stable_id=c.stable_id AND h.session_id IS NOT NULL),
       (SELECT binding FROM attachments a WHERE a.stable_id=c.stable_id AND a.valid=1 ORDER BY observed_at DESC LIMIT 1)) binding,
     CASE WHEN NOT EXISTS (SELECT 1 FROM session_hosts h WHERE h.stable_id=c.stable_id AND h.session_id IS NOT NULL)
       AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.stable_id=c.stable_id AND a.valid=1)
-      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal j
+      THEN (SELECT json_extract(j.detail, '$.host_probe_error') FROM journal_all j
         WHERE j.stable_id=c.stable_id AND j.kind='session_started' ORDER BY j.ingest_seq DESC LIMIT 1) END host_probe_error
     FROM current c LEFT JOIN sessions s ON s.stable_id=c.stable_id
     WHERE c.q5_reason IN ('turn_hung','dead_connection')
@@ -238,7 +238,7 @@ export function queryHealth(db: Database): HealthView {
   const coverage = db.query(`SELECT count(DISTINCT COALESCE(stable_id, emitter_id)) n
     FROM coverage_gaps WHERE from_at>=?`).get(cutoff) as { n: number };
   const telemetry = db.query(`SELECT count(DISTINCT json_extract(detail, '$.native_id')) n
-    FROM journal WHERE kind='telemetry_gap' AND at>=?`).get(cutoff) as { n: number };
+    FROM journal_all WHERE kind='telemetry_gap' AND at>=?`).get(cutoff) as { n: number };
   return { open_incidents: incidents.map(withParsedDetail), coverage_gaps: coverage.n, telemetry_gaps: telemetry.n };
 }
 

@@ -50,7 +50,7 @@ function ensureCurrent(db: Database, stableId: string, writerId: string, row: Jo
 /** Q4 is deliberately conservative: any recorded change-capable tool or commit
  * keeps the completed session in Q2. Unknown tool details are not evidence. */
 function hasChangeEvidence(db: Database, stableId: string, throughSeq: number): boolean {
-  const rows = db.query(`SELECT kind, detail FROM journal
+  const rows = db.query(`SELECT kind, detail FROM journal_all
     WHERE stable_id=? AND ingest_seq<=? AND kind IN ('commit_observed','tool_activity','settled','session_ended')`)
     .all(stableId, throughSeq) as Array<{ kind: string; detail: string | null }>;
   return rows.some((candidate) => {
@@ -225,7 +225,7 @@ function orphanDrainedEmitter(db: Database, row: JournalRow, detail: Record<stri
   const emitterId = stringDetail(detail, "emitter_id"); if (!emitterId) return false;
   const stableId = stringDetail(detail, "stable_id") ?? null;
   const orphaned = db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE origin_emitter_id=? AND state='pending'").run(row.at, emitterId).changes > 0;
-  const last = db.query("SELECT seq, at FROM journal WHERE emitter_id=? AND ingest_seq<? ORDER BY ingest_seq DESC LIMIT 1").get(emitterId, row.ingest_seq) as { seq: number; at: number } | null;
+  const last = db.query("SELECT seq, at FROM journal_all WHERE emitter_id=? AND ingest_seq<? ORDER BY ingest_seq DESC LIMIT 1").get(emitterId, row.ingest_seq) as { seq: number; at: number } | null;
   // Review P2 M3: duplicate emitter_drained findings (recon restart + ingest
   // lag) must not create duplicate tail gaps — one drained tail per emitter.
   db.query(`INSERT INTO coverage_gaps(stable_id, emitter_id, from_seq, from_at, to_at, reason)

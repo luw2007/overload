@@ -121,7 +121,7 @@ export function audit(db: Database, options: AuditOptions): AuditReport {
   if (!Number.isSafeInteger(options.sample) || options.sample < 0) throw new Error("sample must be a non-negative integer");
   if (!Number.isSafeInteger(options.sinceMs) || options.sinceMs < 0) throw new Error("sinceMs must be a non-negative integer");
   const cutoff = options.now - options.sinceMs;
-  const windowRows = db.query("SELECT ingest_seq, stable_id, at, kind, detail FROM journal WHERE at>=? AND at<=? ORDER BY at DESC, ingest_seq DESC").all(cutoff, options.now) as JournalRow[];
+  const windowRows = db.query("SELECT ingest_seq, stable_id, at, kind, detail FROM journal_all WHERE at>=? AND at<=? ORDER BY at DESC, ingest_seq DESC").all(cutoff, options.now) as JournalRow[];
   const firstQualifying = new Map<string, JournalRow>();
   for (const row of windowRows) {
     const detail = objectDetail(row.detail);
@@ -140,7 +140,7 @@ export function audit(db: Database, options: AuditOptions): AuditReport {
   const cwdById = new Map((db.query("SELECT stable_id, cwd FROM sessions").all() as SessionRow[]).map((row) => [row.stable_id, row.cwd]));
   const history = new Map<string, JournalRow[]>();
   if (selectedIds.length) {
-    const allRows = db.query("SELECT ingest_seq, stable_id, at, kind, detail FROM journal WHERE at<=? ORDER BY at ASC, ingest_seq ASC").all(options.now) as JournalRow[];
+    const allRows = db.query("SELECT ingest_seq, stable_id, at, kind, detail FROM journal_all WHERE at<=? ORDER BY at ASC, ingest_seq ASC").all(options.now) as JournalRow[];
     for (const row of allRows) {
       if (!selected.has(row.stable_id)) continue;
       const rows = history.get(row.stable_id);

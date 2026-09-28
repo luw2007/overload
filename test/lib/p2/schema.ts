@@ -47,6 +47,9 @@ export const SCHEMA_SQL_P2 = SCHEMA_SQL + "\n" + P2_DDL_SQL;
 export function openLedgerP2(path: string): Database {
   const db = new Database(path);
   db.exec(SCHEMA_SQL_P2);
+  db.exec(`CREATE TABLE IF NOT EXISTS journal_7d AS SELECT * FROM journal WHERE 0;
+    CREATE TABLE IF NOT EXISTS journal_30d AS SELECT * FROM journal WHERE 0;
+    CREATE VIEW IF NOT EXISTS journal_all AS SELECT * FROM journal UNION ALL SELECT * FROM journal_7d UNION ALL SELECT * FROM journal_30d`);
   return db;
 }
 
