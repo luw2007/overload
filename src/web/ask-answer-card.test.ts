@@ -27,7 +27,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-type ProbeResult = { answer_status: number; answer_body: Record<string, unknown>; live_buttons: string[]; inert_buttons: number; inert_chips: string[]; ack_requests: number };
+type ProbeResult = { answer_status: number; answer_body: Record<string, unknown>; live_buttons: string[]; inert_buttons: number; inert_chips: string[]; ack_requests: number; top_line: string; legacy_q1_path: string };
 
 async function clickGreen(base: string): Promise<ProbeResult> {
   const script = String.raw`
@@ -40,7 +40,8 @@ with sync_playwright() as p:
     page = browser.new_page()
     acks = []
     page.on("request", lambda request: acks.append(request.url) if "/api/ack/" in request.url else None)
-    page.goto(base + "/agents")
+    # Pending asks live in the primary attention IA (Decide), not only on the Agents diagnostics page.
+    page.goto(base + "/decide")
     live = page.locator("article.decision-card", has_text="Green or Blue?")
     inert = page.locator("article.decision-card", has_text="Deploy now?")
     live.locator("button.answer", has_text="Green").wait_for()
@@ -48,6 +49,7 @@ with sync_playwright() as p:
         "live_buttons": live.locator("button.answer").all_inner_texts(),
         "inert_buttons": inert.locator("button.answer").count(),
         "inert_chips": inert.locator(".option-chip").all_inner_texts(),
+        "top_line": page.locator("main").inner_text(),
     }
     with page.expect_response(lambda response: "/api/orchestrator/answer/" in response.url) as answered:
         live.locator("button.answer", has_text="Green").click()
@@ -55,6 +57,9 @@ with sync_playwright() as p:
     result["answer_status"] = response.status
     result["answer_body"] = response.json()
     result["ack_requests"] = len(acks)
+    page.goto(base + "/q1")
+    page.locator("article.decision-card", has_text="Green or Blue?").wait_for()
+    result["legacy_q1_path"] = page.evaluate("location.pathname")
     print(json.dumps(result))
     browser.close()
 `;
@@ -108,7 +113,9 @@ describe("live ask decision card", () => {
     expect((await consume()).status).toBe(404);
 
     const probe = await clickGreen(base);
-    expect(probe).toMatchObject({ answer_status: 200, answer_body: { ok: true }, live_buttons: ["Green", "Blue"], inert_buttons: 0, inert_chips: ["yes", "no"], ack_requests: 0 });
+    expect(probe).toMatchObject({ answer_status: 200, answer_body: { ok: true }, live_buttons: ["Green", "Blue"], inert_buttons: 0, inert_chips: ["yes", "no"], ack_requests: 0, legacy_q1_path: "/decide" });
+    // Both pending asks are owed decisions in Decide's top line.
+    expect(probe.top_line).toContain("2 decisions owed");
 
     const first = await consume();
     expect(first.status).toBe(200);

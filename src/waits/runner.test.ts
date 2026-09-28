@@ -331,6 +331,39 @@ describe("observeDueWaits", () => {
     await expect(f.run({ batchSize: 0 })).rejects.toThrow(RangeError);
     expect(f.row(w.wait_id).version).toBe(1);
   });
+
+  test("MINOR-3: poison dispositions back off and park after the budget, never starving newer rows", async () => {
+    const f = fixture();
+    const other = createWork(f.control, { title: "other", source: "test", contract }, T);
+    const ready = (w: ConditionWait, at: number) =>
+      observeConditionWait(f.control, w.wait_id, w.version, { kind: "ready", observed: { state: "MERGED" }, fingerprint: "pr:MERGED", source_generation: 11, observed_at: at }, { next_check_at: null }, at).wait;
+    // A full batch (20) of older pending dispositions that fail every round: their Attention moved to another Work.
+    const poison = Array.from({ length: 20 }, (_, i) => ready(f.wait(100 + i), T + 2000 + i));
+    f.control.query(`UPDATE control_attention SET work_id=? WHERE item_id IN (${poison.map(() => "?").join(",")})`).run(other.work_id, ...poison.map((w) => w.item_id));
+    const healthy = ready(f.wait(7), T + 5000);
+    const round = async () => {
+      const failure = await f.run().catch((error: unknown) => error);
+      return failure instanceof ObserveWaitsFailure ? failure : null;
+    };
+
+    // Round 1: every poison row fails once (surfaced, not silent contention) and is backed off.
+    const first = await round();
+    expect(first?.failures).toHaveLength(20);
+    expect(first?.result).toMatchObject({ conflicted: 0, parked: 0 });
+    expect(f.row(healthy.wait_id).disposition_state).toBe("pending");
+    // Round 2, same minute: the backed-off rows no longer hold the head of the queue; the newer row lands.
+    expect(await round()).toBeNull();
+    expect(f.row(healthy.wait_id).disposition_state).not.toBe("pending");
+    // The budget: after the third failure each poison row is parked and reported once, then left alone.
+    f.now += 1 * MIN; expect((await round())?.result.parked).toBe(0);
+    f.now += 2 * MIN;
+    const parked = await round();
+    expect(parked?.result.parked).toBe(20);
+    expect(parked?.failures.map(String).filter((text) => /disposition parked after 3\/3 failures: .*attention item moved to another work/.test(text))).toHaveLength(20);
+    f.now += 60 * MIN;
+    expect(await round()).toBeNull();
+    for (const w of poison) expect(f.row(w.wait_id)).toMatchObject({ disposition_state: "pending", version: w.version });
+  });
 });
 
 describe("waits cli observe --once", () => {

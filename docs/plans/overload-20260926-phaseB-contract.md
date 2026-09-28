@@ -2,7 +2,7 @@
 
 日期：2026-09-27  
 范围：`docs/plans/overload-20260926-attention-product.md` §8–§9、§14–§15 B01–B09  
-状态：实施契约，**尚未实现、未启用、未部署，也未通过生产或真实外部渠道验收**
+状态：实施契约；**已在工作树中实现**（`src/waits/**`、control schema v7、`/api/waits`、Decide 页等待区），由 `OVERLOAD_CONDITION_WAITS` 开关控制，**默认关闭、未部署，也未通过生产或真实外部渠道验收**
 
 ## 1. 目的、词义与边界
 

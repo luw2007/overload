@@ -469,11 +469,24 @@ class SpoolWriter {
   private async drainAsync(): Promise<void> {
     await this.ready
     while (this.queue.length && !this.disabled) {
-      const item = this.queue.shift()!
-      // Counters describe all failures known at the instant of the write attempt.
-      item.dropped_total = this.droppedTotal
-      item.write_error_total = this.writeErrorTotal
-      const line = `${JSON.stringify(item)}\n`
+      // One open/write/close per batch, not per line: open() alone can cost
+      // milliseconds under endpoint scanning or load, which capped the writer
+      // near 120 lines/s and let bursts overflow WRITE_QUEUE_LIMIT. A batch
+      // never crosses the segment size limit, so the inline seal still fires
+      // at the first line that reaches SEGMENT_MAX_BYTES.
+      let batch = ""
+      let batchBytes = 0
+      let count = 0
+      while (this.queue.length && (count === 0 || this.segmentBytes + batchBytes < SEGMENT_MAX_BYTES)) {
+        const item = this.queue.shift()!
+        // Counters describe all failures known at the instant of the write attempt.
+        item.dropped_total = this.droppedTotal
+        item.write_error_total = this.writeErrorTotal
+        const line = `${JSON.stringify(item)}\n`
+        batch += line
+        batchBytes += Buffer.byteLength(line)
+        count++
+      }
       try {
         const handle = await open(
           this.activePath,
@@ -482,15 +495,15 @@ class SpoolWriter {
         )
         try {
           await handle.chmod(0o600)
-          await handle.writeFile(line, "utf8")
+          await handle.writeFile(batch, "utf8")
         } finally {
           await handle.close()
         }
-        this.segmentBytes += Buffer.byteLength(line)
+        this.segmentBytes += batchBytes
         this.armSealTimer()
         if (this.segmentBytes >= SEGMENT_MAX_BYTES) await this.seal()
       } catch {
-        this.writeErrorTotal++
+        this.writeErrorTotal += count
         // Failed events are not retried indefinitely; the resident counter exposes the gap.
       }
     }

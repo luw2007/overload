@@ -5,6 +5,8 @@ Status: Phase A implementation contract aligned to the delivered implementation;
 
 This document is the copy-pasteable boundary between Phase A implementation slices. Terms marked **EXISTING** name current code. Terms marked **NEW** are the only new contracts authorized here.
 
+Code evidence cites a file and the symbol named in the same sentence, not line numbers: line citations went stale while the tree was still changing.
+
 ## 1. Scope and non-goals
 
 Phase A implements and verifies acceptance scenarios **A01–A17** from `overload-20260926-attention-product.md:384-402`:
@@ -29,26 +31,26 @@ Explicit non-goals:
 
 The following are **EXISTING** and are grounded in `local://phaseA-facts.md`:
 
-- `Contract`, `Work`, and `AttentionItem` are defined at `src/control/types.ts:8-65`; Attention state is `open | applying | resolved | superseded` and effect state is `not_started | applying | succeeded | failed | unknown` (`src/control/types.ts:45-46`). Do not duplicate these facts.
-- `listAttention` excludes `applying` from Now/Inbox/Done; `listAttentionFollowUps` is the separate applying/failure responsibility read model (`src/control/store.ts:604-658`). Done semantics remain unchanged.
-- resolve uses revision/material CAS and external-effect guards; Ack and defer neither answer nor authorize (`src/control/store.ts:660-756,991-1031`).
-- schema ownership is `control_schema_meta` plus explicit `CONTROL_MIGRATIONS`; v6 schema creation and open-Attention baseline backfill run in one immediate migration transaction, and opening an already-v6 database idempotently repairs missing open rows (`src/control/store.ts:231-275`).
-- `DecisionViewPackage` and `assembleDecisionView` exist at `src/control/context-assembler.ts:59-79,329-364`. Options are derived by the shared store helper; generic option metadata and approval-target effects are authoritative, and unavailable semantics fail assembly with `needs_context` (`src/control/store.ts:417-495`; `src/control/context-assembler.ts:352-354`).
-- context routes receive only the server-injected actor. The Attention mutation route requires a trusted server actor for `resolve` before parsing the decision body; Ack/defer remain seen/presentation actions and do not consume a decision (`src/web/context-routes.ts:11-17,28-41,74-88`; `src/web/server.ts:304-364`).
-- stale Attention or material submissions map to HTTP 409 with `code:"stale_attention"`, current revision/state/effect state, and a decision-package refresh URL (`src/web/server.ts:93-104,327-371`).
-- the Web decision path fetches and renders the decision package; raw evidence remains outside the normal card/drawer path (`src/web/static/app.js:57-67,342-350,610-613`).
-- mailbox targets, answers, receipts, and effect observations remain authoritative (`src/decision-bot/mailbox.ts:8-12,21-42`). `consumeDecision` owns single consumption and `effect_observed` reconciliation (`src/decision-bot/mailbox.ts:68-81`; `src/extension/overload.ts:491-492`).
-- adapter dispatch moves a card to applying and reopens dispatch rejection as `open/unknown` (`src/adapters/service.ts:896-990`).
-- control outbox identity/hash and ledger projection already exist (`src/control/outbox.ts:31-49,52-68,90-97`). State mutation, material projection, and outbox insertion remain one source transaction.
-- Feishu is an existing writeback path, not proof of a configured real-channel production smoke: its card action emits `itemId`, `revision`, and `answer` (`src/adapters/feishu.ts:234-268`), and `AdapterService.accept` applies ownership/version/expiry rules before mailbox or generic resolve (`src/adapters/service.ts:132-231`).
-- notification shadow defaults preserve the legacy Q1/hung newline sender as the only sender while recording candidate comparisons; Attention is candidate-only until cutover (`src/notify/nudge.ts:303-405`).
+- `Contract`, `Work`, and `AttentionItem` are defined at `src/control/types.ts`; Attention state is `open | applying | resolved | superseded` and effect state is `not_started | applying | succeeded | failed | unknown` (`src/control/types.ts`). Do not duplicate these facts.
+- `listAttention` excludes `applying` from Now/Inbox/Done; `listAttentionFollowUps` is the separate applying/failure responsibility read model (`src/control/store.ts`). Done semantics remain unchanged.
+- resolve uses revision/material CAS and external-effect guards; Ack and defer neither answer nor authorize (`src/control/store.ts`).
+- schema ownership is `control_schema_meta` plus explicit `CONTROL_MIGRATIONS`; v6 schema creation and open-Attention baseline backfill run in one immediate migration transaction, and opening an already-v6 database idempotently repairs missing open rows (`src/control/store.ts`).
+- `DecisionViewPackage` and `assembleDecisionView` exist at `src/control/context-assembler.ts`. Options are derived by the shared store helper; generic option metadata and approval-target effects are authoritative, and unavailable semantics fail assembly with `needs_context` (`src/control/store.ts`; `src/control/context-assembler.ts`).
+- context routes receive only the server-injected actor. The Attention mutation route requires a trusted server actor for `resolve` before parsing the decision body; Ack/defer remain seen/presentation actions and do not consume a decision (`src/web/context-routes.ts`; `src/web/server.ts`).
+- stale Attention or material submissions map to HTTP 409 with `code:"stale_attention"`, current revision/state/effect state, and a decision-package refresh URL (`src/web/server.ts`).
+- the Web decision path fetches and renders the decision package; raw evidence remains outside the normal card/drawer path (`src/web/static/app.js`).
+- mailbox targets, answers, receipts, and effect observations remain authoritative (`src/decision-bot/mailbox.ts`). `consumeDecision` owns single consumption and `effect_observed` reconciliation (`src/decision-bot/mailbox.ts`; `src/extension/overload.ts`).
+- adapter dispatch moves a card to applying and reopens dispatch rejection as `open/unknown` (`src/adapters/service.ts`).
+- control outbox identity/hash and ledger projection already exist (`src/control/outbox.ts`). State mutation, material projection, and outbox insertion remain one source transaction.
+- Feishu is an existing writeback path, not proof of a configured real-channel production smoke: its card action emits `itemId`, `revision`, and `answer` (`src/adapters/feishu.ts`), and `AdapterService.accept` applies ownership/version/expiry rules before mailbox or generic resolve (`src/adapters/service.ts`).
+- notification shadow defaults preserve the legacy Q1/hung newline sender as the only sender while recording candidate comparisons; Attention is candidate-only until cutover (`src/notify/nudge.ts`).
 - `package.json:7-12` provides only `bun test`; there is no repository typecheck script.
 
 ## 3. Frozen persistence contract
 
 ### 3.1 Migration and baseline strategy
 
-`CONTROL_SCHEMA_VERSION` is 6. The non-destructive v6 migration creates the following tables and indexes with `CREATE TABLE/INDEX IF NOT EXISTS`, projects generation-1 material for every existing open Attention row, and updates `control_schema_meta` to 6 in the same immediate transaction. Opening an already-v6 database performs the same missing-row scan in an idempotent immediate repair transaction. Historical open rows therefore receive a baseline but do not directly send: under the default shadow configuration the incumbent legacy Q1/hung sender remains the only sender, while the candidate path only records comparisons/outcomes. Upsert likewise derives and projects the current material baseline atomically with the Attention row, event, and outbox (`src/control/store.ts:246-275,403-412`).
+As of Phase A, `CONTROL_SCHEMA_VERSION` was 6; the current tree is at 7, where the Phase B v7 migration only adds the wait and prerequisite-edge tables (see `docs/plans/overload-20260926-phaseB-contract.md` §3.2) and leaves the v6 Phase A tables below unchanged. The non-destructive v6 migration creates the following tables and indexes with `CREATE TABLE/INDEX IF NOT EXISTS`, projects generation-1 material for every existing open Attention row, and updates `control_schema_meta` to 6 in the same immediate transaction. Opening an already-v6 database performs the same missing-row scan in an idempotent immediate repair transaction. Historical open rows therefore receive a baseline but do not directly send: under the default shadow configuration the incumbent legacy Q1/hung sender remains the only sender, while the candidate path only records comparisons/outcomes. Upsert likewise derives and projects the current material baseline atomically with the Attention row, event, and outbox (`src/control/store.ts`).
 ```sql
 CREATE TABLE IF NOT EXISTS control_attention_material (
   item_id TEXT PRIMARY KEY,
@@ -110,7 +112,7 @@ CREATE TABLE IF NOT EXISTS control_notification_shadow (
 );
 ```
 
-`subject` is the stable responsibility identity: `attention:<item_id>`, `q1:<request_uid>`, or `hung:<stable_id>`. It deliberately excludes Attention revision. `material_key` is `<subject>:<fingerprint>` for Attention; unlinked legacy subjects use `<subject>:legacy-open`. Native Attention and legacy Q1/hung are treated as the same responsibility only when an explicit producer-recorded approval/request binding resolves unambiguously; titles, summaries, parsed IDs, and resemblance are never correlations. Unlinked legacy rows remain separate coverage gaps rather than being guessed away (`src/notify/nudge.ts:80-181`). `owner_epoch` changes only during explicit cutover. The uniqueness constraint prevents both channels or retries from claiming the same interruption in one epoch. `channel` records the chosen primary delivery; non-primary channels may still update cards/status but must not insert a sending claim.
+`subject` is the stable responsibility identity: `attention:<item_id>`, `q1:<request_uid>`, or `hung:<stable_id>`. It deliberately excludes Attention revision. `material_key` is `<subject>:<fingerprint>` for Attention; unlinked legacy subjects use `<subject>:legacy-open`. Native Attention and legacy Q1/hung are treated as the same responsibility only when an explicit producer-recorded approval/request binding resolves unambiguously; titles, summaries, parsed IDs, and resemblance are never correlations. Unlinked legacy rows remain separate coverage gaps rather than being guessed away (`src/notify/nudge.ts`). `owner_epoch` changes only during explicit cutover. The uniqueness constraint prevents both channels or retries from claiming the same interruption in one epoch. `channel` records the chosen primary delivery; non-primary channels may still update cards/status but must not insert a sending claim.
 
 `approval_id`, `receipt_id`, and `outbox_event_id` are nullable audit correlations, not replacement authorities. Cross-database foreign keys are intentionally absent. Writers record authoritative identities when known; missing or ambiguous legacy linkage remains null and separately represented.
 
@@ -133,12 +135,12 @@ Canonicalization is deterministic and local:
 
 1. trim every string, normalize CRLF/CR to LF, collapse internal Unicode whitespace to one ASCII space, and normalize Unicode to NFC;
 2. preserve `option_effects` in executable `AttentionItem.options` order; sort `decisive_evidence` by `object_id`, then numeric `revision`, then normalized `conclusion`;
-3. serialize objects with lexicographically sorted keys, arrays in the order above, JSON primitives unchanged, and no insignificant whitespace—the same recursive canonical JSON behavior already used by `src/control/outbox.ts:8-14` and `src/decision-bot/mailbox.ts:14-19` should be extracted/reused rather than forked;
+3. serialize objects with lexicographically sorted keys, arrays in the order above, JSON primitives unchanged, and no insignificant whitespace—the same recursive canonical JSON behavior already used by `src/control/outbox.ts` and `src/decision-bot/mailbox.ts` should be extracted/reused rather than forked;
 4. `fingerprint = sha256(canonical(inputs))`; `material_key = subject + ":" + fingerprint`.
 
 Timestamps, card revision, updated time, prose summary, heartbeat, ordinary logs, and source-declared `material_change` are not inputs. `risk`, `decision`, and `consequence` are deterministic projections from current card/contract facts. `option_effects` comes only from server-known option semantics. `decisive_evidence` is the card's own pinned evidence object (`AttentionItem.evidence.{object_id,revision}` and its conclusion), not raw logs. `DecisionViewPackage.trigger_evidence` (pool facts linked to the Work) is display context only and is deliberately NOT a material input: linking a new fact does not change the fingerprint; a decision-relevant fact must be pinned by a card revision. Expiry contributes only exact `expires_at` and derived `expired`; threshold dedup remains separately keyed by `threshold`.
 
-Every upsert derives material through `deriveAttentionMaterialInputs` and projects it in the same immediate transaction as the Attention row, Attention event, and outbox; the assembler calls that same derivation/projection path before returning a package (`src/control/store.ts:403-412,483-495`; `src/control/context-assembler.ts:352-360`). A missing historical open projection is inserted as generation 1 by migration/reopen repair. Equal fingerprints retain generation and refresh `computed_at`; a different fingerprint increments generation. A source assertion can request recomputation but cannot choose the fingerprint, urgency, authorization, or notification.
+Every upsert derives material through `deriveAttentionMaterialInputs` and projects it in the same immediate transaction as the Attention row, Attention event, and outbox; the assembler calls that same derivation/projection path before returning a package (`src/control/store.ts`; `src/control/context-assembler.ts`). A missing historical open projection is inserted as generation 1 by migration/reopen repair. Equal fingerprints retain generation and refresh `computed_at`; a different fingerprint increments generation. A source assertion can request recomputation but cannot choose the fingerprint, urgency, authorization, or notification.
 
 ## 4. Frozen TypeScript seams
 
@@ -180,7 +182,7 @@ export function resolveAttention(
 ): AttentionItem;
 ```
 
-`listAttention` retains the existing zone behavior. `resolveAttention` is the single public wrapper for generic decisions; it requires a non-empty trusted actor, while approval-linked items continue through mailbox write/consume and are rejected by this wrapper. Ack is seen-only (`acknowledged_at`) and defer only changes presentation timing; neither answers, authorizes, or resolves. `listAttentionFollowUps` derives fields from existing Attention plus mailbox receipt/effect observations and does not persist a second status. It includes answer-recorded-but-unconsumed, applying, verification-required, failed, and unknown responsibility, and excludes verified success with no remaining responsibility. Web exposes this exact model at `GET /api/control/attention?zone=follow_up` as `{items: AttentionFollowUp[]}` (`src/control/store.ts:604-756,991-1031`; `src/web/server.ts:237-242`).
+`listAttention` retains the existing zone behavior. `resolveAttention` is the single public wrapper for generic decisions; it requires a non-empty trusted actor, while approval-linked items continue through mailbox write/consume and are rejected by this wrapper. Ack is seen-only (`acknowledged_at`) and defer only changes presentation timing; neither answers, authorizes, or resolves. `listAttentionFollowUps` derives fields from existing Attention plus mailbox receipt/effect observations and does not persist a second status. It includes answer-recorded-but-unconsumed, applying, verification-required, failed, and unknown responsibility, and excludes verified success with no remaining responsibility. Web exposes this exact model at `GET /api/control/attention?zone=follow_up` as `{items: AttentionFollowUp[]}` (`src/control/store.ts`; `src/web/server.ts`).
 
 Unknown or failed effects must reopen the same item responsibility (`state='open'`, effect state retained as `unknown` or `failed`, revision incremented) or remain in follow-up if dispatch is still being reconciled. They must never silently enter Done or spawn a replacement Work solely to bypass a receipt.
 
@@ -227,7 +229,7 @@ export interface DecisionViewPackage {
 export function assembleDecisionView(db: Database, input: GetContextPackageInput): AssemblyResult;
 ```
 
-Option order equals `AttentionItem.options`; IDs are unchanged. Generic `stop`, `continue`, and `narrow` metadata lives in the shared store derivation used by both material fingerprinting and assembly. `narrow` requires both reason and replacement contract. Approval options use the active registered target effect and state explicitly that choosing records an answer, not effect success. Any unknown option without authoritative active target semantics makes assembly fail closed with `needs_context`; neither material projection nor UI invents executable semantics or buttons (`src/control/store.ts:417-495`; `src/control/context-assembler.ts:352-354`). The Web drawer submits `attention_revision`, current contract revision, affected-card snapshots where applicable, and the material fingerprint; a changed package displays the new package while retaining only an unsubmitted local draft.
+Option order equals `AttentionItem.options`; IDs are unchanged. Generic `stop`, `continue`, and `narrow` metadata lives in the shared store derivation used by both material fingerprinting and assembly. `narrow` requires both reason and replacement contract. Approval options use the active registered target effect and state explicitly that choosing records an answer, not effect success. Any unknown option without authoritative active target semantics makes assembly fail closed with `needs_context`; neither material projection nor UI invents executable semantics or buttons (`src/control/store.ts`; `src/control/context-assembler.ts`). The Web drawer submits `attention_revision`, current contract revision, affected-card snapshots where applicable, and the material fingerprint; a changed package displays the new package while retaining only an unsubmitted local draft.
 
 ### 4.3 Mailbox, effects, audit, and outbox
 
@@ -325,11 +327,11 @@ export async function runNotificationCycle(input: {
 }): Promise<{ claimed: number; sent: number; failed: number; unknown: number; shadowed: number }>;
 ```
 
-Collection is side-effect free. Claim/outcome writes are durable. Default `shadow` is legacy-only send: `nudgeOnce` runs the incumbent Q1/hung newline-state sender first, then records candidate comparison rows and `shadowed` outcomes without invoking the candidate sender; Attention is candidate-only until explicit cutover (`src/notify/nudge.ts:328-405`). `failed` retries only while `attempt_count < max_attempts`; `unknown` is not blindly resent. A channel receipt means channel acceptance, not user read. macOS and Feishu share the same `control_notifications` claim, `owner_epoch`, and primary-channel policy after cutover; they cannot independently dedup.
+Collection is side-effect free. Claim/outcome writes are durable. Default `shadow` is legacy-only send: `nudgeOnce` runs the incumbent Q1/hung newline-state sender first, then records candidate comparison rows and `shadowed` outcomes without invoking the candidate sender; Attention is candidate-only until explicit cutover (`src/notify/nudge.ts`). `failed` retries only while `attempt_count < max_attempts`; `unknown` is not blindly resent. A channel receipt means channel acceptance, not user read. macOS and Feishu share the same `control_notifications` claim, `owner_epoch`, and primary-channel policy after cutover; they cannot independently dedup.
 
 ### 4.5 HTTP conflict body
 
-Stale Attention revision or material-fingerprint submissions return HTTP 409 with this body; the route does not apply the submitted answer and gives the client the current state plus the package refresh URL (`src/web/server.ts:93-104,327-371`):
+Stale Attention revision or material-fingerprint submissions return HTTP 409 with this body; the route does not apply the submitted answer and gives the client the current state plus the package refresh URL (`src/web/server.ts`):
 
 ```ts
 export type StaleAttentionBody = {

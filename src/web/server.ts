@@ -825,7 +825,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
                   : undefined,
               attemptId:
                 typeof body.attemptId === "string" ? body.attemptId : undefined,
-            };const policy=loadPolicy(options.policyPath,mailbox);if(!binding.humanOnly&&matchingRule(policy,normalized as any))normalized.decisionMode="scoped_auto";
+            };const policy=loadPolicy(options.policyPath,mailbox);/* Structured asks stay human decisions: no policy rule may let the bot answer them. */if(!binding.humanOnly&&effect!=="ask_answer"&&normalized.scope?.gate!=="ask"&&matchingRule(policy,normalized as any))normalized.decisionMode="scoped_auto";
             const target = mailbox
               .transaction(() => {
                 const registered = registerTarget(mailbox,normalized);
