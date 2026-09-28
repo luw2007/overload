@@ -26,4 +26,33 @@ jobs:
       - name: Verify runtime dependencies resolve
         run: bun -e 'require.resolve("@larksuiteoapi/node-sdk")'
 
+      # The browser acceptance suites drive real Chromium: src/web/ui-regression.test.ts and
+      # src/web/waits.test.ts shell out to `python3 -c` and use playwright.sync_api, so
+      # `bun install` does not reach them. They hold A06/A07's browser proof, which the audit
+      # found to be the weakest thing in Phase A and which now runs against the real loopback
+      # surface rather than stubbed routes. Guarding them into a skip would leave that proof
+      # unrun everywhere except a machine that happens to have Playwright — the same failure
+      # mode the plutil and @larksuiteoapi findings already showed this repo is prone to.
+      # setup-python rather than the runner's system interpreter: the image marks that one
+      # externally managed (PEP 668) and pip refuses to install into it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright and the Chromium binary
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install playwright
+          python3 -m playwright install --with-deps chromium
+
+      # Same reasoning as the SDK guard above: a missing browser must fail here, loudly, and
+      # not disappear into test files that then look like they were never written.
+      - name: Verify the browser probe dependencies resolve
+        run: |
+          python3 - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              p.chromium.launch(headless=True).close()
+          PY
+
       - run: bun test
