@@ -14,8 +14,8 @@ import {
 } from "../src/recon/recon";
 
 // The killer spies record every escalation attempt (before delegating to the
-// real /bin/kill on the child's own detached process group) so a leaked inner
-// KILL timer is observable even when the target pgid is already dead.
+// real group killer on the child's own detached process group) so a leaked
+// inner KILL timer is observable even when the target pgid is already dead.
 type Signal = "TERM" | "KILL";
 let pullCalls: Signal[] = [];
 let reconCalls: Signal[] = [];
