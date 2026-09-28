@@ -143,12 +143,12 @@ changing it:
 ```sh
 sqlite3 ~/.overload/ledger.db "
 SELECT round(json_extract(h.detail,'\$.hung_ms')/60000.0,0) hung_min,
-  CASE WHEN EXISTS (SELECT 1 FROM journal j
+  CASE WHEN EXISTS (SELECT 1 FROM journal_all j
     WHERE j.stable_id=json_extract(h.detail,'\$.stable_id')
       AND j.ingest_seq>h.ingest_seq
       AND j.kind IN ('tool_activity','settled','working'))
   THEN 'resumed (false positive)' ELSE 'never resumed' END verdict,
-  count(*) FROM journal h WHERE h.kind='turn_hung' GROUP BY 1,2 ORDER BY 1;"
+  count(*) FROM journal_all h WHERE h.kind='turn_hung' GROUP BY 1,2 ORDER BY 1;"
 ```
 
 `dead_connection` cannot be tuned this way and should not be: it reports
@@ -168,5 +168,13 @@ its emitter process to be gone, because a live writer still holds that
 descriptor. The journal is the history, so removing consumed transport bytes
 loses nothing. Scans stay flat regardless of spool size for the same reason:
 a file whose cursor equals its size is never opened.
+
+The journal itself is tiered so the hot table stays small as history grows.
+Once an hour the ingest loop moves already-projected events older than seven
+days into `journal_7d`, and those older than thirty days into `journal_30d`,
+one bounded batch per pass. Nothing is deleted and `ingest_seq` stays globally
+monotone, so any query that wants full history must read the `journal_all`
+view rather than the `journal` table — `journal` alone holds only the recent
+window plus anything the reducer has not projected yet.
 
 To remove services without deleting history, run `scripts/install-launchd.sh --uninstall`. To reset history, first stop services, then remove `~/.overload/` deliberately.

@@ -17,6 +17,7 @@ function seededLedger(events: Array<{ at: number; kind: string }> = [{ at: NOW -
   const path = join(root, "ledger.db");
   const db = new Database(path);
   db.run("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, at INTEGER, kind TEXT, detail TEXT)");
+  db.run("CREATE VIEW journal_all AS SELECT * FROM journal");
   for (const event of events) db.run("INSERT INTO journal(at, kind, detail) VALUES (?, ?, '{}')", [event.at, event.kind]);
   return { path, db };
 }

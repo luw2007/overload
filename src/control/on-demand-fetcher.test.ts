@@ -393,6 +393,7 @@ describe("fetchOnDemand — journal source (cross-db readonly)", () => {
     const ledgerPath = `/tmp/test-ledger-journal-${Date.now()}.db`; try { unlinkSync(ledgerPath); } catch {}
     const ledger = new Database(ledgerPath, { create: true });
     ledger.exec("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY AUTOINCREMENT, detail TEXT)");
+    ledger.exec("CREATE VIEW journal_all AS SELECT * FROM journal");
     const journalDetail = JSON.stringify({ kind: "effect_observed", note: "test effect" });
     ledger.run("INSERT INTO journal(detail) VALUES(?)", [journalDetail]);
     ledger.close();

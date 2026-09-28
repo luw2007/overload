@@ -17,6 +17,7 @@ function sessionFixture(): Database {
   db.run("CREATE TABLE session_incarnations(stable_id TEXT, writer_id TEXT, liveness_domain TEXT, pid INTEGER, proc_boot_id TEXT, started_at INTEGER, last_seen_at INTEGER)");
   db.run("CREATE TABLE requests(stable_id TEXT, request_uid TEXT, kind TEXT, created_at INTEGER, resolved_at INTEGER, detail TEXT, state TEXT)");
   db.run("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, stable_id TEXT, at INTEGER, emitter_id TEXT, writer_id TEXT, kind TEXT, detail TEXT)");
+  db.run("CREATE VIEW journal_all AS SELECT * FROM journal");
   return db;
 }
 
@@ -112,6 +113,7 @@ describe("queryHealth", () => {
     db.run("CREATE TABLE incidents(source TEXT, opened_at INTEGER, closed_at INTEGER, detail TEXT)");
     db.run("CREATE TABLE coverage_gaps(stable_id TEXT, emitter_id TEXT, from_at INTEGER)");
     db.run("CREATE TABLE journal(at INTEGER, kind TEXT, detail TEXT)");
+    db.run("CREATE VIEW journal_all AS SELECT * FROM journal");
     const now = Date.now();
     const recent = now - HOUR;
     const stale = now - 25 * HOUR;
@@ -136,6 +138,7 @@ describe("queryHung", () => {
     db.run("CREATE TABLE current(stable_id TEXT PRIMARY KEY, state TEXT, queue TEXT, q5_reason TEXT, last_event_at INTEGER, last_progress_at INTEGER)");
     db.run("CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, host TEXT)");
     db.run("CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, stable_id TEXT, kind TEXT, detail TEXT)");
+    db.run("CREATE VIEW journal_all AS SELECT * FROM journal");
     db.run("CREATE TABLE session_hosts(stable_id TEXT, app TEXT, session_id TEXT)");
     db.run("CREATE TABLE attachments(stable_id TEXT, platform TEXT, binding TEXT, observed_at INTEGER, valid INTEGER)");
     return db;

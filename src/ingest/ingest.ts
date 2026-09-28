@@ -10,10 +10,12 @@ import { appendClassifierActivated, CLASSIFIER_VERSION } from "./classifier";
 import { scanCmux } from "./cmux";
 import { PROGRESS_KINDS } from "../shared/types";
 import { pruneSpool } from "./prune";
+import { archiveJournal, ARCHIVE_BATCH_SIZE } from "./archive";
 
 const DEFAULT_SCAN_INTERVAL_MS = 2_000;
 const DEFAULT_REDUCER_BATCH_SIZE = 500;
 const DEFAULT_PRUNE_INTERVAL_MS = 3_600_000;
+const DEFAULT_ARCHIVE_INTERVAL_MS = 3_600_000;
 const DEFAULT_SPOOL_RETENTION_MS = 86_400_000;
 const MAX_SPOOL_READ_BYTES = 4 * 1024 * 1024;
 const MAX_SPOOL_LINE_BYTES = 64 * 1024;
@@ -124,7 +126,7 @@ function migrateProgressColumn(db: Database): void {
   if (columns.some((column) => column.name === "last_progress_at")) return;
   db.exec("ALTER TABLE current ADD COLUMN last_progress_at INTEGER");
   const kinds = Object.keys(PROGRESS_KINDS).map((kind) => `'${kind}'`).join(",");
-  db.exec(`UPDATE current SET last_progress_at=(SELECT MAX(j.at) FROM journal j
+  db.exec(`UPDATE current SET last_progress_at=(SELECT MAX(j.at) FROM journal_all j
     WHERE j.stable_id=current.stable_id AND j.kind IN (${kinds}))`);
 }
 
@@ -135,7 +137,7 @@ function requireText(path: string): string {
 export function activateClassifier(db: Database, home = homedir(), spoolRoot = join(home, ".overload", "spool"), at = Date.now()): boolean {
   const existing = db.query("SELECT 1 FROM classifier_activations WHERE version=?").get(CLASSIFIER_VERSION);
   if (existing) return false;
-  const watermark = (db.query("SELECT COALESCE(MAX(ingest_seq), 0) AS seq FROM journal").get() as { seq: number }).seq;
+  const watermark = (db.query("SELECT COALESCE(MAX(ingest_seq), 0) AS seq FROM journal_all").get() as { seq: number }).seq;
   appendClassifierActivated(CLASSIFIER_VERSION, at, home, spoolRoot);
   db.query("INSERT INTO classifier_activations(version, activated_at_journal_seq, activated_at) VALUES (?, ?, ?)")
     .run(CLASSIFIER_VERSION, watermark, at);
@@ -284,6 +286,8 @@ function insertEnvelope(db: Database, envelope: Envelope, spoolRef: string): boo
   const stableId = `${envelope.host}:${envelope.runtime}:${envelope.session}`;
   const detail = envelope.detail && typeof envelope.detail === "object" && !Array.isArray(envelope.detail)
     ? envelope.detail : {};
+  if (db.query("SELECT 1 FROM journal_7d WHERE host=? AND emitter_id=? AND seq=? UNION ALL SELECT 1 FROM journal_30d WHERE host=? AND emitter_id=? AND seq=? LIMIT 1")
+    .get(envelope.host, envelope.emitter_id, envelope.seq, envelope.host, envelope.emitter_id, envelope.seq)) return false;
   const result = db.query(`INSERT OR IGNORE INTO journal(host, emitter_id, seq, at, stable_id, writer_id, kind, detail, spool_ref)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(envelope.host, envelope.emitter_id, envelope.seq, envelope.at,
       stableId, envelope.writer_id, envelope.kind, JSON.stringify(detail), spoolRef);
@@ -334,11 +338,17 @@ async function main(): Promise<void> {
   let host = "local";
   try { host = (await readFile(join(home, "host"), "utf8")).trim() || "local"; } catch { /* single-machine default */ }
   let lastPruneAt = 0;
+  let lastArchiveAt = 0;
   const run = async () => {
     const result = await scanOnce(db, spool, config.reducer_batch_size, config.cmux_workstream_path);
     // Watchdog liveness contract (review P2 m4): the ingest loop owns this touch.
     try { await Bun.write(heartbeatPath, String(Date.now())); } catch { /* watchdog will alarm */ }
     if (once) console.log(`ingested ${result.inserted} new event(s) from ${result.files} file(s)`);
+    if (Date.now() - lastArchiveAt >= DEFAULT_ARCHIVE_INTERVAL_MS) {
+      const archived = archiveJournal(db);
+      lastArchiveAt = archived === ARCHIVE_BATCH_SIZE ? 0 : Date.now();
+      if (archived) console.log(`archived ${archived} journal event(s)`);
+    }
     if (Date.now() - lastPruneAt < config.prune_interval_ms) return;
     lastPruneAt = Date.now();
     const swept = await pruneSpool(db, spool, { host, retentionMs: config.spool_retention_ms });

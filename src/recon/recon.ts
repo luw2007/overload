@@ -215,10 +215,13 @@ export class ReconDaemon {
   private liveProcessIncarnations(db: Database): Incarnation[] {
     return safeAll<Incarnation>(db, `SELECT i.stable_id, i.writer_id, i.pid, i.proc_boot_id,
       i.started_at, i.last_seen_at, s.cwd, s.runtime, s.session, s.host,
-      (SELECT MAX(j.at) FROM journal j WHERE j.emitter_id=i.writer_id) AS last_event_at
+      (SELECT MAX(at) FROM (
+        SELECT MAX(at) AS at FROM journal WHERE emitter_id=i.writer_id
+        UNION ALL SELECT MAX(at) FROM journal_7d WHERE emitter_id=i.writer_id
+        UNION ALL SELECT MAX(at) FROM journal_30d WHERE emitter_id=i.writer_id)) AS last_event_at
       FROM session_incarnations i JOIN sessions s ON s.stable_id=i.stable_id
       WHERE i.liveness_domain='process' AND i.pid > 0
-        AND NOT EXISTS (SELECT 1 FROM journal e WHERE e.stable_id=i.stable_id
+        AND NOT EXISTS (SELECT 1 FROM journal_all e WHERE e.stable_id=i.stable_id
           AND e.writer_id=i.writer_id AND e.kind='session_ended')`);
   }
 
@@ -232,14 +235,14 @@ export class ReconDaemon {
   /** One finding per silence episode: a finding newer than the last real event
    *  means this episode is already reported. Survives recon restarts. */
   private findingIsStale(db: Database, kind: FindingKind, emitterId: string, since: number): boolean {
-    const row = safeGet(db, `SELECT MAX(at) AS at FROM journal WHERE kind=?
+    const row = safeGet(db, `SELECT MAX(at) AS at FROM journal_all WHERE kind=?
       AND json_extract(detail, '$.emitter_id')=?`, kind, emitterId);
     return typeof row?.at === "number" ? row.at < since : true;
   }
 
   /** Ingest owns the journal clock: if it stopped, every session looks hung. */
   private pipelineFresh(db: Database, now: number): boolean {
-    const row = safeGet(db, "SELECT MAX(at) AS at FROM journal WHERE host=?", this.config.host);
+    const row = safeGet(db, "SELECT MAX(at) AS at FROM journal_all WHERE host=?", this.config.host);
     return typeof row?.at === "number" ? now - row.at < this.config.turn_hang_ms / 2 : false;
   }
 
@@ -256,7 +259,7 @@ export class ReconDaemon {
   }
 
   private lastNetworkAddresses(db: Database): string[] | null {
-    const row = safeGet(db, `SELECT json_extract(detail, '$.current') AS current FROM journal
+    const row = safeGet(db, `SELECT json_extract(detail, '$.current') AS current FROM journal_all
       WHERE kind='network_changed' ORDER BY ingest_seq DESC LIMIT 1`);
     if (typeof row?.current !== "string") return null;
     try {
@@ -285,7 +288,7 @@ export class ReconDaemon {
   }
 
   private sourceOutageOpen(db: Database, source: string): boolean {
-    const row = safeGet(db, `SELECT kind FROM journal
+    const row = safeGet(db, `SELECT kind FROM journal_all
       WHERE kind IN ('source_outage','source_recovered')
         AND json_extract(detail, '$.source')=?
       ORDER BY ingest_seq DESC LIMIT 1`, source);
@@ -301,7 +304,7 @@ export class ReconDaemon {
   }
 
   private hasJournalFinding(db: Database, kind: FindingKind, emitterId: string): boolean {
-    return safeGet(db, "SELECT 1 AS found FROM journal WHERE kind=? AND json_extract(detail, '$.emitter_id')=? LIMIT 1", kind, emitterId) !== null;
+    return safeGet(db, "SELECT 1 AS found FROM journal_all WHERE kind=? AND json_extract(detail, '$.emitter_id')=? LIMIT 1", kind, emitterId) !== null;
   }
 
   private async spoolAtEof(db: Database, host: string, emitterId: string): Promise<boolean> {
@@ -388,13 +391,13 @@ export class ReconDaemon {
   }
 
   private latestTelemetryGapAt(db: Database, nativeId: string): number | undefined {
-    const row = safeGet(db, `SELECT at FROM journal WHERE kind='telemetry_gap'
+    const row = safeGet(db, `SELECT at FROM journal_all WHERE kind='telemetry_gap'
       AND json_extract(detail, '$.native_id')=? ORDER BY ingest_seq DESC LIMIT 1`, nativeId);
     return typeof row?.at === "number" ? row.at : undefined;
   }
 
   private sessionStillVanished(db: Database, stableId: string, platform: string): boolean {
-    const row = safeGet(db, `SELECT kind FROM journal
+    const row = safeGet(db, `SELECT kind FROM journal_all
       WHERE kind IN ('session_vanished','attachment_observed')
         AND json_extract(detail, '$.stable_id')=?
         AND json_extract(detail, '$.platform')=?

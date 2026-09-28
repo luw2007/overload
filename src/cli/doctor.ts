@@ -63,7 +63,7 @@ const LIVE_SESSION_KINDS = [
 async function checkLedger(deps: DoctorDeps): Promise<{ result: CheckResult; db: Database | null }> {
   try {
     const db = new Database(deps.ledgerPath, { readonly: true });
-    db.query("SELECT 1 FROM journal LIMIT 1").get();
+    db.query("SELECT 1 FROM journal_all LIMIT 1").get();
     return { result: { status: "OK", label: "ledger", detail: deps.ledgerPath }, db };
   } catch (error) {
     return { result: { status: "FAIL", label: "ledger", detail: `unreachable: ${(error as Error).message}` }, db: null };
@@ -115,7 +115,7 @@ async function checkHeartbeat(deps: DoctorDeps, name: string, path: string, maxA
 async function checkTelemetryLiveness(deps: DoctorDeps, db: Database | null): Promise<CheckResult> {
   if (!db) return { status: "FAIL", label: "telemetry:liveness", detail: "ledger unavailable" };
   const placeholders = LIVE_SESSION_KINDS.map(() => "?").join(",");
-  const row = db.query(`SELECT max(at) at FROM journal WHERE kind IN (${placeholders})`).get(...LIVE_SESSION_KINDS) as { at: number | null } | null;
+  const row = db.query(`SELECT max(at) at FROM journal_all WHERE kind IN (${placeholders})`).get(...LIVE_SESSION_KINDS) as { at: number | null } | null;
   const lastAt = row?.at ?? null;
   const now = deps.now();
   if (lastAt != null && now - lastAt <= STALL_PROFILE_MS.narrow) {
@@ -123,7 +123,7 @@ async function checkTelemetryLiveness(deps: DoctorDeps, db: Database | null): Pr
   }
   const ageLabel = lastAt == null ? "no session events recorded" : `no session events for ${Math.round((now - lastAt) / 60_000)}m`;
   const windowStart = lastAt ?? now - STALL_PROFILE_MS.narrow;
-  const corroboration = db.query("SELECT count(*) n FROM journal WHERE kind='telemetry_gap' AND at >= ?").get(windowStart) as { n: number };
+  const corroboration = db.query("SELECT count(*) n FROM journal_all WHERE kind='telemetry_gap' AND at >= ?").get(windowStart) as { n: number };
   if (corroboration.n > 0) {
     return {
       status: "FAIL", label: "telemetry:liveness",

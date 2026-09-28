@@ -434,7 +434,7 @@ export function reduceClassifyPass(db: Database, opts: ReduceOpts): ReduceResult
             .query("SELECT request_uid, stable_id FROM requests WHERE origin_emitter_id=? AND state='pending'")
             .all(em) as Array<{ request_uid: string; stable_id: string }>;
           const last = db
-            .query("SELECT COALESCE(MAX(seq), 0) AS s, COALESCE(MAX(at), ?) AS a FROM journal WHERE emitter_id=?")
+            .query("SELECT COALESCE(MAX(seq), 0) AS s, COALESCE(MAX(at), ?) AS a FROM journal_all WHERE emitter_id=?")
             .get(row.at, em) as { s: number; a: number };
           for (const p of pend) {
             db.query("UPDATE requests SET state='orphaned', resolved_at=? WHERE request_uid=?").run(row.at, p.request_uid);

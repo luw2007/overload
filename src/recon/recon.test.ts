@@ -17,6 +17,9 @@ async function fixture() {
   const db = new Database(ledger);
   db.exec(`
     CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY, host TEXT, emitter_id TEXT, seq INTEGER, at INTEGER, stable_id TEXT, writer_id TEXT, kind TEXT, detail TEXT);
+    CREATE TABLE journal_7d AS SELECT * FROM journal WHERE 0;
+    CREATE TABLE journal_30d AS SELECT * FROM journal WHERE 0;
+    CREATE VIEW journal_all AS SELECT * FROM journal UNION ALL SELECT * FROM journal_7d UNION ALL SELECT * FROM journal_30d;
     CREATE TABLE sessions(stable_id TEXT PRIMARY KEY, host TEXT, runtime TEXT, session TEXT, cwd TEXT);
     CREATE TABLE session_incarnations(stable_id TEXT, writer_id TEXT, liveness_domain TEXT, pid INTEGER, proc_boot_id TEXT, started_at INTEGER, last_seen_at INTEGER);
     CREATE TABLE cursors(file_name TEXT PRIMARY KEY, bytes INTEGER);

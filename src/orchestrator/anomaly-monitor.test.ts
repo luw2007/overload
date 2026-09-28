@@ -799,6 +799,7 @@ describe("anomaly-monitor §9 weak probes: probeNoGrowth / probeRepeatedTool", (
     db.exec(`
       CREATE TABLE IF NOT EXISTS sessions(stable_id TEXT PRIMARY KEY, host TEXT, runtime TEXT, session TEXT, origin TEXT DEFAULT 'unknown', cwd TEXT, branch TEXT, created_at INTEGER, first_seen_at INTEGER);
       CREATE TABLE IF NOT EXISTS journal(ingest_seq INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL, emitter_id TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, stable_id TEXT NOT NULL, writer_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT, spool_ref TEXT);
+      CREATE VIEW IF NOT EXISTS journal_all AS SELECT * FROM journal;
     `);
     const origin = `orch:task:${taskId}:${attemptId}`;
     db.run("INSERT OR REPLACE INTO sessions(stable_id, origin, created_at) VALUES(?,?,?)", ["sess-rep", origin, 1]);

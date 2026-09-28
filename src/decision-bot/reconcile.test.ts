@@ -21,7 +21,8 @@ function makeLedger(path: string): Database {
     at INTEGER NOT NULL,
     kind TEXT NOT NULL,
     detail TEXT NOT NULL
-  );`);
+  );
+  CREATE VIEW journal_all AS SELECT * FROM journal;`);
   return db;
 }
 

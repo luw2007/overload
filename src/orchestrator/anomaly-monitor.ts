@@ -341,7 +341,7 @@ export class AnomalyMonitor {
       const session = db.query("SELECT stable_id FROM sessions WHERE origin=? ORDER BY created_at DESC LIMIT 1").get(origin) as { stable_id: string } | undefined;
       if (!session) return false;
       const rows = db
-        .query("SELECT detail FROM journal WHERE stable_id=? AND kind='tool_activity' ORDER BY ingest_seq DESC LIMIT 20")
+        .query("SELECT detail FROM journal_all WHERE stable_id=? AND kind='tool_activity' ORDER BY ingest_seq DESC LIMIT 20")
         .all(session.stable_id) as { detail: string | null }[];
       if (rows.length < 3) return false;
       // rows DESC；转成时间正序，提取 tool 名，change=true 视为有状态变化（打断重复）。

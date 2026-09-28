@@ -112,6 +112,8 @@ export async function scanCmux(db: Database, path: string, reducerBatchSize = 50
       const emitterId = `cmux-${generation!.generation_uuid}`;
       for (const event of events) {
         const stableId = `local:cmux:${event.session}`;
+        if (db.query("SELECT 1 FROM journal_7d WHERE host=? AND emitter_id=? AND seq=? UNION ALL SELECT 1 FROM journal_30d WHERE host=? AND emitter_id=? AND seq=? LIMIT 1")
+          .get("local", emitterId, event.byteStart, "local", emitterId, event.byteStart)) continue;
         const result = db.query(`INSERT OR IGNORE INTO journal(host, emitter_id, seq, at, stable_id, writer_id, kind, detail, spool_ref)
           VALUES ('local', ?, ?, ?, ?, ?, ?, ?, ?)`).run(emitterId, event.byteStart, event.at, stableId,
             event.writerId, event.kind, JSON.stringify(event.detail), `${path}:${event.byteStart}`);
