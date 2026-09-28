@@ -43,13 +43,21 @@ CREATE TABLE IF NOT EXISTS coverage_gaps(
 /** Full P1+P2 frozen DDL. */
 export const SCHEMA_SQL_P2 = SCHEMA_SQL + "\n" + P2_DDL_SQL;
 
+/** Journal tiering, kept out of SCHEMA_SQL_P2 because the freeze predates it.
+ * Every harness path that opens a ledger must apply it, or `journal_all`
+ * readers see "no such table". */
+export const JOURNAL_TIER_DDL = `
+CREATE TABLE IF NOT EXISTS journal_7d AS SELECT * FROM journal WHERE 0;
+CREATE TABLE IF NOT EXISTS journal_30d AS SELECT * FROM journal WHERE 0;
+CREATE VIEW IF NOT EXISTS journal_all AS
+  SELECT * FROM journal UNION ALL SELECT * FROM journal_7d UNION ALL SELECT * FROM journal_30d;
+`;
+
 /** Open (or create) a ledger with the complete frozen P1+P2 schema. */
 export function openLedgerP2(path: string): Database {
   const db = new Database(path);
   db.exec(SCHEMA_SQL_P2);
-  db.exec(`CREATE TABLE IF NOT EXISTS journal_7d AS SELECT * FROM journal WHERE 0;
-    CREATE TABLE IF NOT EXISTS journal_30d AS SELECT * FROM journal WHERE 0;
-    CREATE VIEW IF NOT EXISTS journal_all AS SELECT * FROM journal UNION ALL SELECT * FROM journal_7d UNION ALL SELECT * FROM journal_30d`);
+  db.exec(JOURNAL_TIER_DDL);
   return db;
 }
 

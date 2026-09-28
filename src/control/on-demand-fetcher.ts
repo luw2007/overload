@@ -160,6 +160,8 @@ function fetchFromSource(
         const cols = (ledgerDb.query("PRAGMA table_info(journal)").all() as Array<{ name: string }>)
           .map((c) => c.name);
         const hasWorkCol = cols.includes("work_id");
+        // journal_all, not journal: a `journal:<seq>` reference must stay
+        // resolvable after the event ages into an archive tier.
         const sql = hasWorkCol
           ? "SELECT detail FROM journal_all WHERE ingest_seq=? AND work_id=?"
           : "SELECT detail FROM journal_all WHERE ingest_seq=?";

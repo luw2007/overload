@@ -39,7 +39,7 @@ import {
   type EventEnvelope,
   type HostId,
 } from "../../../src/shared/types";
-import { SCHEMA_SQL_P2 } from "./schema";
+import { JOURNAL_TIER_DDL, SCHEMA_SQL_P2 } from "./schema";
 
 export type SourceName = "herdr" | "orca" | "cmux";
 
@@ -213,6 +213,7 @@ export function runReconPass(deps: ReconDeps, state: ReconState): Finding[] {
     // the read-only queries below stay well-defined.
     db = new Database(":memory:");
     db.exec(SCHEMA_SQL_P2);
+    db.exec(JOURNAL_TIER_DDL);
   }
   try {
     // 1. Source snapshots with outage aggregation.
@@ -229,7 +230,7 @@ export function runReconPass(deps: ReconDeps, state: ReconState): Finding[] {
          FROM session_incarnations si
          WHERE si.liveness_domain='process'
            AND NOT EXISTS (
-             SELECT 1 FROM journal j WHERE j.stable_id=si.stable_id AND j.kind='session_ended')`,
+             SELECT 1 FROM journal_all j WHERE j.stable_id=si.stable_id AND j.kind='session_ended')`,
       )
       .all() as Array<{ stable_id: string; writer_id: string; pid: number | null; last_seen_at: number | null }>;
 
