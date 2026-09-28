@@ -882,6 +882,79 @@ export default function overload(pi: ExtensionApi): void {
     } catch { /* Host refused the tool: asks stay observational. */ }
   }
 
+  // Context handoff receiver (docs/plans/overload-20260928-manager-chat.md §1.5).
+  // A handoff is context, not a priority change or an interruption: briefs are
+  // attached to the next prompt and the agent decides adopt/defer/reject itself.
+  const injectedHandoffs = new Set<string>()
+  const HANDOFF_FETCH_TIMEOUT_MS = 1500
+
+  async function handoffCall(path: string, body?: Record<string, unknown>): Promise<any> {
+    const response = await globalThis.fetch(`http://127.0.0.1:${controlPlanePort}${path}`, body
+      ? { method: "POST", signal: AbortSignal.timeout(2000), headers: controlPlaneHeaders, body: JSON.stringify(body) }
+      : { signal: AbortSignal.timeout(HANDOFF_FETCH_TIMEOUT_MS) })
+    const value = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(String(value?.message || value?.error || `HTTP ${response.status}`))
+    return value
+  }
+
+  async function fetchPendingHandoffs(): Promise<any[]> {
+    if (!stableId) return []
+    let timer: ReturnType<typeof setTimeout> | undefined
+    // Hard deadline independent of fetch's own abort handling: never hold the turn.
+    const deadline = new Promise<undefined>((resolve) => { timer = setTimeout(resolve, HANDOFF_FETCH_TIMEOUT_MS) })
+    try {
+      const result = await Promise.race([handoffCall(`/api/handoff/pending?target_kind=session&target_id=${encodeURIComponent(stableId)}`).catch(() => undefined), deadline])
+      return Array.isArray(result?.items) ? result.items : []
+    } finally { clearTimeout(timer) }
+  }
+
+  function renderHandoff(item: any): string {
+    const brief = item?.brief ?? {}
+    const list = (label: string, values: unknown) => Array.isArray(values) && values.length ? `${label}:\n${values.map((v) => `- ${String(v)}`).join("\n")}\n` : ""
+    return `## Handoff ${item.request_id} (state: ${item.state}${item.ack_decision ? `/${item.ack_decision}` : ""})\nPurpose: ${brief.purpose ?? ""}\n${brief.context ? `Context: ${brief.context}\n` : ""}${list("Constraints", brief.constraints)}${list("Inputs", brief.inputs)}${list("Acceptance", brief.acceptance)}Return requirement: ${brief.return_requirement ?? ""}\n`
+  }
+
+  const HANDOFF_PREAMBLE = "Overload context handoff: the owner forwarded context for this session. This is NOT a priority change and NOT an interruption; finish or keep your current work as you judge best. Decide yourself: call handoff_ack with adopt, defer, reject or no_change (and a reason), and when done call handoff_conclude with your decision or conclusion so it returns to the origin.\n\n"
+
+  on("before_agent_start", async () => {
+    const items = (await fetchPendingHandoffs()).filter((item) => typeof item?.request_id === "string" && !injectedHandoffs.has(item.request_id))
+    if (!items.length) return undefined
+    for (const item of items) {
+      injectedHandoffs.add(item.request_id)
+      if (item.state === "pending") void handoffCall(`/api/handoff/${encodeURIComponent(item.request_id)}/read`, {}).catch(() => {})
+    }
+    return { message: { customType: "overload_handoff", content: HANDOFF_PREAMBLE + items.map(renderHandoff).join("\n"), display: true, details: { request_ids: items.map((item) => item.request_id) } } }
+  })
+
+  function toolText(text: string, details: Record<string, unknown> = {}): AskToolResult {
+    return { content: [{ type: "text", text }], details }
+  }
+
+  async function handoffTool(run: () => Promise<any>): Promise<AskToolResult> {
+    try {
+      const value = await run()
+      return toolText(JSON.stringify(value), { ok: true })
+    } catch (error) {
+      return toolText(`handoff call failed: ${(error as Error)?.message || String(error)}`, { ok: false })
+    }
+  }
+
+  if (typeof pi.registerTool === "function") {
+    const tools = [
+      { name: "handoff_inbox", label: "Handoff inbox", description: "List Overload context handoffs addressed to this session that you have not concluded yet.", parameters: { type: "object", properties: {}, additionalProperties: false },
+        execute: async () => { const items = await fetchPendingHandoffs(); return toolText(items.length ? HANDOFF_PREAMBLE + items.map(renderHandoff).join("\n") : "No pending handoffs.", { count: items.length }) } },
+      { name: "handoff_ack", label: "Handoff ack", description: "Acknowledge an Overload context handoff: adopt, defer, reject or no_change, with a reason. A deferred handoff may be acknowledged again later.",
+        parameters: { type: "object", properties: { request_id: { type: "string" }, decision: { type: "string", enum: ["adopt", "defer", "reject", "no_change"] }, reason: { type: "string" } }, required: ["request_id", "decision", "reason"], additionalProperties: false },
+        execute: (_id: string, params: any) => handoffTool(() => handoffCall(`/api/handoff/${encodeURIComponent(String(params?.request_id ?? ""))}/ack`, { decision: params?.decision, reason: params?.reason })) },
+      { name: "handoff_conclude", label: "Handoff conclude", description: "Record the single, final decision or conclusion for an Overload context handoff; it is returned to where the handoff came from. Can only be recorded once.",
+        parameters: { type: "object", properties: { request_id: { type: "string" }, kind: { type: "string", enum: ["decision", "conclusion"] }, text: { type: "string" } }, required: ["request_id", "kind", "text"], additionalProperties: false },
+        execute: (_id: string, params: any) => handoffTool(() => handoffCall(`/api/handoff/${encodeURIComponent(String(params?.request_id ?? ""))}/conclude`, { kind: params?.kind, text: params?.text })) },
+    ]
+    for (const tool of tools) {
+      try { pi.registerTool(tool) } catch { /* Host refused the tool: handoffs stay readable via the dashboard. */ }
+    }
+  }
+
   function shellCommand(command: string): string {
     const tokens = command.trim().split(/\s+/)
     while (/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(tokens[0] || "")) tokens.shift()

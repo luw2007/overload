@@ -93,3 +93,13 @@ its origin, so agent-spawned worktrees classify as agent work.
 ## Remote spool pull
 
 The optional pull job copies a remote spool through SSH and `rsync`. Configure the remote, spool path, destination, command paths, failure threshold, and timeout as CLI flags to `src/pull/pull.ts` (see [configuration.md](configuration.md)). `scripts/deploy-devbox.sh` installs the pi/omp extension onto a reachable remote host over SSH; set `OVERLOAD_REMOTE` (and optionally `OVERLOAD_HOST_ID`) to target a host other than the default.
+
+## Context handoff
+
+The owner (or the Manager) can forward context to a live pi/omp/prime session as a `collaboration_brief_v0` (`POST /api/handoff`). Receiver semantics:
+
+- It is **not a priority change** and **not an interruption**: the create receipt always reports `priority_changed:false, todo_created:false, execution_interrupted:false`. The current turn is never blocked.
+- On `before_agent_start` the Overload extension fetches `GET /api/handoff/pending?target_kind=session&target_id=<stable_id>` (1500 ms deadline, failures silent), attaches unseen briefs to the prompt as context, and marks them read. The `handoff_inbox` tool lists them on demand.
+- The receiving agent decides itself with `handoff_ack {request_id, decision: adopt|defer|reject|no_change, reason}`; a `defer` may later be re-acknowledged.
+- `handoff_conclude {request_id, kind: decision|conclusion, text}` records one immutable conclusion, which is queued back to the origin (`GET /api/handoff/returns?destination_kind=manager_conversation&destination_id=owner`, or `attention_item` + item id). A second conclusion is rejected with 409.
+- Unconcluded requests expire after 7 days. Inspect with `overload handoff list [state]` / `overload handoff show <id>`.

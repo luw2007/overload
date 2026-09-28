@@ -20,6 +20,8 @@ import { mgmtRoute } from "./mgmt-routes";
 import { contextRoute } from "./context-routes";
 import { managerRoute, type ManagerRouteDeps } from "../manager/routes";
 import { recordAcceptance } from "../manage/manifest";
+import { acknowledgeHandoff, createHandoffRequest, expireStaleHandoffs, listHandoffReturns, listHandoffs, listPendingHandoffs, markHandoffRead, recordHandoffConclusion } from "../control/handoff";
+import type { HandoffAckDecision, HandoffConclusionKind, HandoffSourceKind, HandoffState } from "../control/handoff-types";
 import { actOnAttention, projectAttentionEffect, cancelConditionWait, ControlError, createWork, getAttention, getAttentionMaterial, getConditionWait, getWork, listAttention, listAttentionFollowUps, listConditionWaits, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, resolveAttention, reviseContract, promoteWork } from "../control/store";
 import { previewContractRevision } from "../control/store";
 import type { AttentionDecisionInput, AttentionItem, ConditionWait, Contract, CreateWaitInput, StaleAttentionBody, WaitBaseline, WaitCondition, WaitDispositionInput, WaitErrorKind, WaitSourceAdapters, WaitState } from "../control/types";
@@ -461,6 +463,47 @@ function checkOrigin(request: Request, port: number): Response | null {
   return null;
 }
 
+// Context handoff (docs/plans/overload-20260928-manager-chat.md §1.5): a brief
+// delivered to a receiver session. Not a priority change, not an interruption.
+async function handoffRoute(request: Request, url: URL, controlPath: string): Promise<Response | null> {
+  if (url.pathname !== "/api/handoff" && !url.pathname.startsWith("/api/handoff/")) return null;
+  if (request.method === "POST" && !request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });
+  let input: Record<string, unknown> = {};
+  if (request.method === "POST") { try { input = await bodyObject(request); } catch { return json({ error: "invalid", message: "JSON object required" }, { status: 400 }); } }
+  const control = openControl(controlPath);
+  try {
+    if (request.method === "POST" && url.pathname === "/api/handoff") {
+      const receipt = createHandoffRequest(control, { source_kind: input.source_kind as HandoffSourceKind, source_id: input.source_id as string, target_kind: input.target_kind as "session", target_id: input.target_id as string, brief: input.brief as never, original_message: (input.original_message ?? null) as string | null });
+      return json(receipt, { status: 201 });
+    }
+    if (request.method === "GET" && url.pathname === "/api/handoff") {
+      expireStaleHandoffs(control);
+      return json({ items: listHandoffs(control, (url.searchParams.get("state") || undefined) as HandoffState | undefined) });
+    }
+    if (request.method === "GET" && url.pathname === "/api/handoff/pending") {
+      const targetId = url.searchParams.get("target_id");
+      if (url.searchParams.get("target_kind") !== "session" || !targetId) return json({ error: "invalid", message: "target_kind=session and target_id are required" }, { status: 400 });
+      expireStaleHandoffs(control);
+      return json({ items: listPendingHandoffs(control, { target_kind: "session", target_id: targetId }) });
+    }
+    if (request.method === "GET" && url.pathname === "/api/handoff/returns") {
+      const kind = url.searchParams.get("destination_kind"), id = url.searchParams.get("destination_id");
+      if (!kind || !id) return json({ error: "invalid", message: "destination_kind and destination_id are required" }, { status: 400 });
+      return json({ items: listHandoffReturns(control, { destination_kind: kind, destination_id: id }) });
+    }
+    const action = url.pathname.match(/^\/api\/handoff\/([^/]+)\/(read|ack|conclude)$/);
+    if (request.method === "POST" && action) {
+      const id = routeParameter(action[1]!);
+      if (action[2] === "read") return json(markHandoffRead(control, id));
+      if (action[2] === "ack") return json(acknowledgeHandoff(control, id, input.decision as HandoffAckDecision, typeof input.reason === "string" ? input.reason : ""));
+      return json(recordHandoffConclusion(control, id, input.kind as HandoffConclusionKind, input.text as string));
+    }
+    return json({ error: "not found" }, { status: 404 });
+  } catch (error) {
+    return controlError(error);
+  } finally { control.close(); }
+}
+
 // Loopback is the v1 trust boundary for host/origin (CSRF), but NOT for caller
 // identity. Context routes (plan §4.2) require a server-injected actor; the
 // loopback bind only proves "same machine", not "trusted model". The actor below
@@ -572,6 +615,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (context) return context;
         const manager = await managerRoute(request, url, { ...options.manager, controlPath, ledgerPath, configPath: options.manager?.configPath ?? options.policyPath });
         if (manager) return manager;
+        const handoff = await handoffRoute(request, url, controlPath);
+        if (handoff) return handoff;
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
           const control = openControl(controlPath);
