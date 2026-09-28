@@ -19,6 +19,7 @@ function fixture() {
     CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
     CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
     CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+    CREATE VIEW journal_all AS SELECT * FROM journal;
     CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);`);
   return { control, ledger };
 }
@@ -234,6 +235,7 @@ describe("nudgeOnce compatibility and cutover policy", () => {
       CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
       CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
       CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+      CREATE VIEW journal_all AS SELECT * FROM journal;
       CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);
       INSERT INTO sessions VALUES ('s1','local');
       INSERT INTO requests VALUES ('r1','s1','decision','pending',1700000000000,'{"approval_id":"r1"}');`);
@@ -263,6 +265,7 @@ describe("nudgeOnce compatibility and cutover policy", () => {
       CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
       CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
       CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+      CREATE VIEW journal_all AS SELECT * FROM journal;
       CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);
       INSERT INTO sessions VALUES ('s1','local');
       INSERT INTO requests VALUES ('r1','s1','decision','pending',1700000000000,'{}');`);
@@ -288,6 +291,7 @@ describe("nudgeOnce compatibility and cutover policy", () => {
       CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
       CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
       CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+      CREATE VIEW journal_all AS SELECT * FROM journal;
       CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);
       INSERT INTO sessions VALUES ('s1','local');
       INSERT INTO requests VALUES ('r1','s1','decision','pending',1700000000000,'{}');`);
@@ -319,6 +323,7 @@ describe("nudgeOnce compatibility and cutover policy", () => {
       CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
       CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
       CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+      CREATE VIEW journal_all AS SELECT * FROM journal;
       CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);
       INSERT INTO sessions VALUES ('s1','local');
       INSERT INTO requests VALUES ('r1','s1','decision','pending',1700000000000,'{}');`);
@@ -368,6 +373,7 @@ describe("nudgeOnce compatibility and cutover policy", () => {
       CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
       CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
       CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+      CREATE VIEW journal_all AS SELECT * FROM journal;
       CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);
       INSERT INTO sessions VALUES ('s-linked','local');
       INSERT INTO requests VALUES ('r-linked','s-linked','decision','pending',1700000000000,'{"approval_id":"r-linked"}');`);
@@ -404,6 +410,7 @@ describe("nudgeOnce compatibility and cutover policy", () => {
       CREATE TABLE session_hosts(stable_id TEXT,session_id TEXT,app TEXT);
       CREATE TABLE attachments(stable_id TEXT,binding TEXT,platform TEXT,valid INTEGER,observed_at INTEGER);
       CREATE TABLE journal(ingest_seq INTEGER PRIMARY KEY,stable_id TEXT,kind TEXT,detail TEXT);
+      CREATE VIEW journal_all AS SELECT * FROM journal;
       CREATE TABLE current(stable_id TEXT PRIMARY KEY,q5_reason TEXT,state TEXT,last_progress_at INTEGER,last_event_at INTEGER);
       INSERT INTO sessions VALUES ('s1','local');
       INSERT INTO requests VALUES ('r1','s1','decision','pending',1700000000000,'{}');`);
