@@ -18,6 +18,7 @@ import { listingSnapshotProbe } from "../shared/checkpoint";
 import type { LaunchLeases } from "../shared/launch-lease";
 import { mgmtRoute } from "./mgmt-routes";
 import { contextRoute } from "./context-routes";
+import { managerRoute, type ManagerRouteDeps } from "../manager/routes";
 import { recordAcceptance } from "../manage/manifest";
 import { actOnAttention, projectAttentionEffect, cancelConditionWait, ControlError, createWork, getAttention, getAttentionMaterial, getConditionWait, getWork, listAttention, listAttentionFollowUps, listConditionWaits, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, resolveAttention, reviseContract, promoteWork } from "../control/store";
 import { previewContractRevision } from "../control/store";
@@ -466,7 +467,7 @@ function checkOrigin(request: Request, port: number): Response | null {
 // is a transition-state minimal trusted injection: production must bind actor to
 // an authenticated session/token instead of an env var. Do NOT read actor from
 // request headers / body / query.
-export function startWebServer(options: { ledgerPath?: string; controlPath?: string; policyPath?: string; orchestratorPath?: string; spoolRoot?: string; publishIntervalMs?: number; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe; checkpointProbe?: CheckpointProbe; actor?: string; waitAdapters?: WaitSourceAdapters; conditionWaits?: boolean } = {}) {
+export function startWebServer(options: { ledgerPath?: string; controlPath?: string; policyPath?: string; orchestratorPath?: string; spoolRoot?: string; publishIntervalMs?: number; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe; checkpointProbe?: CheckpointProbe; actor?: string; waitAdapters?: WaitSourceAdapters; conditionWaits?: boolean; manager?: Omit<ManagerRouteDeps, "controlPath" | "ledgerPath"> } = {}) {
   // 在创建任何 DB/SpoolWriter 之前显式解析全部路径：不允许把 undefined 传到 open*
   // （Bun 会据 undefined 在 CWD 创建名为 "undefined" 的文件）。
   const ledgerPath = options.ledgerPath ?? process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
@@ -569,6 +570,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if (management) return management;
         const context = await contextRoute(request, url, { controlPath, actor });
         if (context) return context;
+        const manager = await managerRoute(request, url, { ...options.manager, controlPath, ledgerPath, configPath: options.manager?.configPath ?? options.policyPath });
+        if (manager) return manager;
         if (request.method === "GET" && url.pathname === "/api/summary") return json(withReadonlyDb(ledgerPath, (db) => {
           const health = queryHealth(db);
           const control = openControl(controlPath);
@@ -951,7 +954,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
 }
 
 function dashboardRoute(path: string): boolean {
-  return /^\/(conversations|decide|ledger|works|tasks|candidates|rules|agents|now|inbox|done|sessions|health|q1|archive|hung|zombie)(?:\/.*)?$/.test(path);
+  return /^\/(conversations|manager|decide|ledger|works|tasks|candidates|rules|agents|now|inbox|done|sessions|health|q1|archive|hung|zombie)(?:\/.*)?$/.test(path);
 }
 
 if (import.meta.main) {

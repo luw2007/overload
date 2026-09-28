@@ -2,7 +2,7 @@
   const $ = id => document.getElementById(id);
   const escapeHtml = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const e = escapeHtml;
-  const pages = ['decide','conversations','ledger','works','tasks','candidates','agents'];
+  const pages = ['decide','manager','conversations','ledger','works','tasks','candidates','agents'];
   const LEGACY_ZONE = {now:'decide',inbox:'decide',done:'decide',q1:'decide',hung:'agents',zombie:'agents',archive:'agents',sessions:'agents',health:'agents'};
   const state = {
     page: "decide",
@@ -34,6 +34,10 @@
     waitsError: null,
     waitsOpen: false,
     waitsGate: null,
+    managerContext: null,
+    managerTurns: [],
+    managerDraft: "",
+    managerPosting: false,
   };
   // Refresh slices: each page section loads, applies and renders on its own as its fetch resolves, so one slow
   // endpoint delays only its own section. A slice result is dropped only when a newer refresh already applied that
@@ -41,7 +45,7 @@
   // Polls reuse a slice's still-pending request instead of stacking another one behind a slow endpoint.
   let refreshSeq = 0, renderFrame = 0;
   const applied = new Map(), failures = new Map(), inflight = new Map(), packages = new Map();
-  const PAGE_SLICES = {ledger:['ledger'],works:['works'],candidates:['works'],conversations:['conversations']};
+  const PAGE_SLICES = {ledger:['ledger'],works:['works'],candidates:['works'],conversations:['conversations'],manager:['managerContext','managerTurns']};
   const formatTime = value => value == null ? '—' : new Date(value).toLocaleString();
   const humanDuration = ms => ms == null ? '—' : ms < 60000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`;
   function showError(error) {
@@ -405,16 +409,50 @@
     if (Array.isArray(data?.conversations)) return data.conversations;
     throw new Error('Conversation response was not a list.');
   }
+  // ── Manager (docs/plans/overload-20260928-manager-chat.md §3): read-only attention steward. ──
+  const TRIAGE_GROUPS=[['user_gate','你要拍板'],['user_action','你要动手'],['agent_work','Agent 可继续']];
+  const TURN_STATUS={running:'进行中',answered:'已回答',invalid_envelope:'回答格式无效',failed:'未完成',unavailable:'未配置模型'};
+  function managerTiles(ctx) {
+    const startOfDay=new Date();startOfDay.setHours(0,0,0,0);
+    const tiles=[['需要你',ctx.attention.now.length+ctx.attention.inbox.length],['进行中',ctx.attention.follow_up.length+ctx.works.filter(w=>w.state==='active').length],['等待中',ctx.waits.filter(w=>w.state==='watching').length],['今日已完成',ctx.recent_done.filter(x=>x.updated_at>=startOfDay.getTime()).length]];
+    return `<div class="metrics manager-brief">${tiles.map(([label,value])=>`<div class="metric"><div class="metric-label">${e(label)}</div><div class="metric-value">${e(value)}</div></div>`).join('')}</div>${ctx.coverage.attention_omitted||ctx.coverage.sessions_omitted?`<p class="meta">快照已截断：${e(ctx.coverage.attention_omitted)} 个事项、${e(ctx.coverage.sessions_omitted)} 个会话未纳入</p>`:''}`;
+  }
+  function managerTriage(turn,ctx) {
+    const triage=turn?.status==='answered'?[...(turn.envelope?.triage||[])].sort((a,b)=>a.order-b.order):[];
+    if(!triage.length)return '';
+    const title=id=>[...(ctx?.attention.now||[]),...(ctx?.attention.inbox||[]),...(ctx?.attention.follow_up||[])].find(x=>x.item_id===id)?.conclusion||id;
+    return TRIAGE_GROUPS.map(([kind,label])=>{const rows=triage.filter(t=>t.kind===kind);return rows.length?`<section class="manager-group" data-triage="${kind}"><h3>${e(label)} <span class="muted mono">${rows.length}</span></h3><div class="list">${rows.map(t=>`<div class="row"><div class="mono">${e(t.order)}</div><div><div class="row-title"><a href="/decide?item=${encodeURIComponent(t.item_id)}">${e(title(t.item_id))}</a> <span class="mono muted">${t.urgency==='stated'?'有期限/风险':'推断紧急度'}${t.dependency_status==='unverified_recorded'?' · 证据未核实，建议 Agent 先核对':''}</span></div><div class="row-note">${e(t.reason)}</div></div></div>`).join('')}</div></section>`:'';}).join('');
+  }
+  function managerTurn(turn,latest=false) {
+    const env=turn.envelope||{},receipts=turn.handoff_receipts||[];
+    const extras=[env.protected_action?`<p class="meta"><b>受保护动作（仅为提案，非执行授权）</b> ${e(env.protected_action.kind)} · ${e(env.protected_action.description)}</p>`:'',(env.gaps||[]).length?`<p class="meta"><b>覆盖缺口</b> ${env.gaps.map(e).join('；')}</p>`:'',receipts.length?`<p class="meta"><b>转交</b> ${receipts.map(r=>`${e(r.target_id)}：${r.state==='delivered'?'已送达':'未送达'}${r.reason?`（${e(r.reason)}）`:''}`).join('；')}</p>`:'',turn.status==='invalid_envelope'?`<p class="meta"><b>校验错误</b> ${e(turn.failure_reason)}</p>`:''].join('');
+    return `<article class="conversation-turn manager-turn" data-turn-id="${e(turn.turn_id)}"><p class="meta">${e(formatTime(turn.started_at))} · ${e(turn.source)} · ${e(TURN_STATUS[turn.status]||turn.status)}</p><p><b>你</b> ${e(turn.question)}</p>${latest||turn.answer_markdown?`<pre class="manager-answer">${e(turn.answer_markdown||'')}</pre>`:''}${extras}</article>`;
+  }
+  function renderManager() {
+    const ctx=state.managerContext,turns=state.managerTurns||[],latest=turns[0];
+    const composer=`<form id="manager-ask" class="conversation-composer"><label for="manager-text">问 Manager</label><textarea id="manager-text" name="question" rows="3" placeholder="例如：现在我该先决什么？" ${state.managerPosting?'disabled':''}>${e(state.managerDraft)}</textarea><div class="conversation-composer-actions"><span class="conversation-compose-status" aria-live="polite">${state.managerPosting?'思考中…':'只读：回答不批准、不执行、不改优先级。'}</span><button type="submit" class="primary" ${state.managerPosting?'disabled':''}>发送</button></div></form>`;
+    return `${head('Manager','全局注意力管家：现在该先决什么、为什么、什么可以不管')}${ctx?managerTiles(ctx):''}${composer}${latest?`<h2>最近一轮</h2>${managerTurn(latest,true)}${managerTriage(latest,ctx)}`:empty('还没有提问。')}${turns.length>1?`<h2>历史</h2>${turns.slice(1).map(t=>managerTurn(t)).join('')}`:''}`;
+  }
+  async function submitManagerQuestion(form) {
+    if(state.managerPosting)return;
+    const question=(form.elements.question?.value??'').trim();
+    if(!question){showError(new Error('问题不能为空。'));return;}
+    state.managerDraft=question;state.managerPosting=true;render();
+    try {await post('/api/manager/ask',{question,source:'web'});state.managerDraft='';}
+    catch(error){showError(error.status===409?new Error('Manager 正在回答上一个问题，请稍后再试。'):error);}
+    finally {state.managerPosting=false;await refresh();render();}
+  }
   function renderAgents() {
     return head('Agents','Session diagnostics and legacy recovery actions.')+`<div id="agent-summary" class="meta">${sliceView('health',()=>`${e(state.health?.open_incidents?.length||0)} open incidents · ${e(state.health?.coverage_gaps||0)} coverage gaps · ${e(state.health?.telemetry_gaps||0)} telemetry gaps`)}</div><div id="agent-status" role="status"></div><section id="detail"></section><section id="content"><h2>Decision requests</h2>${button('Acknowledge selected','bulk-ack')}${button('Clear selection','clear-selection')}${sliceView('q1',()=>state.q1.map(decisionCard).join('')||empty('No decision requests.'))}<h2>Hung sessions</h2>${sliceView('hung',()=>state.hung.map(hungCard).join('')||empty('No hung sessions.'))}<h2>Zombie / handoff</h2>${sliceView('zombie',()=>state.zombie.groups.map(zombieCard).join('')||empty('No zombie groups.'))}<h3>Orphaned requests</h3>${sliceView('zombie',()=>state.zombie.orphaned_requests.map(r=>`<article class="card">${e(r.summary || r.request_uid)}${button('Acknowledge','orphan-ack',r.request_uid)}</article>`).join('')||empty('No orphaned requests.'))}<h2>Sessions</h2>${sliceView('sessions',()=>`<div class="table-wrap"><table><thead><tr><th>Session</th><th>Agent</th><th>Host</th><th>State / queue</th><th>Last event</th></tr></thead><tbody>${state.sessions.map(r=>`<tr><td>${sessionLink(r.stable_id)} ${resumeCapability(r)} ${jumpActions(r, "stable_id", "jump-session")}</td><td>${e(r.agent)}</td><td>${e(r.host)}</td><td>${e(r.run_state)} · ${e(r.queue)}</td><td>${e(formatTime(r.last_event_at))}</td></tr>`).join('')}</tbody></table></div>`)}<h2>Archive</h2>${sliceView('archive',()=>`<div class="table-wrap"><table><thead><tr><th>Session</th><th>Kind</th><th>Status</th><th>Time</th><th>Summary</th></tr></thead><tbody>${state.archive.map(r=>`<tr><td>${sessionLink(r.stable_id)}</td><td>${e(r.origin)}</td><td>${r.closed_out?'Closed out':'Archived'}</td><td>${e(formatTime(r.last_event_at))}</td><td>${e(r.state || r.run_state)}</td></tr>`).join('')}</tbody></table></div>`)}<h2>Health</h2>${sliceView('health',()=>json(state.health))}</section>`;
   }
-  function render() {if(editor)return;document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.page));const waiting=(PAGE_SLICES[state.page]||[]).find(key=>!applied.has(key));$('main').innerHTML=waiting?sliceView(waiting):({decide:renderDecide,conversations:renderConversations,ledger:renderLedger,works:renderWorks,tasks:renderTasks,candidates:renderCandidates,agents:renderAgents})[state.page]();$('workspace-actions').hidden=state.page==='conversations';if(state.page!=='conversations')$('workspace-actions').innerHTML=`<div>Operator workspace<small>真实数据 · 需要你判断时才介入</small></div><span class="muted">选择工作项，审阅证据与影响</span>`;if(state.page==='agents'&&state.session){$('content').hidden=true;renderDetail();}}
+  function render() {if(editor)return;document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.page));const waiting=(PAGE_SLICES[state.page]||[]).find(key=>!applied.has(key));$('main').innerHTML=waiting?sliceView(waiting):({decide:renderDecide,manager:renderManager,conversations:renderConversations,ledger:renderLedger,works:renderWorks,tasks:renderTasks,candidates:renderCandidates,agents:renderAgents})[state.page]();$('workspace-actions').hidden=state.page==='conversations';if(state.page!=='conversations')$('workspace-actions').innerHTML=`<div>Operator workspace<small>真实数据 · 需要你判断时才介入</small></div><span class="muted">选择工作项，审阅证据与影响</span>`;if(state.page==='agents'&&state.session){$('content').hidden=true;renderDetail();}}
   const sliceView=(key,html)=>applied.has(key)?html():failures.has(key)?empty(`Unavailable: ${failures.get(key)}`):empty('Loading…');
   function scheduleRender() {if(!renderFrame)renderFrame=requestAnimationFrame(flushRender);}
   function flushRender() {
     if(renderFrame)cancelAnimationFrame(renderFrame);renderFrame=0;
     // A refresh never re-renders over a message being composed; the draft is re-captured on the next refresh.
     if(state.page==='conversations'&&(state.conversationPosting||document.activeElement?.id==='conversation-text'))return;
+    if(state.page==='manager'&&(state.managerPosting||document.activeElement?.id==='manager-text'))return;
     render();
   }
   /** The current view's sections. `scope` names the exact view (page, range, session) a result is fetched for. */
@@ -427,6 +465,7 @@
     if(page==='ledger') {const range=state.range,since=range==='all'?0:Date.now()-(range==='week'?7:1)*86400000;slice('ledger',get('ledger',`/api/ledger?since=${since}`),{param:range});}
     if(page==='works') {slice('works',get('works','/api/works'));slice('waits',loadWaits);}
     if(page==='candidates') slice('works',get('works','/api/works'));
+    if(page==='manager') {slice('managerContext',get('managerContext','/api/manager/context'));slice('managerTurns',()=>fetchJson('/api/manager/turns?limit=20').then(data=>({managerTurns:data.turns})));}
     if(page==='conversations') slice('conversations',()=>fetchJson('/api/conversations').then(data=>({conversations:conversationPayload(data)})),{after:settleConversationPending});
     if(page==='agents') {for(const key of ['q1','hung','zombie','sessions','health','archive'])slice(key,get(key,`/api/${key}`));if(state.session)slice('detail',get('detail',`/api/sessions/${encodeURIComponent(state.session)}`),{param:state.session});}
     return list;
@@ -883,7 +922,7 @@
     if (target.id === "detail-back") return navigate("agents");
   }
   function exportCsv() {const rows=[['Work','Asked','Decided','Waited','Chose','Effect'],...state.ledger.slowest.map(r=>[r.title,r.asked_at,r.decided_at??'—',r.waited_ms,r.chose??'—',r.effect_state??'—'])];const csv=rows.map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='overload-ledger.csv';a.click();URL.revokeObjectURL(url);}
-  document.addEventListener('submit',event=>{if(event.target.id==='conversation-message'){event.preventDefault();void submitConversationMessage(event.target);}if(event.target.id==='task-handoff'){event.preventDefault();void submitTaskHandoff(event.target);}});
+  document.addEventListener('submit',event=>{if(event.target.id==='manager-ask'){event.preventDefault();void submitManagerQuestion(event.target);}if(event.target.id==='conversation-message'){event.preventDefault();void submitConversationMessage(event.target);}if(event.target.id==='task-handoff'){event.preventDefault();void submitTaskHandoff(event.target);}});
   document.addEventListener('input',event=>{if(event.target.id==='conversation-text'){state.conversationDraft=event.target.value;state.conversationDrafts[state.conversationId]=event.target.value;event.target.form.querySelector('button[type="submit"]').disabled=state.conversationPosting||!event.target.value.trim();}});
   document.addEventListener('submit',async event=>{const form=event.target;if(form.id!=='capture'&&!form.matches('form.promote'))return;event.preventDefault();const submit=form.querySelector('button');submit.disabled=true;try {if(form.id==='capture')await post('/api/works',{title:form.elements.idea.value.trim(),source:'operator',candidate:true});else {const work=state.works.find(w=>w.work_id===form.dataset.id);await post(`/api/works/${encodeURIComponent(work.work_id)}/promote`,{expected_revision:work.revision,reason:'promoted from candidates',contract:{objective:form.elements.objective.value.trim(),acceptance:[{id:'a1',kind:'human',description:form.elements.acceptance.value.trim()}],non_goals:[],scope:{cwd:'.'},budget:{},stop_conditions:[{id:'s1',kind:'judgment',description:'operator review'}],decision_owner:'operator'}});}await refresh();}catch(error){showError(error);}finally{submit.disabled=false;}});
   document.addEventListener('click',async event=>{const target=event.target.closest('button,a[data-nav],a.drill,[data-task-track]');if(!target)return;if(target.closest('form')&&target.dataset.action!=='task-preconditions')return;event.preventDefault();if(target.dataset.nav)return navigate(target.dataset.nav);if(target.dataset.taskTrack){history.pushState(null,'',`/tasks?track=${target.dataset.taskTrack}`);return restoreRoute();}if(target.dataset.taskId){history.pushState(null,'',`/tasks/${encodeURIComponent(target.dataset.taskId)}`);return restoreRoute();}target.disabled=true;try {await handleAction(target);}catch(error){showError(error);}finally{target.disabled=false;if(target.dataset.action==='apply-editor')validateEditor();}});
