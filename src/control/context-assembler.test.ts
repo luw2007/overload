@@ -1,6 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ensureControlSchema, createWork, upsertAttention } from "./store";
+import { cancelTarget, openMailbox, registerTarget } from "../decision-bot/mailbox";
 import type { Contract } from "./types";
 import {
   createObject,
@@ -29,6 +33,21 @@ function fixture() {
   const db = new Database(":memory:");
   db.exec("PRAGMA foreign_keys=ON");
   ensureControlSchema(db);
+  ensureContextReducerSchema(db);
+  return db;
+}
+
+const mailboxRoots: string[] = [];
+afterEach(() => {
+  for (const root of mailboxRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+// approval_targets lives on the mailbox schema, which openMailbox only creates for a
+// file-backed database. The approval-option branch therefore cannot use the in-memory fixture.
+function mailboxFixture() {
+  const root = mkdtempSync(join(tmpdir(), "overload-assembler-approval-"));
+  mailboxRoots.push(root);
+  const db = openMailbox(join(root, "control.db"));
   ensureContextReducerSchema(db);
   return db;
 }
@@ -182,6 +201,105 @@ describe("T5 context-assembler", () => {
     expect(JSON.parse(baseline.inputs).option_effects).toEqual([
       { option: "allow-once", effect: "records answer; execution semantics unavailable" },
     ]);
+    db.close();
+  });
+
+  // A06 §4.2: every option carries deterministic server-owned display metadata, in
+  // AttentionItem.options order, with the executable ID unchanged. `narrow` is the only
+  // generic option that demands both a reason and a replacement contract.
+  test("generic decision options carry server-owned metadata in AttentionItem.options order", () => {
+    const db = fixture();
+    const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
+    makeAttention(db, work.work_id, "generic-options", { options: ["continue", "narrow", "stop"] });
+
+    const result = getContextPackage({
+      consumer_type: "decision_ui", consumer_id: "generic-options", work_id: work.work_id,
+      package_type: "decision_view", actor: "alice", db,
+    });
+    const ok = expectOk(result);
+    if (ok.package.package_type !== "decision_view") throw new Error("type");
+
+    expect(ok.package.options).toEqual([
+      {
+        id: "continue",
+        label: "Continue work",
+        effect: "records acceptance of the remaining risk and continues the work",
+        consequence: "Work continues under the current contract and budget.",
+        requires_reason: false,
+        requires_contract: false,
+      },
+      {
+        id: "narrow",
+        label: "Narrow scope",
+        effect: "replaces the work contract with a reviewed narrower contract",
+        consequence: "Other open cards for the previous contract are superseded.",
+        requires_reason: true,
+        requires_contract: true,
+      },
+      {
+        id: "stop",
+        label: "Stop work",
+        effect: "stops the work and releases its controlled resources",
+        consequence: "Work moves to stopped and its remaining scope is not executed.",
+        requires_reason: false,
+        requires_contract: false,
+      },
+    ]);
+    db.close();
+  });
+
+  // A06 §4.2: an approval option borrows the active registered target effect and says
+  // outright that choosing it records an answer, not effect success. Generic options in
+  // the same card keep their own metadata, and closing the target fails assembly closed.
+  test("approval options use the active registered target effect and record-not-succeed wording", () => {
+    const db = mailboxFixture();
+    const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
+    const target = registerTarget(db, {
+      consumerOwner: "extension", approvalId: "ap-1", question: "merge the release PR?",
+      options: ["approve", "stop"], effect: "merge_pull_request", scope: {}, evidence: {},
+      expiresAt: Date.now() + 60_000,
+    });
+    makeAttention(db, work.work_id, "approval-item", {
+      options: ["approve", "stop"], approval_id: "ap-1", consumer_owner: "extension",
+    });
+
+    const ok = expectOk(getContextPackage({
+      consumer_type: "decision_ui", consumer_id: "approval-item", work_id: work.work_id,
+      package_type: "decision_view", actor: "alice", db,
+    }));
+    if (ok.package.package_type !== "decision_view") throw new Error("type");
+
+    expect(ok.package.options).toEqual([
+      {
+        id: "approve",
+        label: "approve",
+        effect: "records answer; execution pending: merge_pull_request",
+        consequence: "Records “approve” for the registered merge_pull_request target; success is not yet verified.",
+        requires_reason: false,
+        requires_contract: false,
+      },
+      {
+        id: "stop",
+        label: "Stop work",
+        effect: "stops the work and releases its controlled resources",
+        consequence: "Work moves to stopped and its remaining scope is not executed.",
+        requires_reason: false,
+        requires_contract: false,
+      },
+    ]);
+
+    // Only an *active* target carries authority: once it is closed the unknown option has no
+    // server-known semantics left and assembly must fail closed rather than invent a button.
+    expect(cancelTarget(db, "extension", "ap-1", target.targetVersion)).toBe(true);
+    const afterCancel = getContextPackage({
+      consumer_type: "decision_ui", consumer_id: "approval-item", work_id: work.work_id,
+      package_type: "decision_view", actor: "alice", db,
+    });
+    expect(afterCancel.ok).toBe(false);
+    if (!afterCancel.ok) {
+      expect(afterCancel.code).toBe("needs_context");
+      expect(afterCancel.reason).toBe("decision option semantics unavailable");
+    }
     db.close();
   });
 

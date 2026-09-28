@@ -419,8 +419,13 @@ bun test src/control/store.test.ts src/control/store-extra.test.ts src/control/c
 bun test src/decision-bot/mailbox.test.ts src/decision-bot/reconcile.test.ts
 bun test src/adapters/service.test.ts src/adapters/feishu.test.ts
 bun test src/notify/nudge.test.ts
-bun test src/web/server.test.ts src/web/context-ui.test.ts src/web/ui-regression.test.ts src/web/ledger.test.ts
+bun test src/web/server.test.ts src/web/context-ui.test.ts src/web/ui-regression.test.ts src/web/ledger.test.ts src/web/contract-closure.test.ts
 bun test
 ```
+
+`src/web/contract-closure.test.ts` carries the only §4.5 material-fingerprint conflict coverage
+(omitted fingerprint, rotated fingerprint at a current revision, stale revision with a current
+fingerprint, and the accepted submission); it belongs to the web slice above rather than to a
+separate run.
 
 Browser acceptance must exercise the actual loopback surface for A06, A07, A10, A12, and A14. Channel acceptance uses isolated Feishu adapter tests; one configured real-channel smoke is still required by the production release gate when credentials and explicit operator authorization are available. A mock receipt proves state rules, not external delivery, and this document does not claim the Feishu real channel has been verified.
