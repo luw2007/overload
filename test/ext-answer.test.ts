@@ -250,6 +250,50 @@ describe("ATT-3 answer round-trip", () => {
     expect(requested?.detail?.approval_id).toBeUndefined();
   });
 
+  // §4.5 client half. The ask target lives for 24h, so "retry until expiry" is indistinguishable
+  // from hanging: the poll has to stop on the 409 itself.
+  test("a lost consume race stops the ask poll instead of waiting out the 24h target TTL", async () => {
+    let consumes = 0;
+    controlPlane = ({ url }) => {
+      if (url.endsWith("/api/decision/target")) return json({ targetVersion: "v-conflict" });
+      if (url.includes("/api/decision/consume/")) {
+        consumes++;
+        return new Response(JSON.stringify({
+          error: "conflict", message: "decision already consumed by another entry",
+          code: "already_consumed", retry: false,
+          approval_id: "ask-conflict", consumer_owner: "extension",
+          expected_target_version: "v-conflict", current_target_version: "v-conflict",
+          current_target_state: "consumed", current_state: "applying", current_effect_state: "applying",
+          current_revision: 4, receipt_id: "receipt-winner",
+          decision_package_url: "/api/context/decision-package?item_id=ask-conflict&work_id=work-1",
+        }), { status: 409, headers: { "content-type": "application/json" } });
+      }
+      return json({ closed: false });
+    };
+    const h = await harness({ approval_gate: { enabled: false } });
+    await Promise.all(h.dispatch("tool_call", { toolName: "ask", toolCallId: "ask-conflict", input: GREEN_BLUE }));
+    // No terminal contender, so the ask can only end by the Web poll stopping.
+    await expect(h.tools.get("ask")!.execute("ask-conflict", GREEN_BLUE, undefined, undefined, { hasUI: false }))
+      .rejects.toThrow("ask was already_consumed through another entry");
+    expect(consumes).toBe(1);
+
+    await Promise.all(h.dispatch("tool_execution_end", { toolName: "ask", toolCallId: "ask-conflict", result: undefined, isError: true }));
+    const events = await h.close();
+    // One terminal decision_resolved, as always — the conflict rides on it rather than adding a second.
+    const resolved = events.filter((e) => e.kind === "decision_resolved" && e.detail?.request_id === "ask-conflict");
+    expect(resolved.map((e) => e.detail)).toEqual([expect.objectContaining({
+      state: "cancelled", error: true,
+      conflict: {
+        code: "already_consumed", current_target_version: "v-conflict", current_target_state: "consumed",
+        current_state: "applying", current_effect_state: "applying", current_revision: 4,
+        receipt_id: "receipt-winner",
+        decision_package_url: "/api/context/decision-package?item_id=ask-conflict&work_id=work-1",
+      },
+    })]);
+    // Another entry's receipt is never claimed as ours.
+    expect(events.some((e) => e.kind === "control_event" && e.detail?.event_kind === "effect_observed")).toBe(false);
+  });
+
   test("multi-select asks are not Web-answerable", async () => {
     controlPlane = ({ url }) => url.endsWith("/api/decision/target") ? json({ targetVersion: "v-multi" }) : new Response(null, { status: 404 });
     const h = await harness({ approval_gate: { enabled: false } });

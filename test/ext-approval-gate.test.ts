@@ -125,6 +125,47 @@ describe("approval gate", () => {
     } finally { globalThis.fetch = oldFetch; }
   });
 
+  // §4.5 client half: a 409 says another entry already holds this decision, so the poll refreshes
+  // current state and stops. Before this, a lost race looked exactly like "not answered yet" and the
+  // gate kept polling a target that could never answer it again, all the way to expiry.
+  test("a lost consume race stops the poll with current state instead of waiting out expiry", async () => {
+    const oldFetch = globalThis.fetch;
+    let consumes = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/api/decision/target")) return Response.json({ targetVersion: "v1" });
+      consumes++;
+      return Response.json({
+        error: "conflict", message: "decision already consumed by another entry",
+        code: "already_consumed", retry: false,
+        approval_id: "conflict-call", consumer_owner: "extension",
+        expected_target_version: "v1", current_target_version: "v1",
+        current_target_state: "consumed", current_state: "applying", current_effect_state: "applying",
+        current_revision: 3, receipt_id: "receipt-winner",
+        decision_package_url: "/api/context/decision-package?item_id=conflict-call&work_id=work-1",
+      }, { status: 409 });
+    }) as typeof fetch;
+    try {
+      // A 60s gate polled every 2s: waiting out expiry cannot finish inside a test timeout.
+      const h = await harness({ approval_gate: { enabled: true, timeout_ms: 60_000, require_approval_bash_patterns: ["^echo"] } });
+      const started = Date.now();
+      expect((await Promise.all(h.dispatch("tool_call", { toolName: "bash", toolCallId: "conflict-call", input: { command: "echo hi" } })))[0])
+        .toEqual({ block: true, reason: "overload approval gate: already_consumed by another entry" });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      // Stopped, not retried: exactly one consume, and no cancel of a target another entry owns.
+      expect(consumes).toBe(1);
+      const events = await h.close();
+      expect(events.find((item) => item.kind === "decision_resolved")?.detail).toEqual({
+        request_id: "conflict-call", gated: true, state: "cancelled",
+        conflict: {
+          code: "already_consumed", current_target_version: "v1", current_target_state: "consumed",
+          current_state: "applying", current_effect_state: "applying", current_revision: 3,
+          receipt_id: "receipt-winner",
+          decision_package_url: "/api/context/decision-package?item_id=conflict-call&work_id=work-1",
+        },
+      });
+    } finally { globalThis.fetch = oldFetch; }
+  });
+
   test("block rules win over require rules", async () => {
     const h = await harness({ approval_gate: { enabled: true, block_bash_patterns: ["^echo"], require_approval_bash_patterns: ["^echo"] } });
     expect((await Promise.all(h.dispatch("tool_call", { toolName: "bash", toolCallId: "both-call", input: { command: "echo hi" } })))[0]).toEqual({ block: true, reason: "overload approval gate: ^echo" });
