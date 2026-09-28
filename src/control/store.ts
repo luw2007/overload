@@ -36,7 +36,7 @@ export class ControlError extends Error {
   ) { super(message); this.name = "ControlError"; }
 }
 
-export const CONTROL_SCHEMA_VERSION = 7;
+export const CONTROL_SCHEMA_VERSION = 8;
 export const CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS control_schema_meta(
   id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, migrated_at INTEGER NOT NULL
@@ -375,7 +375,8 @@ const CONTROL_MIGRATIONS:ControlMigration[]=[
   // v3 is the context schema; it also carries effect_detail (why an effect ended the way it did) so both
   // lineages' v3 shapes converge. Both steps are idempotent.
   {to:3,destructive:false,apply(db){db.exec(CONTEXT_SCHEMA);if(!(db.query("PRAGMA table_info(control_attention)").all() as Array<{name:string}>).some(column=>column.name==="effect_detail"))db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(3,Date.now());}},
-  {to:4,destructive:false,apply(db){ensureContextReducerSchema(db);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(4,Date.now());}},
+  // The coordinator lineage stamped v3 for effect_detail alone, so such a DB never ran CONTEXT_SCHEMA; replay it (idempotent).
+  {to:4,destructive:false,apply(db){db.exec(CONTEXT_SCHEMA);ensureContextReducerSchema(db);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(4,Date.now());}},
   // v5 回填：collector 无状态、redirectWork 可复活任意状态 work、orchestrator 无条件注入 rootProblemId，
   // 因此全部 work（含 candidate/stopped/completed）都必须有根 problem。这里直接执行迁移内部 SQL，
   // 不能调用公开的 ensureRootProblem：公开 helper 会再次 ensureControlSchema，并把同一连接先推进到 v6。
@@ -388,6 +389,8 @@ const CONTROL_MIGRATIONS:ControlMigration[]=[
   {to:6,destructive:false,apply(db){db.exec(CONTROL_V6_SCHEMA);backfillOpenAttentionMaterialLocked(db,Date.now());db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(6,Date.now());}},
   // v7 additive only: wait + prerequisite-edge tables; no backfill, no waits, no recovery.
   {to:7,destructive:false,apply(db){db.exec(CONTROL_V7_SCHEMA);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(7,Date.now());}},
+  // The public lineage reached v7 without effect_detail; converge both lineages on one shape.
+  {to:8,destructive:false,apply(db){if(!(db.query("PRAGMA table_info(control_attention)").all() as Array<{name:string}>).some(column=>column.name==="effect_detail"))db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(8,Date.now());}},
 ];
 export function ensureControlSchema(db: Database): void {
   const version=controlSchemaVersion(db);
