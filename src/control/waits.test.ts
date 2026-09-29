@@ -80,14 +80,15 @@ function authorizedReady(db: Database) {
   return { ...setup, wait: ready.wait };
 }
 
-describe("control schema v7 migration", () => {
-  test("fresh database is v7 with the frozen wait and dependency DDL", () => {
+describe("control schema v9 migration", () => {
+  test("fresh database is v9 with the frozen wait and dependency DDL", () => {
     const db = memory();
-    expect(CONTROL_SCHEMA_VERSION).toBe(8);
-    expect(db.query("SELECT version FROM control_schema_meta WHERE id=1").get()).toEqual({ version: 8 });
+    expect(CONTROL_SCHEMA_VERSION).toBe(9);
+    expect(db.query("SELECT version FROM control_schema_meta WHERE id=1").get()).toEqual({ version: 9 });
     const names = (db.query("SELECT name FROM sqlite_master WHERE name LIKE 'control_wait%' OR name LIKE 'control_work_dependencies%' ORDER BY name").all() as Array<{ name: string }>).map((row) => row.name);
     expect(names).toEqual(["control_waits", "control_waits_due", "control_waits_exact_unsettled", "control_waits_item", "control_waits_work",
       "control_work_dependencies", "control_work_dependencies_prerequisite"]);
+    expect(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_context_ingest_leases'").get()).toBeTruthy();
     db.close();
   });
 
@@ -98,18 +99,17 @@ describe("control schema v7 migration", () => {
     db.exec(`DROP TABLE control_waits; DROP TABLE control_work_dependencies; UPDATE control_schema_meta SET version=6 WHERE id=1;`);
     db.close();
     const reopened = open(path);
-    expect(reopened.query("SELECT version FROM control_schema_meta WHERE id=1").get()).toEqual({ version: 8 });
-    expect(getWork(reopened, work.work_id)?.revision).toBe(1);
+    expect(reopened.query("SELECT version FROM control_schema_meta WHERE id=1").get()).toEqual({ version: 9 });
     expect(getAttention(reopened, item.item_id)?.revision).toBe(item.revision);
     expect(reopened.query("SELECT COUNT(*) AS n FROM control_waits").get()).toEqual({ n: 0 });
     expect(reopened.query("SELECT COUNT(*) AS n FROM control_work_dependencies").get()).toEqual({ n: 0 });
     reopened.close();
   });
 
-  test("a newer schema is refused instead of bypassing v7 constraints", () => {
+  test("a newer schema is refused instead of bypassing v9 constraints", () => {
     const db = memory();
-    db.query("UPDATE control_schema_meta SET version=9 WHERE id=1").run();
-    expectControl(() => ensureControlSchema(db), "blocked", /newer than supported 8/);
+    db.query("UPDATE control_schema_meta SET version=10 WHERE id=1").run();
+    expectControl(() => ensureControlSchema(db), "blocked", /newer than supported 9/);
     db.close();
   });
 

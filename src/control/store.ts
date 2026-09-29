@@ -36,7 +36,7 @@ export class ControlError extends Error {
   ) { super(message); this.name = "ControlError"; }
 }
 
-export const CONTROL_SCHEMA_VERSION = 8;
+export const CONTROL_SCHEMA_VERSION = 9;
 export const CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS control_schema_meta(
   id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, migrated_at INTEGER NOT NULL
@@ -353,6 +353,14 @@ CREATE INDEX IF NOT EXISTS control_work_dependencies_prerequisite
   ON control_work_dependencies(prerequisite_work_id, state, work_id);
 `;
 
+const CONTROL_V9_SCHEMA = `
+CREATE TABLE IF NOT EXISTS control_context_ingest_leases(
+  spool_key TEXT PRIMARY KEY,
+  owner_token TEXT NOT NULL,
+  lease_until INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);`;
+
 function controlSchemaVersion(db:Database):number {
   const exists=db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_schema_meta'").get();
   if(!exists)return 0;
@@ -391,6 +399,8 @@ const CONTROL_MIGRATIONS:ControlMigration[]=[
   {to:7,destructive:false,apply(db){db.exec(CONTROL_V7_SCHEMA);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(7,Date.now());}},
   // The public lineage reached v7 without effect_detail; converge both lineages on one shape.
   {to:8,destructive:false,apply(db){if(!(db.query("PRAGMA table_info(control_attention)").all() as Array<{name:string}>).some(column=>column.name==="effect_detail"))db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(8,Date.now());}},
+  // v9 additive only: durable spool-pass ownership prevents concurrent importers from reading or renaming one segment.
+  {to:9,destructive:false,apply(db){db.exec(CONTROL_V9_SCHEMA);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(9,Date.now());}},
 ];
 export function ensureControlSchema(db: Database): void {
   const version=controlSchemaVersion(db);

@@ -37,11 +37,11 @@ if [ -z "$project_dir" ]; then project_dir=$(CDPATH='' cd -- "$script_dir/.." &&
 else project_dir=$(CDPATH='' cd -- "$project_dir" && pwd -P) || { printf 'project directory does not exist: %s\n' "$project_dir" >&2; exit 2; }
 fi
 
-[ -f "$project_dir/src/ingest/ingest.ts" ] || { printf 'not an Overload checkout: %s\n' "$project_dir" >&2; exit 2; }
-[ -f "$project_dir/scripts/maintenance.sh" ] || { printf 'not an Overload checkout: %s\n' "$project_dir" >&2; exit 2; }
-command -v launchctl >/dev/null 2>&1 || { printf 'launchctl is required (macOS only)\n' >&2; exit 1; }
-bun_path=$(command -v bun) || { printf 'bun is required; install it before running this script\n' >&2; exit 1; }
-bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- "$bun_path")
+if [ "$dry_run" -ne 1 ]; then
+  command -v launchctl >/dev/null 2>&1 || { printf 'launchctl is required (macOS only)\n' >&2; exit 1; }
+  bun_path=$(command -v bun) || { printf 'bun is required; install it before running this script\n' >&2; exit 1; }
+  bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- "$bun_path")
+fi
 
 agents_dir=$HOME/Library/LaunchAgents
 logs_dir=$HOME/.overload/logs

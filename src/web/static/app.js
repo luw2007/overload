@@ -763,7 +763,10 @@
     if (action === "attention-evidence") {
       const item = findAttention(id), pkg=item.decision_package;
       if(!pkg)return showError(new Error('Decision context is unavailable. Refresh the current package.'));
-      return dialog("drawer",pkg.conclusion,`<dl><dt>Trigger</dt><dd>${e(pkg.trigger)}</dd><dt>Impact</dt><dd>${e(pkg.impact)}</dd><dt>Recommendation</dt><dd>${e(pkg.recommendation)}</dd><dt>Owner</dt><dd>${e(pkg.owner)}</dd><dt>Expires</dt><dd>${e(formatTime(pkg.expires_at))}</dd></dl><h3>Decisive evidence</h3>${pkg.trigger_evidence.map(x=>`<p>${e(x.summary)} · <code>${e(x.reference)}</code></p>`).join('')||'<p>None</p>'}<h3>Options</h3>${pkg.options.map(x=>`<p><strong>${e(x.label)}</strong> — ${e(x.effect)}<br>${e(x.consequence)}</p>`).join('')}${sourceLink(pkg.source_link)}`);
+      const semantic = Array.isArray(pkg.semantic_assessments) && pkg.semantic_assessments.length
+        ? `<h3>Advisory semantic assessment</h3>${pkg.semantic_assessments.map(x=>`<p><strong>${e(x.verdict||x.state)}</strong>${x.confidence===null||x.confidence===undefined?'':` · ${e(Math.round(x.confidence*100))}%`}<br>${e(x.rationale||x.error||'No result available.')}<br><small>Advisory only — it cannot decide, approve, or resume work.</small></p>`).join('')}`
+        : '';
+      return dialog("drawer",pkg.conclusion,`<dl><dt>Trigger</dt><dd>${e(pkg.trigger)}</dd><dt>Impact</dt><dd>${e(pkg.impact)}</dd><dt>Recommendation</dt><dd>${e(pkg.recommendation)}</dd><dt>Owner</dt><dd>${e(pkg.owner)}</dd><dt>Expires</dt><dd>${e(formatTime(pkg.expires_at))}</dd></dl><h3>Decisive evidence</h3>${pkg.trigger_evidence.map(x=>`<p>${e(x.summary)} · <code>${e(x.reference)}</code></p>`).join('')||'<p>None</p>'}${semantic}<h3>Options</h3>${pkg.options.map(x=>`<p><strong>${e(x.label)}</strong> — ${e(x.effect)}<br>${e(x.consequence)}</p>`).join('')}${sourceLink(pkg.source_link)}`);
     }
     if (action === "work") return openWork(id);
     if (action === "toggle-waits") {

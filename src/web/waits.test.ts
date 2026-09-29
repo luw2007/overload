@@ -24,6 +24,7 @@ const contract: Contract = {
 const roots: string[] = [];
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
 afterEach(() => {
+  delete process.env.OVERLOAD_ACTOR;
   for (const server of servers.splice(0)) server.stop(true);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });

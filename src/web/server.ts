@@ -39,6 +39,9 @@ import { publishControlEvents } from "../control/outbox";
 import { openStore } from "../orchestrator/store";
 import { Coordinator } from "../orchestrator/coordinator";
 import { ingestContextSpool } from "../control/context-ingest";
+import { ingestExternalObservation, listExternalObservations } from "../control/external-observations";
+import { claimSemanticAssessments, listSemanticAssessments, scheduleSemanticAssessment, settleSemanticAssessment } from "../control/semantic-assessments";
+import { validateExternalObservationInput } from "../shared/external-observation-contract";
 import {ensureAdapterSchema,type Conversation,type StoredTurn} from '../adapters/store';
 import {randomUUID} from 'node:crypto';
 import { SpoolWriter } from "../orchestrator/spool";
@@ -49,10 +52,18 @@ const DEFAULT_WEB_PORT = 4870;
 /** The list is a launchpad for drill-down, not an inventory: 1000 rows serve nobody. */
 const SESSION_LIST_LIMIT = 100;
 let warnedInvalidConfig = false;
+let warnedInvalidWebPort = false;
 
 export type WebConfig = { web_port: number };
 
-export async function loadWebConfig(path = join(homedir(), ".overload", "config.json")): Promise<WebConfig> {
+/** Port precedence is config.json > OVERLOAD_WEB_PORT > 4870. config.json wins because it is
+ *  the only setting the extension also reads when it resolves the control-plane port, so it is
+ *  the one that keeps both sides agreeing. The env var is a fallback for manual runs; the
+ *  LaunchAgent never sees it, since the plists carry only OVERLOAD_ROOT and OVERLOAD_BUN. */
+export async function loadWebConfig(
+  path = join(homedir(), ".overload", "config.json"),
+  env: { OVERLOAD_WEB_PORT?: string } = process.env,
+): Promise<WebConfig> {
   let value: Record<string, unknown> = {};
   try {
     const parsed = JSON.parse(await readFile(path, "utf8"));
@@ -62,7 +73,21 @@ export async function loadWebConfig(path = join(homedir(), ".overload", "config.
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") warnInvalidConfig(path);
   }
   if (value.web_port !== undefined && !positiveInteger(value.web_port)) warnInvalidConfig(path);
-  return { web_port: positiveInteger(value.web_port) ? value.web_port : DEFAULT_WEB_PORT };
+  if (positiveInteger(value.web_port)) return { web_port: value.web_port };
+  return { web_port: envPort(env.OVERLOAD_WEB_PORT) ?? DEFAULT_WEB_PORT };
+}
+
+/** An unusable value is reported and ignored: a listener that refuses to start is a worse
+ *  answer than the default port, and silently doing nothing is what this var used to do. */
+function envPort(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const parsed = Number(raw);
+  if (raw.trim() !== "" && positiveInteger(parsed)) return parsed;
+  if (!warnedInvalidWebPort) {
+    warnedInvalidWebPort = true;
+    console.error(`overload web: ignoring invalid OVERLOAD_WEB_PORT ${JSON.stringify(raw)}`);
+  }
+  return null;
 }
 
 function positiveInteger(value: unknown): value is number {
@@ -510,7 +535,7 @@ async function handoffRoute(request: Request, url: URL, controlPath: string): Pr
 // is a transition-state minimal trusted injection: production must bind actor to
 // an authenticated session/token instead of an env var. Do NOT read actor from
 // request headers / body / query.
-export function startWebServer(options: { ledgerPath?: string; controlPath?: string; policyPath?: string; orchestratorPath?: string; spoolRoot?: string; publishIntervalMs?: number; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe; checkpointProbe?: CheckpointProbe; actor?: string; waitAdapters?: WaitSourceAdapters; conditionWaits?: boolean; manager?: Omit<ManagerRouteDeps, "controlPath" | "ledgerPath"> } = {}) {
+export function startWebServer(options: { ledgerPath?: string; controlPath?: string; policyPath?: string; orchestratorPath?: string; spoolRoot?: string; publishIntervalMs?: number; contextIngest?: { max_files?: number; max_lines?: number; max_bytes?: number }; port?: number; jump?: (target: JumpTarget) => Promise<JumpResult>; resume?: ResumeExecutor; processAlive?: ProcessProbe; checkpointProbe?: CheckpointProbe; actor?: string; waitAdapters?: WaitSourceAdapters; conditionWaits?: boolean; manager?: Omit<ManagerRouteDeps, "controlPath" | "ledgerPath"> } = {}) {
   // 在创建任何 DB/SpoolWriter 之前显式解析全部路径：不允许把 undefined 传到 open*
   // （Bun 会据 undefined 在 CWD 创建名为 "undefined" 的文件）。
   const ledgerPath = options.ledgerPath ?? process.env.OVERLOAD_LEDGER_PATH ?? join(homedir(), ".overload", "ledger.db");
@@ -574,9 +599,9 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         try {
           const spool = new SpoolWriter(orchestrator, spoolRoot);
           try {
-            const stats = ingestContextSpool(control, spool.dir);
-            if (stats.read > 0) {
-              console.error(`overload web: context ingest read=${stats.read} created=${stats.created} idempotent=${stats.idempotent} quarantined=${stats.quarantined} failed=${stats.failed}`);
+            const stats = ingestContextSpool(control, spool.dir, options.contextIngest);
+            if (stats.busy || stats.read > 0 || stats.deferred > 0 || stats.blocked_files > 0) {
+              console.error(`overload web: context ingest busy=${stats.busy} backlog_files=${stats.backlog_files} backlog_bytes=${stats.backlog_bytes} read=${stats.read} bytes_read=${stats.bytes_read} processed_files=${stats.processed_files} deferred=${stats.deferred} blocked_files=${stats.blocked_files} created=${stats.created} idempotent=${stats.idempotent} quarantined=${stats.quarantined} failed=${stats.failed}`);
             }
           } finally { spool.close(); }
         } finally { orchestrator.close(); }
@@ -645,6 +670,61 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
           const since = url.searchParams.has("since") ? Number(url.searchParams.get("since")) : until - 7*86400000;
           if (!Number.isFinite(since)||!Number.isFinite(until)||since<0||since>until) return json({error:"invalid time window"},{status:400});
           const db=openAnswersDb(controlPath);try{return json(ledgerReport(db,{since,until}));}finally{db.close();}
+        }
+        if (url.pathname === "/api/external-observations") {
+          if (request.method === "GET") {
+            const state = url.searchParams.get("state") ?? undefined;
+            if (state !== undefined && !["unmatched", "attention_open", "historical", "recovered"].includes(state)) return json({ error: "invalid", message: "invalid state" }, { status: 400 });
+            const workId = url.searchParams.get("work_id") ?? undefined;
+            const limitText = url.searchParams.get("limit");
+            const limit = limitText === null ? undefined : Number(limitText);
+            const db = openAnswersDb(controlPath);
+            try { return json({ observations: listExternalObservations(db, { ...(workId ? { work_id: workId } : {}), ...(state ? { state: state as "unmatched" | "attention_open" | "historical" | "recovered" } : {}), ...(limit === undefined ? {} : { limit }) }) }); }
+            catch (error) { return controlError(error); }
+            finally { db.close(); }
+          }
+          if (request.method === "POST") {
+            if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });
+            let body: unknown;
+            try { body = await request.json(); validateExternalObservationInput(body); }
+            catch (error) { return json({ error: "invalid", message: error instanceof Error ? error.message : "invalid external observation" }, { status: 400 }); }
+            const db = openAnswersDb(controlPath);
+            try { return json(ingestExternalObservation(db, body, Date.now())); }
+            catch (error) { return controlError(error); }
+            finally { db.close(); }
+          }
+          return json({ error: "not_found" }, { status: 404 });
+        }
+        const semanticRoute = url.pathname.match(/^\/api\/attention\/([^/]+)\/semantic-assessments(?:\/(claim|settle))?$/);
+        if (semanticRoute) {
+          const itemId = routeParameter(semanticRoute[1]);
+          const action = semanticRoute[2] ?? null;
+          if (request.method === "GET" && action === null) {
+            const db = openAnswersDb(controlPath);
+            try { return json({ assessments: listSemanticAssessments(db, itemId) }); }
+            finally { db.close(); }
+          }
+          if (request.method !== "POST") return json({ error: "not_found" }, { status: 404 });
+          if (!request.headers.get("sec-fetch-site") && !request.headers.get("sec-fetch-mode")) return json({ error: "forbidden" }, { status: 403 });
+          const body = await bodyObject(request);
+          const db = openAnswersDb(controlPath);
+          try {
+            if (action === null) {
+              if (typeof body.model !== "string") return json({ error: "invalid", message: "model is required" }, { status: 400 });
+              return json({ assessment: scheduleSemanticAssessment(db, itemId, body.model, Date.now()) });
+            }
+            if (action === "claim") {
+              if (typeof body.model !== "string") return json({ error: "invalid", message: "model is required" }, { status: 400 });
+              return json({ claims: claimSemanticAssessments(db, { model: body.model, ...(typeof body.limit === "number" ? { limit: body.limit } : {}), ...(typeof body.lease_ms === "number" ? { lease_ms: body.lease_ms } : {}) }, Date.now()) });
+            }
+            if (typeof body.assessment_id !== "string" || typeof body.lease_token !== "string") return json({ error: "invalid", message: "assessment_id and lease_token are required" }, { status: 400 });
+            return json({ assessment: settleSemanticAssessment(db, {
+              assessment_id: body.assessment_id, lease_token: body.lease_token,
+              ...(body.result && typeof body.result === "object" ? { result: body.result as { verdict: "ordinary" | "needs_attention" | "uncertain"; rationale: string; confidence: number } } : {}),
+              ...(typeof body.unavailable === "string" ? { unavailable: body.unavailable } : {}),
+            }, Date.now()) });
+          } catch (error) { return controlError(error); }
+          finally { db.close(); }
         }
         if (request.method === "GET" && url.pathname === "/api/rules") {
           const db=openAnswersDb(controlPath);try{return json(rulesReport(db,loadPolicy(options.policyPath,db),Date.now()));}finally{db.close();}

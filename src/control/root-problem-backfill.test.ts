@@ -65,8 +65,8 @@ function metaVersion(db: Database): number {
 }
 
 describe("存量 work 根 problem 回填 hotfix", () => {
-  test("schema 常量版本为 8", () => {
-    expect(CONTROL_SCHEMA_VERSION).toBe(8);
+  test("schema 常量版本为 9", () => {
+    expect(CONTROL_SCHEMA_VERSION).toBe(9);
   });
 
   test("every supported v0-v5 schema upgrades exactly through the current version", () => {

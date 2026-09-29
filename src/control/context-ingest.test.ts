@@ -1,8 +1,9 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { ensureControlSchema } from "./store";
 import { ensureContextReducerSchema } from "./context-reducer";
 import { ingestContextSpool } from "./context-ingest";
@@ -98,6 +99,105 @@ describe("context-ingest", () => {
 
     const stats = ingestContextSpool(db, dir);
     expect(stats.read).toBe(1); // 只处理新文件，跳过 .processed
+    db.close();
+  });
+});
+
+describe("external observation envelopes", () => {
+  test("matched live envelope uses the existing Work, Attention, and context evidence chain", () => {
+    const db = controlFixture();
+    db.query(`INSERT INTO control_works(work_id,title,source,source_id,state,revision,contract,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run("W1", "t", "test", null, "active", 1, JSON.stringify({ decision_owner: "owner" }), 1, 1);
+    const dir = mkdtempSync(join(tmpdir(), "ingest-external-observation-"));
+    dirs.push(dir);
+    const summary = "external observer found an unresolved runtime change";
+    const hash = createHash("sha256").update(summary).digest("hex");
+    writeFileSync(join(dir, "active-context-collector.1.ndjson"), JSON.stringify({
+      v: 1, at: 1, kind: "context.external_observation",
+      detail: { source_id: "shadow", source_event_id: "e1", observation_revision: 1, work_id: "W1", kind: "live", subject: "runtime changed", summary, content_hash: hash, observed_at: "2026-09-28T00:00:00.000Z", urgency: "inbox" },
+    }) + "\n");
+    const stats = ingestContextSpool(db, dir);
+    expect(stats).toMatchObject({ read: 1, created: 1, failed: 0 });
+    const observation = db.query("SELECT attention_item_id,state FROM control_external_observations").get() as { attention_item_id: string; state: string };
+    expect(observation.state).toBe("attention_open");
+    const card = db.query("SELECT work_id,owner FROM control_attention WHERE item_id=?").get(observation.attention_item_id) as { work_id: string; owner: string };
+    expect(card).toEqual({ work_id: "W1", owner: "owner" });
+    db.close();
+  });
+});
+
+describe("bounded context spool ingestion", () => {
+  test("file budget advances oldest sealed segments fairly over successive passes", () => {
+    const db = controlFixture();
+    const dir = mkdtempSync(join(tmpdir(), "ingest-bounded-files-"));
+    dirs.push(dir);
+    for (const seq of [1, 2, 3]) writeFileSync(join(dir, `active-context-collector.${seq}.ndjson`), JSON.stringify({ v: 1, at: seq, kind: "context.fact_observed", detail: makePayload({ source_event_id: `bounded-${seq}`, object_canonical_key: `bounded-${seq}` }) }) + "\n");
+    const first = ingestContextSpool(db, dir, { max_files: 1, max_lines: 10, max_bytes: 100_000 });
+    expect(first).toMatchObject({ backlog_files: 3, processed_files: 1, deferred: 2, created: 1 });
+    const second = ingestContextSpool(db, dir, { max_files: 1, max_lines: 10, max_bytes: 100_000 });
+    const third = ingestContextSpool(db, dir, { max_files: 1, max_lines: 10, max_bytes: 100_000 });
+    expect(second).toMatchObject({ processed_files: 1, created: 1 });
+    expect(third).toMatchObject({ processed_files: 1, created: 1, deferred: 0 });
+    expect(db.query("SELECT COUNT(*) n FROM control_context_objects").get()).toMatchObject({ n: 3 });
+    db.close();
+  });
+
+  test("line and byte exhaustion retain whole next segment for retry", () => {
+    const db = controlFixture();
+    const dir = mkdtempSync(join(tmpdir(), "ingest-bounded-budget-"));
+    dirs.push(dir);
+    const line = JSON.stringify({ v: 1, at: 1, kind: "context.fact_observed", detail: makePayload({ source_event_id: "budget-1", object_canonical_key: "budget-1" }) }) + "\n";
+    writeFileSync(join(dir, "active-context-collector.1.ndjson"), line);
+    writeFileSync(join(dir, "active-context-collector.2.ndjson"), line.replaceAll("budget-1", "budget-2"));
+    const lineLimited = ingestContextSpool(db, dir, { max_files: 4, max_lines: 1, max_bytes: 100_000 });
+    expect(lineLimited).toMatchObject({ processed_files: 1, deferred: 1, created: 1 });
+    const byteLimited = ingestContextSpool(db, dir, { max_files: 4, max_lines: 10, max_bytes: 1 });
+    expect(byteLimited).toMatchObject({ processed_files: 0, blocked_files: 1, deferred: 1, read: 0 });
+    expect(readdirSync(dir)).toContain("active-context-collector.2.ndjson");
+    const retried = ingestContextSpool(db, dir, { max_files: 4, max_lines: 10, max_bytes: 100_000 });
+    expect(retried).toMatchObject({ processed_files: 1, created: 1 });
+    db.close();
+  });
+
+  test("quarantine remains isolated and next pass has no duplicated projection", () => {
+    const db = controlFixture();
+    const dir = mkdtempSync(join(tmpdir(), "ingest-bounded-quarantine-"));
+    dirs.push(dir);
+    const good = JSON.stringify({ v: 1, at: 1, kind: "context.fact_observed", detail: makePayload({ source_event_id: "isolation", object_canonical_key: "isolation" }) });
+    writeFileSync(join(dir, "active-context-collector.1.ndjson"), `{invalid}\n${good}\n`);
+    const first = ingestContextSpool(db, dir, { max_files: 1, max_lines: 10, max_bytes: 100_000 });
+    expect(first).toMatchObject({ created: 1, failed: 1, processed_files: 1 });
+    expect(ingestContextSpool(db, dir, { max_files: 1, max_lines: 10, max_bytes: 100_000 })).toMatchObject({ read: 0, created: 0 });
+    expect(db.query("SELECT COUNT(*) n FROM control_context_objects").get()).toMatchObject({ n: 1 });
+    db.close();
+  });
+
+  test("a segment exceeding the line limit is deferred without persisting any prefix", () => {
+    const db = controlFixture();
+    const dir = mkdtempSync(join(tmpdir(), "ingest-bounded-atomic-lines-"));
+    dirs.push(dir);
+    const first = JSON.stringify({ v: 1, at: 1, kind: "context.fact_observed", detail: makePayload({ source_event_id: "atomic-line-1", object_canonical_key: "atomic-line-1" }) });
+    const second = JSON.stringify({ v: 1, at: 2, kind: "context.fact_observed", detail: makePayload({ source_event_id: "atomic-line-2", object_canonical_key: "atomic-line-2" }) });
+    writeFileSync(join(dir, "active-context-collector.1.ndjson"), `${first}\n${second}\n`);
+    expect(ingestContextSpool(db, dir, { max_files: 1, max_lines: 1, max_bytes: 100_000 })).toMatchObject({ read: 0, created: 0, deferred: 1 });
+    expect(db.query("SELECT COUNT(*) n FROM control_context_objects").get()).toMatchObject({ n: 0 });
+    expect(ingestContextSpool(db, dir, { max_files: 1, max_lines: 10, max_bytes: 100_000 })).toMatchObject({ read: 2, created: 2, processed_files: 1 });
+    db.close();
+  });
+});
+describe("context spool lease", () => {
+  test("active durable lease makes concurrent pass busy without consuming files", () => {
+    const db = controlFixture();
+    const dir = mkdtempSync(join(tmpdir(), "ingest-lease-"));
+    dirs.push(dir);
+    writeFileSync(join(dir, "active-context-collector.1.ndjson"), JSON.stringify({ v: 1, at: 1, kind: "context.fact_observed", detail: makePayload({ source_event_id: "lease", object_canonical_key: "lease" }) }) + "\n");
+    const spoolKey = createHash("sha256").update(resolve(dir)).digest("hex");
+    db.query("INSERT INTO control_context_ingest_leases(spool_key,owner_token,lease_until,updated_at) VALUES(?,?,?,?)").run(spoolKey, "other", Date.now() + 60_000, Date.now());
+    const blocked = ingestContextSpool(db, dir);
+    expect(blocked).toMatchObject({ busy: true, read: 0, processed_files: 0 });
+    expect(readdirSync(dir)).toContain("active-context-collector.1.ndjson");
+    db.query("DELETE FROM control_context_ingest_leases").run();
+    expect(ingestContextSpool(db, dir)).toMatchObject({ busy: false, created: 1, processed_files: 1 });
     db.close();
   });
 });

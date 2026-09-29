@@ -50,6 +50,8 @@ export function isAuthoritativeReference(reference: string): boolean {
   if (/^contract:.+@\d+$/.test(reference)) return true;
   // attention:<item_id>@<rev>
   if (/^attention:.+@\d+$/.test(reference)) return true;
+  // external-observation:<sha256 id>
+  if (/^external-observation:[0-9a-f]{64}$/.test(reference)) return true;
   // http/https — 白名单
   if (/^https?:\/\//.test(reference)) {
     for (const allowed of HTTP_WHITELIST) {

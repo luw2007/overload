@@ -147,6 +147,23 @@ function fetchFromSource(
     return { payload: JSON.stringify(row) };
   }
 
+  // external-observation:<id> — retained immutable observer material. The
+  // observation row is already bound to its Work, so full evidence uses the
+  // same visibility and hash verification path as every other context object.
+  const externalObservationMatch = reference.match(/^external-observation:([a-f0-9]{64})$/);
+  if (externalObservationMatch) {
+    const [, observationId] = externalObservationMatch;
+    try {
+      const row = db.query(
+        "SELECT summary FROM control_external_observations WHERE observation_id=? AND work_id=?",
+      ).get(observationId, work_id) as { summary: string } | null;
+      if (!row) return { blocked: true, reason: "cross-work: external observation not bound to this work", code: "forbidden" };
+      return { payload: row.summary };
+    } catch {
+      return { blocked: true, reason: "external observation unavailable", code: "unavailable" };
+    }
+  }
+
   // journal:<seq> — 从 ledger.db 只读跨库读取
   const journalMatch = reference.match(/^journal:(\d+)$/);
   if (journalMatch) {
