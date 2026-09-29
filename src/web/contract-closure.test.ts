@@ -1,4 +1,4 @@
-import {afterEach,expect,test} from 'bun:test';
+import {afterAll,expect,test} from 'bun:test';
 import {Database} from 'bun:sqlite';
 import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
@@ -8,7 +8,11 @@ import {createWork,recordStopCondition,getAttention,getAttentionMaterial,project
 import type {Contract} from '../control/types';
 import {startWebServer} from './server';
 
-afterEach(() => { delete process.env.OVERLOAD_ACTOR; });
+// These tests inject the trusted actor through OVERLOAD_ACTOR, which is process-global: bun runs
+// every file of a `bun test src/web` in one process, so leaving it set makes any later file that
+// asserts the "no server-side actor" 501 path (src/web/waits.test.ts) see an actor and fail.
+const priorActor=process.env.OVERLOAD_ACTOR;
+afterAll(()=>{ if(priorActor===undefined) delete process.env.OVERLOAD_ACTOR; else process.env.OVERLOAD_ACTOR=priorActor; });
 
 test('reviewed narrow refuses newly arrived cards; fresh review applies and archives siblings',async()=>{
  const root=mkdtempSync(join(tmpdir(),'contract-http-')),ledgerPath=join(root,'ledger.db'),controlPath=join(root,'control.db');

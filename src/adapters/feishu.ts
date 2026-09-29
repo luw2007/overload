@@ -290,6 +290,28 @@ export class FeishuChannel implements ChannelAdapter {
     );
     return;
    }
+   // Plan §4.5: another entry already consumed this decision, or the target can no longer accept it.
+   // Local mailbox facts win, so Feishu reports current state and never retries the answer — returning
+   // here (rather than rethrowing) is what keeps the channel from re-delivering it.
+   if (
+    error instanceof Error &&
+    (error.message === "already_consumed" ||
+     error.message === "expired" ||
+     error.message === "owner_conflict")
+   ) {
+    await this.channel.send(
+     action.chatId,
+     {
+      markdown: error.message === "already_consumed"
+       ? "该决定已在其他入口被记录，本次回答不会重复生效；卡片显示的是当前状态。"
+       : error.message === "expired"
+        ? "该决定已过期，本次回答不会生效；请刷新后查看当前状态。"
+        : "该决定由其他入口的所有者持有，本次回答不会生效；请刷新后查看当前状态。",
+     },
+     { replyTo: action.messageId },
+    );
+    return;
+   }
    throw error;
   }
  }

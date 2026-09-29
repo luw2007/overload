@@ -136,14 +136,17 @@ function remainingTimeout(deadline: number): number {
  *  grandchild — is reaped instead of deferring SIGTERM until the child exits
  *  naturally, which would let a hung transfer blow past the time budget.
  *
- *  Awaits /bin/kill and checks its exit code: when the group is already gone
- *  (rc != 0) we fall back to killing the direct child. Never fire-and-forget,
- *  so a failed escalation is visible and reaped. */
+ *  Issues the kill(2) syscall directly rather than shelling out to /bin/kill:
+ *  procps-ng kill (every Linux distro) does not accept a negative PGID after
+ *  -s SIG — it misreads it as another signal spec, signals the wrong group and
+ *  still exits 0 — so a /bin/kill group sweep is a silent no-op on Linux that
+ *  also hides the failure from the exit-code fallback below. On ESRCH (group
+ *  already gone, or the child never became a leader) we fall back to killing
+ *  the direct child, so a failed escalation is still reaped. */
 export async function killProcessTree(proc: { pid: number }, signal: "TERM" | "KILL"): Promise<void> {
   try {
-    const child = Bun.spawn(["/bin/kill", "-s", signal, "--", `-${proc.pid}`], { stdout: "ignore", stderr: "ignore" });
-    const rc = await child.exited;
-    if (rc === 0) return;
+    process.kill(-proc.pid, `SIG${signal}`);
+    return;
   } catch { /* fall through to direct-child fallback */ }
   try { (proc as unknown as { kill: (s: string) => void }).kill(`SIG${signal}`); } catch { /* already gone */ }
 }

@@ -59,6 +59,55 @@ describe("WEB-01 loadWebConfig", () => {
     writeFileSync(zero, JSON.stringify({ web_port: 0 }));
     expect((await loadWebConfig(zero)).web_port).toBe(4870);
   });
+
+  // OVERLOAD_WEB_PORT used to be read by the adapter daemon alone, so exporting it and
+  // expecting the dashboard to move silently did nothing. It is now the fallback between
+  // config.json and the built-in default. config.json still wins: it is the only setting
+  // the extension also honours when it resolves the control-plane port.
+  test("OVERLOAD_WEB_PORT is the fallback when config.json sets no web_port", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-webcfg-"));
+    roots.push(root);
+    const missing = join(root, "does-not-exist.json");
+    const empty = join(root, "empty.json");
+    writeFileSync(empty, JSON.stringify({}));
+
+    expect((await loadWebConfig(missing, { OVERLOAD_WEB_PORT: "5100" })).web_port).toBe(5100);
+    expect((await loadWebConfig(empty, { OVERLOAD_WEB_PORT: "5100" })).web_port).toBe(5100);
+  });
+
+  test("config.json web_port wins over OVERLOAD_WEB_PORT", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-webcfg-"));
+    roots.push(root);
+    const good = join(root, "good.json");
+    writeFileSync(good, JSON.stringify({ web_port: 9999 }));
+    expect((await loadWebConfig(good, { OVERLOAD_WEB_PORT: "5100" })).web_port).toBe(9999);
+  });
+
+  test("an unusable OVERLOAD_WEB_PORT falls back to 4870 rather than crashing the listener", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-webcfg-"));
+    roots.push(root);
+    const missing = join(root, "does-not-exist.json");
+    for (const raw of ["not-a-number", "0", "-1", "", "4870.5"]) {
+      expect((await loadWebConfig(missing, { OVERLOAD_WEB_PORT: raw })).web_port).toBe(4870);
+    }
+    expect((await loadWebConfig(missing, {})).web_port).toBe(4870);
+  });
+
+  // The suite has a history of env leaking between files in one bun process; the default
+  // argument must still be process.env, so this asserts the wiring rather than the parsing.
+  test("loadWebConfig reads process.env by default", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-webcfg-"));
+    roots.push(root);
+    const missing = join(root, "does-not-exist.json");
+    const previous = process.env.OVERLOAD_WEB_PORT;
+    process.env.OVERLOAD_WEB_PORT = "5177";
+    try {
+      expect((await loadWebConfig(missing)).web_port).toBe(5177);
+    } finally {
+      if (previous === undefined) delete process.env.OVERLOAD_WEB_PORT;
+      else process.env.OVERLOAD_WEB_PORT = previous;
+    }
+  });
 });
 
 describe("WEB-03/04 SPA shell + static", () => {

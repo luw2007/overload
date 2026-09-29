@@ -37,17 +37,15 @@ let killed = false;
 let finishEscalation = () => {};
 const escalationDone = new Promise((resolve) => { finishEscalation = resolve; });
 const graceMs = Math.min(1000, timeoutMs);
+// kill(2) directly, never /bin/kill: procps-ng kill misreads a negative PGID
+// as a signal spec, so it sweeps the wrong group, exits 0 anyway, and makes
+// both the sweep and the liveness probe silently wrong on Linux.
 const killGroup = async (signal) => {
-  const killer = Bun.spawn(["/bin/kill", `-${signal}`, "--", `-${proc.pid}`], {
-    stdin: "ignore", stdout: "ignore", stderr: "ignore",
-  });
-  if (await killer.exited !== 0) {
-    try { proc.kill(signal === "TERM" ? "SIGTERM" : "SIGKILL"); } catch {}
-  }
+  const name = signal === "TERM" ? "SIGTERM" : "SIGKILL";
+  try { process.kill(-proc.pid, name); }
+  catch { try { proc.kill(name); } catch {} }
 };
-const groupAlive = () => Bun.spawnSync(["/bin/kill", "-0", "--", `-${proc.pid}`], {
-  stdin: "ignore", stdout: "ignore", stderr: "ignore",
-}).exitCode === 0;
+const groupAlive = () => { try { process.kill(-proc.pid, 0); return true; } catch { return false; } };
 const finalDeadline = setTimeout(() => {
   killed = true;
   void killGroup("KILL").then(finishEscalation);

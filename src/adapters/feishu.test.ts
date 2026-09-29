@@ -247,6 +247,35 @@ test("replies once when a card decision is stale", async () => {
  await instance.stop();
 });
 
+// Plan §4.5: local mailbox facts win, so the entry that lost the consume race reports current state
+// and never retries the answer.
+test("A09 reports current state once and does not retry when another entry already consumed", async () => {
+ const instance = channel();
+ let attempts = 0;
+ await instance.start(async () => {
+  attempts++;
+  throw new Error("already_consumed");
+ });
+ const action = {
+  messageId: "card-consumed",
+  chatId: "chat",
+  operator: { openId: "owner" },
+  action: {
+   tag: "button",
+   value: { itemId: "item-consumed", revision: 1, answer: "approve" },
+  },
+  raw: raw("action-consumed", "tenant"),
+ };
+ await fake.emit("cardAction", action);
+ expect(attempts).toBe(1);
+ expect(fake.sent).toEqual([{
+  to: "chat",
+  input: { markdown: "该决定已在其他入口被记录，本次回答不会重复生效；卡片显示的是当前状态。" },
+  options: { replyTo: "card-consumed" },
+ }]);
+ await instance.stop();
+});
+
 test("normalizes card callbacks without unauthenticated tenant bypass", async () => {
  const instance = channel();
  const events: ChannelEvent[] = [];

@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createConditionWait, createWork, openControl, upsertAttention } from "../control/store";
+import { createConditionWait, createWork, getAttention, openControl, upsertAttention } from "../control/store";
 import { openMailbox, registerTarget } from "../decision-bot/mailbox";
 import { startWebServer } from "./server";
 
@@ -38,15 +38,21 @@ function seedLedger(root: string): string {
   return path;
 }
 
+// The decision card is assembled server-side, so the seeded work needs a real decision_owner
+// (the assembler refuses a decision_view for anyone else) and the card's options must all have
+// server-known semantics — an option the store cannot explain fails assembly closed by design.
 function seedAttention(root: string): string {
   const ctrlPath = join(root, "control.db");
   const ctrl = openControl(ctrlPath);
-  const work = createWork(ctrl, { title: "test-work", source: "test" });
+  const work = createWork(ctrl, { title: "test-work", source: "test", contract: {
+    objective: "keep the decision surface honest", acceptance: [{ id: "a1", kind: "human", description: "operator decides" }],
+    non_goals: [], scope: { cwd: "/tmp" }, budget: {}, stop_conditions: [], decision_owner: "operator",
+  } });
   upsertAttention(ctrl, {
     item_id: "att-defer-1", work_id: work.work_id, state: "open",
     effect_state: "not_started", urgency: "now",
     conclusion: "需要决策", trigger: "test", impact: "test impact",
-    recommendation: "continue", options: ["stop", "continue", "defer"],
+    recommendation: "continue", options: ["stop", "continue"],
     owner: "operator", expires_at: null, source_link: null,
     approval_id: null, consumer_owner: null,
     contract_revision: work.revision, decision_mode: "human_only", evidence: {}
@@ -66,59 +72,91 @@ function seedAttention(root: string): string {
   return ctrlPath;
 }
 
-async function boot(root: string, ledgerPath: string, controlPath?: string, jump?: any) {
+async function boot(root: string, ledgerPath: string, controlPath?: string, jump?: any, actor?: string) {
   writeFileSync(join(root, "host"), "local\n");
   const server = startWebServer({
     ledgerPath, controlPath, orchestratorPath: join(root, "orch.db"),
-    spoolRoot: root, publishIntervalMs: 60_000, port: 0, jump,
+    spoolRoot: root, publishIntervalMs: 60_000, port: 0, jump, actor,
   });
   servers.push(server);
   return `http://127.0.0.1:${server.port}`;
 }
 
-async function browserProbe(base: string): Promise<Record<string, any>> {
+/**
+ * A06/A07 browser acceptance on the real loopback surface (contract §8): nothing is stubbed.
+ * The page fetches the server-assembled decision package, renders the card and the drawer from
+ * it, and submits a real decision. `bump` runs between load and click — it makes the rendered
+ * package genuinely stale, so the click gets the server's own StaleAttentionBody rather than a
+ * hand-written one. The handshake files keep that ordering deterministic instead of racing a sleep.
+ */
+async function browserProbe(base: string, root: string, bump: () => void): Promise<Record<string, any>> {
+  const loadedFile = join(root, "probe-loaded"), goFile = join(root, "probe-go");
   const script = String.raw`
-import json, sys
+import json, os, sys, time
 from playwright.sync_api import sync_playwright
 
-base = sys.argv[1]
+base, loaded_file, go_file = sys.argv[1], sys.argv[2], sys.argv[3]
+seen = {"conflict": None, "package_fetches": 0, "submitted": None}
+
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     page = browser.new_page()
-    package_revision = {"value": 1}
 
-    def route_package(route):
-        revision = package_revision["value"]
-        route.fulfill(status=200, content_type="application/json", body=json.dumps({
-            "package_type": "decision_view", "item_id": "att-defer-1", "work_id": "probe-work",
-            "attention_revision": revision, "material_fingerprint": "fp-current",
-            "conclusion": "Needs decision", "trigger": "test trigger",
-            "trigger_evidence": [{"summary": "current evidence" if revision == 2 else "initial evidence", "reference": "test:probe"}],
-            "impact": "test impact", "recommendation": "continue", "owner": "operator",
-            "contract_revision": 1, "expires_at": None, "source_link": None,
-            "options": [{"id": "stop", "label": "Stop", "effect": "Stops work", "consequence": "No duplicate action"}]
-        }))
+    def on_request(request):
+        if request.url.endswith("/api/attention/att-defer-1/resolve"):
+            seen["submitted"] = json.loads(request.post_data)
 
-    def route_resolve(route):
-        package_revision["value"] = 2
-        route.fulfill(status=409, content_type="application/json", body=json.dumps({
-            "error": "stale attention revision", "current_revision": 2,
-            "decision_package_url": "/api/context/decision-package?item_id=att-defer-1&work_id=probe-work"
-        }))
+    def on_response(response):
+        if "/api/context/decision-package" in response.url:
+            seen["package_fetches"] += 1
+        if response.url.endswith("/api/attention/att-defer-1/resolve") and response.status == 409:
+            seen["conflict"] = response.json()
 
-    page.route("**/api/context/decision-package?*", route_package)
-    page.route("**/api/attention/att-defer-1/resolve", route_resolve)
+    page.on("request", on_request)
+    page.on("response", on_response)
     page.goto(base + "/decide")
-    page.locator('button[data-action="resolve"][data-option="stop"]').click()
+    card = page.locator('[data-item-id="att-defer-1"]')
+    card.locator('button[data-action="resolve"][data-option="stop"]').wait_for()
+    card_html, card_text = card.inner_html(), card.inner_text()
+    card.locator('button[data-action="expand"]').click()
+    expanded_text = card.inner_text()
+
+    # The drawer renders the same server-owned option metadata. It is modal, so it has to be
+    # dismissed again before the decision buttons underneath are clickable.
+    card.locator('button[data-action="attention-evidence"]').click()
+    drawer = page.locator("#drawer")
+    drawer.wait_for(state="visible")
+    drawer_html, drawer_text = drawer.inner_html(), drawer.inner_text()
+    drawer.locator('button[data-action="dismiss"]').click()
+    page.wait_for_function("!document.getElementById('drawer').open")
+
+    packages_before_click = seen["package_fetches"]
+    with open(loaded_file, "w") as handle:
+        handle.write("1")
+    deadline = time.time() + 30
+    while not os.path.exists(go_file) and time.time() < deadline:
+        time.sleep(0.02)
+
+    card.locator('button[data-action="resolve"][data-option="stop"]').click()
     page.locator('#error button', has_text="Reload current decisions").wait_for()
     page.get_by_text("Draft answer retained: stop", exact=False).wait_for()
+    page.get_by_text("impact after a concurrent write", exact=False).first.wait_for()
     follow_up = page.locator('[data-item-id="att-follow-up"]')
     follow_up.wait_for()
     result = {
+        "card_html": card_html,
+        "card_text": card_text,
+        "expanded_text": expanded_text,
+        "drawer_html": drawer_html,
+        "drawer_text": drawer_text,
+        "conflict": seen["conflict"],
+        "submitted": seen["submitted"],
+        "packages_before_click": packages_before_click,
+        "package_fetches": seen["package_fetches"],
+        "refreshed_card": card.inner_text(),
         "draft": page.get_by_text("Draft answer retained: stop", exact=False).inner_text(),
         "error": page.locator("#error").inner_text(),
         "reload_buttons": page.locator('#error button', has_text="Reload current decisions").count(),
-        "current_evidence": page.get_by_text("current evidence", exact=False).count(),
         "follow_up": follow_up.inner_text(),
         "follow_up_actions": follow_up.locator('button[data-action="resolve"]').count(),
         "done_has_follow_up": "Verify the accepted change" in page.locator('button[data-done="all"]').inner_text(),
@@ -126,7 +164,11 @@ with sync_playwright() as p:
     print(json.dumps(result))
     browser.close()
 `;
-  const proc = Bun.spawn(["python3", "-c", script, base], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(["python3", "-c", script, base, loadedFile, goFile], { stdout: "pipe", stderr: "pipe" });
+  const deadline = Date.now() + 30_000;
+  while (!existsSync(loadedFile) && Date.now() < deadline) await Bun.sleep(25);
+  if (existsSync(loadedFile)) bump();
+  writeFileSync(goFile, "1");
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
   ]);
@@ -262,7 +304,7 @@ describe("attention defer integration", () => {
 
 
 describe("attention browser behavior", () => {
-  test("applying Work remains visible and stale conflict preserves the draft against the current package", async () => {
+  test("A06/A07: the real card and drawer render the server package and a stale submit returns the full conflict body", async () => {
     const root = mkdtempSync(join(tmpdir(), "overload-attention-browser-"));
     roots.push(root);
     const ledgerPath = join(root, "ledger.db");
@@ -270,20 +312,77 @@ describe("attention browser behavior", () => {
     db.exec(SCHEMA_SQL);
     db.close();
     const controlPath = seedAttention(root);
-    const base = await boot(root, ledgerPath, controlPath);
+    const base = await boot(root, ledgerPath, controlPath, undefined, "operator");
 
-    const dom = await browserProbe(base);
+    // Between page load and the click, another writer changes the card's material facts.
+    let staleRevision = 0, workId = "";
+    const bump = () => {
+      const ctrl = openControl(controlPath);
+      const current = getAttention(ctrl, "att-defer-1")!;
+      staleRevision = current.revision;
+      workId = current.work_id;
+      upsertAttention(ctrl, { ...current, impact: "impact after a concurrent write", expected_revision: current.revision });
+      ctrl.close();
+    };
+
+    const dom = await browserProbe(base, root, bump);
+
+    // A06: the card and the drawer show server-derived option metadata, never raw JSON.
+    expect(dom.card_text).toContain("Stop work");
+    expect(dom.card_text).toContain("Continue work");
+    expect(dom.expanded_text).toContain("stops the work and releases its controlled resources");
+    expect(dom.expanded_text).toContain("Work moves to stopped and its remaining scope is not executed.");
+    expect(dom.drawer_text).toContain("Stop work");
+    expect(dom.drawer_text).toContain("records acceptance of the remaining risk and continues the work");
+    expect(dom.drawer_text).toContain("Work continues under the current contract and budget.");
+    for (const markup of [dom.card_html, dom.drawer_html] as string[]) {
+      expect(markup).not.toContain("<pre");
+      expect(markup).not.toContain("package_type");
+      expect(markup).not.toContain("material_fingerprint");
+    }
+
+    // A07 §4.2: an ordinary stop — not just the narrow editor — submits the attention revision,
+    // the current contract revision and the material fingerprint that the package handed it.
+    expect(dom.submitted).toEqual({
+      attention_revision: staleRevision,
+      expected_contract_revision: 1,
+      material_fingerprint: expect.any(String),
+      selected_option: "stop",
+    });
+    expect(dom.submitted.material_fingerprint.length).toBeGreaterThan(0);
+
+    // A07 §4.5: the browser received the server's own conflict body, every field of it.
+    expect(dom.conflict).toEqual({
+      error: "conflict",
+      message: "stale attention revision",
+      code: "stale_attention",
+      item_id: "att-defer-1",
+      expected_revision: staleRevision,
+      current_revision: staleRevision + 1,
+      current_state: "open",
+      current_effect_state: "not_started",
+      decision_package_url: `/api/context/decision-package?item_id=att-defer-1&work_id=${encodeURIComponent(workId)}`,
+    });
+
+    // The rejected submit left the item untouched, and the page refetched the package from the
+    // URL the conflict body handed it: the new package is displayed, the draft is only local.
+    const after = openControl(controlPath);
+    expect(getAttention(after, "att-defer-1")).toMatchObject({ state: "open", effect_state: "not_started", revision: staleRevision + 1 });
+    after.close();
+    expect(dom.package_fetches).toBeGreaterThan(dom.packages_before_click);
+    expect(dom.refreshed_card).toContain("impact after a concurrent write");
+    expect(dom.draft).toContain("Draft answer retained: stop");
+    expect(dom.draft).toContain("Refresh the current package before retrying");
+    expect(dom.error).toContain("No changes were applied");
+    expect(dom.reload_buttons).toBe(1);
+
+    // A10 regression kept from the previous probe: applying work stays visible and unanswerable.
     expect(dom.follow_up).toContain("Verify the accepted change");
     expect(dom.follow_up).toContain("patch written");
     expect(dom.follow_up).toContain("Operator verifies the deployed behavior");
     expect(dom.follow_up_actions).toBe(0);
     expect(dom.done_has_follow_up).toBe(false);
-    expect(dom.draft).toContain("Draft answer retained: stop");
-    expect(dom.draft).toContain("Refresh the current package before retrying");
-    expect(dom.error).toContain("No changes were applied");
-    expect(dom.reload_buttons).toBe(1);
-    expect(dom.current_evidence).toBeGreaterThan(0);
-  }, 20_000);
+  }, 60_000);
 });
 
 describe("B09 generic Resume shares the conservative wait-recovery gate", () => {

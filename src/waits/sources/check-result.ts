@@ -32,9 +32,13 @@ function classify(error: unknown): unknown {
   if (error instanceof CheckSourceError || !(error instanceof SQLiteError)) return error;
   const code = typeof error.code === "string" ? error.code : "";
   if (code.startsWith("SQLITE_BUSY") || code.startsWith("SQLITE_LOCKED")) return new CheckSourceError("transient", "orchestrator database is busy");
-  // The file was just found readable, so this is not a missing source: a read-only open also fails when a WAL
-  // database has no -shm index and no running writer to create it. Neither cause is proven, so it is `unknown`.
-  if (code.startsWith("SQLITE_CANTOPEN")) return new CheckSourceError("unknown", "orchestrator database exists but cannot be opened read-only");
+  // The file was just found readable, so this is not a missing source: a read-only open also fails on a WAL
+  // database whose -shm index is absent and whose directory SQLite may not write, since even a read-only
+  // reader needs that index. SQLITE_READONLY_* lands here too — this source is only ever opened read-only, so
+  // a write refusal can only be SQLite failing to lay down its own sidecars. Neither cause is proven: `unknown`.
+  if (code.startsWith("SQLITE_CANTOPEN") || code.startsWith("SQLITE_READONLY")) {
+    return new CheckSourceError("unknown", "orchestrator database exists but cannot be opened read-only");
+  }
   if (code.startsWith("SQLITE_PERM") || code.startsWith("SQLITE_AUTH")) return new CheckSourceError("permission_denied", "orchestrator database access denied");
   if (code.startsWith("SQLITE_CORRUPT") || code.startsWith("SQLITE_NOTADB")) return new CheckSourceError("invalid_response", "orchestrator database is corrupt");
   if (code === "SQLITE_ERROR") return new CheckSourceError("configuration", `orchestrator database does not have the check-result schema: ${error.message.slice(0, 200)}`);

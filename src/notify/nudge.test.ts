@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createWork, openControl, promoteWork, upsertAttention } from "../control/store";
+import { createWork, openControl, promoteWork, resolveAttentionDecision, upsertAttention } from "../control/store";
 import type { NotificationDelivery, NotificationEnvironment, NotificationPolicy, NotificationSender } from "./nudge";
 import { collectNotificationCandidates, nudgeOnce, notificationCapability, runNotificationCycle } from "./nudge";
 
@@ -113,6 +113,46 @@ describe("notification projection and durable claims", () => {
     control.close(); ledger.close();
   });
 
+  test("A04 a real risk change through upsertAttention claims material_change exactly once", async () => {
+    const { control, ledger } = fixture(); const now = 1_700_000_000_000; const sender = new Sender();
+    // No hand-written material row: the fingerprint here is the one the store derives from the card.
+    const item = attention(control, "risk", now);
+    const material = () => control.query("SELECT material_key,generation FROM control_attention_material WHERE item_id='risk'")
+      .get() as { material_key: string; generation: number };
+    const first = material();
+    expect(first.generation).toBe(1);
+    expect((await runNotificationCycle({ ledger, control, policy: policy(), sender, now })).sent).toBe(1);
+
+    const changed = upsertAttention(control, { ...item, expected_revision: item.revision, impact: "data loss is now certain" }, now + 1);
+    const second = material();
+    expect(second.generation).toBe(2);
+    expect(second.material_key).not.toBe(first.material_key);
+
+    expect(await runNotificationCycle({ ledger, control, policy: policy(), sender, now: now + 2 })).toMatchObject({ claimed: 1, sent: 1 });
+    expect(control.query("SELECT threshold,material_key,item_revision FROM control_notifications WHERE subject='attention:risk' ORDER BY created_at").all()).toEqual([
+      { threshold: "new_now", material_key: first.material_key, item_revision: item.revision },
+      { threshold: "material_change", material_key: second.material_key, item_revision: changed.revision },
+    ]);
+    // The same changed basis must not interrupt a second time.
+    expect((await runNotificationCycle({ ledger, control, policy: policy(), sender, now: now + 3 })).claimed).toBe(0);
+    expect(sender.calls).toEqual([["attention:risk"], ["attention:risk"]]);
+    control.close(); ledger.close();
+  });
+
+  test("A14 an ordinary completion claims nothing further", async () => {
+    const { control, ledger } = fixture(); const now = 1_700_000_000_000; const sender = new Sender();
+    const item = attention(control, "completed", now, "fp-completed");
+    expect((await runNotificationCycle({ ledger, control, policy: policy(), sender, now })).sent).toBe(1);
+
+    const resolved = resolveAttentionDecision(control, item.item_id, item.revision, { selected_option: "stop" }, now + 1, "owner");
+    expect(resolved).toMatchObject({ state: "resolved", effect_state: "succeeded" });
+
+    expect(await runNotificationCycle({ ledger, control, policy: policy(), sender, now: now + 2 })).toMatchObject({ claimed: 0, sent: 0 });
+    expect(control.query("SELECT threshold FROM control_notifications WHERE subject='attention:completed'").all()).toEqual([{ threshold: "new_now" }]);
+    expect(sender.calls).toHaveLength(1);
+    control.close(); ledger.close();
+  });
+
   test("A16 persists bounded failures and never blindly retries unknown delivery", async () => {
     const { control, ledger } = fixture(); const now = 1_700_000_000_000;
     attention(control, "failed", now, "fp-failed");
@@ -217,6 +257,32 @@ describe("notification projection and durable claims", () => {
     expect(sender.calls).toHaveLength(1);
     const feishuSender = { channel: "feishu" as const, send: async () => ({ outcome: "sent" as const }) };
     await expect(runNotificationCycle({ ledger, control, policy: { ...policy("send", "cutover-v2"), primary_channel: "macos" }, sender: feishuSender, now: now + 2 })).rejects.toThrow("not primary");
+    control.close(); ledger.close();
+  });
+
+  test("A17 a second primary channel cannot re-claim what the first already sent in the same epoch", async () => {
+    const { control, ledger } = fixture();
+    const now = 1_700_000_000_000;
+    attention(control, "shared", now, "fp-shared");
+    const macos = new Sender();
+    expect(await runNotificationCycle({ ledger, control, policy: policy("send", "shared-epoch"), sender: macos, now })).toMatchObject({ claimed: 1, sent: 1 });
+
+    // Same owner epoch, other primary channel: channel is not part of the claim identity, so the
+    // durable row already written by macOS must leave nothing for Feishu to claim.
+    const feishuCalls: string[][] = [];
+    const feishu: NotificationSender = {
+      channel: "feishu",
+      send: async (candidates) => { feishuCalls.push(candidates.map(({ subject }) => subject)); return { outcome: "sent" }; },
+    };
+    const second = await runNotificationCycle({
+      ledger, control, policy: { ...policy("send", "shared-epoch"), primary_channel: "feishu" }, sender: feishu, now: now + 1,
+    });
+
+    expect(second).toMatchObject({ claimed: 0, sent: 0 });
+    expect(feishuCalls).toEqual([]);
+    expect(macos.calls).toEqual([["attention:shared"]]);
+    expect(control.query("SELECT channel,outcome,attempt_count FROM control_notifications WHERE subject='attention:shared'").all())
+      .toEqual([{ channel: "macos", outcome: "sent", attempt_count: 1 }]);
     control.close(); ledger.close();
   });
 });

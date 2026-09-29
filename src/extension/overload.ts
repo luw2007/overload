@@ -9,8 +9,6 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { execFile, execFileSync } from "node:child_process"
-import { scrubText } from "../shared/redact"
-import { parseHostId } from "../shared/types"
 
 const SEGMENT_MAX_AGE_MS = 30_000
 const SEGMENT_MAX_BYTES = 1_048_576
@@ -55,6 +53,37 @@ type ExtensionApi = {
 type AskQuestion = { id?: string; question?: string; header?: string; options?: Array<string | { label?: string }>; multi?: boolean; recommended?: number }
 type AskTarget = { approvalId: string; targetVersion: string; expiresAt: number }
 type AskAnswer = { id: string; question: string; options: string[]; multi: boolean; selectedOptions: string[]; customInput?: string }
+
+// Plan §4.5 client half. A 409 from the consume route is terminal for this entry: another
+// entry already holds the decision, so the poll refreshes current state and stops instead of
+// retrying the answer until the target expires.
+type ConsumeConflict = {
+  code: string
+  current_target_version: string | null
+  current_target_state: string | null
+  current_state: string | null
+  current_effect_state: string | null
+  current_revision: number | null
+  receipt_id: string | null
+  decision_package_url: string | null
+}
+async function consumeConflict(response: { status: number; json: () => Promise<unknown> }): Promise<ConsumeConflict | undefined> {
+  if (response.status !== 409) return undefined
+  let body: unknown
+  try { body = await response.json() } catch { body = null }
+  const row = body && typeof body === "object" ? body as Record<string, unknown> : {}
+  const text = (key: string): string | null => typeof row[key] === "string" ? row[key] : null
+  return {
+    code: text("code") ?? "conflict",
+    current_target_version: text("current_target_version"),
+    current_target_state: text("current_target_state"),
+    current_state: text("current_state"),
+    current_effect_state: text("current_effect_state"),
+    current_revision: typeof row.current_revision === "number" ? row.current_revision : null,
+    receipt_id: text("receipt_id"),
+    decision_package_url: text("decision_package_url"),
+  }
+}
 
 // Reserved dialog rows, spelled as omp's built-in ask spells them.
 const ASK_OTHER_OPTION = "Other (type your own)"
@@ -112,6 +141,14 @@ function detectRuntime(): Runtime {
 function safeComponent(value: unknown, fallback: string): string {
   const clean = String(value || "").replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 180)
   return clean || fallback
+}
+
+// Installed as a single copied file (scripts/install-extension.sh), so it cannot
+// import ../shared/types; this mirrors src/shared/types.ts parseHostId.
+function parseHostId(value: string): string {
+  const host = value.trim()
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(host)) throw new Error(`invalid host id: ${value}`)
+  return host
 }
 
 function textFrom(value: unknown): string {
@@ -567,6 +604,9 @@ export default function overload(pi: ExtensionApi): void {
   // toolCallId; execute takes ownership, tool_execution_end closes leftovers.
   const askTargets = new Map<string, AskTarget>()
   const askWebAnswers = new Map<string, { actor: string; receiptId: string }>()
+  // An ask whose target another entry consumed. The terminal decision_resolved is emitted at
+  // tool_execution_end, so the conflict rides along on it rather than adding a second one.
+  const askWebConflicts = new Map<string, ConsumeConflict>()
   const isAskTool = (name: unknown) => name === "ask" || name === "ask_user"
   let askToolRegistered = false
   let controlPlanePort = DEFAULT_WEB_PORT
@@ -754,6 +794,14 @@ export default function overload(pi: ExtensionApi): void {
           if(answer === "approve" && typeof payload.receiptId === "string")receiptByToolCall.set(event.toolCallId,{receiptId:payload.receiptId,attemptId:typeof payload.attemptId==="string"?payload.attemptId:undefined,effect:String(detail.class||"gated_tool")})
           return answer === "approve" ? undefined : { block: true, reason: `overload approval gate: denied by ${actor}` }
         }
+        // §4.5: another entry consumed this decision. Terminal for this entry — report where
+        // the decision stands and stop, rather than polling a target that can never answer us
+        // again. Still fail-closed: the answer never reached this session, so the tool blocks.
+        const conflict = await consumeConflict(response)
+        if (conflict) {
+          emit("decision_resolved", { request_id: detail.request_id, gated: true, state: "cancelled", conflict })
+          return { block: true, reason: `overload approval gate: ${conflict.code} by another entry` }
+        }
       } catch { /* Poll errors are fail-closed at expiry, not an early allow. */ }
       await new Promise<void>((resolve) => {
         const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); resolve() }
@@ -793,7 +841,7 @@ export default function overload(pi: ExtensionApi): void {
   // never aborted client-side: the server may commit the receipt after any
   // client timeout, and an abandoned response would lose the only copy of the
   // answer. A late response after `stop` is recorded as undelivered instead.
-  async function awaitWebAnswer(toolCallId: string, target: AskTarget, stop: AbortSignal): Promise<{ answer: string; actor: string; receiptId: string } | undefined> {
+  async function awaitWebAnswer(toolCallId: string, target: AskTarget, stop: AbortSignal): Promise<{ answer: string; actor: string; receiptId: string } | { conflict: ConsumeConflict } | undefined> {
     while (!stop.aborted && Date.now() < target.expiresAt) {
       try {
         const response = await globalThis.fetch(`http://127.0.0.1:${controlPlanePort}/api/decision/consume/${encodeURIComponent(target.approvalId)}`, { method: "POST", headers: controlPlaneHeaders, body: JSON.stringify({ consumer_owner: "extension", target_version: target.targetVersion }) })
@@ -808,6 +856,10 @@ export default function overload(pi: ExtensionApi): void {
           }
           return { answer: field("answer"), actor: field("actor") || "unknown", receiptId }
         }
+        // §4.5: another entry consumed this ask. Stop polling instead of waiting out the
+        // target's TTL; the terminal contender, when there is one, still decides.
+        const conflict = await consumeConflict(response)
+        if (conflict) return { conflict }
       } catch { /* Poll errors retry until expiry; the terminal can still answer. */ }
       await new Promise<void>((resolve) => {
         const finish = () => { clearTimeout(timer); stop.removeEventListener("abort", finish); resolve() }
@@ -856,9 +908,12 @@ export default function overload(pi: ExtensionApi): void {
       }
       if (target) {
         contenders.push(awaitWebAnswer(toolCallId, target, poll.signal).then((web) => {
-          if (!web) {
+          if (!web || "conflict" in web) {
+            if (web) askWebConflicts.set(toolCallId, web.conflict)
             if (ui) return new Promise<never>(() => {})
-            throw new Error("ask expired before an Overload answer arrived")
+            throw new Error(web
+              ? `ask was ${web.conflict.code} through another entry; no answer reached this session`
+              : "ask expired before an Overload answer arrived")
           }
           webWon = true
           askWebAnswers.set(toolCallId, { actor: web.actor, receiptId: web.receiptId })
@@ -1189,6 +1244,8 @@ export default function overload(pi: ExtensionApi): void {
     if (unclaimed) cancelAskTarget(unclaimed)
     const web = askWebAnswers.get(event.toolCallId)
     askWebAnswers.delete(event.toolCallId)
+    const conflict = askWebConflicts.get(event.toolCallId)
+    askWebConflicts.delete(event.toolCallId)
     const selected = selectedOption(event.result)
     emit("decision_resolved", {
       request_id: event.toolCallId,
@@ -1197,6 +1254,8 @@ export default function overload(pi: ExtensionApi): void {
       state: event.isError ? "cancelled" : "resolved",
       ...(selected ? { selected } : {}),
       ...(web ? { actor: web.actor, receipt_id: web.receiptId } : {}),
+      // §4.5: the Web leg stopped on a lost race; the terminal still decided the ask.
+      ...(conflict ? { conflict } : {}),
       ...(event.isError ? { error: true } : {}),
     })
   })

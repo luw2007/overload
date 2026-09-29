@@ -5,8 +5,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
-import { cancelTarget, closeTarget, consumeDecision, expireActiveTargets,
-  observeReceiptEffect, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
+import { cancelTarget, closeTarget, consumeConflictBody, consumeDecisionResult, expireActiveTargets,
+  isConsumeConflict, observeReceiptEffect, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
 import type { ConsumerOwner } from "../decision-bot/mailbox";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate, loadPolicy, matchingRule, policyAuthorizes, rulesReport } from "../decision-bot/policy";
 import { disablePolicyRule, enablePolicyRule, proposeRuleFromAttention } from "../decision-bot/policy";
@@ -52,10 +52,18 @@ const DEFAULT_WEB_PORT = 4870;
 /** The list is a launchpad for drill-down, not an inventory: 1000 rows serve nobody. */
 const SESSION_LIST_LIMIT = 100;
 let warnedInvalidConfig = false;
+let warnedInvalidWebPort = false;
 
 export type WebConfig = { web_port: number };
 
-export async function loadWebConfig(path = join(homedir(), ".overload", "config.json")): Promise<WebConfig> {
+/** Port precedence is config.json > OVERLOAD_WEB_PORT > 4870. config.json wins because it is
+ *  the only setting the extension also reads when it resolves the control-plane port, so it is
+ *  the one that keeps both sides agreeing. The env var is a fallback for manual runs; the
+ *  LaunchAgent never sees it, since the plists carry only OVERLOAD_ROOT and OVERLOAD_BUN. */
+export async function loadWebConfig(
+  path = join(homedir(), ".overload", "config.json"),
+  env: { OVERLOAD_WEB_PORT?: string } = process.env,
+): Promise<WebConfig> {
   let value: Record<string, unknown> = {};
   try {
     const parsed = JSON.parse(await readFile(path, "utf8"));
@@ -65,7 +73,21 @@ export async function loadWebConfig(path = join(homedir(), ".overload", "config.
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") warnInvalidConfig(path);
   }
   if (value.web_port !== undefined && !positiveInteger(value.web_port)) warnInvalidConfig(path);
-  return { web_port: positiveInteger(value.web_port) ? value.web_port : DEFAULT_WEB_PORT };
+  if (positiveInteger(value.web_port)) return { web_port: value.web_port };
+  return { web_port: envPort(env.OVERLOAD_WEB_PORT) ?? DEFAULT_WEB_PORT };
+}
+
+/** An unusable value is reported and ignored: a listener that refuses to start is a worse
+ *  answer than the default port, and silently doing nothing is what this var used to do. */
+function envPort(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const parsed = Number(raw);
+  if (raw.trim() !== "" && positiveInteger(parsed)) return parsed;
+  if (!warnedInvalidWebPort) {
+    warnedInvalidWebPort = true;
+    console.error(`overload web: ignoring invalid OVERLOAD_WEB_PORT ${JSON.stringify(raw)}`);
+  }
+  return null;
 }
 
 function positiveInteger(value: unknown): value is number {
@@ -967,7 +989,10 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
             return json({ closed }, { status: closed ? 200 : 409 });
           } finally { mailbox.close(); }
         }
-        if(request.method==="POST"&&url.pathname.startsWith("/api/decision/consume/")){if(!request.headers.get("sec-fetch-site")&&!request.headers.get("sec-fetch-mode"))return json({error:"forbidden"},{status:403});let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}const id=routeParameter(url.pathname.slice("/api/decision/consume/".length));if(!id||body?.consumer_owner!=="extension"||typeof body.target_version!=="string")return json({error:"invalid consume"},{status:400});const mailbox=openAnswersDb(controlPath);try{const policy=loadPolicy(options.policyPath,mailbox);const r=consumeDecision(mailbox,{consumerOwner:"extension",approvalId:id,targetVersion:body.target_version,policyHash:policy.hash,liveValid:()=>true,policyValid:(t,p)=>!!p&&policyAuthorizes(policy,t,p.answer,p.policyHash)});return r?json(r):json({error:"not ready"},{status:404});}finally{mailbox.close();}}
+        if(request.method==="POST"&&url.pathname.startsWith("/api/decision/consume/")){if(!request.headers.get("sec-fetch-site")&&!request.headers.get("sec-fetch-mode"))return json({error:"forbidden"},{status:403});let body:any;try{body=await request.json();}catch{return json({error:"invalid JSON"},{status:400});}const id=routeParameter(url.pathname.slice("/api/decision/consume/".length));if(!id||body?.consumer_owner!=="extension"||typeof body.target_version!=="string")return json({error:"invalid consume"},{status:400});const mailbox=openAnswersDb(controlPath);try{const policy=loadPolicy(options.policyPath,mailbox);const r=consumeDecisionResult(mailbox,{consumerOwner:"extension",approvalId:id,targetVersion:body.target_version,policyHash:policy.hash,liveValid:()=>true,policyValid:(t,p)=>!!p&&policyAuthorizes(policy,t,p.answer,p.policyHash)});if(r.ok)return json(r.receipt);
+          // A lost race is a conflict carrying current state (§4.5), not "the answer is not written yet".
+          if(isConsumeConflict(r.reason))return json(consumeConflictBody(mailbox,"extension",id,body.target_version,r.reason),{status:409});
+          return json({error:"not ready",reason:r.reason},{status:404});}finally{mailbox.close();}}
         if(request.method=== "POST" &&
           url.pathname === "/api/decision/effect"
         ) {
