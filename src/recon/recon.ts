@@ -535,11 +535,14 @@ function commMatchesRuntime(comm: string, runtime: string | null): boolean {
   return (allowed[runtime ?? ""] ?? [runtime ?? ""]).some((part) => part && name.includes(part));
 }
 
+/** Signals the whole process group via kill(2). Never shell out to /bin/kill
+ *  for this: procps-ng kill misreads a negative PGID as a signal spec, sweeps
+ *  the wrong group and still exits 0, so the sweep silently does nothing on
+ *  Linux. Same contract as pull.ts killProcessTree. */
 export async function killGroup(proc: { pid: number }, signal: "TERM" | "KILL"): Promise<void> {
   try {
-    const child = Bun.spawn(["/bin/kill", "-s", signal, `-${proc.pid}`], { stdout: "ignore", stderr: "ignore" });
-    const rc = await child.exited;
-    if (rc === 0) return;
+    process.kill(-proc.pid, `SIG${signal}`);
+    return;
   } catch { /* fall through to direct-child fallback */ }
   try { (proc as unknown as { kill: (s: string) => void }).kill(`SIG${signal}`); } catch { /* gone */ }
 }
