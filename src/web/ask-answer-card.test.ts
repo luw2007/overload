@@ -110,6 +110,8 @@ describe("live ask decision card", () => {
     db.close();
 
     const consume = () => fetch(`${base}/api/decision/consume/${encodeURIComponent(APPROVAL_ID)}`, { method: "POST", headers: extensionHeaders, body: JSON.stringify({ consumer_owner: "extension", target_version: targetVersion }) });
+    // Nobody has answered yet: the target is still active, so this is "come back later", not a
+    // conflict. A09 keeps 404 for exactly this case.
     expect((await consume()).status).toBe(404);
 
     const probe = await clickGreen(base);
@@ -120,6 +122,10 @@ describe("live ask decision card", () => {
     const first = await consume();
     expect(first.status).toBe(200);
     expect(await first.json()).toMatchObject({ answer: "Green", actor: "ui", approvalId: APPROVAL_ID, targetVersion });
-    expect((await consume()).status).toBe(404);
+    // The lost race: the first consume already took the answer. A09 makes this a terminal 409 with
+    // the current state, so the losing entry refreshes instead of retrying — it is not "not ready".
+    const second = await consume();
+    expect(second.status).toBe(409);
+    expect(await second.json()).toMatchObject({ error: "conflict", code: "already_consumed", retry: false, approval_id: APPROVAL_ID, consumer_owner: "extension" });
   }, 60_000);
 });

@@ -380,7 +380,7 @@ Default `shadow` preserves the incumbent legacy Q1/hung newline-state sender as 
 Cutover is ordered and reversible:
 
 1. deploy v6; its transactional backfill/repair gives missing open Attention generation-1 material without directly sending, while default shadow keeps legacy Q1/hung as the only sender;
-2. run focused A01–A17 tests and inspect shadow false-negative/duplicate rows; this is not a claim that A17 has production shadow coverage, and unlinked legacy rows remain visible coverage gaps;
+2. run focused A01–A17 tests and inspect shadow false-negative/duplicate rows with `bun run src/notify/shadow-report.ts` (§8), which reports `false_negatives`, `duplicates` and `unlinked_attention` read-only over `control_notification_shadow`; this is not a claim that A17 has production shadow coverage, and unlinked legacy rows remain visible coverage gaps;
 3. stop the legacy newline-state sender path;
 4. atomically configure one primary channel, set a fresh owner epoch (for example `phase-a-send-1`), and set mode `send` for the single maintenance owner;
 5. restart only that owner, verify a pending claim becomes one durable terminal outcome, and confirm the other channel did not claim it; a configured real-channel smoke requires credentials and explicit operator authorization and has not yet been claimed here;
@@ -419,8 +419,20 @@ bun test src/control/store.test.ts src/control/store-extra.test.ts src/control/c
 bun test src/decision-bot/mailbox.test.ts src/decision-bot/reconcile.test.ts
 bun test src/adapters/service.test.ts src/adapters/feishu.test.ts
 bun test src/notify/nudge.test.ts
-bun test src/web/server.test.ts src/web/context-ui.test.ts src/web/ui-regression.test.ts src/web/ledger.test.ts
+bun test src/web/server.test.ts src/web/context-ui.test.ts src/web/ui-regression.test.ts src/web/ledger.test.ts src/web/contract-closure.test.ts
 bun test
+bun run src/notify/shadow-report.ts
 ```
+
+`src/web/contract-closure.test.ts` carries the only §4.5 material-fingerprint conflict coverage
+(omitted fingerprint, rotated fingerprint at a current revision, stale revision with a current
+fingerprint, and the accepted submission); it belongs to the web slice above rather than to a
+separate run.
+
+`bun run src/notify/shadow-report.ts` is the §6 step 2 shadow inspection, not a test: it reads
+`control_notification_shadow` on the configured control database and prints one JSON line with
+`compared`, `false_negatives`, `duplicates` and `unlinked_attention`. It is read-only apart from
+the idempotent schema ensure, takes no arguments, and is run against a deployed database during
+cutover rather than as part of a slice.
 
 Browser acceptance must exercise the actual loopback surface for A06, A07, A10, A12, and A14. Channel acceptance uses isolated Feishu adapter tests; one configured real-channel smoke is still required by the production release gate when credentials and explicit operator authorization are available. A mock receipt proves state rules, not external delivery, and this document does not claim the Feishu real channel has been verified.
