@@ -86,7 +86,8 @@ Defaults as they will actually apply on a fresh install:
 | `OVERLOAD_ROOT` | the checkout dir | set by installer |
 | `OVERLOAD_BUN` | absolute path to `bun` | set by installer |
 | `OVERLOAD_LEDGER_PATH` | `~/.overload/ledger.db` | `src/cli/overload.ts:25`, `src/cli/doctor.ts:31` |
-| `OVERLOAD_ANSWERS_PATH` | `~/.overload/orchestrator-answers.db` | `src/web/server.ts:517`, `src/waits/cli.ts:30`, `src/cli/mgmt.ts:9` |
+| `OVERLOAD_ANSWERS_PATH` | `~/.overload/orchestrator-answers.db` | `src/web/server.ts` `startWebServer`, `src/waits/cli.ts:30`, `src/cli/mgmt.ts:9` |
+| `OVERLOAD_WEB_PORT` | unset → `4870`, unless `config.json` sets `web_port` | `src/web/server.ts` `loadWebConfig` (see below) |
 | `OVERLOAD_NOTIFICATION_MODE` | **`shadow`** | `src/notify/nudge.ts:304`, `:382` |
 | `OVERLOAD_NOTIFICATION_PRIMARY` | `macos` | `src/notify/nudge.ts:306` |
 | `OVERLOAD_NOTIFICATION_OWNER` | `maintenance` | `src/notify/nudge.ts:292`, `:308` |
@@ -103,11 +104,30 @@ context-bearing or owner-bearing item exits 1 with
 `error: context decision requires --actor or OVERLOAD_ACTOR` (`src/cli/overload.ts:90-93`), and
 `context purge` always requires it (`:113-114`). Pass `--actor` or export it in your own shell.
 
-**The web port is not `OVERLOAD_WEB_PORT`.** The web server reads `web_port` from
-`~/.overload/config.json`, defaulting to `4870`, and binds `127.0.0.1` only
-(`src/web/server.ts:48`, `:55`, `:65`, `:596`). `OVERLOAD_WEB_PORT` is read by the *adapter
-daemon* alone (`src/adapters/daemon.ts:146`). Setting it expecting the dashboard to move will
-silently do nothing.
+**The web port: `config.json` first, `OVERLOAD_WEB_PORT` second.** `loadWebConfig`
+(`src/web/server.ts`) resolves the dashboard port as `web_port` from
+`~/.overload/config.json` > `OVERLOAD_WEB_PORT` > `4870`, and `startWebServer` binds
+`127.0.0.1` only. Neither an unusable env value (non-numeric, empty, `0`, negative,
+fractional) nor an unreadable or invalid `config.json` stops the listener: each is reported
+once per process on stderr and the next source in the chain wins —
+`overload web: ignoring invalid OVERLOAD_WEB_PORT "abc"` from `envPort`,
+`overload web: ignoring invalid config <path>` from `warnInvalidConfig`. Under launchd that
+stderr is `/tmp/overload-web.err` and nowhere else.
+
+**Prefer `config.json` on this deploy**, for two reasons:
+
+- **launchd never sees the environment variable.** The plists carry only `OVERLOAD_ROOT` and
+  `OVERLOAD_BUN` (`install-launchd.sh:84`), so exporting `OVERLOAD_WEB_PORT` in your shell does
+  not move the dashboard the `web` agent runs. It moves a `bun src/web/server.ts` you start by
+  hand, which is what the fallback is for.
+- **The extension only reads `config.json`.** `loadApprovalGate` in
+  `src/extension/overload.ts` takes the control-plane port from `web_port` and never looks at
+  the environment. Move the port with the env var alone and the extension keeps posting
+  answerable-ask and approval-gate traffic to `127.0.0.1:4870` while the dashboard listens
+  elsewhere.
+
+`src/adapters/daemon.ts` also reads `OVERLOAD_WEB_PORT`, for the adapter daemon's own
+dashboard. That is a separate process from the `web` LaunchAgent and not part of this install.
 
 ## 2. Command sequence
 
@@ -150,7 +170,7 @@ There is **no `--with-orchestrator` path through `setup.sh`** — it always pass
 `--install` (`setup.sh:28`). To include the optional orchestrator agent, run
 `scripts/install-launchd.sh --with-orchestrator --install` directly instead of step 4.
 
-**5 — restart pi/omp.** The extension is copied, not hot-loaded (`install-extension.sh:51`).
+**5 — restart pi/omp.** The extension is copied, not hot-loaded (`install-extension.sh:48-51`).
 Until both runtimes restart, no session telemetry is emitted and `doctor`'s
 `telemetry:liveness` will not go OK.
 
@@ -193,17 +213,24 @@ Checked deliberately against `runDoctor`; each of these is a real blind spot on 
 
 - **Notification configuration and shadow output.** Nothing in `doctor` reads any
   `OVERLOAD_NOTIFICATION_*` variable or the `control_notification_shadow` table. See the silent
-  failure in §5.
+  failure in §5. The table itself is readable with `bun run src/notify/shadow-report.ts`, which
+  prints one JSON line (`compared`, `false_negatives`, `duplicates`, `unlinked_attention`) over
+  the control database and writes nothing but the idempotent schema ensure. That is the
+  contract's §6 step 2 inspection, not a deploy check — useful once shadow rows exist, not on
+  the day of install.
 - **That the web server answers.** It checks launchd `state = running` (`:88-93`), never an HTTP
-  request to `127.0.0.1:4870`. A process that is up but failing every request reports `OK`.
+  request to the dashboard port (`4870` by default). A process that is up but failing every
+  request reports `OK`.
 - **The orchestrator agent.** Not in `KEEPALIVE_LABELS` (`:52`) and not given an interval check,
   so even a `--with-orchestrator` install leaves it entirely unverified.
 - **The Feishu adapter daemon.** Not a LaunchAgent at all; outside `doctor`'s model.
 - **The control database.** `checkLedger` opens `ledger.db` only (`:63-71`). A missing or corrupt
   `~/.overload/orchestrator-answers.db` — which the web surface, waits and mgmt all use — is not
   detected.
-- **`config.json` validity.** An invalid file is ignored with a warning at server start
-  (`src/web/server.ts:64`); `doctor` never looks.
+- **`config.json` validity.** An invalid file — and an unusable `OVERLOAD_WEB_PORT` — is
+  ignored with one stderr line at server start (`warnInvalidConfig` / `envPort` in
+  `src/web/server.ts`); `doctor` never looks, so a typo'd `web_port` shows up only as the
+  dashboard being on `4870` and as a line in `/tmp/overload-web.err`.
 - **bun's version.**
 - **Extension freshness.** `checkExtension` only stats for existence (`:73-78`), so a stale copy
   from a previous checkout reports `OK`. After upgrading, rerun
@@ -302,7 +329,12 @@ off macOS.
 
 - **No plist is written or parsed.** The dry run returns at `install-launchd.sh:102`, before
   `write_plist` ever runs. XML escaping, the generated schedule keys and `plutil -lint`
-  (`:91`, itself conditional on `plutil` existing) are untested by it.
+  (`:91`, itself conditional on `plutil` existing) are untested by it. `test/launchd-contract.test.ts`
+  does parse plists on Linux with its own reader, keeping `plutil` as a macOS-only agreement
+  check — but it reads the checked-in `launchd/*.plist` **templates**, which are not the files
+  `write_plist` generates (the templates go through `/bin/sh -lc` and `$OVERLOAD_BUN`, the
+  generated ones name bun's absolute path directly). A green suite says nothing about the plist
+  that actually lands in `~/Library/LaunchAgents`.
 - **No `launchctl` call happens.** `bootstrap`, `bootout`, and the `launchctl print` parsing
   that every `doctor` launchd check depends on (`src/cli/doctor.ts:80-86`) are entirely
   unexercised. This is the largest untested surface in the deploy.
