@@ -4,6 +4,7 @@ import {
   CONTROL_SCHEMA_VERSION,
   CONTROL_SCHEMA,
   ControlError,
+  actOnAttention,
   createWork,
   deriveAttentionMaterialInputs,
   computeMaterialFingerprint,
@@ -19,6 +20,7 @@ import {
   recordAttentionFeedback,
   recordAttentionResolution,
   redirectWork,
+  resolveAttention,
   upsertAttention,
 } from "./store";
 import { enqueueControlEvent, ensureOutbox, publishControlEvents } from "./outbox";
@@ -68,6 +70,42 @@ test("listAttention zones filter open vs done and defer", () => {
   }, 2);
   expect(listAttention(d, "now", 3).map((x) => x.item_id)).toEqual(["now"]);
   expect(listAttention(d, "inbox", 3).map((x) => x.item_id)).toEqual(["inbox"]);
+  d.close();
+});
+
+// A05 / contract §5 invariant 8: defer only moves presentation timing. It must not touch expires_at,
+// must not re-baseline the material projection, and must not survive the original expiry.
+test("A05 a successful defer moves presentation timing only and never the expiry", () => {
+  const d = db();
+  const w = createWork(d, { title: "w", source: "t", contract }, 1_000);
+  const expiresAt = 5_000;
+  const deferUntil = 9_000; // deliberately later than the expiry the user is trying to outlast
+  const item = upsertAttention(d, {
+    item_id: "deferred", work_id: w.work_id, state: "open", effect_state: "not_started",
+    urgency: "inbox", conclusion: "decide", trigger: "risk", impact: "blocked", recommendation: null,
+    options: ["continue"], owner: "owner", expires_at: expiresAt, source_link: null, approval_id: null,
+    consumer_owner: null, contract_revision: w.revision, decision_mode: "human_only", evidence: {},
+  }, 1_000);
+  const baseline = getAttentionMaterial(d, item.item_id)!;
+
+  const deferred = actOnAttention(d, item.item_id, item.revision, "defer", { defer_until: deferUntil }, "owner", 2_000);
+
+  expect(deferred.expires_at).toBe(item.expires_at);
+  expect(deferred).toMatchObject({ revision: item.revision + 1, defer_until: deferUntil, state: "open" });
+  expect(getAttention(d, item.item_id)).toMatchObject({ expires_at: expiresAt, defer_until: deferUntil, revision: item.revision + 1 });
+  // Presentation timing is not a material input, so deferring cannot re-baseline the fingerprint either.
+  expect(getAttentionMaterial(d, item.item_id)).toMatchObject({ fingerprint: baseline.fingerprint, generation: baseline.generation });
+
+  // While the deferral is live the card is out of both actionable zones.
+  expect(listAttention(d, "now", 2_100).map((x) => x.item_id)).toEqual([]);
+  expect(listAttention(d, "inbox", 2_100).map((x) => x.item_id)).toEqual([]);
+  // Current behaviour: between the original expiry and defer_until the card is in no zone — deferral still
+  // outranks expiry for presentation. Pinned deliberately; see the thread report for the open decision.
+  expect(listAttention(d, "now", expiresAt + 1).map((x) => x.item_id)).toEqual([]);
+  expect(listAttention(d, "inbox", expiresAt + 1).map((x) => x.item_id)).toEqual([]);
+  // Once the deferral lapses the original expiry — not the urgency — puts the card in Now.
+  expect(listAttention(d, "now", deferUntil + 1).map((x) => x.item_id)).toEqual(["deferred"]);
+  expect(listAttention(d, "inbox", deferUntil + 1).map((x) => x.item_id)).toEqual([]);
   d.close();
 });
 
@@ -304,10 +342,13 @@ describe("Phase A control foundation", () => {
     const first = getAttentionMaterial(d, item.item_id)!;
     expect(first).toMatchObject({ generation: 1, computed_at: 10 });
 
+    const revisionBeforeProse = item.revision;
     item = upsertAttention(d, {
       ...item, expected_revision: item.revision, trigger: "rewritten prose", recommendation: "continue",
       evidence: { heartbeat: 99, ordinary_log: "progress" },
     }, 11);
+    // A03: the card revision still advances so CAS keeps working; only the material baseline stands still.
+    expect(item.revision).toBe(revisionBeforeProse + 1);
     expect(getAttentionMaterial(d, item.item_id)).toMatchObject({ fingerprint: first.fingerprint, generation: 1, computed_at: 11 });
 
     item = upsertAttention(d, { ...item, expected_revision: item.revision, impact: "data loss" }, 12);
@@ -421,6 +462,45 @@ describe("Phase A control foundation", () => {
     expect(listWorks(d)).toHaveLength(1);
     expect(listAttentionFollowUps(d).find((entry) => entry.item.item_id === item.item_id)?.stage).toBe("unknown");
     expect(() => projectAttentionEffect(d, link, observe("tool-stale", "failed", 2, { error: "old" }), 5)).toThrow(ControlError);
+    d.close();
+  });
+
+  // A03: a revision bump with no material change must still move CAS forward and must not claim an interruption.
+  test("A03 a material-unchanged revision advances CAS and raises no notification claim", () => {
+    const d = db();
+    const work = createWork(d, { title: "cas", source: "test", contract }, 1);
+    const item = upsertAttention(d, {
+      item_id: "cas", work_id: work.work_id, state: "open", effect_state: "not_started", urgency: "now",
+      conclusion: "Choose path", trigger: "initial prose", impact: "destructive write", recommendation: null,
+      options: ["continue"], owner: "owner", expires_at: null, source_link: null, approval_id: null,
+      consumer_owner: null, contract_revision: work.revision, decision_mode: "human_only", evidence: {},
+    }, 2);
+    const baseline = getAttentionMaterial(d, item.item_id)!;
+
+    const refreshed = upsertAttention(d, {
+      ...item, expected_revision: item.revision, trigger: "same decision, rephrased",
+      evidence: { heartbeat: 7, ordinary_log: "still working" },
+    }, 3);
+    const material = getAttentionMaterial(d, item.item_id)!;
+    expect(refreshed.revision).toBe(item.revision + 1);
+    expect(material).toMatchObject({ fingerprint: baseline.fingerprint, generation: baseline.generation });
+
+    // The pre-update revision is now stale for CAS even though the judgement basis did not change.
+    let stale: unknown;
+    try {
+      resolveAttention(d, item.item_id, { attention_revision: item.revision, material_fingerprint: material.fingerprint, selected_option: "continue" }, "owner", 4);
+    } catch (error) { stale = error; }
+    expect(stale).toBeInstanceOf(ControlError);
+    expect((stale as ControlError).details).toMatchObject({
+      code: "stale_attention", expected_revision: item.revision, current_revision: refreshed.revision, current_state: "open",
+    });
+    expect(getAttention(d, item.item_id)).toMatchObject({ revision: refreshed.revision, state: "open" });
+    // No interruption was claimed for a material-unchanged revision.
+    expect(d.query("SELECT COUNT(*) n FROM control_notifications WHERE item_id=?").get(item.item_id)).toEqual({ n: 0 });
+
+    // The current revision, with the unchanged fingerprint, is accepted.
+    expect(resolveAttention(d, item.item_id, { attention_revision: refreshed.revision, material_fingerprint: material.fingerprint, selected_option: "continue" }, "owner", 5))
+      .toMatchObject({ item_id: item.item_id, state: "resolved", effect_state: "succeeded" });
     d.close();
   });
 });
