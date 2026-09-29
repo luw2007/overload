@@ -52,10 +52,18 @@ const DEFAULT_WEB_PORT = 4870;
 /** The list is a launchpad for drill-down, not an inventory: 1000 rows serve nobody. */
 const SESSION_LIST_LIMIT = 100;
 let warnedInvalidConfig = false;
+let warnedInvalidWebPort = false;
 
 export type WebConfig = { web_port: number };
 
-export async function loadWebConfig(path = join(homedir(), ".overload", "config.json")): Promise<WebConfig> {
+/** Port precedence is config.json > OVERLOAD_WEB_PORT > 4870. config.json wins because it is
+ *  the only setting the extension also reads when it resolves the control-plane port, so it is
+ *  the one that keeps both sides agreeing. The env var is a fallback for manual runs; the
+ *  LaunchAgent never sees it, since the plists carry only OVERLOAD_ROOT and OVERLOAD_BUN. */
+export async function loadWebConfig(
+  path = join(homedir(), ".overload", "config.json"),
+  env: { OVERLOAD_WEB_PORT?: string } = process.env,
+): Promise<WebConfig> {
   let value: Record<string, unknown> = {};
   try {
     const parsed = JSON.parse(await readFile(path, "utf8"));
@@ -65,7 +73,21 @@ export async function loadWebConfig(path = join(homedir(), ".overload", "config.
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") warnInvalidConfig(path);
   }
   if (value.web_port !== undefined && !positiveInteger(value.web_port)) warnInvalidConfig(path);
-  return { web_port: positiveInteger(value.web_port) ? value.web_port : DEFAULT_WEB_PORT };
+  if (positiveInteger(value.web_port)) return { web_port: value.web_port };
+  return { web_port: envPort(env.OVERLOAD_WEB_PORT) ?? DEFAULT_WEB_PORT };
+}
+
+/** An unusable value is reported and ignored: a listener that refuses to start is a worse
+ *  answer than the default port, and silently doing nothing is what this var used to do. */
+function envPort(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const parsed = Number(raw);
+  if (raw.trim() !== "" && positiveInteger(parsed)) return parsed;
+  if (!warnedInvalidWebPort) {
+    warnedInvalidWebPort = true;
+    console.error(`overload web: ignoring invalid OVERLOAD_WEB_PORT ${JSON.stringify(raw)}`);
+  }
+  return null;
 }
 
 function positiveInteger(value: unknown): value is number {
