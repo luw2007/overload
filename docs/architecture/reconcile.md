@@ -306,7 +306,7 @@ CREATE TABLE IF NOT EXISTS task_recovery(
 
 ## §5 决策 5：opt-in 闸门
 
-`scripts/install-launchd.sh` 目前把 orchestrator 排除在默认 `labels` 之外（`scripts/install-launchd.sh:48-50`），需 `--with-orchestrator` 才装。
+`scripts/install-launchd.sh` 目前把 orchestrator 排除在默认 `labels` 之外（`scripts/install-launchd.sh:80-82`），需 `--with-orchestrator` 才装。
 
 **本轮之前挂在闸门上的 N6 已经解决。** `1ba45da` 让 `pollRunning` 在 `evidenceReady` 返回 `no_check` 时直接 `check_absent`（`orchestrator.ts:75`），进入 `blocked(no_check)`（`store.ts:15`、`store.ts:44`），不再扣预算白烧两次 runner；`collectEvidence` 也不再把「存在但不可执行的 check」误当作「没有 check」（`evidence.ts:14-17`）。本文早期版本以 N6 为撤闸门的唯一剩余项，该结论已过期。
 
@@ -323,7 +323,7 @@ CREATE TABLE IF NOT EXISTS task_recovery(
 
 - **worktree GC 仍是 CLI，无后台作业**（计划 §3.6，`src/orchestrator/cli.ts:16` 的 `gc` 子命令）。默认安装 orchestrator 会让 `~/.overload/worktrees/` 在无人跑 `orch gc` 时单调增长。这不影响正确性，但属于典型的「默认开启后用户会遇到而今天遇不到」的新问题，且没有任何自动收敛机制。
 - **`intent` 的结构性残余**（§3.2 残余窗口 4）。它有界、不双开、以人类决策收尾，但会在罕见的崩溃时序下要求一次人工 reopen。默认安装意味着这条路径会被更多人碰到。
-- 本脚本仅 macOS（`install-launchd.sh:42` 要求 `launchctl`），闸门结论不覆盖其他平台。
+- 本脚本仅 macOS（`install-launchd.sh:70` 要求 `launchctl`），闸门结论不覆盖其他平台。
 
 **结论：N5+N7 按本文落地后，条件 1–6 可达，且正确性方面的阻塞项全部关闭（双开、无围栏租约、活性不可判、无界停滞、N6 浪费）。撤掉 `--with-orchestrator` 的最小剩余工作量 = worktree GC 后台作业一项**，它与本文正交、体量小。本文**不**主张在本轮就撤闸门：撤闸门应与 GC 作业同一轮落地，因为默认开启后无界增长的磁盘占用是一个用户可见的回归，而它今天被闸门挡着。不夸大，也不再把 N6 记为欠账。
 

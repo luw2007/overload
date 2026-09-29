@@ -23,14 +23,19 @@ For **narrow**, the main workspace provides three stages: edit the replacement c
 Install supported services from any checkout location:
 
 ```sh
-scripts/install-launchd.sh --install
+scripts/install-launchd.sh --install --actor NAME
 ```
 
-The installer writes four user LaunchAgents by default: ingest, maintenance, pull, and web. The optional fifth, orchestrator, is written only with `--with-orchestrator`; `--uninstall` removes all five. No Decision Bot daemon is installed as a LaunchAgent — the bot never runs as a standalone service; when explicitly opted in it is driven on demand or by a foreground `decision-bot run`. It derives absolute paths for the current checkout and `bun`, so moving or upgrading the checkout requires a reinstall:
+`--actor NAME` (or `OVERLOAD_ACTOR` in the installing shell) is required. It is written into the
+`web` plist and is the only way the dashboard gets a trusted operator identity: launchd agents
+inherit nothing from your login shell, and without one `/api/context/decision-package` and
+`/api/waits` answer `501`, so `/decide` loads but no decision can be answered. It must equal the
+`decision_owner` on the works you decide. The installer writes four user LaunchAgents by default:
+ingest, maintenance, pull, and web. The optional fifth, orchestrator, is written only with `--with-orchestrator`; `--uninstall` removes all five. No Decision Bot daemon is installed as a LaunchAgent — the bot never runs as a standalone service; when explicitly opted in it is driven on demand or by a foreground `decision-bot run`. It derives absolute paths for the current checkout and `bun`, so moving or upgrading the checkout requires a reinstall:
 
 ```sh
 scripts/install-launchd.sh --uninstall
-scripts/install-launchd.sh --project-dir /absolute/path/to/overload --install
+scripts/install-launchd.sh --project-dir /absolute/path/to/overload --install --actor NAME
 ```
 
 Preview affected files without changing the system:

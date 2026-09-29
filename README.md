@@ -21,21 +21,24 @@ The dashboard listens exclusively on `127.0.0.1:4870`. Do not proxy or bind it t
 ```sh
 cd /path/to/overload
 bun test
-scripts/setup.sh
+scripts/setup.sh --actor $USER   # the operator identity the dashboard decides under
 bun src/cli/overload.ts doctor
 open http://127.0.0.1:4870
 ```
 
-`scripts/setup.sh` composes the standalone installers below; each also runs
+`--actor NAME` is required to install: it is written into the `web` LaunchAgent and is the only
+way the dashboard gets a trusted operator identity (launchd inherits nothing from your shell).
+It must equal the `decision_owner` on the works you decide, or every decision on `/decide` is
+unanswerable. `scripts/setup.sh` composes the standalone installers below; each also runs
 on its own and accepts `--dry-run` to preview without changing the system:
 
 ```sh
-scripts/install-launchd.sh --install     # ingest, maintenance, pull, web LaunchAgents
+scripts/install-launchd.sh --install --actor $USER   # ingest, maintenance, pull, web LaunchAgents
 scripts/install-extension.sh --install   # pi/omp lifecycle telemetry; restart the runtime after
 ```
 
 The optional orchestrator LaunchAgent (`src/orchestrator/`) is installed only
-with `scripts/install-launchd.sh --install --with-orchestrator`.
+with `scripts/install-launchd.sh --install --actor NAME --with-orchestrator`.
 
 No installer sets up a prime-agent extension (its extension-directory
 convention is unverified; see docs/guides/integrations.md).
@@ -147,7 +150,7 @@ The human mailbox, human answers, and `decision-bot takeover` work without enabl
 
 ### Orchestrator
 
-`src/orchestrator/` launches its own `pi` children and gates them as ordinary Now decisions. It ships in source but is not installed, run, or depended on by default; the optional LaunchAgent is written only with `scripts/install-launchd.sh --install --with-orchestrator`.
+`src/orchestrator/` launches its own `pi` children and gates them as ordinary Now decisions. It ships in source but is not installed, run, or depended on by default; the optional LaunchAgent is written only with `scripts/install-launchd.sh --install --actor NAME --with-orchestrator`.
 
 ## License
 

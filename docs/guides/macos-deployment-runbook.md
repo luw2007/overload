@@ -20,12 +20,12 @@ and its rollback.
 
 | What | Checked by | Failure |
 |---|---|---|
-| macOS with `launchctl` | `install-launchd.sh:49` | **Loud.** `launchctl is required (macOS only)`, exit 1 |
-| `bun` on `PATH` | `install-launchd.sh:50` | **Loud.** `bun is required; install it before running this script`, exit 1 |
-| A real checkout | `install-launchd.sh:40-41` | **Loud.** `not an Overload checkout: <dir>`, exit 2 — requires both `src/ingest/ingest.ts` and `scripts/maintenance.sh` |
+| macOS with `launchctl` | `install-launchd.sh:70` | **Loud.** `launchctl is required (macOS only)`, exit 1 |
+| `bun` on `PATH` | `install-launchd.sh:71` | **Loud.** `bun is required; install it before running this script`, exit 1 |
+| A real checkout | `install-launchd.sh:50-51` | **Loud.** `not an Overload checkout: <dir>`, exit 2 — requires both `src/ingest/ingest.ts` and `scripts/maintenance.sh` |
 | `src/extension/overload.ts` present | `install-extension.sh:34` | **Loud.** `missing extension: <path>`, exit 1 |
 
-`bun`'s resolved absolute path is baked into every plist (`install-launchd.sh:51`, `:84`), so
+`bun`'s resolved absolute path is baked into every plist (`install-launchd.sh:73`, `:109`), so
 **moving the checkout or replacing bun requires a reinstall**, not a restart.
 
 **bun version: nothing enforces one.** `package.json` has no `engines` field and no script
@@ -58,8 +58,8 @@ you do not need Playwright.
 
 | Path | Created by | Mode |
 |---|---|---|
-| `~/Library/LaunchAgents` | `install-launchd.sh:105` (`mkdir -p`) | umask default |
-| `~/.overload/logs` | `install-launchd.sh:105` (`mkdir -p`) | umask default |
+| `~/Library/LaunchAgents` | `install-launchd.sh:130` (`mkdir -p`) | umask default |
+| `~/.overload/logs` | `install-launchd.sh:130` (`mkdir -p`) | umask default |
 | `~/.overload` | **`ingest` at first run**, `src/ingest/ingest.ts:84-85` | `0700`, forced |
 | `~/.overload/ledger.db` | `ingest`, `src/ingest/ingest.ts:91-95` | `0600`, forced |
 | `~/.pi/agent/extensions`, `~/.omp/agent/extensions` | `install-extension.sh:46-47` | `0700` |
@@ -69,13 +69,14 @@ The installer does **not** set `0700` on `~/.overload` — `ingest` does, on its
 once. A `WARN` there immediately after install is expected, not a defect.
 
 Service logs: `/tmp/overload-{ingest,maintenance,pull,web}.{log,err}`
-(`install-launchd.sh:87-88`). Only the optional orchestrator logs into `~/.overload/logs/`.
+(`install-launchd.sh:112-113`). Only the optional orchestrator logs into `~/.overload/logs/`.
 
 ### Environment variables — read this before setting any
 
-**The plists set exactly two: `OVERLOAD_ROOT` and `OVERLOAD_BUN`** (`install-launchd.sh:84`).
-launchd agents do not inherit your login shell environment, so **anything you export in
-`.zshrc` never reaches the daemons.** Every other variable takes its compiled-in default. To
+**The plists set `OVERLOAD_ROOT` and `OVERLOAD_BUN`, plus `OVERLOAD_ACTOR` on the `web` job
+alone** (`install-launchd.sh:109`, `:94-95`). launchd agents do not inherit your login shell
+environment, so **anything you export in `.zshrc` never reaches the daemons.** Every other
+variable takes its compiled-in default. To
 change one for a service you must edit its plist and re-bootstrap; that is a deliberate
 configuration change, not a deployment step.
 
@@ -97,12 +98,38 @@ Defaults as they will actually apply on a fresh install:
 | `OVERLOAD_CONDITION_WAITS` | unset → observer **disabled** | `scripts/maintenance.sh:91-92` |
 | `OVERLOAD_RECON_TIMEOUT_MS` | `45000` | `scripts/maintenance.sh:11` |
 | `OVERLOAD_OBSERVER_TIMEOUT_MS` | `5000`, hard-capped at 5000 | `scripts/maintenance.sh:16-22` |
-| `OVERLOAD_ACTOR` | unset | `src/cli/overload.ts:83` |
+| `OVERLOAD_ACTOR` | **required**, set by the installer on the `web` job only | `src/web/server.ts` `startWebServer`, `src/cli/overload.ts:83` |
 
-`OVERLOAD_ACTOR` is an operator concern, not a service one: `attention … resolve` on a
-context-bearing or owner-bearing item exits 1 with
+**`OVERLOAD_ACTOR` is a service concern, and the dashboard is unusable without it.** The web
+server takes the trusted actor from `startWebServer` options or `OVERLOAD_ACTOR` and from nowhere
+else — a client may never assert its own identity (`src/web/context-routes.ts`). With no actor,
+`/api/context/decision-package` and `/api/waits` answer `501 not_implemented`, so `/decide` loads
+but every owed decision renders "Decision context is unavailable" with no options and cannot be
+answered. launchd agents inherit nothing from your login shell, so exporting it in fish does not
+reach the service: it has to be in the plist, which is why `scripts/install-launchd.sh` refuses to
+install without `--actor NAME` (or `OVERLOAD_ACTOR` in the installing shell).
+
+The value must equal the `decision_owner` on the contracts you decide, not a service name: the
+assembler admits only the decision owner to a `decision_view` (`src/control/context-assembler.ts`
+`assertWorkAccess`), and anyone else gets `403 forbidden — actor is not decision owner`. On this
+install that is the macOS account name, `luwei.will`. To check before installing:
+
+```sh
+sqlite3 ~/.overload/orchestrator-answers.db \
+  "SELECT json_extract(contract,'\$.decision_owner') owner, count(*) FROM control_works GROUP BY owner;"
+```
+
+Changing it later means rewriting the plist and reloading the job — `launchctl kickstart -k` reuses
+the plist launchd already registered and will not pick up a new environment:
+
+```sh
+scripts/install-launchd.sh --install --actor luwei.will
+```
+
+The CLI takes the same identity from `--actor` or your own shell's `OVERLOAD_ACTOR`:
+`attention … resolve` on a context-bearing or owner-bearing item exits 1 with
 `error: context decision requires --actor or OVERLOAD_ACTOR` (`src/cli/overload.ts:90-93`), and
-`context purge` always requires it (`:113-114`). Pass `--actor` or export it in your own shell.
+`context purge` always requires it (`:113-114`).
 
 **The web port: `config.json` first, `OVERLOAD_WEB_PORT` second.** `loadWebConfig`
 (`src/web/server.ts`) resolves the dashboard port as `web_port` from
@@ -116,8 +143,9 @@ stderr is `/tmp/overload-web.err` and nowhere else.
 
 **Prefer `config.json` on this deploy**, for two reasons:
 
-- **launchd never sees the environment variable.** The plists carry only `OVERLOAD_ROOT` and
-  `OVERLOAD_BUN` (`install-launchd.sh:84`), so exporting `OVERLOAD_WEB_PORT` in your shell does
+- **launchd never sees the environment variable.** The plists carry `OVERLOAD_ROOT`,
+  `OVERLOAD_BUN` and (on `web`) `OVERLOAD_ACTOR` (`install-launchd.sh:109`), so exporting
+  `OVERLOAD_WEB_PORT` in your shell does
   not move the dashboard the `web` agent runs. It moves a `bun src/web/server.ts` you start by
   hand, which is what the fallback is for.
 - **The extension only reads `config.json`.** `loadApprovalGate` in
@@ -141,7 +169,7 @@ bun --version                     # 1. expect >= 1.4.2; nothing enforces this
 cd /absolute/path/to/overload
 bun install                       # 2. the one runtime dependency
 sh scripts/setup.sh --dry-run     # 3. preview, changes nothing
-sh scripts/setup.sh               # 4. the install
+sh scripts/setup.sh --actor luwei.will   # 4. the install
 # 5. restart pi and omp so they load the extension
 # 6. wait ~60s for the first maintenance and pull ticks
 bun src/cli/overload.ts doctor    # 7. verify
@@ -151,13 +179,16 @@ bun src/cli/overload.ts doctor    # 7. verify
 `Checked 52 installs across 53 packages (no changes)` when already present.
 
 **3 — dry run.** Prints the labels and paths it *would* touch, then exits 0 without requiring
-`launchctl` or `bun` (`install-launchd.sh:45-47`, `:94-103`). Six lines on a Mac: four agents
+`launchctl` or `bun` (`install-launchd.sh:62-67`, `:119-128`). Six lines on a Mac: four agents
 plus two extension targets. Any `remove-legacy …` lines are leftover `works.*.overload.*.plist`
 jobs from an older prefix that the real run will boot out and delete
-(`install-launchd.sh:98-101`, `:107-111`) — expected on an upgrade, suspicious on a virgin Mac.
+(`install-launchd.sh:123-126`, `:131-136`) — expected on an upgrade, suspicious on a virgin Mac.
 
-**4 — install.** `setup.sh` composes the two installers in order (`setup.sh:31-32`). Correct
-output, in order:
+**4 — install.** `--actor` is required: it is the operator identity the web dashboard assembles
+decision context under, and `install-launchd.sh` refuses to install without it (see
+[Environment variables](#environment-variables--read-this-before-setting-any) for why, and for how
+to confirm the value). `setup.sh` composes the two installers in order, forwarding the actor
+through `OVERLOAD_ACTOR`. Correct output, in order:
 
 ```
 Installed Overload LaunchAgents from /absolute/path/to/overload
@@ -169,17 +200,18 @@ Setup complete. Verify with:
 
 `setup.sh` runs under `set -eu`, so a failure in `install-launchd.sh` stops before the
 extension step. Four `launchctl bootstrap` calls happen silently
-(`install-launchd.sh:112-118`); `bootstrap` printing anything is a problem.
+(`install-launchd.sh:137-143`); `bootstrap` printing anything is a problem.
 
 There is **no `--with-orchestrator` path through `setup.sh`** — it always passes a bare
-`--install` (`setup.sh:28`). To include the optional orchestrator agent, run
-`scripts/install-launchd.sh --with-orchestrator --install` directly instead of step 4.
+`--install`. To include the optional orchestrator agent, run
+`scripts/install-launchd.sh --with-orchestrator --install --actor luwei.will` directly instead of
+step 4.
 
 **5 — restart pi/omp.** The extension is copied, not hot-loaded (`install-extension.sh:48-51`).
 Until both runtimes restart, no session telemetry is emitted and `doctor`'s
 `telemetry:liveness` will not go OK.
 
-**6 — wait.** `maintenance` and `pull` are `StartInterval` 60s jobs (`install-launchd.sh:73-74`).
+**6 — wait.** `maintenance` and `pull` are `StartInterval` 60s jobs (`install-launchd.sh:98-99`).
 `heartbeat:ingest` fails above 30s old and `heartbeat:pull` warns above 90s
 (`src/cli/doctor.ts:53-54`). Running `doctor` immediately after install reports failures that
 resolve themselves within about a minute.
@@ -251,11 +283,11 @@ sh scripts/install-extension.sh --uninstall   # removes both extension copies
 
 `--uninstall` iterates `all_labels`, so it removes the orchestrator plist too whether or not it
 was installed, plus any legacy `works.*.overload.*.plist`
-(`install-launchd.sh:59`, `:107-111`, `:121-125`). Expect `Removed Overload LaunchAgents` and
+(`install-launchd.sh:80`, `:131-136`, `:146-150`). Expect `Removed Overload LaunchAgents` and
 `removed Overload extension for pi and omp`.
 
-**`setup.sh` has no `--uninstall`** — it accepts only `--dry-run` and `--help`
-(`setup.sh:19-24`). There is no single-command rollback; call both installers.
+**`setup.sh` has no `--uninstall`** — it accepts only `--actor`, `--dry-run` and `--help`
+(`setup.sh:23-33`). There is no single-command rollback; call both installers.
 
 ### What rollback leaves behind
 
@@ -285,8 +317,9 @@ Three independent facts:
 1. `OVERLOAD_NOTIFICATION_MODE` defaults to `"shadow"` when unset —
    `src/notify/nudge.ts:304` and `:382`, both `env.OVERLOAD_NOTIFICATION_MODE ?? "shadow"`.
 2. The installers never set it. The only `EnvironmentVariables` written into any plist are
-   `OVERLOAD_ROOT` and `OVERLOAD_BUN` (`install-launchd.sh:84`), and neither `setup.sh` nor
-   `install-extension.sh` writes environment anywhere.
+   `OVERLOAD_ROOT`, `OVERLOAD_BUN` and, on the `web` job, `OVERLOAD_ACTOR`
+   (`install-launchd.sh:109`, `:94-95`), and neither `setup.sh` nor `install-extension.sh`
+   writes environment anywhere.
 3. launchd agents do not inherit the login shell, so even
    `export OVERLOAD_NOTIFICATION_MODE=send` in `.zshrc` would not reach the `maintenance` job
    that runs `nudge` (`scripts/maintenance.sh:99`).
@@ -332,7 +365,7 @@ off macOS.
 
 **Not proved, and unverifiable from Linux:**
 
-- **No plist is written or parsed.** The dry run returns at `install-launchd.sh:102`, before
+- **No plist is written or parsed.** The dry run returns at `install-launchd.sh:127`, before
   `write_plist` ever runs. XML escaping, the generated schedule keys and `plutil -lint`
   (`:91`, itself conditional on `plutil` existing) are untested by it. `test/launchd-contract.test.ts`
   does parse plists on Linux with its own reader, keeping `plutil` as a macOS-only agreement

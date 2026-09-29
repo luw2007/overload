@@ -15,7 +15,9 @@ async function run(root: string, args: string[]) {
   const bin = join(root, "bin");
   const proc = Bun.spawn(["/bin/sh", "scripts/install-launchd.sh", ...args], {
     cwd: process.cwd(),
-    env: { ...process.env, HOME: join(root, "home"), PATH: `${bin}:/usr/bin:/bin`, LAUNCHCTL_LOG: join(root, "launchctl.log") },
+    // OVERLOAD_ACTOR is cleared so the installer's own --actor requirement is what these runs exercise,
+    // never whatever identity the machine running the suite happens to export.
+    env: { ...process.env, OVERLOAD_ACTOR: "", HOME: join(root, "home"), PATH: `${bin}:/usr/bin:/bin`, LAUNCHCTL_LOG: join(root, "launchctl.log") },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -54,7 +56,7 @@ function bootstrappedNames(root: string): string[] {
 describe("portable launchd installer", () => {
   test("installs four jobs by default", async () => {
     const { root, project, agents } = fixture();
-    const installed = await run(root, ["--install", "--project-dir", project]);
+    const installed = await run(root, ["--install", "--actor", "test-operator", "--project-dir", project]);
     expect(installed).toMatchObject({ exitCode: 0, stderr: "" });
 
     const names = ["ingest", "maintenance", "pull", "web"];
@@ -71,6 +73,15 @@ describe("portable launchd installer", () => {
     expect(existsSync(join(agents, "app.overload.orchestrator.plist"))).toBe(false);
     expect(existsSync(join(agents, "works.example.overload.notifier.plist"))).toBe(false);
 
+    // launchd inherits nothing from the installing shell, so the web server's trusted actor only
+    // exists if it is written into its plist. Without it every decision on /decide is unanswerable.
+    expect(readFileSync(join(agents, "app.overload.web.plist"), "utf8"))
+      .toContain("<key>OVERLOAD_ACTOR</key><string>test-operator</string>");
+    // No other job has a caller identity to assert, so none of them carries one.
+    for (const name of ["ingest", "maintenance", "pull"]) {
+      expect(readFileSync(join(agents, `app.overload.${name}.plist`), "utf8")).not.toContain("OVERLOAD_ACTOR");
+    }
+
     const removed = await run(root, ["--uninstall", "--project-dir", project]);
     expect(removed).toMatchObject({ exitCode: 0, stderr: "" });
     for (const name of names) expect(existsSync(join(agents, `app.overload.${name}.plist`))).toBe(false);
@@ -79,7 +90,7 @@ describe("portable launchd installer", () => {
   test("installs orchestrator only with --with-orchestrator and uninstall removes all five", async () => {
     const { root, project, agents } = fixture();
     const names = ["ingest", "maintenance", "pull", "web", "orchestrator"];
-    const installed = await run(root, ["--install", "--with-orchestrator", "--project-dir", project]);
+    const installed = await run(root, ["--install", "--with-orchestrator", "--actor", "test-operator", "--project-dir", project]);
     expect(installed).toMatchObject({ exitCode: 0, stderr: "" });
     expect(bootstrappedNames(root)).toEqual(names);
     for (const name of names) expect(existsSync(join(agents, `app.overload.${name}.plist`))).toBe(true);
@@ -93,6 +104,27 @@ describe("portable launchd installer", () => {
     for (const name of names) expect(existsSync(join(agents, `app.overload.${name}.plist`))).toBe(false);
   });
 
+  test("refuses to install without an operator identity, and says so", async () => {
+    const { root, project, agents } = fixture();
+    const refused = await run(root, ["--install", "--project-dir", project]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("--actor NAME or set OVERLOAD_ACTOR");
+    expect(refused.stderr).toContain("decision_owner");
+    expect(existsSync(join(agents, "app.overload.web.plist"))).toBe(false);
+    expect(existsSync(join(root, "launchctl.log"))).toBe(false);
+
+    // OVERLOAD_ACTOR in the installing shell is the other accepted source.
+    const bin = join(root, "bin");
+    const viaEnv = Bun.spawn(["/bin/sh", "scripts/install-launchd.sh", "--install", "--project-dir", project], {
+      cwd: process.cwd(),
+      env: { ...process.env, OVERLOAD_ACTOR: "env-operator", HOME: join(root, "home"), PATH: `${bin}:/usr/bin:/bin`, LAUNCHCTL_LOG: join(root, "launchctl.log") },
+      stdout: "pipe", stderr: "pipe",
+    });
+    expect(await viaEnv.exited).toBe(0);
+    expect(readFileSync(join(agents, "app.overload.web.plist"), "utf8"))
+      .toContain("<key>OVERLOAD_ACTOR</key><string>env-operator</string>");
+  });
+
   test("--dry-run previews without launchctl or bun on PATH", async () => {
     const { root, project } = fixture();
     // Drop the shimmed launchctl/bun so PATH looks like a non-macOS host.
@@ -103,13 +135,15 @@ describe("portable launchd installer", () => {
     expect(out.stdout).toContain("install app.overload.ingest");
     expect(out.stderr).toContain("launchctl not found");
     expect(out.stderr).toContain("bun not found");
+    // A missing actor is reported the same way as a missing host tool: a note, never a failed preview.
+    expect(out.stderr).toContain("note: no operator identity");
     expect(existsSync(join(root, "launchctl.log"))).toBe(false);
   });
 
   test("stops before bootstrap when plutil rejects plist", async () => {
     const { root, project } = fixture();
     script(join(root, "bin", "plutil"), 'case "$2" in\n  *orchestrator.plist) exit 1;;\nesac\nexit 0');
-    const failed = await run(root, ["--install", "--with-orchestrator", "--project-dir", project]);
+    const failed = await run(root, ["--install", "--with-orchestrator", "--actor", "test-operator", "--project-dir", project]);
     expect(failed.exitCode).toBe(1);
     expect(bootstrappedNames(root)).toEqual(["ingest", "maintenance", "pull", "web"]);
   });

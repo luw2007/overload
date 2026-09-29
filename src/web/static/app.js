@@ -73,9 +73,18 @@
   function askSection(asks) {if(!applied.has('q1')&&!failures.has('q1'))return '';return `<div class="section-heading"><h2>Agents waiting on you</h2><small>Live agent questions · answering unblocks the agent</small></div><div class="list asks">${sliceView('q1',()=>asks.map(decisionCard).join('')||empty('No agent is waiting on a question.'))}</div>`;}
   function automationReason(item) {if(state.rules.bot_disabled)return 'bot disabled';if(item.decision_mode==='human_only')return 'human-only by contract';const r=state.rules.rules.find(r=>r.state==='observing' && (r.scope.includes(item.work_id)||(item.evidence?.repo && r.scope.includes(item.evidence.repo))));return r?`rule ${r.id} proposed · observing ${r.observed}/5`:'no enabled rule matches';}
   const effectNote={applying:'你已决定 · 执行中',succeeded:'你已决定 · 已生效',failed:'你已决定 · 执行失败',unknown:'你已决定 · 结果未知'};
+  // A row without its package cannot be answered, so the note says why and whether refreshing can help.
+  // 501/403 are deployment faults (§4.2: the actor is server-injected, never client-supplied) and no
+  // amount of refreshing clears them — telling the operator to refresh would hide a broken install.
+  function packageNote(failure) {
+    if(!failure)return 'Decision context is unavailable. Refresh before answering.';
+    if(failure.status===501)return 'Decision context is unavailable: this server has no operator identity configured (OVERLOAD_ACTOR), so it refuses to assemble decision context. Refreshing will not help — configure the web service and restart it.';
+    if(failure.status===403)return `Decision context is unavailable: this server's operator identity is not this work's decision owner (${failure.detail}). Refreshing will not help — configure OVERLOAD_ACTOR as the decision owner and restart the web service.`;
+    return `Decision context is unavailable: ${failure.detail}. Refresh before answering.`;
+  }
   function decisionRow(item) {
     const pkg=item.decision_package;
-    if(!pkg)return `<div class="row" data-item-id="${e(item.item_id)}"><div>${dot(pkg===undefined?'yellow':'red')}</div><div><div class="row-title">${e(item.conclusion)}</div><div class="row-note" role="status">${pkg===undefined?'Loading decision context…':'Decision context is unavailable. Refresh before answering.'}</div>${waitNote(item)}</div></div>`;
+    if(!pkg)return `<div class="row" data-item-id="${e(item.item_id)}"><div>${dot(pkg===undefined?'yellow':'red')}</div><div><div class="row-title">${e(item.conclusion)}</div><div class="row-note" role="status">${pkg===undefined?'Loading decision context…':e(packageNote(item.decision_package_error))}</div>${waitNote(item)}</div></div>`;
     const red=item.decision_mode==='human_only'||(pkg.expires_at!=null&&pkg.expires_at<=Date.now()),decided=effectNote[item.effect_state];
     const options=pkg.options.map(o=>`<button data-action="resolve" data-id="${e(item.item_id)}" data-option="${e(o.id)}" title="${e(o.consequence)}">${e(o.label)}</button>`).join('');
     const draft=decisionDrafts.get(item.item_id);
@@ -89,7 +98,10 @@
   const WAIT_STATE = {watching:['Watching','blue'],ready:['Condition met','green'],unavailable:['Source unavailable','red'],expired:['Stopped watching','red'],cancelled:['Cancelled','blue']};
   const watchingWait = itemId => (state.waits||[]).find(m=>m.wait.item_id===itemId&&m.wait.state==='watching');
   const findWait = waitId => (state.waits||[]).find(m=>m.wait.wait_id===waitId);
-  async function loadWaits() {try {const data=await fetchJson('/api/waits?limit=200');return {waits:data.items,waitsGate:data.gate||null,waitsError:null};} catch(error) {return {waits:null,waitsGate:null,waitsError:error.status===501?null:(error.message||String(error))};}}
+  // A 501 here is a deployment fault (no server-side actor identity), not "the feature is off" — the
+  // server says that with the §14.1 gate instead. Hiding the section would make a broken install look
+  // like a configured one, so every failure, 501 included, reaches waitSection as an error.
+  async function loadWaits() {try {const data=await fetchJson('/api/waits?limit=200');return {waits:data.items,waitsGate:data.gate||null,waitsError:null};} catch(error) {return {waits:null,waitsGate:null,waitsError:error.status===501?'this server has no operator identity configured (OVERLOAD_ACTOR)':(error.message||String(error))};}}
   // Until the waits slice settles, which Decide items a watching wait hides (and whether wait creation is offered) is
   // unknown: the owed list, its counts and every wait affordance stay in a loading state rather than guess.
   const waitsSettled = () => applied.has('waits')||failures.has('waits');
@@ -479,17 +491,18 @@
   // Decision packages load per displayed item revision once the lists have rendered. A row keeps the package it already
   // showed for the same revision until the fresh one arrives; `undefined` means still loading, `null` unavailable.
   const packageKey=item=>`${item.item_id}#${item.revision}`;
-  function decoratePackages() {for(const item of [...state.attention.now,...state.attention.inbox])item.decision_package=packages.get(packageKey(item))?.pkg;}
+  function decoratePackages() {for(const item of [...state.attention.now,...state.attention.inbox]){const entry=packages.get(packageKey(item));item.decision_package=entry?.pkg;item.decision_package_error=entry?.error??null;}}
   async function loadPackages(seq) {
     const active=[...state.attention.now,...state.attention.inbox],shown=new Set(active.map(packageKey));
     for(const key of packages.keys())if(!shown.has(key))packages.delete(key);
     decoratePackages();
     await Promise.all(active.map(async item=>{
-      let pkg=null;
-      try{pkg=await fetchJson(`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`);}catch{}
+      let pkg=null,error=null;
+      try{pkg=await fetchJson(`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`);}
+      catch(failure){error={status:failure.status??0,detail:failure.data?.reason||failure.message||String(failure)};}
       const key=packageKey(item);
       if((packages.get(key)?.seq??0)>seq)return;
-      packages.set(key,{seq,pkg});decoratePackages();scheduleRender();
+      packages.set(key,{seq,pkg,error});decoratePackages();scheduleRender();
     }));
   }
   function settleConversationPending() {if(!state.conversationPending)return;const selected=state.conversations.find(row=>String(row.id)===String(state.conversationPending.conversationId));if(selected?.turns?.some(turn=>String(turn.id)===String(state.conversationPending.turnId)))state.conversationPending=null;}

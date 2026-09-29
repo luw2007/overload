@@ -4,21 +4,31 @@ set -eu
 
 usage() {
   cat <<'EOF'
-Usage: scripts/install-launchd.sh [--install|--uninstall] [--project-dir PATH] [--dry-run] [--with-orchestrator]
+Usage: scripts/install-launchd.sh [--install|--uninstall] --actor NAME [--project-dir PATH] [--dry-run] [--with-orchestrator]
 
 Installs or removes four supported Overload LaunchAgents for current user. Pass --with-orchestrator to include optional orchestrator job.
 Pending decisions surface in loopback web dashboard; maintenance job emits one aggregated macOS notification.
+
+--actor NAME (or OVERLOAD_ACTOR in the environment) is required to install. It is the trusted operator
+identity the web server assembles decision context under, and it must equal the decision_owner recorded
+on the works you decide. Without it the dashboard loads but every decision is unanswerable.
 EOF
 }
 
 mode=install
 project_dir=
+actor=${OVERLOAD_ACTOR:-}
 with_orchestrator=0
 dry_run=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --install) mode=install ;;
     --uninstall) mode=uninstall ;;
+    --actor)
+      shift
+      [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+      actor=$1
+      ;;
     --project-dir)
       shift
       [ "$#" -gt 0 ] || { usage >&2; exit 2; }
@@ -39,13 +49,24 @@ fi
 
 [ -f "$project_dir/src/ingest/ingest.ts" ] || { printf 'not an Overload checkout: %s\n' "$project_dir" >&2; exit 2; }
 [ -f "$project_dir/scripts/maintenance.sh" ] || { printf 'not an Overload checkout: %s\n' "$project_dir" >&2; exit 2; }
+# launchd agents inherit nothing from a login shell, so an actor that is not written into the plist
+# does not exist for the web server: context routes and condition waits answer 501 and every decision
+# on the dashboard becomes unanswerable. Refuse to install a dashboard in that state rather than
+# produce one that looks healthy.
+actor_missing=1
+case $actor in *[!\ ]*) actor_missing=0 ;; esac
+actor_hint='an operator identity is required to install: pass --actor NAME or set OVERLOAD_ACTOR
+it must match the decision_owner on the works you decide; without it the web dashboard loads but no decision can be answered
+'
 # A dry run only prints the labels and paths it would touch, so it needs
 # neither launchctl nor bun; keep the preview usable off macOS and report the
 # missing tools as notes instead of failing.
 if [ "$dry_run" -eq 1 ]; then
   command -v launchctl >/dev/null 2>&1 || printf 'note: launchctl not found; the real run requires macOS\n' >&2
   command -v bun >/dev/null 2>&1 || printf 'note: bun not found; install it before the real run\n' >&2
+  if [ "$mode" = install ] && [ "$actor_missing" -eq 1 ]; then printf 'note: no operator identity; %s' "$actor_hint" >&2; fi
 else
+  if [ "$mode" = install ] && [ "$actor_missing" -eq 1 ]; then printf '%s' "$actor_hint" >&2; exit 2; fi
   command -v launchctl >/dev/null 2>&1 || { printf 'launchctl is required (macOS only)\n' >&2; exit 1; }
   bun_path=$(command -v bun) || { printf 'bun is required; install it before running this script\n' >&2; exit 1; }
   bun_path=$(CDPATH='' cd -- "$(dirname -- "$bun_path")" && pwd -P)/$(basename -- "$bun_path")
@@ -68,6 +89,10 @@ xml_escape() {
 write_plist() {
   name=$1
   target=$agents_dir/$prefix.$name.plist
+  # Only the web server reads OVERLOAD_ACTOR (src/web/server.ts startWebServer); the other jobs have
+  # no caller identity to assert, so they do not carry one.
+  actor_env=
+  if [ "$name" = web ]; then actor_env="<key>OVERLOAD_ACTOR</key><string>$(xml_escape "$actor")</string>"; fi
   case "$name" in
     ingest) arguments="<string>$(xml_escape "$bun_path")</string><string>$(xml_escape "$project_dir/src/ingest/ingest.ts")</string>"; schedule='<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>' ;;
     maintenance) arguments="<string>$(xml_escape "$project_dir/scripts/maintenance.sh")</string>"; schedule='<key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>' ;;
@@ -81,7 +106,7 @@ write_plist() {
 <plist version="1.0"><dict>
   <key>Label</key><string>$prefix.$name</string>
   <key>ProgramArguments</key><array>$arguments</array>
-  <key>EnvironmentVariables</key><dict><key>OVERLOAD_ROOT</key><string>$(xml_escape "$project_dir")</string><key>OVERLOAD_BUN</key><string>$(xml_escape "$bun_path")</string></dict>
+  <key>EnvironmentVariables</key><dict><key>OVERLOAD_ROOT</key><string>$(xml_escape "$project_dir")</string><key>OVERLOAD_BUN</key><string>$(xml_escape "$bun_path")</string>$actor_env</dict>
   $schedule
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>$(if [ "$name" = orchestrator ]; then xml_escape "$logs_dir/orchestrator.log"; else printf '/tmp/overload-%s.log' "$name"; fi)</string>
