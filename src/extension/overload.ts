@@ -9,8 +9,6 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { execFile, execFileSync } from "node:child_process"
-import { scrubText } from "../shared/redact"
-import { parseHostId } from "../shared/types"
 
 const SEGMENT_MAX_AGE_MS = 30_000
 const SEGMENT_MAX_BYTES = 1_048_576
@@ -112,6 +110,14 @@ function detectRuntime(): Runtime {
 function safeComponent(value: unknown, fallback: string): string {
   const clean = String(value || "").replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 180)
   return clean || fallback
+}
+
+// Installed as a single copied file (scripts/install-extension.sh), so it cannot
+// import ../shared/types; this mirrors src/shared/types.ts parseHostId.
+function parseHostId(value: string): string {
+  const host = value.trim()
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(host)) throw new Error(`invalid host id: ${value}`)
+  return host
 }
 
 function textFrom(value: unknown): string {
