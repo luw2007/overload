@@ -12,7 +12,7 @@ import { SpoolWriter } from "../orchestrator/spool";
 import { CoordinatorWorkers } from "./worker-runtime";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { startWebServer } from "../web/server";
+import { loadWebConfig, startWebServer } from "../web/server";
 
 type AuthorizationEntry = ChannelIdentity & {
  ownerId: string;
@@ -108,6 +108,25 @@ function authorizationEntries(): AuthorizationEntry[] {
   throw new Error("Authorization contains duplicate conversation routes");
  return entries;
 }
+/** The control plane is one HTTP server per machine on a well-known port: the extension the
+ *  runtime loads resolves that port from configuration (`web_port` > `OVERLOAD_WEB_PORT` > 4870)
+ *  and cannot discover an ephemeral one, and every instance is the same stateless view over one
+ *  control database. So the daemon hosts it only when nobody else does. On a host that also runs
+ *  the `web` agent that agent owns the port, and the channel must stay up rather than die on
+ *  EADDRINUSE and flap under launchd KeepAlive; on an adapter-only host the port is free and the
+ *  daemon still serves it, which is what its own pi workers post their decisions to. */
+async function hostControlPlane(configPath?: string) {
+ const port = (await loadWebConfig(configPath)).web_port;
+ try {
+  return startWebServer({ controlPath: process.env.OVERLOAD_ANSWERS_PATH, port });
+ } catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+  console.error(
+   `adapter: control plane already served on 127.0.0.1:${port}; not hosting a second one`,
+  );
+  return null;
+ }
+}
 function selectFactory<T>(
  registry: Record<string, T>,
  name: string,
@@ -121,6 +140,9 @@ function selectFactory<T>(
 export async function startAdapterDaemon(options?: {
  channelFactories?: Record<string, ChannelFactory>;
  runtimeFactories?: Record<string, RuntimeFactory>;
+ /** Test seam, like the factories above: `homedir()` is resolved once per process, so a test
+  *  cannot move `~/.overload/config.json` by setting HOME. */
+ webConfigPath?: string;
 }) {
  const entries = authorizationEntries();
  const app = credentials();
@@ -141,10 +163,7 @@ export async function startAdapterDaemon(options?: {
   "runtime",
  )();
  const db = openMailbox(process.env.OVERLOAD_ANSWERS_PATH);
- const web = startWebServer({
-  controlPath: process.env.OVERLOAD_ANSWERS_PATH,
-  port: Number(process.env.OVERLOAD_WEB_PORT ?? 4870),
- });
+ const web = await hostControlPlane(options?.webConfigPath);
  const coordinatorDb = entries.some((entry) => entry.workId) ? openStore() : null;
  const bridge = coordinatorDb ? new CoordinatorBridge(db, coordinatorDb) : null;
  bridge?.start(Number(process.env.OVERLOAD_COORDINATOR_PORT ?? 4891));
@@ -257,7 +276,7 @@ export async function startAdapterDaemon(options?: {
   await service.start();
  } catch (error) {
   await service.stop();
-  web.stop(true);
+  web?.stop(true);
   bridge?.stop();
   await workers?.close();
   coordinatorDb?.close();
@@ -271,7 +290,7 @@ export async function startAdapterDaemon(options?: {
   async stop() {
    clearInterval(timer);
    await service.stop();
-   web.stop(true);
+   web?.stop(true);
    await workers?.close();
    bridge?.stop();
    coordinatorDb?.close();

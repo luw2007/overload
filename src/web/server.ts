@@ -529,6 +529,14 @@ async function handoffRoute(request: Request, url: URL, controlPath: string): Pr
   } finally { control.close(); }
 }
 
+/** A refused bind (EADDRINUSE) must not leave this instance's publish/ingest timers behind: a
+ *  caller that survives the failure — the adapter daemon, which keeps its channel up when the
+ *  `web` agent already serves the port — would otherwise keep duplicating that instance's
+ *  publish and ingest work every second. */
+function bindOrRelease<T>(bind: () => T, release: () => void): T {
+  try { return bind(); } catch (error) { release(); throw error; }
+}
+
 // Loopback is the v1 trust boundary for host/origin (CSRF), but NOT for caller
 // identity. Context routes (plan §4.2) require a server-injected actor; the
 // loopback bind only proves "same machine", not "trusted model". The actor below
@@ -615,7 +623,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
   }
   const timer = setInterval(publish, options.publishIntervalMs ?? 1_000);
   timer.unref?.();
-  const server = Bun.serve({
+  const server = bindOrRelease(() => Bun.serve({
     // Loopback is the v1 trust boundary. Add authentication before supporting
     // shared machines or any non-loopback bind address.
     hostname: "127.0.0.1",
@@ -1075,7 +1083,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         return json({ error: "internal server error" }, { status: 500 });
       }
     },
-  });
+  }), () => { clearInterval(timer); if (ingestTimer) clearInterval(ingestTimer); });
   const originalStop = server.stop.bind(server);
   server.stop = ((closeActiveConnections?: boolean) => { clearInterval(timer); if (ingestTimer) clearInterval(ingestTimer); return originalStop(closeActiveConnections); }) as typeof server.stop;
   return server;

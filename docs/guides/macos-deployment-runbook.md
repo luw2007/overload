@@ -126,8 +126,13 @@ stderr is `/tmp/overload-web.err` and nowhere else.
   answerable-ask and approval-gate traffic to `127.0.0.1:4870` while the dashboard listens
   elsewhere.
 
-`src/adapters/daemon.ts` also reads `OVERLOAD_WEB_PORT`, for the adapter daemon's own
-dashboard. That is a separate process from the `web` LaunchAgent and not part of this install.
+`src/adapters/daemon.ts` hosts the same control plane, resolved through the same
+`loadWebConfig`, for the pi workers it spawns: on a host that runs only the channel adapter it
+is the only server the extension can post to. It hosts it **only when the port is free** — when
+the `web` LaunchAgent already holds it, the daemon logs `adapter: control plane already served
+on 127.0.0.1:<port>; not hosting a second one` and runs without one, because every instance is
+the same view over one control database. The adapter is a separate process from the `web`
+agent and not part of this install.
 
 ## 2. Command sequence
 

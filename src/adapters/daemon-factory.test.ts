@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startAdapterDaemon } from "./daemon";
@@ -42,7 +42,16 @@ class FakeRuntime implements AgentRuntime {
 
 const FAKE_CHANNEL_KEYS = ["OVERLOAD_CHANNEL", "OVERLOAD_RUNTIME", "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_INSTANCE_ID", "OVERLOAD_CHANNEL_AUTH_FILE", "OVERLOAD_RUNTIME_CWD", "OVERLOAD_ANSWERS_PATH", "OVERLOAD_WEB_PORT", "HOME", "OVERLOAD_LEDGER_PATH", "OVERLOAD_ORCHESTRATOR_PATH", "OVERLOAD_SPOOL_ROOT"];
 
-function setupEnv(): { root: string; channel: FakeChannel } {
+/** The control-plane port must be known before the daemon starts, so it is reserved and released
+ *  rather than taken from a live listener. */
+function freePort(): number {
+  const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("probe") });
+  const port = probe.port;
+  probe.stop(true);
+  return port;
+}
+
+function setupEnv(): { root: string; channel: FakeChannel; webPort: number } {
   saveEnv(FAKE_CHANNEL_KEYS);
   const root = mkdtempSync(join(tmpdir(), "overload-daemon-factory-"));
   roots.push(root);
@@ -62,29 +71,39 @@ function setupEnv(): { root: string; channel: FakeChannel } {
   process.env.OVERLOAD_ANSWERS_PATH = join(root, "answers.db");
   process.env.OVERLOAD_CHANNEL = "fake";
   process.env.OVERLOAD_RUNTIME = "fake";
-  process.env.OVERLOAD_WEB_PORT = "0"; // the daemon hosts its own dashboard; never collide with a live one
-  // ...nor touch the operator's real ledger/spool (homedir() may also be mocked by another test file).
+  delete process.env.OVERLOAD_WEB_PORT;
+  // The daemon hosts the control plane on the configured port; keep it off a live one, and off
+  // the operator's real ledger/spool (homedir() may also be mocked by another test file).
   process.env.HOME = root;
+  const webPort = freePort();
+  mkdirSync(join(root, ".overload"), { recursive: true });
+  writeFileSync(webConfigPath(root), JSON.stringify({ web_port: webPort }));
   process.env.OVERLOAD_LEDGER_PATH = join(root, "ledger.db");
   process.env.OVERLOAD_ORCHESTRATOR_PATH = join(root, "orchestrator.db");
   process.env.OVERLOAD_SPOOL_ROOT = root;
   writeFileSync(join(root, "host"), "local\n");
 
   const channel = new FakeChannel();
-  return { root, channel };
+  return { root, channel, webPort };
 }
 
-function fakeFactories(channel: FakeChannel) {
+function webConfigPath(root: string): string {
+  return join(root, ".overload", "config.json");
+}
+
+function fakeFactories(channel: FakeChannel, root: string) {
   return {
     channelFactories: { fake: () => channel },
     runtimeFactories: { fake: () => new FakeRuntime() },
+    // homedir() is fixed at process start, so HOME=root does not move the real config file.
+    webConfigPath: webConfigPath(root),
   };
 }
 
 describe("ADP-01 startAdapterDaemon factory injection", () => {
   test("injects fake channel + runtime, starts service, returns stop()", async () => {
-    const { channel } = setupEnv();
-    const daemon = await startAdapterDaemon(fakeFactories(channel));
+    const { channel, root } = setupEnv();
+    const daemon = await startAdapterDaemon(fakeFactories(channel, root));
     expect(channel.started).toBe(1);
     expect(typeof daemon.stop).toBe("function");
     // The daemon registers a 1s setInterval; after stop() the timer is cleared.
@@ -93,17 +112,17 @@ describe("ADP-01 startAdapterDaemon factory injection", () => {
   }, 20_000); // the daemon hosts a web server whose first ledger initialization takes seconds
 
   test("missing FEISHU_APP_ID throws before connecting to network", async () => {
-    setupEnv();
+    const { root } = setupEnv();
     delete process.env.FEISHU_APP_ID;
     delete process.env.FEISHU_APP_SECRET;
     delete process.env.FEISHU_APP_FILE;
-    await expect(startAdapterDaemon(fakeFactories(new FakeChannel()))).rejects.toThrow(/FEISHU_APP_ID is required/);
+    await expect(startAdapterDaemon(fakeFactories(new FakeChannel(), root))).rejects.toThrow(/FEISHU_APP_ID is required/);
   });
 
   test("missing OVERLOAD_CHANNEL_AUTH_FILE throws", async () => {
-    setupEnv();
+    const { root } = setupEnv();
     delete process.env.OVERLOAD_CHANNEL_AUTH_FILE;
-    await expect(startAdapterDaemon(fakeFactories(new FakeChannel()))).rejects.toThrow(/OVERLOAD_CHANNEL_AUTH_FILE is required/);
+    await expect(startAdapterDaemon(fakeFactories(new FakeChannel(), root))).rejects.toThrow(/OVERLOAD_CHANNEL_AUTH_FILE is required/);
   });
 
   test("unsupported channel name throws", async () => {
@@ -113,14 +132,42 @@ describe("ADP-01 startAdapterDaemon factory injection", () => {
       .rejects.toThrow(/Unsupported channel/);
   });
 
+  test("hosts the control plane on the configured web_port", async () => {
+    const { channel, root, webPort } = setupEnv();
+    const daemon = await startAdapterDaemon(fakeFactories(channel, root));
+    try {
+      const response = await fetch(`http://127.0.0.1:${webPort}/api/capabilities`);
+      expect(response.status).toBe(200);
+      expect((await response.json()).web).toMatchObject({ bind: "127.0.0.1", port: webPort });
+    } finally {
+      await daemon.stop();
+    }
+  }, 20_000);
+
+  test("starts anyway when another process already serves the control-plane port", async () => {
+    const { channel, root, webPort } = setupEnv();
+    const sibling = Bun.serve({ hostname: "127.0.0.1", port: webPort, fetch: () => new Response("sibling") });
+    try {
+      const daemon = await startAdapterDaemon(fakeFactories(channel, root));
+      expect(channel.started).toBe(1);
+      // The port's existing owner keeps serving it: the daemon must not replace or fight it.
+      expect(await (await fetch(`http://127.0.0.1:${webPort}/api/capabilities`)).text()).toBe("sibling");
+      await daemon.stop();
+      expect(channel.stopped).toBe(1);
+      expect(await (await fetch(`http://127.0.0.1:${webPort}/api/capabilities`)).text()).toBe("sibling");
+    } finally {
+      sibling.stop(true);
+    }
+  }, 20_000);
+
   test("service.start failure triggers service.stop() and rethrows", async () => {
-    setupEnv();
+    const { root } = setupEnv();
     const failingChannel = new FakeChannel();
     failingChannel.start = async () => { throw new Error("connect failed"); };
     let stopped = false;
     const origStop = failingChannel.stop.bind(failingChannel);
     failingChannel.stop = async () => { stopped = true; await origStop(); };
-    await expect(startAdapterDaemon(fakeFactories(failingChannel))).rejects.toThrow("connect failed");
+    await expect(startAdapterDaemon(fakeFactories(failingChannel, root))).rejects.toThrow("connect failed");
     expect(stopped).toBe(true);
   }, 20_000);
 });
