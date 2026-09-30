@@ -340,3 +340,12 @@ test("computeProgressView is pure: same inputs give same output and mutate nothi
  expect(JSON.stringify(turn)).toBe(frozenTurn);
  expect(db.query("SELECT COUNT(*) n FROM channel_progress WHERE desired_version>0").get()).toEqual({ n: 0 });
 });
+
+test("a turn that never emits a tool event still goes stale from its creation time", () => {
+ const db = fixture("running");
+ const row = ensureProgressRow(db, "t1", T0 + 121_000)!;
+ expect(row.last_activity_at).toBe(T0);
+ const turn = { state: "running", reason: null, created_at: T0 };
+ expect(computeProgressView(row, turn, ctx(T0 + 119_000)).state).toBe("running");
+ expect(computeProgressView(row, turn, ctx(T0 + 121_000)).state).toBe("stale");
+});

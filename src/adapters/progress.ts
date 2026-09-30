@@ -129,7 +129,7 @@ export function computeProgressView(
  if (turn.state === "queued") return live("queued", "排队中", "正在等待前序任务", null);
  if (turn.state === "blocked" && ctx.openDecision)
   return live("waiting_decision", "等待决策", "等待你在下方决策卡中处理", null);
- // simplified: a turn with no activity recorded yet is never stale; stage D should stamp activity at submit.
+ // null only for rows that predate the seed; those are never stale.
  const idle = row.last_activity_at === null ? 0 : ctx.now - row.last_activity_at;
  if (row.last_activity_at !== null && idle >= STALE_AFTER_MS) {
   const tail = activeTool ? `；工具 ${activeTool} 尚未结束` : "";
@@ -162,18 +162,19 @@ const getRow = (db: Database, turnId: string) =>
  db.query("SELECT * FROM channel_progress WHERE turn_id=?").get(turnId) as ProgressRow | null;
 export const getProgress = getRow;
 
-// Invariants 1 and 2: turn_id is the primary key and create_uuid is written once, by INSERT OR IGNORE.
+// last_activity_at is seeded with the turn's creation time so a turn that never emits a tool event still
+// has a staleness baseline. Invariants 1 and 2: turn_id is the primary key and create_uuid is written once, by INSERT OR IGNORE.
 export function ensureProgressRow(db: Database, turnId: string, now: number): ProgressRow | null {
  const turn = db
   .query(
-   "SELECT t.conversation_id, c.address FROM conversation_turns t JOIN conversations c ON c.id=t.conversation_id WHERE t.id=?",
+   "SELECT t.conversation_id, t.created_at, c.address FROM conversation_turns t JOIN conversations c ON c.id=t.conversation_id WHERE t.id=?",
   )
-  .get(turnId) as { conversation_id: string; address: string } | null;
+  .get(turnId) as { conversation_id: string; created_at: number; address: string } | null;
  if (!turn) return null;
  const address = JSON.parse(turn.address) as ChannelAddress;
  db.run(
-  "INSERT OR IGNORE INTO channel_progress(turn_id,conversation_id,channel_instance_id,create_uuid,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-  [turnId, turn.conversation_id, address.instanceId, randomUUID(), now, now],
+  "INSERT OR IGNORE INTO channel_progress(turn_id,conversation_id,channel_instance_id,create_uuid,last_activity_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+  [turnId, turn.conversation_id, address.instanceId, randomUUID(), turn.created_at, now, now],
  );
  return getRow(db, turnId);
 }
