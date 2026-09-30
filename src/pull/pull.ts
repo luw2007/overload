@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
 import { constants as fsConstants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rename, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { ENVELOPE_VERSION, type EventEnvelope } from "../shared/types";
 
 const DEFAULT_TIMEOUT_MS = 55_000;
+const DEFAULT_LOCK_STALE_MS = 10 * 60_000;
 const TRANSFERRED_FILE = /(?:^|\/)(?:seg|active)-[^/]+-\d+(?:-recovered)?\.ndjson$/;
 
 export type PullConfig = {
@@ -23,6 +24,7 @@ export type PullConfig = {
   heartbeat: string;
   state: string;
   lock: string;
+  lock_stale_ms?: number;
 };
 
 export type PullSummary = { files: number; bytes: number; failures: number; success: boolean };
@@ -256,12 +258,31 @@ export async function loadConfig(args: string[]): Promise<{ config: PullConfig; 
     heartbeat: values.get("heartbeat") ?? join(overload, "pull.heartbeat"),
     state: values.get("state") ?? join(overload, "pull-state.json"),
     lock: values.get("lock") ?? join(overload, "pull.lock"),
+    lock_stale_ms: positiveInteger(values.get("lock-stale-ms"), DEFAULT_LOCK_STALE_MS),
   } };
 }
 
-export async function underSingleFlight(config: PullConfig, originalArgs: string[]): Promise<number> {
+async function staleFallbackLock(lockdir: string, staleMs: number): Promise<boolean> {
+  let age: number;
+  // The lock vanishing between our mkdir and this stat is how contention normally
+  // resolves, not an error: the holder finished. We cannot prove the lock is stale
+  // if we cannot read it, so decline to break it and let the next run pull.
+  try { age = Date.now() - (await stat(lockdir)).mtimeMs; }
+  catch { return false; }
+  let pid: number | null = null;
+  try {
+    const value = Number((await readFile(join(lockdir, "pid"), "utf8")).trim());
+    if (Number.isSafeInteger(value) && value > 0) pid = value;
+  } catch { /* A legacy lock has no owner metadata; age still expires it. */ }
+  if (pid !== null) {
+    try { process.kill(pid, 0); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return true; }
+  }
+  return age > staleMs;
+}
+
+export async function underSingleFlight(config: PullConfig, originalArgs: string[], flock = Bun.which("flock")): Promise<number> {
   await secureDirectory(dirname(config.lock));
-  const flock = Bun.which("flock");
   if (flock) {
     const proc = Bun.spawn([flock, "-n", config.lock, Bun.argv[0]!, Bun.argv[1]!, ...originalArgs, "--locked"], {
       stdout: "inherit", stderr: "inherit",
@@ -269,10 +290,22 @@ export async function underSingleFlight(config: PullConfig, originalArgs: string
     return proc.exited;
   }
   const fallback = `${config.lock}.d`;
-  try { await mkdir(fallback); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return 0; throw error; }
-  try { return await execute(config); }
-  finally { await import("node:fs/promises").then(({ rmdir }) => rmdir(fallback).catch(() => {})); }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // Only the acquisition is allowed to read EEXIST as contention; a pull that
+    // itself fails with EEXIST must surface, not look like a busy lock.
+    try { await mkdir(fallback); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (attempt > 0 || !await staleFallbackLock(fallback, config.lock_stale_ms ?? DEFAULT_LOCK_STALE_MS)) return 0;
+      await rm(fallback, { recursive: true, force: true });
+      continue;
+    }
+    try {
+      await writeFile(join(fallback, "pid"), `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+      return await execute(config);
+    } finally { await rm(fallback, { recursive: true, force: true }); }
+  }
+  return 0;
 }
 
 async function execute(config: PullConfig): Promise<number> {

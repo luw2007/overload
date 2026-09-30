@@ -12,7 +12,8 @@
  */
 import { afterAll, expect, test } from "bun:test";
 import {
-  chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync,
+  utimesSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,6 +52,46 @@ const config: PullConfig = {
 };
 
 afterAll(() => rmSync(tmpRoot, { recursive: true, force: true }));
+
+test("recovers a stale mkdir lock and executes the pull", async () => {
+  mkdirSync(lockdir);
+  writeFileSync(join(lockdir, "pid"), `${process.pid}\n`);
+  const old = new Date(Date.now() - 20 * 60_000);
+  utimesSync(lockdir, old, old);
+
+  const rc = await underSingleFlight({ ...config, ssh_cmd: "/usr/bin/true", lock_stale_ms: 10 * 60_000 }, [], null);
+  expect(rc).toBe(0);
+  expect(existsSync(lockdir)).toBe(false);
+  expect(readFileSync(rsyncLog, "utf8").trim().split("\n").filter(Boolean)).toHaveLength(1);
+  rmSync(rsyncLog, { force: true });
+});
+
+test("recovers a fresh mkdir lock whose owner PID is dead", async () => {
+  const child = Bun.spawn(["/usr/bin/true"]);
+  await child.exited;
+  mkdirSync(lockdir);
+  writeFileSync(join(lockdir, "pid"), `${child.pid}\n`);
+
+  const rc = await underSingleFlight({ ...config, ssh_cmd: "/usr/bin/true" }, [], null);
+  expect(rc).toBe(0);
+  expect(existsSync(lockdir)).toBe(false);
+  expect(readFileSync(rsyncLog, "utf8").trim().split("\n").filter(Boolean)).toHaveLength(1);
+  rmSync(rsyncLog, { force: true });
+});
+
+// The lock disappearing between our mkdir and the staleness stat is how
+// contention normally resolves -- the holder finished. underSingleFlight has
+// always returned rather than thrown on a busy lock, and must keep doing so.
+// A dangling symlink fails that same stat deterministically.
+test("declines an unreadable lock by returning, not throwing", async () => {
+  symlinkSync(join(tmpRoot, "no-such-target"), lockdir);
+  try {
+    expect(await underSingleFlight({ ...config, ssh_cmd: "/usr/bin/true" }, [], null)).toBe(0);
+    expect(existsSync(rsyncLog)).toBe(false);
+  } finally {
+    rmSync(lockdir, { force: true });
+  }
+});
 
 // This host has no flock(1); the mkdir-EEXIST fallback path is what we exercise.
 // On a host with flock(1) the re-exec path is taken and this scenario does not
