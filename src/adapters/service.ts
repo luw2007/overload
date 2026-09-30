@@ -41,6 +41,21 @@ import type {
  CoordinatorBinding,
 } from "./types";
 import type { AttentionItem } from "../control/types";
+import {
+ beginProgressCreate,
+ listDueProgress,
+ markProgressCreateFailed,
+ markProgressCreated,
+ markProgressDegraded,
+ markProgressPatched,
+ markProgressRetry,
+ openRuntimeDecision,
+ projectProgress,
+ recordProgressActivity,
+ repairProgressOnStart,
+ type ProgressRow,
+ type ProgressView,
+} from "./progress";
 export type ChannelAuthorization = {
  ownerId: string;
  role?: "owner" | "requester";
@@ -64,11 +79,31 @@ export type AdapterServiceConfig = {
   reference: SessionReference,
  ) => CoordinatorBinding | undefined;
  silentTurn?: (turnId: string) => boolean;
+ // Clock for the progress paths only (throttles, budget, backoff); tests inject one, production uses Date.now.
+ now?: () => number;
  coordinatorDecision?: (
   item: AttentionItem,
   answer: string,
   actor: string,
  ) => boolean;
+};
+// fast-channel §8.2 progress throttles.
+const PROGRESS_TRANSITION_GAP_MS = 1000;
+const PROGRESS_ACTIVITY_GAP_MS = 5000;
+const PROGRESS_PATCH_CAP = 60;
+const PROGRESS_BUDGET_PER_SECOND = 2;
+const PROGRESS_MAX_ATTEMPTS = 4;
+// A claimed PATCH is invisible to other flushers this long; a crash mid-PATCH delays the retry, nothing more.
+const PROGRESS_LEASE_MS = 30000;
+const ACTIVE_TURN_STATES = "'queued','submitting','running','blocked','cancelling'";
+const NEXT_STEP: Record<string, string> = {
+ queued: "等待前序任务",
+ running: "等待工具返回",
+ waiting_decision: "请查看下方决策卡",
+ completed: "请查看结果消息",
+ failed: "请查看结果消息",
+ cancelled: "请查看结果消息",
+ unknown: "请查看结果消息",
 };
 export class AdapterService {
  readonly token = randomUUID();
@@ -77,6 +112,11 @@ export class AdapterService {
  private stopping = false;
  private sending = false;
  private reactionSync: Promise<void> | null = null;
+ private progressSending = false;
+ // Timestamps of recent progress calls (create or PATCH): the global "2 per second" window.
+ private progressCalls: number[] = [];
+ // Per-turn last send, for the 1s / 5s gaps. Lost on restart, which only makes the next send a transition.
+ private progressLast = new Map<string, { at: number; state: string }>();
  constructor(
   readonly db: Database,
   readonly config: AdapterServiceConfig,
@@ -98,6 +138,12 @@ export class AdapterService {
   this.db.run(
    "UPDATE channel_deliveries SET state='unknown',reason='delivery_receipt_lost' WHERE state='sending'",
   );
+  // A create in flight at exit has an unknown outcome: it degrades the card and is never re-created.
+  repairProgressOnStart(this.db, now);
+  for (const row of this.db
+   .query("SELECT turn_id FROM channel_progress WHERE create_state IN ('unknown','failed') AND degraded=0")
+   .all() as { turn_id: string }[])
+   markProgressDegraded(this.db, row.turn_id, "create_not_confirmed", now);
   const lost = this.db
    .query(
     "SELECT item_id FROM runtime_decisions WHERE dispatch_state='submitting'",
@@ -644,6 +690,10 @@ export class AdapterService {
      .query("SELECT * FROM conversation_turns WHERE id=? AND conversation_id=?")
      .get(event.turnId, c.id) as StoredTurn | null;
     if (!turn) throw new Error("runtime_turn_mismatch");
+    if (event.kind === "tool_started" || event.kind === "tool_finished") {
+     recordProgressActivity(this.db, event, this.clock());
+     return;
+    }
     if (turn.state === "cancelling" && event.kind === "blocked") return;
     if (event.kind === "blocked" && event.requestId && event.options?.length) {
      let work = c.work_id ? getWork(this.db, c.work_id) : null;
@@ -942,6 +992,142 @@ export class AdapterService {
   this.projectCards();
   await this.flush();
   await this.syncReactions();
+  // Progress runs strictly after decisions, results and reactions: it must never delay them (§8.3).
+  this.projectProgressViews();
+  await this.flushProgress();
+ }
+ private clock(): number {
+  return this.config.now?.() ?? Date.now();
+ }
+ projectProgressViews(): void {
+  const now = this.clock();
+  const ids = this.db
+   .query(
+    `SELECT id turn_id FROM conversation_turns WHERE state IN (${ACTIVE_TURN_STATES})
+     UNION SELECT turn_id FROM channel_progress WHERE degraded=0 AND view_state NOT IN ('completed','failed','cancelled','unknown')`,
+   )
+   .all() as { turn_id: string }[];
+  for (const { turn_id } of ids)
+   projectProgress(this.db, turn_id, { now, openDecision: openRuntimeDecision(this.db, turn_id) });
+ }
+ private progressBudgetOpen(now: number): boolean {
+  this.progressCalls = this.progressCalls.filter((at) => at > now - 1000);
+  return this.progressCalls.length < PROGRESS_BUDGET_PER_SECOND;
+ }
+ // Stale and terminal views skip the 5s coalescing gap; a state change waits 1s; anything else 5s.
+ private progressThrottled(row: ProgressRow, view: ProgressView, now: number): boolean {
+  if (view.terminal) return now - this.lastProgressAt(row) < PROGRESS_TRANSITION_GAP_MS;
+  if (row.patch_count >= PROGRESS_PATCH_CAP) return true;
+  if (view.state === "stale") return false;
+  const changed = this.progressLast.get(row.turn_id)?.state !== view.state;
+  return now - this.lastProgressAt(row) < (changed ? PROGRESS_TRANSITION_GAP_MS : PROGRESS_ACTIVITY_GAP_MS);
+ }
+ private lastProgressAt(row: ProgressRow): number {
+  return Math.max(row.last_patch_at ?? 0, this.progressLast.get(row.turn_id)?.at ?? 0);
+ }
+ private progressMessage(row: ProgressRow, view: ProgressView) {
+  const conversation = this.db
+   .query("SELECT address FROM conversations WHERE id=?")
+   .get(row.conversation_id) as { address: string };
+  // Only fields of the already-redacted ProgressView reach the card; no turn text, output or ids.
+  const lines = view.summary.split("；").map((part) => "- " + part);
+  const next = NEXT_STEP[view.state];
+  if (next) lines.push("- 下一步：" + next);
+  return {
+   deliveryUuid: row.create_uuid,
+   address: JSON.parse(conversation.address) as ChannelAddress,
+   title: view.title,
+   text: lines.join("\n"),
+  };
+ }
+ // Sends at most the global budget of progress calls, terminal views first, then stale, then the rest.
+ // Never called from observe(), so its failures cannot reach that catch's mark-every-turn-unknown.
+ async flushProgress(): Promise<void> {
+  if (this.progressSending || this.stopping) return;
+  this.progressSending = true;
+  try {
+   const rank = (view: ProgressView) => (view.terminal ? 0 : view.state === "stale" ? 1 : 2);
+   const due = listDueProgress(this.db, this.clock(), this.config.silentTurn, 200)
+    .filter((row) => row.desired_view_json)
+    .map((row) => ({ row, view: JSON.parse(row.desired_view_json!) as ProgressView }))
+    .sort((a, b) => rank(a.view) - rank(b.view));
+   for (const { row, view } of due) {
+    if (this.stopping) break;
+    const now = this.clock();
+    const channel = this.config.channels.find((c) => c.instanceId === row.channel_instance_id);
+    if (row.create_state === "none" ? !channel?.createProgress : !channel?.updateProgress) continue;
+    if (row.create_state === "sent" && this.progressThrottled(row, view, now)) continue;
+    if (!this.progressBudgetOpen(now)) break;
+    if (row.create_state === "none") await this.createProgressCard(channel!, row, view, now);
+    else await this.patchProgressCard(channel!, row, view, now);
+   }
+  } finally {
+   this.progressSending = false;
+  }
+ }
+ private async createProgressCard(channel: ChannelAdapter, row: ProgressRow, view: ProgressView, now: number) {
+  if (!beginProgressCreate(this.db, row.turn_id, now)) return;
+  this.progressCalls.push(now);
+  const version = row.desired_version;
+  let receipt;
+  try {
+   receipt = await channel.createProgress!(this.progressMessage(row, view));
+  } catch {
+   receipt = { state: "unknown", reason: "create_exception" } as const;
+  }
+  const done = this.clock();
+  if (receipt.state === "sent") {
+   markProgressCreated(this.db, row.turn_id, receipt.messageId, version, done);
+   this.progressLast.set(row.turn_id, { at: done, state: view.state });
+   return;
+  }
+  // begin bumped attempts, so the calls made so far are row.attempts+1.
+  if (receipt.state === "retryable" && row.attempts + 1 < PROGRESS_MAX_ATTEMPTS) {
+   // Retryable means the server did not create it: back to 'none' (CAS on 'sending') with a delay.
+   this.db.run(
+    "UPDATE channel_progress SET create_state='none',next_at=?,reason=?,updated_at=? WHERE turn_id=? AND create_state='sending'",
+    [done + (receipt.retryAfterMs ?? Math.min(60000, 1000 * 2 ** row.attempts)), receipt.reason, done, row.turn_id],
+   );
+   return;
+  }
+  // failed, unknown or retries exhausted: never a second card.
+  markProgressCreateFailed(this.db, row.turn_id, receipt.state === "unknown" ? "unknown" : "failed", receipt.reason, done);
+  markProgressDegraded(this.db, row.turn_id, receipt.reason, done);
+ }
+ private async patchProgressCard(channel: ChannelAdapter, row: ProgressRow, view: ProgressView, now: number) {
+  const claimed = this.db.run(
+   "UPDATE channel_progress SET next_at=? WHERE turn_id=? AND next_at=? AND create_state='sent' AND degraded=0 AND sent_version<desired_version",
+   [now + PROGRESS_LEASE_MS, row.turn_id, row.next_at],
+  ).changes;
+  if (!claimed) return;
+  this.progressCalls.push(now);
+  // Confirm the snapshot that was sent, not whatever desired_version is by the time the PATCH returns.
+  const version = row.desired_version;
+  let receipt;
+  try {
+   receipt = await channel.updateProgress!(row.message_id!, this.progressMessage(row, view));
+  } catch {
+   receipt = { state: "unknown", reason: "patch_exception" } as const;
+  }
+  const done = this.clock();
+  if (receipt.state === "sent") {
+   markProgressPatched(this.db, row.turn_id, version, done);
+   this.progressLast.set(row.turn_id, { at: done, state: view.state });
+   return;
+  }
+  if (receipt.state === "retryable" && row.attempts + 1 < PROGRESS_MAX_ATTEMPTS) {
+   markProgressRetry(
+    this.db,
+    row.turn_id,
+    row.attempts,
+    done + (receipt.retryAfterMs ?? Math.min(60000, 1000 * 2 ** row.attempts)),
+    receipt.reason,
+    done,
+   );
+   return;
+  }
+  // failed (message_not_found, revoked, permission), unknown, or retries exhausted.
+  markProgressDegraded(this.db, row.turn_id, receipt.reason, done);
  }
  private async consumeAnswers(): Promise<void> {
   const rows = this.db
