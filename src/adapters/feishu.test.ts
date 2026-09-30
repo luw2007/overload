@@ -348,8 +348,9 @@ test("sends threaded text and decision cards without a second client confirmatio
   address: {
    instanceId: "feishu-main",
    tenantId: "tenant",
-   chatId: "chat",
-   threadId: "root",
+   chatId: "oc_5ad11d72b830411d72b836c20",
+   rootMessageId: "om_dc13264520392913993dd051dba21dcf",
+   threadId: "omt_1a3b99f9d2cfb2d2",
   },
   text: "hello",
  };
@@ -358,9 +359,9 @@ test("sends threaded text and decision cards without a second client confirmatio
   messageId: "sent-1",
  });
  expect(fake.sent[0]).toMatchObject({
-  to: "chat",
+  to: "oc_5ad11d72b830411d72b836c20",
   input: { markdown: "hello" },
-  options: { replyTo: "root", replyInThread: true },
+  options: { replyTo: "om_dc13264520392913993dd051dba21dcf", replyInThread: true },
  });
  const decision: ChannelMessage = {
   deliveryId: "d2",
@@ -381,6 +382,9 @@ test("sends threaded text and decision cards without a second client confirmatio
  });
  expect(fake.sent[1].input).toMatchObject({
   card: { header: { title: { content: "Review" } } },
+ });
+ expect(fake.sent[1].options).toMatchObject({
+  replyTo: "om_dc13264520392913993dd051dba21dcf",
  });
  expect(JSON.stringify(fake.sent[1].input)).not.toContain("confirm");
  const update = { ...decision, replaceMessageId: "card-1" };
@@ -534,4 +538,83 @@ test("classifies official SDK delivery errors without pretending success", async
   }),
  ).toEqual({ state: "unknown", reason: "send_timeout" });
  await instance.stop();
+});
+
+// Real-shaped Feishu identifiers: messages are om_*, topics are omt_*, chats are oc_*.
+const CHAT = "oc_5ad11d72b830411d72b836c20";
+const ROOT = "om_dc13264520392913993dd051dba21dcf";
+const REPLY = "om_b2f67d1e3a0c4c8e9d1f5a7b3c2e4d6f";
+const TOPIC = "omt_1a3b99f9d2cfb2d2";
+
+test("§11.1 a topic's first message and its follow-up share the root identity, and replies anchor to om_root", async () => {
+ const instance = channel();
+ const events: ChannelEvent[] = [];
+ await instance.start(async (event) => {
+  events.push(event);
+ });
+ await fake.emit("message", {
+  messageId: ROOT,
+  chatId: CHAT,
+  chatType: "group",
+  senderId: "ou_owner",
+  content: "start",
+  mentionedBot: true,
+  createTime: 1_700_000_000,
+  raw: raw("ev-root", "tenant"),
+ });
+ await fake.emit("message", {
+  messageId: REPLY,
+  chatId: CHAT,
+  chatType: "group",
+  senderId: "ou_owner",
+  content: "follow up",
+  mentionedBot: true,
+  rootId: ROOT,
+  threadId: TOPIC,
+  createTime: 1_700_000_001,
+  raw: raw("ev-reply", "tenant"),
+ });
+ expect(events.map((e) => e.address)).toEqual([
+  { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, rootMessageId: ROOT },
+  { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, rootMessageId: ROOT, threadId: TOPIC },
+ ]);
+ // Reactions still land on the message the user sent.
+ expect(fake.reactions.map((r) => r.messageId)).toEqual([ROOT, REPLY]);
+ // A result for the follow-up carries replyTo=source message; the anchor is still the root.
+ for (const [i, event] of events.entries()) {
+  await instance.send({
+   deliveryId: "d" + i,
+   address: event.address,
+   text: "result",
+   replyTo: event.messageId,
+  });
+  await instance.send({
+   deliveryId: "c" + i,
+   address: event.address,
+   text: "decide",
+   decision: { itemId: "item", revision: 1, title: "Decide", owner: "o", options: ["yes"], state: "open" },
+  });
+ }
+ expect(fake.sent).toHaveLength(4);
+ for (const sent of fake.sent)
+  expect(sent.options).toMatchObject({ replyTo: ROOT, replyInThread: true });
+ expect(fake.sent.map((s) => (s.options as { replyTo: string }).replyTo)).not.toContain(TOPIC);
+ await instance.stop();
+});
+
+test("§11.1 a legacy address whose threadId is a topic id is never used as a reply target", async () => {
+ const instance = channel();
+ await instance.send({
+  deliveryId: "d",
+  address: { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, threadId: TOPIC },
+  text: "result",
+  replyTo: REPLY,
+ });
+ await instance.send({
+  deliveryId: "d2",
+  address: { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, threadId: ROOT },
+  text: "result",
+  replyTo: REPLY,
+ });
+ expect(fake.sent.map((s) => (s.options as { replyTo: string }).replyTo)).toEqual([REPLY, ROOT]);
 });

@@ -45,6 +45,17 @@ CREATE TABLE IF NOT EXISTS channel_card_bindings(item_id TEXT PRIMARY KEY,conver
  if (!conversationColumns.has("coordinator_work_id"))
   db.exec("ALTER TABLE conversations ADD COLUMN coordinator_work_id TEXT");
 }
+// The root message is the conversation key, so a topic's first message and its follow-ups share one
+// conversation. Addresses without a root (other channels, rows written before the split) keep keying on
+// threadId, which is what every existing binding_key already holds.
+export function bindingKey(address: ChannelAddress): string {
+ return JSON.stringify([
+  address.instanceId,
+  address.tenantId,
+  address.chatId,
+  address.rootMessageId ?? address.threadId ?? null,
+ ]);
+}
 export type Conversation = {
  id: string;
  binding_key: string;
@@ -86,12 +97,7 @@ export function acceptCommand(
     event.receivedAt,
    ],
   );
-  const binding = JSON.stringify([
-   event.address.instanceId,
-   event.address.tenantId,
-   event.address.chatId,
-   event.address.threadId ?? null,
-  ]);
+  const binding = bindingKey(event.address);
   let conversation = db
    .query("SELECT * FROM conversations WHERE binding_key=?")
    .get(binding) as Conversation | null;
@@ -143,12 +149,7 @@ export function acceptMessage(
    );
    if (!inserted.changes)
     return { duplicate: true, conversationId: null, turnId: null };
-   const binding = JSON.stringify([
-    event.address.instanceId,
-    event.address.tenantId,
-    event.address.chatId,
-    event.address.threadId ?? null,
-   ]);
+   const binding = bindingKey(event.address);
    let conversation = db
     .query("SELECT * FROM conversations WHERE binding_key=?")
     .get(binding) as Conversation | null;

@@ -5,6 +5,7 @@ import type {
 } from "@larksuiteoapi/node-sdk";
 import type {
  ChannelAdapter,
+ ChannelAddress,
  ChannelEvent,
  ChannelMessage,
  DeliveryReceipt,
@@ -115,6 +116,11 @@ function errorCode(error: unknown): string {
 function missingAnchor(error: unknown): boolean {
  return ["target_revoked", "message_not_found"].includes(errorCode(error));
 }
+/** The message a reply must anchor to. A Feishu thread id (omt_*) is never a valid reply target. */
+export function replyAnchor(address: ChannelAddress): string | undefined {
+ // Addresses stored before rootMessageId existed carried the root in threadId when it was a message id.
+ return address.rootMessageId ?? (address.threadId?.startsWith("om_") ? address.threadId : undefined);
+}
 
 export class FeishuChannel implements ChannelAdapter {
  readonly kind = "feishu";
@@ -177,10 +183,12 @@ export class FeishuChannel implements ChannelAdapter {
   if (!this.accept) return;
   if (message.chatType === "group" && !message.mentionedBot) return;
   const identity = rawIdentity(message.raw, message.messageId);
-  const threadId =
-   message.threadId ??
-   message.rootId ??
-   (message.chatType === "group" ? message.messageId : undefined);
+  // A group message with no root starts its own topic, so it is the root. A direct message with no root
+  // stays keyed on the chat, as before.
+  const rootMessageId =
+   message.rootId ?? (message.chatType === "group" ? message.messageId : undefined);
+  const threadId = message.threadId;
+  const reply = { replyTo: rootMessageId ?? message.messageId };
   try {
    await this.accept({
     kind: "message",
@@ -194,6 +202,7 @@ export class FeishuChannel implements ChannelAdapter {
      instanceId: this.instanceId,
      tenantId: identity.tenantId,
      chatId: requiredString(message.chatId, "chat"),
+     ...(rootMessageId ? { rootMessageId } : {}),
      ...(threadId ? { threadId } : {}),
     },
     messageId: requiredString(message.messageId, "message"),
@@ -216,7 +225,7 @@ export class FeishuChannel implements ChannelAdapter {
       markdown:
        "此会话尚未获得 Overload 执行授权，消息未提交给 Agent。请联系操作员配置访问权限。",
      },
-     { replyTo: message.messageId },
+     reply,
     );
     return;
    }
@@ -224,7 +233,7 @@ export class FeishuChannel implements ChannelAdapter {
     await this.channel.send(
      message.chatId,
      { markdown: "仅会话 Owner 可以执行该命令。" },
-     { replyTo: message.messageId },
+     reply,
     );
     return;
    }
@@ -247,6 +256,10 @@ export class FeishuChannel implements ChannelAdapter {
    typeof value.threadId === "string" && value.threadId
     ? value.threadId
     : undefined;
+  const rootMessageId =
+   typeof value.rootMessageId === "string" && value.rootMessageId
+    ? value.rootMessageId
+    : undefined;
   try {
    await this.accept({
     kind: "decision",
@@ -260,6 +273,7 @@ export class FeishuChannel implements ChannelAdapter {
      instanceId: this.instanceId,
      tenantId: identity.tenantId,
      chatId: requiredString(action.chatId, "chat"),
+     ...(rootMessageId ? { rootMessageId } : {}),
      ...(threadId ? { threadId } : {}),
     },
     messageId: requiredString(action.messageId, "message"),
@@ -339,6 +353,7 @@ export class FeishuChannel implements ChannelAdapter {
     revision: decision.revision,
     answer,
     threadId: message.address.threadId,
+    rootMessageId: message.address.rootMessageId,
    },
   }));
   return {
@@ -378,7 +393,7 @@ export class FeishuChannel implements ChannelAdapter {
    const fresh = Boolean(message.replaceMessageId);
    const replyTo = fresh
     ? undefined
-    : (message.replyTo ?? message.address.threadId);
+    : (replyAnchor(message.address) ?? message.replyTo);
    const options = {
     ...(replyTo ? { replyTo, replyInThread: true } : {}),
     ...(message.deliveryUuid ? { uuid: message.deliveryUuid } : {}),

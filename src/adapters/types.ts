@@ -1,5 +1,6 @@
 export type ChannelIdentity={instanceId:string;tenantId:string;userId:string};
-export type ChannelAddress={instanceId:string;tenantId:string;chatId:string;threadId?:string};
+// rootMessageId (om_*) is the stable conversation key and reply target; threadId (omt_*) is metadata only.
+export type ChannelAddress={instanceId:string;tenantId:string;chatId:string;rootMessageId?:string;threadId?:string};
 export type ChannelEvent={eventId:string;identity:ChannelIdentity;address:ChannelAddress;messageId:string;receivedAt:number;kind:'message';text:string}|{eventId:string;identity:ChannelIdentity;address:ChannelAddress;messageId:string;receivedAt:number;kind:'decision';itemId:string;revision:number;answer:string};
 export type ChannelMessage={deliveryId:string;deliveryUuid?:string;address:ChannelAddress;text:string;replyTo?:string;replaceMessageId?:string;importance?:'important';terminal?:boolean;decision?:{itemId:string;revision:number;title:string;owner:string;options:string[];state:string;expiresAt?:number;reviewUrl?:string}};
 export type DeliveryReceipt={state:'sent';messageId:string}|{state:'retryable'|'failed'|'unknown';reason:string};
