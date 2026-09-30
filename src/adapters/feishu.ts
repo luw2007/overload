@@ -57,18 +57,18 @@ type FeishuSdkChannel = {
  editMessage(messageId: string, text: string): Promise<void>;
  addReaction(messageId: string, emojiType: string): Promise<string>;
  removeReaction(messageId: string, reactionId: string): Promise<void>;
- // The SDK's send() drops `uuid` (1.73.3 SendOptions has no such field), so anything that needs Feishu's
- // server-side dedupe goes through the raw open-platform message API instead.
+ // The SDK's send() drops `uuid` (1.73.3 SendOptions has no such field), so every new outbound delivery
+ // goes through the raw open-platform message API instead, where Feishu dedupes on uuid for an hour.
  rawClient: { im: { v1: { message: FeishuRawMessageApi } } };
 };
 type FeishuRawMessageApi = {
  create(payload: {
   params: { receive_id_type: "chat_id" };
-  data: { receive_id: string; msg_type: string; content: string; uuid: string };
+  data: { receive_id: string; msg_type: string; content: string; uuid?: string };
  }): Promise<unknown>;
  reply(payload: {
   path: { message_id: string };
-  data: { msg_type: string; content: string; reply_in_thread: boolean; uuid: string };
+  data: { msg_type: string; content: string; reply_in_thread: boolean; uuid?: string };
  }): Promise<unknown>;
  patch(payload: {
   path: { message_id: string };
@@ -230,6 +230,34 @@ function receipt(error: unknown): DeliveryReceipt {
 function missingAnchor(error: unknown): boolean {
  const { kind } = classifyFeishuError(error);
  return kind === "target_revoked" || kind === "message_not_found";
+}
+// Same per-message limit the SDK used; Feishu rejects post content over 30 KB.
+const CHUNK_LIMIT = 3500;
+function chunks(text: string): string[] {
+ const out: string[] = [];
+ let current = "";
+ for (const line of text.split("\n")) {
+  const next = current ? current + "\n" + line : line;
+  if (next.length <= CHUNK_LIMIT) {
+   current = next;
+   continue;
+  }
+  if (current) out.push(current);
+  current = line;
+  while (current.length > CHUNK_LIMIT) {
+   out.push(current.slice(0, CHUNK_LIMIT));
+   current = current.slice(CHUNK_LIMIT);
+  }
+ }
+ out.push(current);
+ return out;
+}
+function post(text: string): string {
+ return JSON.stringify({ zh_cn: { title: "", content: [[{ tag: "md", text }]] } });
+}
+/** Feishu caps uuid at 50 characters; every derived uuid stays distinct and under the cap. */
+function derivedUuid(uuid: string | undefined, suffix: string): string | undefined {
+ return uuid && uuid.slice(0, 50 - suffix.length) + suffix;
 }
 /** The message a reply must anchor to. A Feishu thread id (omt_*) is never a valid reply target. */
 export function replyAnchor(address: ChannelAddress): string | undefined {
@@ -502,33 +530,69 @@ export class FeishuChannel implements ChannelAdapter {
    const replyTo = fresh
     ? undefined
     : (replyAnchor(message.address) ?? message.replyTo);
-   // uuid is passed for forward compatibility only: SDK 1.73.3 send() does not forward it, so this path
-   // gets no server-side dedupe. Progress cards, which need it, use createProgress().
-   const options = {
-    ...(replyTo ? { replyTo, replyInThread: true } : {}),
-    ...(message.deliveryUuid ? { uuid: message.deliveryUuid } : {}),
-   };
-   const input = message.decision
-    ? { card: this.card(message) }
-    : { markdown: message.text };
-   let result;
-   try {
-    result = await this.channel.send(message.address.chatId, input, options);
-   } catch (error) {
-    if (!replyTo || !missingAnchor(error)) throw error;
-    result = await this.channel.send(
-     message.address.chatId,
-     input,
-     message.deliveryUuid ? { uuid: message.deliveryUuid } : undefined,
-    );
+   const uuid = message.deliveryUuid;
+   if (message.decision)
+    return {
+     state: "sent",
+     messageId: await this.rawSend(message.address, replyTo, "interactive", JSON.stringify(this.card(message)), uuid),
+    };
+   // Long text is split like the SDK did; each chunk has its own uuid, so a retried delivery re-sends only
+   // what Feishu has not already accepted.
+   let first: string | undefined;
+   for (const [index, chunk] of chunks(message.text).entries()) {
+    const chunkUuid = index ? derivedUuid(uuid, "-" + index) : uuid;
+    let id: string;
+    try {
+     id = await this.rawSend(message.address, replyTo, "post", post(chunk), chunkUuid);
+    } catch (error) {
+     // Same fallback the SDK had: a rejected post goes out once more as plain text.
+     if (classifyFeishuError(error).kind !== "format_error") throw error;
+     id = await this.rawSend(
+      message.address,
+      replyTo,
+      "text",
+      JSON.stringify({ text: chunk }),
+      derivedUuid(chunkUuid, "-t"),
+     );
+    }
+    first ??= id;
    }
-   return {
-    state: "sent",
-    messageId: requiredString(result.messageId, "message_id"),
-   };
+   return { state: "sent", messageId: first! };
   } catch (error) {
    return receipt(error);
   }
+ }
+ /**
+  * One new message through the raw API, with no retry: the delivery outbox owns retries. A reply whose
+  * anchor is gone is re-sent to the chat under the same uuid, since the reply was never created.
+  */
+ private async rawSend(
+  address: ChannelAddress,
+  replyTo: string | undefined,
+  msgType: string,
+  content: string,
+  uuid: string | undefined,
+ ): Promise<string> {
+  const api = this.channel.rawClient.im.v1.message;
+  const dedupe = uuid ? { uuid } : {};
+  if (replyTo) {
+   try {
+    return rawMessageId(
+     await api.reply({
+      path: { message_id: replyTo },
+      data: { msg_type: msgType, content, reply_in_thread: true, ...dedupe },
+     }),
+    );
+   } catch (error) {
+    if (!missingAnchor(error)) throw error;
+   }
+  }
+  return rawMessageId(
+   await api.create({
+    params: { receive_id_type: "chat_id" },
+    data: { receive_id: address.chatId, msg_type: msgType, content, ...dedupe },
+   }),
+  );
  }
  private progressCard(message: ProgressMessage): string {
   // No mentions, no actions: the progress card is low-noise status, and decisions keep their own card.

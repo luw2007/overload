@@ -39,6 +39,46 @@ class FakeLarkChannel {
   }
   return { messageId: "sent-1" };
  }
+ // The raw open-platform API the adapter now sends through. Each call is recorded in `sent` in the same
+ // { to, input, options } shape as send(), so one list shows every outbound message whichever path made it.
+ readonly rawClient = {
+  im: {
+   v1: {
+    message: {
+     reply: async (payload: {
+      path: { message_id: string };
+      data: { msg_type: string; content: string; reply_in_thread: boolean; uuid?: string };
+     }) =>
+      this.raw(undefined, payload.data, {
+       replyTo: payload.path.message_id,
+       replyInThread: payload.data.reply_in_thread,
+      }),
+     create: async (payload: {
+      data: { receive_id: string; msg_type: string; content: string; uuid?: string };
+     }) => this.raw(payload.data.receive_id, payload.data, {}),
+     patch: async () => ({ code: 0 }),
+    },
+   },
+  },
+ };
+ private async raw(
+  to: string | undefined,
+  data: { msg_type: string; content: string; uuid?: string },
+  options: Record<string, unknown>,
+ ) {
+  const content = JSON.parse(data.content);
+  const input =
+   data.msg_type === "interactive"
+    ? { card: content }
+    : data.msg_type === "post"
+      ? { markdown: content.zh_cn.content[0][0].text }
+      : { text: content.text };
+  const result = await this.send(to as string, input, {
+   ...options,
+   ...(data.uuid ? { uuid: data.uuid } : {}),
+  });
+  return { code: 0, data: { message_id: result.messageId } };
+ }
  async updateCard(messageId: string, card: object) {
   this.updates.push({ messageId, card });
   if (this.updateError) throw this.updateError;
@@ -360,7 +400,6 @@ test("sends threaded text and decision cards without a second client confirmatio
   messageId: "sent-1",
  });
  expect(fake.sent[0]).toMatchObject({
-  to: "oc_5ad11d72b830411d72b836c20",
   input: { markdown: "hello" },
   options: { replyTo: "om_dc13264520392913993dd051dba21dcf", replyInThread: true },
  });
@@ -680,17 +719,81 @@ test("§11.2 the progress uuid reaches the raw open-platform request body throug
  expect(requests[1].data).toMatchObject({ receive_id: CHAT, uuid: "overload-progress-4f1c2a" });
 });
 
-test("§3.3 the SDK's send() path drops uuid, which is why progress does not use it", async () => {
+test("§3.3 result and decision deliveries carry their uuid to the raw request body through the real SDK", async () => {
  const { instance, requests } = realSdk(() => ({ code: 0, data: { message_id: "om_result00000000000000000000001" } }));
+ expect(
+  await instance.send({
+   deliveryId: "d",
+   deliveryUuid: "overload-result-uuid",
+   address: progress.address,
+   text: "done",
+   replyTo: REPLY,
+  }),
+ ).toEqual({ state: "sent", messageId: "om_result00000000000000000000001" });
  await instance.send({
-  deliveryId: "d",
-  deliveryUuid: "overload-result-uuid",
+  deliveryId: "c",
+  deliveryUuid: "overload-card-uuid",
   address: progress.address,
-  text: "done",
+  text: "decide",
+  decision: { itemId: "item", revision: 1, title: "Decide", owner: "o", options: ["yes"], state: "open" },
  });
+ expect(requests).toHaveLength(2);
+ for (const request of requests) {
+  expect(request.method).toBe("POST");
+  expect(request.url).toEndWith(`/open-apis/im/v1/messages/${ROOT}/reply`);
+  expect(request.data).toMatchObject({ reply_in_thread: true });
+ }
+ expect(requests[0].data).toMatchObject({ msg_type: "post", uuid: "overload-result-uuid" });
+ expect(JSON.parse(requests[0].data!.content as string)).toEqual({
+  zh_cn: { title: "", content: [[{ tag: "md", text: "done" }]] },
+ });
+ expect(requests[1].data).toMatchObject({ msg_type: "interactive", uuid: "overload-card-uuid" });
+ // The topic id may ride along as button metadata, but it is never the reply target.
+ expect(requests.map((r) => r.url).join()).not.toContain(TOPIC);
+});
+
+test("§3.3 a rate-limited result is one request: no SDK-internal retry or unthreaded copy", async () => {
+ // Through the SDK's send(), 230020 was mislabelled target_revoked and re-sent as a fresh, unthreaded message.
+ const { instance, requests } = realSdk(() => {
+  throw httpError(400, 230020);
+ });
+ expect(
+  await instance.send({
+   deliveryId: "d",
+   deliveryUuid: "overload-result-uuid",
+   address: progress.address,
+   text: "done",
+  }),
+ ).toEqual({ state: "retryable", reason: "rate_limited" });
  expect(requests).toHaveLength(1);
- expect(requests[0].url).toEndWith(`/open-apis/im/v1/messages/${ROOT}/reply`);
- expect(requests[0].data).not.toHaveProperty("uuid");
+});
+
+test("a long result is split into chunks, each with its own uuid under Feishu's 50-character cap", async () => {
+ const { instance, requests } = realSdk(() => ({ code: 0, data: { message_id: "om_chunk000000000000000000000001" } }));
+ const uuid = "overload-" + "a".repeat(32);
+ const text = Array.from({ length: 200 }, (_, i) => `line ${i} ` + "x".repeat(40)).join("\n");
+ await instance.send({ deliveryId: "d", deliveryUuid: uuid, address: progress.address, text });
+ expect(requests.length).toBeGreaterThan(1);
+ const uuids = requests.map((r) => r.data!.uuid as string);
+ expect(uuids[0]).toBe(uuid);
+ expect(new Set(uuids).size).toBe(uuids.length);
+ for (const u of uuids) expect(u.length).toBeLessThanOrEqual(50);
+ const rebuilt = requests.map((r) => JSON.parse(r.data!.content as string).zh_cn.content[0][0].text).join("\n");
+ expect(rebuilt).toBe(text);
+});
+
+test("a result Feishu rejects as a post goes out once as plain text with a distinct uuid", async () => {
+ const { instance, requests } = realSdk((request) => {
+  if (request.data!.msg_type === "post") throw httpError(400, 230001);
+  return { code: 0, data: { message_id: "om_text0000000000000000000000001" } };
+ });
+ expect(
+  await instance.send({ deliveryId: "d", deliveryUuid: "overload-result-uuid", address: progress.address, text: "done" }),
+ ).toEqual({ state: "sent", messageId: "om_text0000000000000000000000001" });
+ expect(requests.map((r) => [r.data!.msg_type, r.data!.uuid])).toEqual([
+  ["post", "overload-result-uuid"],
+  ["text", "overload-result-uuid-t"],
+ ]);
 });
 
 function httpError(status: number, code: number, headers: Record<string, string> = {}) {
