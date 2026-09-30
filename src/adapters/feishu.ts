@@ -5,9 +5,11 @@ import type {
 } from "@larksuiteoapi/node-sdk";
 import type {
  ChannelAdapter,
+ ChannelAddress,
  ChannelEvent,
  ChannelMessage,
  DeliveryReceipt,
+ ProgressMessage,
 } from "./types";
 
 export type FeishuChannelConfig = {
@@ -55,6 +57,23 @@ type FeishuSdkChannel = {
  editMessage(messageId: string, text: string): Promise<void>;
  addReaction(messageId: string, emojiType: string): Promise<string>;
  removeReaction(messageId: string, reactionId: string): Promise<void>;
+ // The SDK's send() drops `uuid` (1.73.3 SendOptions has no such field), so every new outbound delivery
+ // goes through the raw open-platform message API instead, where Feishu dedupes on uuid for an hour.
+ rawClient: { im: { v1: { message: FeishuRawMessageApi } } };
+};
+type FeishuRawMessageApi = {
+ create(payload: {
+  params: { receive_id_type: "chat_id" };
+  data: { receive_id: string; msg_type: string; content: string; uuid?: string };
+ }): Promise<unknown>;
+ reply(payload: {
+  path: { message_id: string };
+  data: { msg_type: string; content: string; reply_in_thread: boolean; uuid?: string };
+ }): Promise<unknown>;
+ patch(payload: {
+  path: { message_id: string };
+  data: { content: string };
+ }): Promise<unknown>;
 };
 type FeishuChannelFactory = (
  options: Parameters<typeof createLarkChannel>[0],
@@ -107,13 +126,148 @@ function actionValue(value: unknown): Record<string, unknown> {
  }
  return record(value);
 }
-function errorCode(error: unknown): string {
- if (!error || typeof error !== "object" || Array.isArray(error)) return "";
- const code = (error as Record<string, unknown>).code;
- return typeof code === "string" ? code : "";
+export type FeishuErrorKind =
+ | "rate_limited"
+ | "not_connected"
+ | "target_revoked"
+ | "message_not_found"
+ | "permission_denied"
+ | "format_error"
+ | "unknown";
+// Feishu business codes, from the open-platform im/v1 message reply and patch references. The SDK's own
+// inferCode() gets two of these wrong (230020 as target_revoked, 99991400 as permission_denied), so a
+// numeric code always wins over the SDK's string code.
+const FEISHU_CODES: Record<number, FeishuErrorKind> = {
+ 99991400: "rate_limited",
+ 230020: "rate_limited",
+ 230011: "target_revoked",
+ 230019: "target_revoked",
+ 230110: "message_not_found",
+ 230001: "format_error",
+ 230025: "format_error",
+ 230099: "format_error",
+ 230002: "permission_denied",
+ 230006: "permission_denied",
+ 230013: "permission_denied",
+ 230017: "permission_denied",
+ 230027: "permission_denied",
+ 230031: "permission_denied",
+ 230035: "permission_denied",
+ 232009: "permission_denied",
+};
+const SDK_CODES = new Set<string>([
+ "rate_limited",
+ "not_connected",
+ "target_revoked",
+ "message_not_found",
+ "permission_denied",
+ "format_error",
+]);
+const NETWORK_CODES = new Set(["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH"]);
+function field(value: unknown, name: string): unknown {
+ return value && typeof value === "object" ? (value as Record<string, unknown>)[name] : undefined;
+}
+function header(headers: unknown, name: string): number | undefined {
+ const get = field(headers, "get");
+ const value =
+  typeof get === "function" ? get.call(headers, name) : field(headers, name);
+ const seconds = Number(value);
+ return value !== undefined && value !== null && Number.isFinite(seconds) && seconds >= 0
+  ? seconds * 1000
+  : undefined;
+}
+/**
+ * One classification for every Feishu failure shape: an SDK LarkChannelError (string `code`, raw error in
+ * `cause`), an axios error (`response.status`, `response.data.code`, `response.headers`), or a 200 body with
+ * a non-zero `code`. Anything unrecognised is `unknown`: the request may have landed, so callers must not
+ * send a replacement.
+ */
+export function classifyFeishuError(error: unknown): {
+ kind: FeishuErrorKind;
+ code: string;
+ retryAfterMs?: number;
+} {
+ const sources = [error, field(error, "cause")].filter(Boolean);
+ let kind: FeishuErrorKind | undefined;
+ let code = "";
+ let retryAfterMs: number | undefined;
+ for (const source of sources) {
+  const response = field(source, "response");
+  const numeric = [field(field(response, "data"), "code"), field(field(source, "data"), "code"), field(source, "code")].find(
+   (value) => typeof value === "number" && value !== 0,
+  ) as number | undefined;
+  const status = field(response, "status") ?? field(source, "status");
+  const headers = field(response, "headers") ?? field(source, "headers");
+  retryAfterMs ??= header(headers, "retry-after") ?? header(headers, "x-ogw-ratelimit-reset");
+  if (!kind && numeric !== undefined && FEISHU_CODES[numeric]) {
+   kind = FEISHU_CODES[numeric];
+   code = String(numeric);
+  } else if (!kind && status === 429) kind = "rate_limited";
+  else if (!kind && (status === 401 || status === 403)) kind = "permission_denied";
+  else if (!kind && status === 404) kind = "message_not_found";
+  if (!code && numeric !== undefined) code = String(numeric);
+ }
+ const named = field(error, "code");
+ if (!kind && typeof named === "string") {
+  if (SDK_CODES.has(named)) kind = named as FeishuErrorKind;
+  else if (NETWORK_CODES.has(named)) kind = "not_connected";
+ }
+ if (!code && typeof named === "string") code = named;
+ return {
+  kind: kind ?? "unknown",
+  code: code || "feishu_send_failed",
+  ...(kind === "rate_limited" && retryAfterMs !== undefined ? { retryAfterMs } : {}),
+ };
+}
+function receipt(error: unknown): DeliveryReceipt {
+ const { kind, code, retryAfterMs } = classifyFeishuError(error);
+ const reason = kind === "unknown" ? code : kind;
+ if (kind === "rate_limited" || kind === "not_connected")
+  return { state: "retryable", reason, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
+ if (kind === "unknown") return { state: "unknown", reason };
+ return { state: "failed", reason };
 }
 function missingAnchor(error: unknown): boolean {
- return ["target_revoked", "message_not_found"].includes(errorCode(error));
+ const { kind } = classifyFeishuError(error);
+ return kind === "target_revoked" || kind === "message_not_found";
+}
+// Same per-message limit the SDK used; Feishu rejects post content over 30 KB.
+const CHUNK_LIMIT = 3500;
+function chunks(text: string): string[] {
+ const out: string[] = [];
+ let current = "";
+ for (const line of text.split("\n")) {
+  const next = current ? current + "\n" + line : line;
+  if (next.length <= CHUNK_LIMIT) {
+   current = next;
+   continue;
+  }
+  if (current) out.push(current);
+  current = line;
+  while (current.length > CHUNK_LIMIT) {
+   out.push(current.slice(0, CHUNK_LIMIT));
+   current = current.slice(CHUNK_LIMIT);
+  }
+ }
+ out.push(current);
+ return out;
+}
+function post(text: string): string {
+ return JSON.stringify({ zh_cn: { title: "", content: [[{ tag: "md", text }]] } });
+}
+/** Feishu caps uuid at 50 characters; every derived uuid stays distinct and under the cap. */
+function derivedUuid(uuid: string | undefined, suffix: string): string | undefined {
+ return uuid && uuid.slice(0, 50 - suffix.length) + suffix;
+}
+/** The message a reply must anchor to. A Feishu thread id (omt_*) is never a valid reply target. */
+export function replyAnchor(address: ChannelAddress): string | undefined {
+ // Addresses stored before rootMessageId existed carried the root in threadId when it was a message id.
+ return address.rootMessageId ?? (address.threadId?.startsWith("om_") ? address.threadId : undefined);
+}
+function rawMessageId(response: unknown): string {
+ const code = field(response, "code");
+ if (typeof code === "number" && code !== 0) throw response;
+ return requiredString(field(field(response, "data"), "message_id"), "message_id");
 }
 
 export class FeishuChannel implements ChannelAdapter {
@@ -177,10 +331,12 @@ export class FeishuChannel implements ChannelAdapter {
   if (!this.accept) return;
   if (message.chatType === "group" && !message.mentionedBot) return;
   const identity = rawIdentity(message.raw, message.messageId);
-  const threadId =
-   message.threadId ??
-   message.rootId ??
-   (message.chatType === "group" ? message.messageId : undefined);
+  // A group message with no root starts its own topic, so it is the root. A direct message with no root
+  // stays keyed on the chat, as before.
+  const rootMessageId =
+   message.rootId ?? (message.chatType === "group" ? message.messageId : undefined);
+  const threadId = message.threadId;
+  const reply = { replyTo: rootMessageId ?? message.messageId };
   try {
    await this.accept({
     kind: "message",
@@ -194,6 +350,7 @@ export class FeishuChannel implements ChannelAdapter {
      instanceId: this.instanceId,
      tenantId: identity.tenantId,
      chatId: requiredString(message.chatId, "chat"),
+     ...(rootMessageId ? { rootMessageId } : {}),
      ...(threadId ? { threadId } : {}),
     },
     messageId: requiredString(message.messageId, "message"),
@@ -216,7 +373,7 @@ export class FeishuChannel implements ChannelAdapter {
       markdown:
        "此会话尚未获得 Overload 执行授权，消息未提交给 Agent。请联系操作员配置访问权限。",
      },
-     { replyTo: message.messageId },
+     reply,
     );
     return;
    }
@@ -224,7 +381,7 @@ export class FeishuChannel implements ChannelAdapter {
     await this.channel.send(
      message.chatId,
      { markdown: "仅会话 Owner 可以执行该命令。" },
-     { replyTo: message.messageId },
+     reply,
     );
     return;
    }
@@ -247,6 +404,10 @@ export class FeishuChannel implements ChannelAdapter {
    typeof value.threadId === "string" && value.threadId
     ? value.threadId
     : undefined;
+  const rootMessageId =
+   typeof value.rootMessageId === "string" && value.rootMessageId
+    ? value.rootMessageId
+    : undefined;
   try {
    await this.accept({
     kind: "decision",
@@ -260,6 +421,7 @@ export class FeishuChannel implements ChannelAdapter {
      instanceId: this.instanceId,
      tenantId: identity.tenantId,
      chatId: requiredString(action.chatId, "chat"),
+     ...(rootMessageId ? { rootMessageId } : {}),
      ...(threadId ? { threadId } : {}),
     },
     messageId: requiredString(action.messageId, "message"),
@@ -315,18 +477,6 @@ export class FeishuChannel implements ChannelAdapter {
    throw error;
   }
  }
- private receiptFor(error: unknown): DeliveryReceipt {
-  const code = errorCode(error);
-  if (code === "rate_limited" || code === "not_connected")
-   return { state: "retryable", reason: code };
-  if (
-   code === "permission_denied" ||
-   code === "target_revoked" ||
-   code === "format_error"
-  )
-   return { state: "failed", reason: code };
-  return { state: "unknown", reason: code || "feishu_send_failed" };
- }
  private card(message: ChannelMessage): object {
   const decision = message.decision;
   if (!decision) throw new Error("decision_required");
@@ -339,6 +489,7 @@ export class FeishuChannel implements ChannelAdapter {
     revision: decision.revision,
     answer,
     threadId: message.address.threadId,
+    rootMessageId: message.address.rootMessageId,
    },
   }));
   return {
@@ -367,7 +518,7 @@ export class FeishuChannel implements ChannelAdapter {
      return { state: "sent", messageId: message.replaceMessageId };
     } catch (error) {
      if (
-      errorCode(error) !== "target_revoked" ||
+      !missingAnchor(error) ||
       message.decision?.state.startsWith("open") ||
       !message.terminal ||
       message.importance !== "important"
@@ -378,31 +529,118 @@ export class FeishuChannel implements ChannelAdapter {
    const fresh = Boolean(message.replaceMessageId);
    const replyTo = fresh
     ? undefined
-    : (message.replyTo ?? message.address.threadId);
-   const options = {
-    ...(replyTo ? { replyTo, replyInThread: true } : {}),
-    ...(message.deliveryUuid ? { uuid: message.deliveryUuid } : {}),
-   };
-   const input = message.decision
-    ? { card: this.card(message) }
-    : { markdown: message.text };
-   let result;
-   try {
-    result = await this.channel.send(message.address.chatId, input, options);
-   } catch (error) {
-    if (!replyTo || !missingAnchor(error)) throw error;
-    result = await this.channel.send(
-     message.address.chatId,
-     input,
-     message.deliveryUuid ? { uuid: message.deliveryUuid } : undefined,
-    );
+    : (replyAnchor(message.address) ?? message.replyTo);
+   const uuid = message.deliveryUuid;
+   if (message.decision)
+    return {
+     state: "sent",
+     messageId: await this.rawSend(message.address, replyTo, "interactive", JSON.stringify(this.card(message)), uuid),
+    };
+   // Long text is split like the SDK did; each chunk has its own uuid, so a retried delivery re-sends only
+   // what Feishu has not already accepted.
+   let first: string | undefined;
+   for (const [index, chunk] of chunks(message.text).entries()) {
+    const chunkUuid = index ? derivedUuid(uuid, "-" + index) : uuid;
+    let id: string;
+    try {
+     id = await this.rawSend(message.address, replyTo, "post", post(chunk), chunkUuid);
+    } catch (error) {
+     // Same fallback the SDK had: a rejected post goes out once more as plain text.
+     if (classifyFeishuError(error).kind !== "format_error") throw error;
+     id = await this.rawSend(
+      message.address,
+      replyTo,
+      "text",
+      JSON.stringify({ text: chunk }),
+      derivedUuid(chunkUuid, "-t"),
+     );
+    }
+    first ??= id;
    }
-   return {
-    state: "sent",
-    messageId: requiredString(result.messageId, "message_id"),
-   };
+   return { state: "sent", messageId: first! };
   } catch (error) {
-   return this.receiptFor(error);
+   return receipt(error);
+  }
+ }
+ /**
+  * One new message through the raw API, with no retry: the delivery outbox owns retries. A reply whose
+  * anchor is gone is re-sent to the chat under the same uuid, since the reply was never created.
+  */
+ private async rawSend(
+  address: ChannelAddress,
+  replyTo: string | undefined,
+  msgType: string,
+  content: string,
+  uuid: string | undefined,
+ ): Promise<string> {
+  const api = this.channel.rawClient.im.v1.message;
+  const dedupe = uuid ? { uuid } : {};
+  if (replyTo) {
+   try {
+    return rawMessageId(
+     await api.reply({
+      path: { message_id: replyTo },
+      data: { msg_type: msgType, content, reply_in_thread: true, ...dedupe },
+     }),
+    );
+   } catch (error) {
+    if (!missingAnchor(error)) throw error;
+   }
+  }
+  return rawMessageId(
+   await api.create({
+    params: { receive_id_type: "chat_id" },
+    data: { receive_id: address.chatId, msg_type: msgType, content, ...dedupe },
+   }),
+  );
+ }
+ private progressCard(message: ProgressMessage): string {
+  // No mentions, no actions: the progress card is low-noise status, and decisions keep their own card.
+  return JSON.stringify({
+   config: { wide_screen_mode: true, update_multi: true },
+   header: { title: { tag: "plain_text", content: message.title } },
+   elements: [{ tag: "markdown", content: message.text }],
+  });
+ }
+ /**
+  * Creates a progress card through the raw message API so the stable uuid reaches Feishu. There is no
+  * anchor fallback and no retry here: an unknown result must never be answered with a second card.
+  */
+ async createProgress(message: ProgressMessage): Promise<DeliveryReceipt> {
+  const api = this.channel.rawClient.im.v1.message;
+  const content = this.progressCard(message);
+  const root = replyAnchor(message.address);
+  try {
+   const response = root
+    ? await api.reply({
+       path: { message_id: root },
+       data: { msg_type: "interactive", content, reply_in_thread: true, uuid: message.deliveryUuid },
+      })
+    : await api.create({
+       params: { receive_id_type: "chat_id" },
+       data: {
+        receive_id: message.address.chatId,
+        msg_type: "interactive",
+        content,
+        uuid: message.deliveryUuid,
+       },
+      });
+   return { state: "sent", messageId: rawMessageId(response) };
+  } catch (error) {
+   return receipt(error);
+  }
+ }
+ async updateProgress(messageId: string, message: ProgressMessage): Promise<DeliveryReceipt> {
+  try {
+   const response = await this.channel.rawClient.im.v1.message.patch({
+    path: { message_id: messageId },
+    data: { content: this.progressCard(message) },
+   });
+   const code = field(response, "code");
+   if (typeof code === "number" && code !== 0) throw response;
+   return { state: "sent", messageId };
+  } catch (error) {
+   return receipt(error);
   }
  }
 }

@@ -23,6 +23,7 @@ import {
  acceptCommand,
  acceptMessage,
  bindSession,
+ bindingKey,
  enqueueDelivery,
  type Conversation,
  type StoredTurn,
@@ -381,12 +382,7 @@ export class AdapterService {
   event: Extract<ChannelEvent, { kind: "message" }>,
   owner: string,
  ): Promise<void> {
-  const binding = JSON.stringify([
-   event.address.instanceId,
-   event.address.tenantId,
-   event.address.chatId,
-   event.address.threadId ?? null,
-  ]);
+  const binding = bindingKey(event.address);
   const c = this.db
    .query("SELECT * FROM conversations WHERE binding_key=? AND owner_id=?")
    .get(binding, owner) as Conversation | null;
