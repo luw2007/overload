@@ -1,11 +1,33 @@
 import { createServer, createConnection, type Server, type Socket } from "node:net";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, appendFileSync, renameSync, chmodSync, openSync, closeSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CommandReceipt, RuntimeEvent, SessionReference } from "./types";
 
 
 type JsonObject = Record<string, unknown>;
+
+// Generic tool names only (fast-channel §5.2): anything else is "tool", so no raw string from a
+// tool call ever reaches a RuntimeEvent. The regex is a second guard on the allowlist itself.
+const SAFE_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "test"]);
+export function safeToolName(raw: unknown): string {
+  if (typeof raw !== "string") return "tool";
+  const name = raw.trim().toLowerCase();
+  return /^[a-z][a-z0-9_-]{0,15}$/.test(name) && SAFE_TOOL_NAMES.has(name) ? name : "tool";
+}
+
+// Maps a Pi tool_execution_start/end record to a fact carrying only ids and the generic name.
+// The event id is derived from (session, turn, hashed toolCallId, phase) so a re-delivered record
+// yields the same eventId; the raw toolCallId is hashed because Pi/providers control its content.
+export function toolActivityEvent(record: JsonObject, sessionId: string, turnId: string): RuntimeEvent | undefined {
+  const type = stringValue(record.type);
+  if (type !== "tool_execution_start" && type !== "tool_execution_end") return undefined;
+  const callId = stringValue(record.toolCallId);
+  if (!callId) return undefined;
+  const kind = type === "tool_execution_start" ? "tool_started" : "tool_finished";
+  const digest = createHash("sha256").update(callId).digest("hex").slice(0, 24);
+  return { eventId: `tool:${sessionId}:${turnId}:${digest}:${kind}`, sessionId, turnId, kind, toolName: safeToolName(record.toolName) };
+}
 type PiStdin = { write(data: string): number | Promise<number>; flush?: () => void | Promise<void> };
 type PiProcess = { stdin: unknown; stdout: unknown; stderr: unknown; exited: Promise<number>; kill?: (signal?: string) => void };
 type AsyncBytes = AsyncIterable<Uint8Array>;
@@ -176,6 +198,7 @@ class PiBroker {
   private readonly journalPath: string;
   private readonly eventSeq = { value: 0 };
   private readonly issued=new Set<string>();
+  private readonly toolEventIds=new Set<string>(); // broker-level dedupe of re-delivered tool records; cleared at turn end
   private activeTurn: { turnId: string; commandId: string; cancelRequested: boolean; failureReason?: string } | undefined;
   private shutdownRequested = false;
   private sessionFile: string | undefined;
@@ -351,10 +374,19 @@ class PiBroker {
       const kind = active.cancelRequested ? "unknown" : active.failureReason ? "failed" : "completed";
       this.publish({ eventId: randomUUID(), sessionId: this.config.sessionId, turnId: active.turnId, kind, ...(active.failureReason ? { reason: active.failureReason } : {}) });
       this.activeTurn = undefined;
+      this.toolEventIds.clear();
       return;
     }
     if (type === "extension_error") {
       if (this.activeTurn) this.activeTurn.failureReason = stringValue(record.error) ?? "extension_error";
+      return;
+    }
+    if (type === "tool_execution_start" || type === "tool_execution_end") {
+      if (!this.activeTurn) return;
+      const event = toolActivityEvent(record, this.config.sessionId, this.activeTurn.turnId);
+      if (!event || this.toolEventIds.has(event.eventId)) return;
+      this.toolEventIds.add(event.eventId);
+      this.publish(event);
       return;
     }
     if (type === "message_update") {
