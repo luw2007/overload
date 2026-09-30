@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
+import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import type { FeishuChannelConfig } from "./feishu";
-import { FeishuChannel } from "./feishu";
+import { classifyFeishuError, FeishuChannel } from "./feishu";
 import type { ChannelEvent, ChannelMessage } from "./types";
 
 type Handler = (value: unknown) => void | Promise<void>;
@@ -617,4 +618,177 @@ test("§11.1 a legacy address whose threadId is a topic id is never used as a re
   replyTo: REPLY,
  });
  expect(fake.sent.map((s) => (s.options as { replyTo: string }).replyTo)).toEqual([REPLY, ROOT]);
+});
+
+type RecordedRequest = { url?: string; method?: string; data?: Record<string, unknown> };
+function realSdk(respond: (request: RecordedRequest) => unknown) {
+ const requests: RecordedRequest[] = [];
+ const httpInstance = {
+  async post(url: string) {
+   if (url.includes("tenant_access_token"))
+    return { code: 0, tenant_access_token: "t-test", expire: 7200 };
+   throw new Error("unexpected post " + url);
+  },
+  async request(request: RecordedRequest) {
+   requests.push(request);
+   return respond(request);
+  },
+ };
+ const instance = new FeishuChannel({
+  appId: "cli_0123456789abcdef",
+  appSecret: "secret",
+  instanceId: "feishu-main",
+  // The real SDK factory; only the HTTP transport is replaced, so every SDK layer between our adapter and
+  // the wire runs as in production.
+  createChannel: (options) =>
+   createLarkChannel({
+    ...options,
+    httpInstance: httpInstance as never,
+    loggerLevel: LoggerLevel.fatal,
+    logger: { error() {}, warn() {}, info() {}, debug() {}, trace() {} },
+    cache: new Map() as never,
+   }) as never,
+ });
+ return { instance, requests };
+}
+const progress = {
+ deliveryUuid: "overload-progress-4f1c2a",
+ address: { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, rootMessageId: ROOT, threadId: TOPIC },
+ title: "正在处理",
+ text: "- 当前：正在处理",
+};
+
+test("§11.2 the progress uuid reaches the raw open-platform request body through the real SDK", async () => {
+ const { instance, requests } = realSdk(() => ({ code: 0, data: { message_id: "om_progress0000000000000000000001" } }));
+ expect(await instance.createProgress(progress)).toEqual({
+  state: "sent",
+  messageId: "om_progress0000000000000000000001",
+ });
+ expect(requests).toHaveLength(1);
+ expect(requests[0].method).toBe("POST");
+ expect(requests[0].url).toEndWith(`/open-apis/im/v1/messages/${ROOT}/reply`);
+ expect(requests[0].data).toMatchObject({
+  msg_type: "interactive",
+  reply_in_thread: true,
+  uuid: "overload-progress-4f1c2a",
+ });
+ expect(JSON.stringify(requests[0])).not.toContain(TOPIC);
+ expect(requests[0].data!.content as string).not.toContain("<at");
+ // Without a root (direct chat) it is a create, and the uuid still reaches the body.
+ await instance.createProgress({ ...progress, address: { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT } });
+ expect(requests[1].url).toEndWith("/open-apis/im/v1/messages");
+ expect(requests[1].data).toMatchObject({ receive_id: CHAT, uuid: "overload-progress-4f1c2a" });
+});
+
+test("§3.3 the SDK's send() path drops uuid, which is why progress does not use it", async () => {
+ const { instance, requests } = realSdk(() => ({ code: 0, data: { message_id: "om_result00000000000000000000001" } }));
+ await instance.send({
+  deliveryId: "d",
+  deliveryUuid: "overload-result-uuid",
+  address: progress.address,
+  text: "done",
+ });
+ expect(requests).toHaveLength(1);
+ expect(requests[0].url).toEndWith(`/open-apis/im/v1/messages/${ROOT}/reply`);
+ expect(requests[0].data).not.toHaveProperty("uuid");
+});
+
+function httpError(status: number, code: number, headers: Record<string, string> = {}) {
+ return Object.assign(new Error(`Request failed with status code ${status}`), {
+  response: { status, data: { code, msg: "error" }, headers },
+ });
+}
+
+test("§3.4 PATCH errors from the real SDK are classified: 429, recall, unknown", async () => {
+ let next: unknown = null;
+ const { instance, requests } = realSdk(() => {
+  throw next;
+ });
+ next = httpError(429, 99991400, { "x-ogw-ratelimit-reset": "7" });
+ expect(await instance.updateProgress(ROOT, progress)).toEqual({
+  state: "retryable",
+  reason: "rate_limited",
+  retryAfterMs: 7000,
+ });
+ expect(requests[0]).toMatchObject({ method: "PATCH" });
+ expect(requests[0].url).toEndWith(`/open-apis/im/v1/messages/${ROOT}`);
+ next = httpError(400, 230020);
+ expect(await instance.updateProgress(ROOT, progress)).toEqual({ state: "retryable", reason: "rate_limited" });
+ next = httpError(400, 230011);
+ expect(await instance.updateProgress(ROOT, progress)).toEqual({ state: "failed", reason: "target_revoked" });
+ next = httpError(400, 230110);
+ expect(await instance.updateProgress(ROOT, progress)).toEqual({ state: "failed", reason: "message_not_found" });
+ next = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+ expect(await instance.updateProgress(ROOT, progress)).toEqual({ state: "retryable", reason: "not_connected" });
+ next = Object.assign(new Error("timeout of 10000ms exceeded"), { code: "ECONNABORTED" });
+ expect(await instance.updateProgress(ROOT, progress)).toEqual({ state: "unknown", reason: "ECONNABORTED" });
+ next = httpError(500, 1);
+ expect(await instance.updateProgress(ROOT, progress)).toEqual({ state: "unknown", reason: "1" });
+ // Each PATCH is one request: no hidden SDK retry behind an unknown result.
+ expect(requests).toHaveLength(7);
+});
+
+test("§3.4 a progress create with an unknown result is not retried or replaced", async () => {
+ const { instance, requests } = realSdk(() => {
+  throw Object.assign(new Error("timeout of 10000ms exceeded"), { code: "ECONNABORTED" });
+ });
+ expect(await instance.createProgress(progress)).toEqual({ state: "unknown", reason: "ECONNABORTED" });
+ expect(requests).toHaveLength(1);
+});
+
+test("§3.4 classification reads every error shape and a numeric Feishu code beats the SDK's string code", () => {
+ // The SDK labels 230020 target_revoked and 99991400 permission_denied; the raw cause decides.
+ const sdk = (code: string, cause: unknown) => Object.assign(new Error(code), { code, cause });
+ expect(classifyFeishuError(sdk("target_revoked", httpError(400, 230020)))).toMatchObject({ kind: "rate_limited" });
+ expect(classifyFeishuError(sdk("permission_denied", httpError(400, 99991400, { "retry-after": "2" })))).toEqual({
+  kind: "rate_limited",
+  code: "99991400",
+  retryAfterMs: 2000,
+ });
+ expect(classifyFeishuError({ code: 230011, msg: "The message is recalled." })).toMatchObject({ kind: "target_revoked" });
+ expect(classifyFeishuError(httpError(403, 0))).toMatchObject({ kind: "permission_denied" });
+ expect(classifyFeishuError(httpError(400, 230099))).toMatchObject({ kind: "format_error" });
+ expect(classifyFeishuError(new Error("boom"))).toEqual({ kind: "unknown", code: "feishu_send_failed" });
+ expect(classifyFeishuError(undefined)).toEqual({ kind: "unknown", code: "feishu_send_failed" });
+});
+
+test("a terminal decision card whose message is gone (SDK 404) still falls back to a fresh card", async () => {
+ const instance = channel();
+ fake.updateError = Object.assign(new Error("target_revoked"), {
+  code: "target_revoked",
+  cause: { response: { status: 404, data: {} } },
+ });
+ expect(
+  await instance.send({
+   deliveryId: "d",
+   address: { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, rootMessageId: ROOT },
+   text: "done",
+   replaceMessageId: "om_gone000000000000000000000000001",
+   importance: "important",
+   terminal: true,
+   decision: { itemId: "item", revision: 2, title: "Done", owner: "o", options: [], state: "resolved" },
+  }),
+ ).toEqual({ state: "sent", messageId: "sent-1" });
+ expect(fake.sent).toHaveLength(1);
+});
+
+test("a rate-limited decision card update is retried later, not replaced by a fresh card", async () => {
+ const instance = channel();
+ // The SDK labels 230020 target_revoked; before this fix that sent a duplicate terminal card.
+ fake.updateError = Object.assign(new Error("target_revoked"), {
+  code: "target_revoked",
+  cause: { response: { status: 400, data: { code: 230020 } } },
+ });
+ expect(
+  await instance.send({
+   deliveryId: "d",
+   address: { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, rootMessageId: ROOT },
+   text: "done",
+   replaceMessageId: "om_card0000000000000000000000000001",
+   importance: "important",
+   terminal: true,
+   decision: { itemId: "item", revision: 2, title: "Done", owner: "o", options: [], state: "resolved" },
+  }),
+ ).toEqual({ state: "retryable", reason: "rate_limited" });
+ expect(fake.sent).toHaveLength(0);
 });
