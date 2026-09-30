@@ -10,13 +10,14 @@ import { appendClassifierActivated, CLASSIFIER_VERSION } from "./classifier";
 import { scanCmux } from "./cmux";
 import { PROGRESS_KINDS } from "../shared/types";
 import { pruneSpool } from "./prune";
-import { archiveJournal, ARCHIVE_BATCH_SIZE } from "./archive";
+import { archiveJournal, ARCHIVE_BATCH_SIZE, pruneJournalCapacity } from "./archive";
 
 const DEFAULT_SCAN_INTERVAL_MS = 2_000;
 const DEFAULT_REDUCER_BATCH_SIZE = 500;
 const DEFAULT_PRUNE_INTERVAL_MS = 3_600_000;
 const DEFAULT_ARCHIVE_INTERVAL_MS = 3_600_000;
 const DEFAULT_SPOOL_RETENTION_MS = 86_400_000;
+const DEFAULT_JOURNAL_MAX_ROWS = 1_000_000;
 const MAX_SPOOL_READ_BYTES = 4 * 1024 * 1024;
 const MAX_SPOOL_LINE_BYTES = 64 * 1024;
 const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
@@ -30,6 +31,8 @@ export type IngestConfig = {
   prune_interval_ms: number;
   /** How long a consumed spool file is kept before it is swept. */
   spool_retention_ms: number;
+  /** Maximum rows retained across the hot and archive journal tables. */
+  journal_max_rows: number;
 };
 
 type SpoolFile = { path: string; size: number };
@@ -72,6 +75,7 @@ export async function loadConfig(path = join(homedir(), ".overload", "config.jso
       ? value.cmux_workstream_path : join(homedir(), ".cmuxterm", "workstream.jsonl"),
     prune_interval_ms: positiveInteger(value.prune_interval_ms, DEFAULT_PRUNE_INTERVAL_MS),
     spool_retention_ms: positiveInteger(value.spool_retention_ms, DEFAULT_SPOOL_RETENTION_MS),
+    journal_max_rows: positiveInteger(value.journal_max_rows, DEFAULT_JOURNAL_MAX_ROWS),
   };
 }
 
@@ -356,8 +360,12 @@ async function main(): Promise<void> {
     if (once) console.log(`ingested ${result.inserted} new event(s) from ${result.files} file(s)`);
     if (Date.now() - lastArchiveAt >= DEFAULT_ARCHIVE_INTERVAL_MS) {
       const archived = archiveJournal(db);
-      lastArchiveAt = archived === ARCHIVE_BATCH_SIZE ? 0 : Date.now();
       if (archived) console.log(`archived ${archived} journal event(s)`);
+      const removed = pruneJournalCapacity(db, config.journal_max_rows);
+      if (removed) console.log(`pruned ${removed} journal event(s) over capacity`);
+      // Either full batch means a backlog: come back next scan instead of in an
+      // hour, so a large arrears drains in bounded transactions rather than one.
+      lastArchiveAt = archived === ARCHIVE_BATCH_SIZE || removed === ARCHIVE_BATCH_SIZE ? 0 : Date.now();
     }
     if (Date.now() - lastPruneAt < config.prune_interval_ms) return;
     lastPruneAt = Date.now();

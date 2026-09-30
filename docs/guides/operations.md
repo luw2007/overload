@@ -177,9 +177,16 @@ a file whose cursor equals its size is never opened.
 The journal itself is tiered so the hot table stays small as history grows.
 Once an hour the ingest loop moves already-projected events older than seven
 days into `journal_7d`, and those older than thirty days into `journal_30d`,
-one bounded batch per pass. Nothing is deleted and `ingest_seq` stays globally
-monotone, so any query that wants full history must read the `journal_all`
-view rather than the `journal` table — `journal` alone holds only the recent
-window plus anything the reducer has not projected yet.
+one bounded batch per pass. `ingest_seq` stays globally monotone, so any query
+that wants retained history must read the `journal_all` view rather than the
+`journal` table. Retention is bounded by `journal_max_rows`: when over capacity,
+ingest deletes only already-projected rows, oldest `heartbeat` rows first, then
+the oldest remaining projected rows. `control_event` rows are not preferred for
+deletion — consumers outside the ledger hold their own cursor over them. An
+active reducer backlog can therefore temporarily exceed the configured cap
+rather than lose input. Capacity pruning deletes at most one bounded batch per
+pass, like archiving; while either comes back full the loop repeats on the next
+scan instead of waiting the hour, so a large backlog drains in short
+transactions rather than one long one that would lock out other writers.
 
 To remove services without deleting history, run `scripts/install-launchd.sh --uninstall`. To reset history, first stop services, then remove `~/.overload/` deliberately.
