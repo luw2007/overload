@@ -23,7 +23,7 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 | `stall_profile_ms` | recon | Silence threshold for a session that is still in `working` state; default `1800000`. Idle sessions are silent by design and are never stalled. |
 | `turn_hang_ms` | recon | A `working` turn with no progress event (heartbeat excluded) for this long is reported as `turn_hung`; default `3600000`. Lower it and you start flagging long thinking: measured on this ledger, a 20-minute bound was false 10 times out of 15. |
 | `command_timeout_ms` | recon | External adapter and remote process-probe command timeout. |
-| `remote_probe_cmd` | recon | Command template used to check process liveness on a non-local ledger host. The default uses batch-mode SSH with a five-second connection timeout. `{host}` and `{pid}` are substituted only after recon validates the host as a safe component and the pid as a positive integer. The command contract is exit `0` = alive, exit `3` = proven absent, and every other exit or timeout = unknown (never dead). |
+| `remote_probe_cmd` | recon | Command template used to check process liveness on a non-local ledger host. Recon runs it once per host, substituting validated `{host}` and a comma-separated `{pids}` list (legacy `{pid}` receives the same list). Exit `0` and exit `1` are both resolved answers and must print the live PIDs on stdout — exit `1` with no output means every probed PID is gone, which is what `ps -p` reports. Every other exit or a timeout is unknown, never dead. |
 
 ### recon CLI flags（覆盖配置）
 - `--herdr-cmd <path>`：覆盖 herdr 可执行文件路径

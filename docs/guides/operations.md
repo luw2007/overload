@@ -108,11 +108,14 @@ observed rather than a failed attempt.
 The watchdog relies on `~/.overload/ingest.heartbeat`. Service stdout and stderr are in `/tmp/overload-*.{log,err}`. The optional orchestrator job writes its logs under `~/.overload/logs/` instead. An unavailable remote source or integration becomes a visible incident; do not delete ledger rows to clear it.
 
 Recon checks process liveness directly for sessions owned by its own host and
-uses `remote_probe_cmd` for other ledger hosts. The default SSH command maps
-exit `0` to alive and emits exit `3` only after the remote shell successfully
-checks both `kill -0` and `ps` and proves the pid absent. OpenSSH connection or
-authentication failures (normally exit `255`), timeouts, and every other exit
-are unknown, never dead. Remote-probe failures are aggregated per host as
+uses `remote_probe_cmd` for other ledger hosts. It batches all candidate PIDs
+for one host into one SSH probe. Exit `0` and exit `1` are both answers — stdout
+lists the PIDs still alive, and an empty list means every probed PID is gone,
+which is what `ps -p` reports with exit `1`. Any other exit (including OpenSSH
+`255`) or a timeout is unknown, never dead. A proven-dead incarnation stops
+being probed once recon's own `emitter_drained` finding for it has been
+ingested; recon never writes a `session_ended` on another host's behalf.
+Remote-probe failures are aggregated per host as
 `source_outage` (`host_probe:<host>`) and produce one `source_recovered` when
 the probe works again. A dead emitter is drained only after recon checks the
 pulled spool tree for that incarnation's host, `spool/<host>/<emitter>`.

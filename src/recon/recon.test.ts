@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReconDaemon, type ReconConfig } from "./recon";
+import { initializeLedger, scanOnce } from "../ingest/ingest";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -163,6 +164,102 @@ describe("ReconDaemon", () => {
 
     expect(calledWith).toEqual(["devbox", 999999]);
     expect(summary.byKind.emitter_dead ?? 0).toBe(0);
+  });
+
+  test("batches same-host pids into one probe", async () => {
+    const f = await fixture();
+    const db = new Database(f.ledger);
+    for (const [suffix, pid] of [["one", 91_001], ["two", 91_002]] as const) {
+      const stable = `devbox:pi:${suffix}`;
+      const writer = `pi-${pid}-devbox`;
+      db.query("INSERT INTO sessions VALUES (?, 'devbox', 'pi', ?, '/repo')").run(stable, suffix);
+      db.query("INSERT INTO session_incarnations VALUES (?, ?, 'process', ?, 'devbox0000', 1, 1)").run(stable, writer, pid);
+      db.query("INSERT INTO journal VALUES (?, 'devbox', ?, 1, 1, ?, ?, 'heartbeat', '{}')").run(pid, writer, stable, writer);
+    }
+    db.close();
+    const calls: Array<[string, number[]]> = [];
+    const daemon = new ReconDaemon(f.config, {
+      ...probes([]),
+      remoteProcesses: async (host, pids) => { calls.push([host, pids]); return new Set<number>(); },
+    });
+
+    expect((await daemon.runOnce()).byKind.emitter_dead).toBe(2);
+    expect(calls).toEqual([["devbox", [91_001, 91_002]]]);
+  });
+
+  /** Routed through the real ingest on the real schema on purpose: recon's spool
+   * output is only durable if `parseEnvelope` accepts it, and a test that
+   * hand-inserts recon's events into the journal cannot see it being rejected. */
+  test("a drained remote incarnation leaves the probe set once real ingest has read recon's spool", async () => {
+    const root = await mkdtemp(join(tmpdir(), "overload-recon-ingest-"));
+    roots.push(root);
+    const spool = join(root, "spool");
+    await mkdir(spool, { recursive: true });
+    const ledger = join(root, "ledger.db");
+    const seed = new Database(ledger);
+    initializeLedger(seed);
+    const stable = "devbox:pi:one";
+    const writer = "pi-91001-devbox";
+    seed.query("INSERT INTO sessions(stable_id,host,runtime,session,cwd) VALUES (?,'devbox','pi','one','/repo')").run(stable);
+    seed.query(`INSERT INTO session_incarnations(stable_id,writer_id,liveness_domain,pid,proc_boot_id,started_at,last_seen_at)
+      VALUES (?,?,'process',91001,'devbox0000',1,1)`).run(stable, writer);
+    seed.query(`INSERT INTO journal(host,emitter_id,seq,at,stable_id,writer_id,kind,detail)
+      VALUES ('devbox',?,1,1,?,?,'heartbeat','{}')`).run(writer, stable, writer);
+    seed.close();
+
+    const herdr = join(root, "herdr.sh"), orca = join(root, "orca.sh"), cmux = join(root, "cmux.json");
+    await writeFile(herdr, "#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"agents\":[]}}'\n", { mode: 0o700 });
+    await writeFile(orca, "#!/bin/sh\nprintf '%s\\n' '[]'\n", { mode: 0o700 });
+    await writeFile(cmux, "{}\n");
+    const config: ReconConfig = {
+      recon_interval_ms: 60_000, drain_grace_ms: 0, stall_profile_ms: 1_000, turn_hang_ms: 1_000,
+      command_timeout_ms: 10_000, host: "local", ledger, spool,
+      herdr_cmd: herdr, orca_cmd: orca, remote_probe_cmd: "unused {host} {pids}", cmux_sessions_file: cmux,
+    };
+    const calls: number[][] = [];
+    const daemon = new ReconDaemon(config, {
+      ...probes([]),
+      remoteProcesses: async (_host, pids) => { calls.push(pids); return new Set<number>(); },
+    });
+
+    const first = await daemon.runOnce();
+    expect(first.byKind.emitter_dead).toBe(1);
+    expect(first.byKind.emitter_drained).toBe(1);
+    expect(calls).toEqual([[91_001]]);
+
+    const db = new Database(ledger);
+    await scanOnce(db, spool);
+    // Recon must never forge a terminal event for another host's session: the
+    // envelope host is the emitter's, and ingest derives stable_id from it.
+    expect(db.query("SELECT COUNT(*) n FROM journal WHERE kind='session_ended'").get()).toEqual({ n: 0 });
+    expect(db.query("SELECT COUNT(*) n FROM journal WHERE kind='emitter_drained' AND host='local'").get()).toEqual({ n: 1 });
+    db.close();
+
+    calls.length = 0;
+    await daemon.runOnce();
+    expect(calls).toEqual([]);
+    // The durable finding, not in-process memory, is what retires it: a fresh
+    // daemon (as after a restart) must not probe it either.
+    const restarted = new ReconDaemon(config, {
+      ...probes([]),
+      remoteProcesses: async (_host, pids) => { calls.push(pids); return new Set<number>(); },
+    });
+    await restarted.runOnce();
+    expect(calls).toEqual([]);
+  });
+
+  /** `ps -p` exits 1 when nothing matched. That is an answer, and treating it as a
+   * failed probe left every all-dead host permanently unresolved behind a
+   * source_outage. Exercises the real probe, not an injected one. */
+  test("the real host probe reads exit 1 as proven-absent and exit 255 as unknown", async () => {
+    for (const [rc, expected] of [[1, { dead: 1, outage: 0 }], [255, { dead: 0, outage: 1 }]] as const) {
+      const f = await fixture();
+      seedRemote(f.ledger, "pi-999999-devbox00");
+      const summary = await new ReconDaemon(
+        { ...f.config, remote_probe_cmd: `exit ${rc}` }, probes([]),
+      ).runOnce();
+      expect({ dead: summary.byKind.emitter_dead ?? 0, outage: summary.byKind.source_outage ?? 0 }).toEqual(expected);
+    }
   });
 
   test("declares a remote incarnation dead only when its injected host probe proves absence", async () => {

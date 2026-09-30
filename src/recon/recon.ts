@@ -71,6 +71,7 @@ export type ReconProbes = {
   localAddresses: () => Set<string>;
   establishedSockets: (pid: number, timeoutMs: number) => Promise<Socket[]>;
   remoteProcess?: (host: string, pid: number, command: string, timeoutMs: number) => Promise<"alive" | "dead">;
+  remoteProcesses?: (host: string, pids: number[], command: string, timeoutMs: number) => Promise<Set<number>>;
   spoolLstat?: typeof lstat;
 };
 
@@ -115,21 +116,33 @@ export class ReconDaemon {
       const incarnations = this.liveProcessIncarnations(db);
       const liveWriters = new Set<string>();
       const remoteProbeStatus = new Map<string, boolean>();
-      for (const incarnation of incarnations) {
-        let state: ProcessState;
-        if (incarnation.host === this.config.host) {
-          state = await inspectProcess(incarnation.pid, incarnation.runtime);
-        } else {
-          try {
-            const result = await (this.probes.remoteProcess ?? remoteProcess)(incarnation.host, incarnation.pid!,
+      const remoteStates = new Map<string, ProcessState>();
+      const remoteByHost = Map.groupBy(incarnations.filter((row) => row.host !== this.config.host), (row) => row.host);
+      for (const [host, rows] of remoteByHost) {
+        try {
+          let alive: Set<number>;
+          if (this.probes.remoteProcesses) {
+            alive = await this.probes.remoteProcesses(host, rows.map((row) => row.pid!),
               this.config.remote_probe_cmd, this.config.command_timeout_ms);
-            remoteProbeStatus.set(incarnation.host, remoteProbeStatus.get(incarnation.host) !== false);
-            state = { alive: result === "alive", verified: result === "dead" ? "remote_probe" : undefined };
-          } catch {
-            remoteProbeStatus.set(incarnation.host, false);
-            continue;
+          } else if (this.probes.remoteProcess) {
+            const results = await Promise.all(rows.map(async (row) => [row.pid!, await this.probes.remoteProcess!(host, row.pid!,
+              this.config.remote_probe_cmd, this.config.command_timeout_ms)] as const));
+            alive = new Set(results.filter(([, state]) => state === "alive").map(([pid]) => pid));
+          } else {
+            alive = await remoteProcesses(host, rows.map((row) => row.pid!), this.config.remote_probe_cmd, this.config.command_timeout_ms);
           }
+          remoteProbeStatus.set(host, true);
+          for (const row of rows) remoteStates.set(row.writer_id,
+            { alive: alive.has(row.pid!), verified: alive.has(row.pid!) ? undefined : "remote_probe" });
+        } catch {
+          remoteProbeStatus.set(host, false);
         }
+      }
+      for (const incarnation of incarnations) {
+        const state = incarnation.host === this.config.host
+          ? await inspectProcess(incarnation.pid, incarnation.runtime)
+          : remoteStates.get(incarnation.writer_id);
+        if (!state) continue;
         if (!state.alive) {
           const firstDeadAt = this.deadAt.get(incarnation.writer_id) ?? now;
           this.deadAt.set(incarnation.writer_id, firstDeadAt);
@@ -223,7 +236,15 @@ export class ReconDaemon {
       FROM session_incarnations i JOIN sessions s ON s.stable_id=i.stable_id
       WHERE i.liveness_domain='process' AND i.pid > 0
         AND NOT EXISTS (SELECT 1 FROM journal_all e WHERE e.stable_id=i.stable_id
-          AND e.writer_id=i.writer_id AND e.kind='session_ended')`);
+          AND e.writer_id=i.writer_id AND e.kind='session_ended')
+        -- Recon cannot write the ledger (it opens readonly) and must not forge a
+        -- session_ended for another host: the envelope's host is the *emitter's*
+        -- host, which ingest checks against the spool path and uses to derive
+        -- stable_id. Its own durable drain finding is the terminal marker, read
+        -- back here the same way wasDrained() reads it, so a proven-dead
+        -- incarnation leaves the probe set for good once it has been drained.
+        AND NOT EXISTS (SELECT 1 FROM journal_all d WHERE d.kind='emitter_drained'
+          AND json_extract(d.detail, '$.emitter_id')=i.writer_id)`);
   }
 
   /** A hung turn is invisible without `current`: heartbeat keeps the emitter
@@ -499,19 +520,28 @@ function stripZone(address: string): string {
 
 const defaultProbes: ReconProbes = { localAddresses, establishedSockets };
 
-/** Probe command contract: 0 means alive, 3 means the remote host proved the
- * process absent, and every other exit (including OpenSSH's 255) is unknown. */
-async function remoteProcess(host: string, pid: number, template: string, timeoutMs: number): Promise<"alive" | "dead"> {
-  if (!SAFE_COMPONENT.test(host) || !Number.isSafeInteger(pid) || pid < 1) throw new Error("unsafe remote probe target");
-  const command = template.replaceAll("{host}", host).replaceAll("{pid}", String(pid));
-  const proc = Bun.spawn(["sh", "-c", command], { stdout: "ignore", stderr: "ignore" });
+/** `ps -p` exits 1 when it matched nothing, which is an *answer* — every probed
+ * pid is gone — not a failed probe. Treating it as inconclusive left the ordinary
+ * steady state (all agents on a host have exited) permanently unresolved and
+ * raised a source_outage that never cleared, so exit 1 is resolved-empty here.
+ * Probe contract: exit 0 or 1 = resolved, stdout lists the survivors; anything
+ * else, including SSH's 255 and a timeout, is inconclusive and never dead. */
+const PROBE_RESOLVED_CODES = new Set([0, 1]);
+
+async function remoteProcesses(host: string, pids: number[], template: string, timeoutMs: number): Promise<Set<number>> {
+  if (!SAFE_COMPONENT.test(host) || !pids.length || pids.some((pid) => !Number.isSafeInteger(pid) || pid < 1)) {
+    throw new Error("unsafe remote probe target");
+  }
+  const list = [...new Set(pids)].join(",");
+  const command = template.replaceAll("{host}", host).replaceAll("{pids}", list).replaceAll("{pid}", list);
+  const proc = Bun.spawn(["sh", "-c", command], { stdout: "pipe", stderr: "ignore" });
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
   try {
+    const stdout = await new Response(proc.stdout).text();
     const rc = await proc.exited;
-    if (!timedOut && rc === 0) return "alive";
-    if (!timedOut && rc === 3) return "dead";
-    throw new Error(`remote probe inconclusive (${timedOut ? "timeout" : rc})`);
+    if (timedOut || !PROBE_RESOLVED_CODES.has(rc)) throw new Error(`remote probe inconclusive (${timedOut ? "timeout" : rc})`);
+    return new Set(stdout.match(/\d+/g)?.map(Number).filter((pid) => pids.includes(pid)) ?? []);
   } finally { clearTimeout(timer); }
 }
 
@@ -702,7 +732,7 @@ async function loadConfig(args: string[]): Promise<{ config: ReconConfig; once: 
     herdr_cmd: values.get("herdr-cmd") ?? "herdr agent list",
     orca_cmd: values.get("orca-cmd") ?? "orca worktree ps --json",
     remote_probe_cmd: values.get("remote-probe-cmd") ??
-      "ssh -o BatchMode=yes -o ConnectTimeout=5 {host} 'kill -0 {pid} 2>/dev/null && exit 0; ps -p {pid} >/dev/null 2>&1 && exit 4; exit 3'",
+      "ssh -o BatchMode=yes -o ConnectTimeout=5 {host} 'ps -p {pids} -o pid='",
     cmux_sessions_file: values.get("cmux-sessions-file") ?? join(homedir(), ".cmuxterm", "*-hook-sessions.json"),
   } };
 }
