@@ -17,6 +17,35 @@ CREATE TABLE IF NOT EXISTS runtime_ownership(session_id TEXT PRIMARY KEY,owner_t
 CREATE TABLE IF NOT EXISTS channel_runtime_events(event_id TEXT NOT NULL,session_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(session_id,event_id));
 CREATE TABLE IF NOT EXISTS runtime_decisions(item_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,turn_id TEXT NOT NULL,request_id TEXT NOT NULL,receipt_id TEXT,dispatch_state TEXT NOT NULL DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS channel_card_bindings(item_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,message_id TEXT,last_revision INTEGER NOT NULL DEFAULT 0,last_state TEXT);
+CREATE TABLE IF NOT EXISTS channel_progress(
+ turn_id TEXT PRIMARY KEY,
+ conversation_id TEXT NOT NULL,
+ channel_instance_id TEXT NOT NULL,
+ message_id TEXT,
+ create_state TEXT NOT NULL DEFAULT 'none' CHECK (create_state IN ('none','sending','sent','unknown','failed')),
+ create_uuid TEXT NOT NULL,
+ view_state TEXT NOT NULL DEFAULT 'queued',
+ desired_version INTEGER NOT NULL DEFAULT 0 CHECK (desired_version >= 0),
+ sent_version INTEGER NOT NULL DEFAULT 0 CHECK (sent_version >= 0),
+ desired_hash TEXT,
+ desired_view_json TEXT,
+ last_activity_at INTEGER,
+ last_activity_label TEXT,
+ completed_tool_count INTEGER NOT NULL DEFAULT 0,
+ last_patch_at INTEGER,
+ patch_count INTEGER NOT NULL DEFAULT 0 CHECK (patch_count >= 0),
+ next_at INTEGER NOT NULL DEFAULT 0,
+ attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+ degraded INTEGER NOT NULL DEFAULT 0 CHECK (degraded IN (0,1)),
+ reason TEXT,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ FOREIGN KEY (turn_id) REFERENCES conversation_turns(id),
+ FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+ CHECK (desired_view_json IS NULL OR json_valid(desired_view_json)),
+ CHECK (sent_version <= desired_version)
+);
+CREATE INDEX IF NOT EXISTS channel_progress_due ON channel_progress(next_at, turn_id) WHERE degraded=0 AND desired_version > sent_version;
 `);
  const columns = new Set(
   (

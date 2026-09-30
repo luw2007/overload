@@ -11,6 +11,7 @@ export type CoordinatorBinding={endpoint:string;token:string;workId:string};
 export type StartRequest={sessionId:string;ownerId:string;cwd:string;provider?:string;model?:string;coordinator?:CoordinatorBinding;readOnly?:boolean;configPath?:string};
 export type TurnRequest={turnId:string;text:string};
 export type CommandReceipt={state:'accepted'|'rejected'|'unknown';commandId:string;reason?:string};
-export type RuntimeEvent={eventId:string;sessionId:string;turnId?:string;kind:'output'|'completed'|'failed'|'unknown'|'blocked';text?:string;reason?:string;checkpoint?:string;requestId?:string;requestMethod?:'select'|'confirm'|'input'|'editor';options?:string[];expiresAt?:number};
+export type ExistingRuntimeEvent={eventId:string;sessionId:string;turnId?:string;kind:'output'|'completed'|'failed'|'unknown'|'blocked';text?:string;reason?:string;checkpoint?:string;requestId?:string;requestMethod?:'select'|'confirm'|'input'|'editor';options?:string[];expiresAt?:number};
+export type RuntimeEvent=ExistingRuntimeEvent|{eventId:string;sessionId:string;turnId:string;kind:'tool_started'|'tool_finished';toolName:string};
 export interface SessionHandle{readonly reference:SessionReference;readonly events:AsyncIterable<RuntimeEvent>;submit(request:TurnRequest):Promise<CommandReceipt>;cancel(turnId:string):Promise<CommandReceipt>;answer?(requestId:string,value:string):Promise<CommandReceipt>;close():Promise<void>}
 export interface AgentRuntime{readonly kind:string;readonly capabilities:{restore:boolean;answer:boolean;steer:boolean};start(request:StartRequest):Promise<SessionHandle>;connect(reference:SessionReference):Promise<SessionHandle>;restore?(reference:SessionReference):Promise<SessionHandle>}
