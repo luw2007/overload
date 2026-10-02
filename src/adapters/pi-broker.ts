@@ -198,6 +198,16 @@ const makeReference = (config: PiBrokerConfig, sessionFile?: string): SessionRef
   runtimeKind: "pi", sessionId: config.sessionId, ownerId: config.ownerId, cwd: config.cwd, ...(sessionFile ? { sessionFile } : {}),
 });
 
+export function buildPiBrokerInvocation(config: PiBrokerConfig): string[] {
+  const argv = [config.command, "--mode", "rpc", "--session-dir", join(config.runtimeRoot, "sessions"), "--no-extensions", "--extension", join(import.meta.dir, "../extension/overload.ts")];
+  if (config.provider) argv.push("--provider", config.provider);
+  if (config.model) argv.push("--model", config.model);
+  if (config.sessionFile) argv.push("--session", config.sessionFile);
+  if (config.coordinator || config.readOnly) argv.push("--tools", config.coordinator ? "read,grep,find,ls,coordinator_dispatch,coordinator_status,coordinator_review,coordinator_deliver" : "read,grep,find,ls");
+  if (config.coordinator) argv.push("-e", join(import.meta.dir, "../extension/coordinator.ts"));
+  return argv;
+}
+
 class PiBroker {
   private server: Server | undefined;
   private child: PiProcess | undefined;
@@ -271,12 +281,7 @@ class PiBroker {
   }
 
   private spawnChild(): void {
-    const argv = [this.config.command, "--mode", "rpc", "--session-dir", join(this.config.runtimeRoot, "sessions"), "--no-extensions", "--extension", join(import.meta.dir, "../extension/overload.ts")];
-    if (this.config.provider) argv.push("--provider", this.config.provider);
-    if (this.config.model) argv.push("--model", this.config.model);
-    if (this.config.sessionFile) argv.push("--session", this.config.sessionFile);
-    if(this.config.coordinator||this.config.readOnly)argv.push('--tools',this.config.coordinator?'read,grep,find,ls,coordinator_dispatch,coordinator_status,coordinator_review,coordinator_deliver':'read,grep,find,ls');
-    if(this.config.coordinator)argv.push('-e',join(import.meta.dir,'../extension/coordinator.ts'));
+    const argv = buildPiBrokerInvocation(this.config);
     const coordinator=this.config.coordinator;
     const proc = Bun.spawn(argv, { cwd: this.config.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe",env:{...process.env,OVERLOAD_RUNTIME_SESSION_ID:this.config.sessionId,...(this.config.configPath?{OVERLOAD_CONFIG_PATH:this.config.configPath}:{}),...(coordinator?{OVERLOAD_COORDINATOR_ENDPOINT:coordinator.endpoint,OVERLOAD_COORDINATOR_TOKEN:coordinator.token,OVERLOAD_COORDINATOR_WORK_ID:coordinator.workId}:{})} }) as unknown as PiProcess & { pid: number };
     this.childIdentity=captureProcessIdentity(proc.pid)??undefined;

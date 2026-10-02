@@ -9,6 +9,7 @@ import {
   readBrokerMetadata,
   runPiBroker,
   connectPiBroker,
+  buildPiBrokerInvocation,
   captureProcessIdentity,
   processLiveness,
   safeToolName,
@@ -65,8 +66,23 @@ test("readBrokerMetadata accepts a valid metadata file and rejects malformed one
 });
 
 test("broker disables extension discovery before loading the repository extension", () => {
-  const source = readFileSync(new URL("./pi-broker.ts", import.meta.url), "utf8");
-  expect(source).toContain('"--no-extensions", "--extension"');
+  const root = "/tmp/runtime";
+  const argv = buildPiBrokerInvocation({
+    runtimeRoot: root,
+    metadataPath: join(root, "metadata", "s.json"),
+    socketPath: join(root, "sockets", "s.sock"),
+    sessionId: "s",
+    ownerId: "o",
+    ownerToken: "t",
+    cwd: "/tmp",
+    command: "pi",
+    stderrLimit: 1024,
+  });
+  const disabled = argv.indexOf("--no-extensions");
+  const explicit = argv.indexOf("--extension");
+  expect(disabled).toBeGreaterThan(0);
+  expect(explicit).toBeGreaterThan(disabled);
+  expect(argv[explicit + 1]).toEndWith("/src/extension/overload.ts");
 });
 
 test("captures and verifies the current process identity on the host OS", () => {
