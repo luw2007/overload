@@ -271,7 +271,7 @@ class PiBroker {
   }
 
   private spawnChild(): void {
-    const argv = [this.config.command, "--mode", "rpc", "--session-dir", join(this.config.runtimeRoot, "sessions"),"--extension",join(import.meta.dir,"../extension/overload.ts")];
+    const argv = [this.config.command, "--mode", "rpc", "--session-dir", join(this.config.runtimeRoot, "sessions"), "--no-extensions", "--extension", join(import.meta.dir, "../extension/overload.ts")];
     if (this.config.provider) argv.push("--provider", this.config.provider);
     if (this.config.model) argv.push("--model", this.config.model);
     if (this.config.sessionFile) argv.push("--session", this.config.sessionFile);

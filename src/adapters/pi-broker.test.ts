@@ -64,6 +64,11 @@ test("readBrokerMetadata accepts a valid metadata file and rejects malformed one
   }
 });
 
+test("broker disables extension discovery before loading the repository extension", () => {
+  const source = readFileSync(new URL("./pi-broker.ts", import.meta.url), "utf8");
+  expect(source).toContain('"--no-extensions", "--extension"');
+});
+
 test("captures and verifies the current process identity on the host OS", () => {
   const identity = captureProcessIdentity(process.pid);
   expect(identity).not.toBeNull();
