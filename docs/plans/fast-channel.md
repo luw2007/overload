@@ -2,7 +2,13 @@
 
 日期：2026-09-30
 
-状态：待开发
+状态：Stage D 已完成；Stage E 部分完成，待补完整真实飞书验收
+
+最新核对：2026-10-02
+
+- Stage A–D 已合入 `master`，Mac、origin 与 devbox 已对齐。
+- Mac 已验证进度卡真实创建；完整 §12 十场景证据仍未收齐，不能标记 Stage E 完成。
+- 已修复 Mac 进程身份探测、Pi 重复加载扩展，以及入站 reaction 阻塞/重复发送问题。
 
 目标仓库：`/data00/home/luwei.will/ai/overload`（devbox）
 
