@@ -226,6 +226,31 @@ test("a slow thread does not block another thread in the same chat", async () =>
  }
 });
 
+test("message acceptance does not wait for a slow reaction", async () => {
+ const h = harness();
+ const release = Promise.withResolvers<void>();
+ try {
+  h.channel.addReaction = async () => {
+   await release.promise;
+   return "reaction-id";
+  };
+  h.channel.removeReaction = async () => {};
+  await h.service.start();
+  const outcome = await Promise.race([
+   h.service.accept(h.event("fast-ack")).then(() => "accepted"),
+   Bun.sleep(100).then(() => "blocked"),
+  ]);
+  expect(outcome).toBe("accepted");
+  expect(h.db.query("SELECT text FROM conversation_turns WHERE source_message_id='fast-ack'").get()).toEqual({
+   text: "question fast-ack",
+  });
+ } finally {
+  release.resolve();
+  await h.service.tick();
+  await h.close();
+ }
+});
+
 test("new rejects unresolved runtime states", async () => {
  const h = harness();
  try {

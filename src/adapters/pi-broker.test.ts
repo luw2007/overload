@@ -9,6 +9,8 @@ import {
   readBrokerMetadata,
   runPiBroker,
   connectPiBroker,
+  captureProcessIdentity,
+  processLiveness,
   safeToolName,
   toolActivityEvent,
   type PiBrokerConfig,
@@ -60,6 +62,14 @@ test("readBrokerMetadata accepts a valid metadata file and rejects malformed one
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("captures and verifies the current process identity on the host OS", () => {
+  const identity = captureProcessIdentity(process.pid);
+  expect(identity).not.toBeNull();
+  expect(identity?.pid).toBe(process.pid);
+  expect(processLiveness(identity!.pid, identity!.startIdentity, identity!.bootIdentity)).toBe("alive");
+  expect(processLiveness(identity!.pid, identity!.startIdentity + "-changed", identity!.bootIdentity)).toBe("dead");
 });
 
 // Real-shaped sensitive values: a provider key, an ssh key path, and a destructive shell line.

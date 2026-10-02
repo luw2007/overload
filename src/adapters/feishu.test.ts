@@ -618,8 +618,8 @@ test("§11.1 a topic's first message and its follow-up share the root identity, 
   { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, rootMessageId: ROOT },
   { instanceId: "feishu-main", tenantId: "tenant", chatId: CHAT, rootMessageId: ROOT, threadId: TOPIC },
  ]);
- // Reactions still land on the message the user sent.
- expect(fake.reactions.map((r) => r.messageId)).toEqual([ROOT, REPLY]);
+ // AdapterService owns the durable acknowledgement. The transport must not add a second reaction.
+ expect(fake.reactions).toEqual([]);
  // A result for the follow-up carries replyTo=source message; the anchor is still the root.
  for (const [i, event] of events.entries()) {
   await instance.send({

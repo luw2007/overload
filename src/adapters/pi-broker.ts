@@ -69,7 +69,18 @@ function atomicWrite(path: string, content: string): void { const temp = `${path
 export type ProcessIdentity = { pid: number; startIdentity: string; bootIdentity: string };
 export type ProcessLiveness = "alive" | "dead" | "unknown";
 
+function commandOutput(argv: string[]): string | undefined {
+  try {
+    const result = Bun.spawnSync(argv, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    if (result.exitCode !== 0) return undefined;
+    return new TextDecoder().decode(result.stdout).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function procStartIdentity(pid: number): string | undefined {
+  if (process.platform === "darwin") return commandOutput(["/bin/ps", "-p", String(pid), "-o", "lstart="]);
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     const end = stat.lastIndexOf(")");
@@ -80,6 +91,7 @@ function procStartIdentity(pid: number): string | undefined {
 }
 
 function procBootIdentity(): string | undefined {
+  if (process.platform === "darwin") return commandOutput(["/usr/sbin/sysctl", "-n", "kern.boottime"]);
   try { return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || undefined; } catch { return undefined; }
 }
 

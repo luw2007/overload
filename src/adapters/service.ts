@@ -227,7 +227,7 @@ export class AdapterService {
   }
   if (event.kind === "message") {
    const accepted = acceptMessage(this.db, event, owner, workId);
-   if (!accepted.duplicate) await this.syncReactions();
+   if (!accepted.duplicate) void this.syncReactions().catch(() => {});
    return;
   }
   if (role === "requester") throw new Error("decision_owner_mismatch");

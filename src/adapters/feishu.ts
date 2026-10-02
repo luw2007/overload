@@ -357,11 +357,6 @@ export class FeishuChannel implements ChannelAdapter {
     text: requiredString(message.content, "content"),
     receivedAt: receivedAt(message.createTime),
    });
-   try {
-    await this.channel.addReaction(message.messageId, "GoGoGo");
-   } catch {
-    /* Like Botmux: acknowledgement is best-effort; accepted work must continue. */
-   }
   } catch (error) {
    if (
     error instanceof Error &&
