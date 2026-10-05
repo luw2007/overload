@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { ensureControlSchema, ControlError } from "../src/control/store";
+import { ensureControlSchema, ControlError, getAttention, getAttentionMaterial, reviseContract, createWork } from "../src/control/store";
 import { bindExecution, createDiscoveredWork } from "../src/manage/store";
 import { ensureMgmtSchema } from "../src/manage/schema";
 import { aliasWork } from "../src/manage/relations";
@@ -13,6 +13,7 @@ import {
  recordAcceptance,
  requestAcceptance,
  type ManifestInput,
+ type ManifestDecisionBasis,
 } from "../src/manage/manifest";
 
 function fixture() {
@@ -52,6 +53,12 @@ const input = (
  entries,
  verification: [{ kind: "test", at: 1, evidence_sha256: "e" }],
 });
+
+function decisionBasis(db: Database, itemId: string): ManifestDecisionBasis {
+ const card = getAttention(db, itemId), material = getAttentionMaterial(db, itemId);
+ if (!card || !material) throw new Error("missing observed acceptance basis");
+ return { attention_revision: card.revision, material_fingerprint: material.fingerprint };
+}
 
 describe("management manifests", () => {
  test("digest canonicalizes sets and covers facts", () => {
@@ -112,7 +119,9 @@ describe("management manifests", () => {
   const computed=await computeManifest(db,fs,alias,{verification:[]});
   expect(computed.work_id).toBe(canonical);expect(computed.entries).toEqual([{artifact_id:"a",version_id:"v1"},{artifact_id:"b",version_id:"v2"}]);
   expect(insertManifest(db,computed,"owner",3).created).toBe(true);
-  const accepted=recordAcceptance(db,insertManifest(db,computed,"owner",3).manifest_id,"accepted","owner",{},3);
+  const manifestId=insertManifest(db,computed,"owner",3).manifest_id;
+  const card=requestAcceptance(db,manifestId,3);
+  const accepted=recordAcceptance(db,manifestId,"accepted","owner",{},decisionBasis(db,card.item_id),3);
   version(db,canonical,"canonical-b","v4",4);db.query("UPDATE mgmt_artifacts SET canonical_key='b' WHERE artifact_id='canonical-b'").run();
   const shadowed=await computeManifest(db,fs,canonical,{verification:[]});expect(shadowed.entries).toEqual([{artifact_id:"a",version_id:"v1"},{artifact_id:"canonical-b",version_id:"v4"}]);expect(invalidateAcceptances(db,canonical,"scope_drift",4)).toBe(1);expect(db.query("SELECT invalidated_reason FROM mgmt_acceptances WHERE acceptance_id=?").get(accepted.acceptance_id)).toEqual({invalidated_reason:"scope_drift"});
   expect(()=>insertManifest(db,input(alias,[{artifact_id:"b",version_id:"v2"}]),"owner",3)).toThrow("manifest work_id must be canonical");
@@ -142,7 +151,7 @@ describe("management manifests", () => {
       .get(item_id) as any
     ).n,
    ).toBe(1);
-   recordAcceptance(db, manifest_id, verdict, "owner", { ok: true }, 5);
+   recordAcceptance(db, manifest_id, verdict, "owner", { ok: true }, decisionBasis(db, item_id), 5);
    expect(
     (
      db
@@ -173,9 +182,9 @@ describe("management manifests", () => {
     "me",
     2,
    ).manifest_id;
-  requestAcceptance(db, m, 3);
-  recordAcceptance(db, m, "accepted", "owner", {}, 4);
-  recordAcceptance(db, om, "accepted", "owner", {}, 4);
+  const card=requestAcceptance(db, m, 3), otherCard=requestAcceptance(db, om, 3);
+  recordAcceptance(db, m, "accepted", "owner", {}, decisionBasis(db, card.item_id), 4);
+  recordAcceptance(db, om, "accepted", "owner", {}, decisionBasis(db, otherCard.item_id), 4);
   version(db, w, "a", "v2", 5);
   expect(invalidateAcceptances(db, w, "changed", 6)).toBe(1);
   expect(
@@ -194,5 +203,36 @@ describe("management manifests", () => {
      .get(om) as any
    ).invalidated_at,
   ).toBeNull();
+ });
+ test("acceptance requires the observed live card and rejects missing or changed material",()=>{
+  const db=fixture(),work=createDiscoveredWork(db,'basis','basis',1);
+  const manifest=insertManifest(db,input(work,[]),'owner',2).manifest_id;
+  try{
+   const fakeBasis:ManifestDecisionBasis={attention_revision:1,material_fingerprint:'unobserved'};
+   expect(()=>recordAcceptance(db,manifest,'accepted','owner',{},fakeBasis,3)).toThrow(ControlError);
+   expect(db.query('SELECT COUNT(*) n FROM mgmt_acceptances').get()).toEqual({n:0});
+   const {item_id}=requestAcceptance(db,manifest,4),firstBasis=decisionBasis(db,item_id);
+   expect(()=>recordAcceptance(db,manifest,'accepted','owner',{},{...firstBasis,material_fingerprint:'wrong'},5)).toThrow(ControlError);
+   requestAcceptance(db,manifest,6);
+   expect(()=>recordAcceptance(db,manifest,'accepted','owner',{},firstBasis,7)).toThrow(ControlError);
+   const observed=decisionBasis(db,item_id);
+   const recorded=recordAcceptance(db,manifest,'accepted','owner',{},observed,8);
+   expect(getAttention(db,item_id)?.state).toBe('resolved');
+   expect(()=>recordAcceptance(db,manifest,'rejected','owner',{},observed,9)).toThrow(ControlError);
+   expect(db.query('SELECT acceptance_id,verdict FROM mgmt_acceptances').all()).toEqual([{acceptance_id:recorded.acceptance_id,verdict:'accepted'}]);
+  } finally {db.close();}
+ });
+ test("acceptance cannot consume a card from an obsolete work contract",()=>{
+  const db=fixture(),contract={objective:'review',acceptance:[{id:'a',kind:'human' as const,description:'owner'}],non_goals:[],scope:{cwd:'/r'},budget:{},stop_conditions:[],decision_owner:'owner'};
+  const work=createWork(db,{title:'contracted',source:'test',contract},1);
+  db.run("INSERT INTO mgmt_work_profile(work_id,origin_mode,closeout_owner,track_state,decision_owner,discovered_title,updated_at) VALUES(?,'discovered','mgmt','tracking','owner','contracted',1)",[work.work_id]);
+  const manifest=insertManifest(db,input(work.work_id,[]),'owner',2).manifest_id;
+  try{
+   const {item_id}=requestAcceptance(db,manifest,3),observed=decisionBasis(db,item_id);
+   reviseContract(db,work.work_id,work.revision,{...contract,objective:'different outcome'},'scope changed',4);
+   expect(()=>recordAcceptance(db,manifest,'accepted','owner',{},observed,5)).toThrow(ControlError);
+   expect(getAttention(db,item_id)?.state).toBe('superseded');
+   expect(db.query('SELECT COUNT(*) n FROM mgmt_acceptances').get()).toEqual({n:0});
+  } finally {db.close();}
  });
 });

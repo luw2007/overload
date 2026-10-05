@@ -17,9 +17,9 @@ CREATE TABLE IF NOT EXISTS tasks(
   stop_reason TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 
--- queued 不持锁；活跃态每 repo 至多一个，由 DB 强制而非查询强制。
+-- A stopped-or-uncertain managed runner holds the repo even after task state blocks.
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_repo_active ON tasks(repo)
-  WHERE state IN ('starting','running','awaiting_human','submitted');
+  WHERE state IN ('starting','running','awaiting_human','submitted') OR stop_state IN ('stop_requested','stop_unconfirmed');
 
 CREATE TABLE IF NOT EXISTS task_events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, at INTEGER NOT NULL,

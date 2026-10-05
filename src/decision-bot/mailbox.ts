@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { ensureControlSchema, getAttention } from "../control/store";
+import { ensureControlSchema, getAttention, projectAttentionEffect } from "../control/store";
 import type { AttentionItem } from "../control/types";
 import { controlPayloadHash } from "../control/outbox";
 
@@ -154,19 +154,41 @@ export function observeReceiptEffect(db: Database, observation: EffectObservatio
     const expectedAttempt = receiptRow.target_attempt ?? receiptRow.attempt_id;
     if (expectedAttempt && expectedAttempt !== observation.attemptId) return false;
     const evidence = canonical(observation.evidence);
-    const prior = db.query("SELECT state,evidence FROM receipt_effect_observations WHERE receipt_id=? AND tool_call_id=?")
-      .get(observation.receiptId, observation.toolCallId) as { state: string; evidence: string } | null;
-    if (prior) {
-      if (prior.state !== observation.state || prior.evidence !== evidence) throw new Error("conflicting_effect_observation");
-      return true;
+    const prior = db.query("SELECT state,evidence,observed_at FROM receipt_effect_observations WHERE receipt_id=? AND tool_call_id=?")
+      .get(observation.receiptId, observation.toolCallId) as { state: string; evidence: string; observed_at: number } | null;
+    if (prior && (prior.state !== observation.state || prior.evidence !== evidence)) throw new Error("conflicting_effect_observation");
+    if (!prior) {
+      db.run("INSERT INTO receipt_effect_observations VALUES(?,?,?,?,?,?)", [
+        observation.receiptId, observation.toolCallId, observation.attemptId ?? null,
+        observation.state, evidence, observation.observedAt,
+      ]);
+      db.run("UPDATE decision_receipts SET applied_at=?,outcome=? WHERE receipt_id=? AND (applied_at IS NULL OR applied_at<=?)", [
+        observation.observedAt, observation.state, observation.receiptId, observation.observedAt,
+      ]);
     }
-    db.run("INSERT INTO receipt_effect_observations VALUES(?,?,?,?,?,?)", [
-      observation.receiptId, observation.toolCallId, observation.attemptId ?? null,
-      observation.state, evidence, observation.observedAt,
-    ]);
-    db.run("UPDATE decision_receipts SET applied_at=?,outcome=? WHERE receipt_id=?", [
-      observation.observedAt, observation.state, observation.receiptId,
-    ]);
+    return true;
+  })();
+}
+
+/** Channel/HTTP/ledger consumers share one atomic observation-to-card path; wait dispatches keep their own transaction. */
+export function observeAndProjectReceiptEffect(db: Database, observation: EffectObservation): boolean {
+  return db.transaction(() => {
+    if (!observeReceiptEffect(db, observation)) return false;
+    const stored = db.query("SELECT observed_at FROM receipt_effect_observations WHERE receipt_id=? AND tool_call_id=?")
+      .get(observation.receiptId, observation.toolCallId) as { observed_at: number };
+    const accepted = { ...observation, observedAt: stored.observed_at };
+    const linked = db.query(`SELECT a.item_id FROM decision_receipts r JOIN control_attention a
+      ON a.approval_id=r.approval_id AND a.consumer_owner=r.consumer_owner WHERE r.receipt_id=?`).all(observation.receiptId) as { item_id: string }[];
+    const sourceQuery = db.query(`SELECT event_id FROM control_outbox WHERE item_id=? AND entity_version<=?
+      AND kind IN ('attention.created','attention.updated') ORDER BY entity_version DESC LIMIT 1`);
+    for (const row of linked) {
+      const item = getAttention(db, row.item_id);
+      if (!item || item.state === "superseded") continue;
+      const source = sourceQuery.get(item.item_id, item.revision) as { event_id: string } | null;
+      if (!source) throw new Error(`effect source event missing: ${item.item_id}`);
+      projectAttentionEffect(db, { work_id: item.work_id, item_id: item.item_id, item_revision: item.revision,
+        approval_id: item.approval_id, receipt_id: observation.receiptId, outbox_event_id: source.event_id }, accepted, accepted.observedAt);
+    }
     return true;
   })();
 }
@@ -201,7 +223,7 @@ export function reconcileEffectEvents(mailbox:Database,ledgerPath:string,now=Dat
         if(!confirmed||confirmed.payload_hash!==envelope.payload_hash||controlPayloadHash(d)!==envelope.payload_hash)continue;
         if(typeof d.receipt_id!=="string"||typeof d.toolCallId!=="string"||!["succeeded","failed","unknown"].includes(d.effect_state)||!d.evidence||typeof d.evidence!=="object")continue;
         try{
-          observeReceiptEffect(mailbox,{receiptId:d.receipt_id,toolCallId:d.toolCallId,attemptId:typeof d.attempt_id==="string"?d.attempt_id:undefined,state:d.effect_state,evidence:d.evidence,observedAt:Number.isSafeInteger(row.at)?row.at:now});
+          observeAndProjectReceiptEffect(mailbox,{receiptId:d.receipt_id,toolCallId:d.toolCallId,attemptId:typeof d.attempt_id==="string"?d.attempt_id:undefined,state:d.effect_state,evidence:d.evidence,observedAt:Number.isSafeInteger(row.at)?row.at:now});
         }catch(error){
           // A second applied event contradicting a recorded observation keeps the first; it must not wedge the cursor.
           if(!(error instanceof Error)||error.message!=="conflicting_effect_observation")throw error;

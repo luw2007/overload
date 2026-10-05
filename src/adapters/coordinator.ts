@@ -40,8 +40,8 @@ export class CoordinatorBridge{
    const input=object(await request.json());const workId=input.work_id;if(typeof workId!=='string')throw new Error('work_id_required');
    const binding=this.db.query('SELECT * FROM channel_coordinators WHERE work_id=?').get(workId) as {token:string;contract_revision:number}|null;const supplied=request.headers.get('authorization')??'';const expected=binding?'Bearer '+binding.token:'';if(!binding||Buffer.byteLength(supplied)!==Buffer.byteLength(expected)||!timingSafeEqual(Buffer.from(supplied),Buffer.from(expected)))return new Response('Forbidden',{status:403});
    const work=getWork(this.db,workId);if(!work||!['active','completed'].includes(work.state)||work.revision!==binding.contract_revision)return Response.json({error:'contract_superseded'},{status:409});
-   if(work.state==='completed'&&action!=='coordinator_status')return Response.json({error:'work_completed'},{status:409});
    const method=new URL(request.url).pathname;let result:unknown;
+   if(work.state==='completed'&&method!=='/coordinator_status')return Response.json({error:'work_completed'},{status:409});
    if(method==='/coordinator_status')result=this.coordinator.status(workId);
    else if(method==='/coordinator_dispatch')result=await this.coordinator.dispatch(input);
    else if(method==='/coordinator_review')result=await this.coordinator.review(input);

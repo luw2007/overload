@@ -205,6 +205,30 @@ describe("T5 context-assembler", () => {
     db.close();
   });
 
+  test("context review exposes facts without inventing executable options", () => {
+    const db = fixture();
+    try {
+      const work = createWork(db, { title: "w", source: "test", contract: makeContract("alice") }, 1);
+      const item = makeAttention(db, work.work_id, "reconcile", {
+        options: [], consumer_owner: "orchestrator",
+        evidence: { kind: "context.recovery_reconcile", task_id: "task-1", reason: "liveness unknown" },
+      });
+      const input = { consumer_type: "decision_ui" as const, consumer_id: item.item_id, work_id: work.work_id,
+        package_type: "decision_view" as const, actor: "alice", db };
+      const result = getContextPackage(input);
+      expect(result.ok).toBe(true);
+      if (result.ok && result.package.package_type === "decision_view") {
+        expect(result.package.context_review).toEqual({ kind: "context.recovery_reconcile", task_id: "task-1" });
+        expect(result.package.options).toEqual([]);
+      }
+      const forbidden = getContextPackage({ ...input, actor: "mallory" });
+      expect(forbidden.ok).toBe(false);
+      if (!forbidden.ok) expect(forbidden.code).toBe("forbidden");
+      const missing = makeAttention(db, work.work_id, "missing", { options: [] });
+      expect(getContextPackage({ ...input, consumer_id: missing.item_id }).ok).toBe(false);
+    } finally { db.close(); }
+  });
+
   // A06 §4.2: every option carries deterministic server-owned display metadata, in
   // AttentionItem.options order, with the executable ID unchanged. `narrow` is the only
   // generic option that demands both a reason and a replacement contract.

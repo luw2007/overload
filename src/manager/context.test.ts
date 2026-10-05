@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildManagerContext } from "./context";
+import { buildManagerContext, loadManagerReadModel } from "./context";
 import { controlDb, item, ledgerDb, NOW, session, work } from "./test-fixtures";
+
+const DAY_MS = 86_400_000;
+const SEVEN_DAYS = 7 * DAY_MS;
 
 describe("buildManagerContext", () => {
   test("empty databases produce an empty, stable snapshot", () => {
@@ -35,10 +38,32 @@ describe("buildManagerContext", () => {
   test("done window caps at 30 and only counts the last 7 days", () => {
     const control = controlDb(); const w = work(control);
     for (let i = 0; i < 33; i++) item(control, w, `d${i}`, { state: "resolved", at: NOW - 1000 - i });
-    item(control, w, "old", { state: "resolved", at: NOW - 8 * 86_400_000 });
+    item(control, w, "old", { state: "resolved", at: NOW - 8 * DAY_MS });
     const ctx = buildManagerContext(control, ledgerDb(), { now: NOW });
     expect(ctx.recent_done).toHaveLength(30);
     expect(ctx.coverage).toMatchObject({ done_included: 30, done_omitted: 3 });
+  });
+  test("done cutoff is inclusive: item exactly at the boundary counts", () => {
+    const control = controlDb(); const w = work(control);
+    const cutoff = NOW - SEVEN_DAYS;
+    item(control, w, "at-cutoff", { state: "resolved", at: cutoff });
+    item(control, w, "just-before", { state: "resolved", at: cutoff - 1 });
+    item(control, w, "just-after", { state: "resolved", at: cutoff + 1 });
+    const ctx = buildManagerContext(control, ledgerDb(), { now: NOW });
+    expect(ctx.recent_done.map((d) => d.item_id).sort()).toEqual(["at-cutoff", "just-after"]);
+    expect(ctx.coverage).toMatchObject({ done_included: 2, done_omitted: 0 });
+  });
+  test("full recent read retains more than one page while the snapshot is capped", () => {
+    const control = controlDb(); const w = work(control);
+    const cutoff = NOW - SEVEN_DAYS;
+    for (let i = 0; i < 101; i++) item(control, w, `recent-${i}`, { state: "resolved", at: cutoff + 1 + i });
+    item(control, w, "ancient", { state: "resolved", at: cutoff - 1 });
+    const full = loadManagerReadModel(control, null, NOW);
+    expect(full.done.map(i => i.item_id)).toEqual(Array.from({ length: 101 }, (_, i) => `recent-${100-i}`));
+    const snapshot = buildManagerContext(control, null, { now: NOW });
+    expect(snapshot.recent_done.map(i => i.item_id)).toEqual(full.done.slice(0, 30).map(i => i.item_id));
+    expect(snapshot.coverage).toMatchObject({ done_included: 30, done_omitted: 71 });
+    control.close();
   });
   test("ended, remote and non-pi sessions are excluded from targets; stuck sessions kept but unreachable", () => {
     const control = controlDb(), ledger = ledgerDb();

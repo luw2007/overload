@@ -55,7 +55,7 @@ function fixture(coverage = "ledger_full", state = "done") {
  ledger.close();
  writeFileSync(join(root,"host"),"local");
  writeFileSync(join(root,"config.json"),JSON.stringify({manage:{hosts:[{host:"local",kind:"local"}]}}));
- return { controlPath, ledgerPath, overloadHome:root };
+ return { controlPath, ledgerPath, overloadHome:root, actor:"owner" };
 }
 const call = (
  f: ReturnType<typeof fixture>,

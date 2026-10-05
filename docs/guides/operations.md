@@ -6,7 +6,23 @@ The primary operating surface is Now / Inbox / Done Attention. The CLI `now`, `i
 
 `/conversations` displays channel-bound messages and ordered runtime turns from the control database. Select a conversation to inspect its owner, channel address, runtime reference, queued input, output, and failure state. The final input area queues an ordinary message; it does not approve a decision or steer a running turn. Successful submission clears the composer; rejected submission retains the draft. `unknown` means execution evidence is incomplete, not permission to repeat the task. Resolve approvals in their decision cards, not by submitting ordinary chat text.
 
+The list loads 50 conversation summaries at a time; **Load older conversations** keeps all earlier conversations reachable. Only the selected conversation's latest 50 turns are fetched, with **Older messages**, **Newer messages**, and **Latest messages** for history navigation. Polling reads the summaries and selected history page, never every conversation's transcript. `GET /api/conversations` returns `{items,next_cursor}`; `GET /api/conversations/:id/turns` accepts `limit` and either `before` or `after` sequence bounds.
+
 The Feishu Runtime continuous conversation is an experimental capability. Plain Feishu text must never bypass a structured decision: decisions submit through card buttons and write back to the authoritative Attention state. The Feishu channel is an input/output projection, not a source of truth.
+
+If a runtime event stream fails or startup finds an ownerless in-flight turn, the turn becomes `unknown`. The channel receives one terminal result linked to the original message, and the received reaction is removed. Partial output is not promoted to a successful result. Queued input does not automatically replay an unknown turn; a stale observer cannot finalize a replacement session or another owner's live lease.
+
+## Recovery inspection and Done receipts
+
+Context review cards expose the original task, current attempt, recovery evidence, checkpoint, and remaining budget. The inspection endpoint is read-only: opening it neither consumes an answer nor starts a process. Live sessions return to the original blocking surface; checkpoint recovery still requires the existing owner and termination checks. Missing checkpoint or unsupported-runtime outcomes show their actual blocking reason, not a liveness-reconciliation recommendation.
+
+Recovery evaluations are keyed to the attempt, contract, and observed facts. New evidence permits reevaluation; a failed spool publication remains retryable. Newer recovery reviews supersede older unacted reviews, and late duplicate delivery cannot reopen them. Reopening rotates runner identity and expires prior unconsumed approvals so they cannot release or expire the new attempt.
+
+Managed worker startup persists its attempt and runtime reference before creating a process. A rejected or uncertain prompt triggers one owner-fenced cleanup attempt; an unconfirmed stop keeps both the repository and concurrency slot held, even after the task becomes blocked or abandoned. Reopening/rework cannot rotate that attempt, and worktree garbage collection refuses its directory until stop confirmation. A new owner can clean up a late-created reference without resubmitting its prompt. Detaching a completed event observer is not process termination: Pi cleanup is confirmed only by stopped metadata for the same process incarnation and a proven-dead child.
+
+Done opens 50 recorded items at a time. **Load older receipts** retrieves only the new page's details, with at most eight receipt requests in flight. Each receipt separates the selected decision, consumption receipt, observed effect, and recorded decision basis. Missing historical context is explicitly unavailable; the current contract is not used as a substitute. A recorded answer alone is not proof that its effect succeeded.
+
+Done and recent-history reads use an ordered partial index, added by control schema 11 without deleting history. Stop older Overload processes before migrating a shared control database, then restart every reader/writer from the same updated checkout; a process supporting an older schema intentionally refuses the newer database.
 
 ## Rule and contract decisions
 
@@ -17,6 +33,18 @@ The loopback web UI uses live control data. In Decide, an eligible approval-link
 Rules supports individual disable/enable. Disable records operator, reason, and time, invalidates pending proposals, and is checked again when consuming an answer. It does not undo a consumed effect or switch off other rules. Candidate enable requires human approval, an elapsed observation window, and at least five matching observations. The global bot switch is a separate advanced setting — see [configuration](configuration.md#advanced-restricted-decision-bot-default-frozen).
 
 For **narrow**, the main workspace provides three stages: edit the replacement contract and reason, preview changed fields and affected cards, then explicitly confirm and approve using the fixed action bar. Background refresh preserves the draft. Returning to edit requires a fresh preview. Approval checks the contract revision and the reviewed card revisions/set atomically. Concurrent changes return `409`; use **Reload current decisions** and review again rather than retrying stale input. The final screen displays the real effect receipt. Pending or unknown effects block unsafe contract changes. Stop/continue/narrow preserve their selected receipt and supersede eligible stale sibling cards.
+
+CLI resolution consumes an explicit decision; it is not an archive shortcut. Read `attention <id>` to obtain the card revision and `material_fingerprint`, then pass that observed identity with the selected option and `--actor` (or `OVERLOAD_ACTOR`):
+
+```sh
+bun src/cli/overload.ts attention <id> resolve '{"attention_revision":1,"material_fingerprint":"<observed fingerprint>","selected_option":"continue"}' --actor <owner>
+```
+
+Missing options, non-owner identities, expired decision bases, and stale revisions/fingerprints cannot resolve the card. Ack/defer change presentation only. Expiry overrides deferral: an expired card returns to Now, without authorizing an expired answer. Artifact acceptance and coordinator delivery also use the server's trusted actor rather than substituting the card's owner.
+
+`POST /api/mgmt/manifests/:id/acceptance` also requires the observed `attention_revision` and `material_fingerprint`, alongside its verdict and optional evidence. The corresponding acceptance card must exist, remain open, and match the current Work contract; acceptance without a card, stale material, and replay of a settled decision are rejected without creating another acceptance. Read `attention <item_id>` or the decision package first. The standard Decide card supplies these tokens automatically.
+
+Decision-context refreshes use at most eight requests in flight across overlapping refreshes and discard obsolete batches. Evidence is refreshed even when the card revision stays unchanged. Leaving a route or changing its history page invalidates that view's in-flight responses, including reentry to the same conversation. Manager snapshots fetch at most 30 Done items from the last seven days and report the exact omitted count; Manager Done reads use 12-item keyset pages over that same window. Full internal recent-history reads remain complete.
 
 ## LaunchAgents
 
@@ -88,6 +116,8 @@ consequential action classes, the latest captured `HANDOFF.md` status,
 uncertainty count, and maximum time awaiting a human. Use `--sample 0` for all
 qualifying sessions; `--since` accepts `7d`, `24h`, or a millisecond value.
 
+Control metrics separate **CONTROL_FLOW** (historical applied transitions inside the window) from **CONTROL_STOCK** (the current snapshot). Flow requires retained journal envelopes matching the applied event's payload hash; repeated publication and same-revision material projections do not add transitions. Missing historical proof increments `coverage_missing`. Feedback counts the current eligible `(item_id, revision)` once; obsolete revisions, orphan feedback, and contradictory votes do not inflate useful/not-useful counts.
+
 The classifier sends a settled handoff to Inbox when its status is `partial` or
 `blocked`, or when it reports one or more uncertainties. A complete handoff
 with zero uncertainties follows the normal idle/archive path. `unknown` is
@@ -129,7 +159,7 @@ is `OK`, `WARN`, or `FAIL`; the command exits 1 if anything is `FAIL`.
 
 `health` reports open incidents plus coverage and telemetry gaps as counts of
 distinct affected subjects, not of repeated finding events. Inspect pending
-decisions in the loopback dashboard; when the Now zone transitions from empty to non-empty, the maintenance job emits one aggregated macOS notification via `osascript` (see `src/notify/nudge.ts`). No per-event notifications are sent while Now remains non-empty.
+decisions in the loopback dashboard. In the default shadow mode, maintenance emits one aggregated macOS notification when a new pending-request or hung-session subject appears, even if another subject is already pending; repeated events for the same subject do not send another notification. The optional explicit send mode uses durable Attention/material identities and urgency thresholds (see `src/notify/nudge.ts`).
 
 `hung` (and the dashboard's 卡死 tab) lists sessions whose turn stopped
 advancing while the process kept heartbeating. Liveness and progress are

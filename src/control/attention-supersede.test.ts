@@ -170,17 +170,16 @@ describe("resolveAttentionByExternalSuccess", () => {
     d.close();
   });
 
-  test("rejected card (superseded/unknown) cannot be overwritten to resolved", () => {
+  test("a rejected card cannot be overwritten to resolved by an external success", () => {
     const d = db();
     const w = createWork(d, { title: "w", source: "t", contract }, 1);
     const card = openCard(d, w.work_id, "rejected", {}, 1);
     recordAttentionResolution(d, card.item_id, card.revision, { verdict: "rejected", actor: "owner", evidence: {} }, 2);
     const rejected = getAttention(d, card.item_id)!;
     expect(rejected.state).toBe("superseded");
-    expect(rejected.effect_state).toBe("unknown");
     const back = resolveAttentionByExternalSuccess(d, card.item_id, rejected.revision, { actor: "reconcile" }, 3);
     expect(back.state).toBe("superseded");
-    expect(back.effect_state).toBe("unknown");
+    expect(back.evidence.selected_option).toBe("reject");
     expect(back.revision).toBe(rejected.revision);
     d.close();
   });

@@ -113,6 +113,19 @@ describe("notification projection and durable claims", () => {
     control.close(); ledger.close();
   });
 
+  test("expired deferred attention remains a notification candidate without duplicating a normal Now item", () => {
+    const { control, ledger } = fixture(), now = 1_700_000_000_000;
+    try {
+      attention(control, "deferred", now, "expired", 1, now + 1000);
+      attention(control, "visible", now, "normal");
+      control.query("UPDATE control_attention SET defer_until=? WHERE item_id='deferred'").run(now + 5000);
+      expect(collectNotificationCandidates(ledger, control, now + 999).map(x => x.item_id)).toEqual(["visible"]);
+      const expired = collectNotificationCandidates(ledger, control, now + 1000);
+      expect(expired.filter(x => x.item_id === "deferred").map(x => x.threshold)).toEqual(["new_now", "expired"]);
+      expect(expired.filter(x => x.item_id === "visible").map(x => x.threshold)).toEqual(["new_now"]);
+    } finally { control.close(); ledger.close(); }
+  });
+
   test("A04 a real risk change through upsertAttention claims material_change exactly once", async () => {
     const { control, ledger } = fixture(); const now = 1_700_000_000_000; const sender = new Sender();
     // No hand-written material row: the fingerprint here is the one the store derives from the card.

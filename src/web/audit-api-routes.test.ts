@@ -45,17 +45,17 @@ function csrf(base: string) {
 }
 
 describe("WEB-09 conversations API", () => {
-  test("GET /api/conversations returns empty array on fresh DB", async () => {
+  test("GET /api/conversations returns an empty page on fresh DB", async () => {
     const path = seedLedger();
     const ctrl = join(join(path, ".."), "control.db");
     openMailbox(ctrl).close();
     const { base } = await boot(path, ctrl);
     const res = await fetch(`${base}/api/conversations`);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual([]);
+    expect(await res.json()).toEqual({ items: [], next_cursor: null });
   });
 
-  test("GET /api/conversations lists seeded conversations with turns", async () => {
+  test("GET /api/conversations returns summaries and selected history is read separately", async () => {
     const path = seedLedger();
     const ctrl = join(join(path, ".."), "control.db");
     const db = openMailbox(ctrl);
@@ -64,11 +64,13 @@ describe("WEB-09 conversations API", () => {
     db.run("INSERT INTO conversation_turns(id,conversation_id,sequence,text,state,created_at) VALUES('turn-1','conv-1',1,'hello','queued',2)");
     db.close();
     const { base } = await boot(path, ctrl);
-    const rows = await (await fetch(`${base}/api/conversations`)).json() as Array<{ id: string; turns: unknown[] }>;
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.id).toBe("conv-1");
-    expect(rows[0]!.turns).toHaveLength(1);
-    expect(rows[0]!.turns[0]).toMatchObject({ text: "hello" });
+    const page = await (await fetch(`${base}/api/conversations`)).json() as { items: Array<{ id: string; last_sequence: number; turns?: unknown[] }> };
+    expect(page.items.map(row => row.id)).toEqual(["conv-1"]);
+    expect(page.items[0]!.last_sequence).toBe(1);
+    expect(page.items[0]!.turns).toBeUndefined();
+    const detail = await (await fetch(`${base}/api/conversations/conv-1/turns`)).json() as { conversation: { id: string }; turns: Array<{ text: string; state: string }> };
+    expect(detail.conversation.id).toBe("conv-1");
+    expect(detail.turns).toEqual([expect.objectContaining({ text: "hello", state: "queued" })]);
   });
 
   test("POST /api/conversations/:id/messages enqueues a turn and returns 201", async () => {

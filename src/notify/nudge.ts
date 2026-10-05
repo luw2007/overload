@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { queryHung, queryQ1 } from "../shared/queries";
-import { enqueueControlEvent, listAttention, openControl } from "../control/store";
+import { enqueueControlEvent, getAttention, listAttention, openControl } from "../control/store";
 import type { AttentionItem } from "../control/types";
 
 export type NotificationChannel = "macos" | "feishu";
@@ -91,9 +91,7 @@ function approvalTargetBinding(control: Database, item: AttentionItem): { reques
 }
 
 function attentionCorrelations(control: Database, now: number, expiresSoonMs: number): AttentionCorrelation[] {
-  const items = listAttention(control).filter((item) => item.state === "open"
-    && (item.urgency === "now" || item.expires_at !== null && item.expires_at <= now)
-    && (item.defer_until === null || item.defer_until <= now || item.expires_at !== null && item.expires_at <= now));
+  const items = listAttention(control, "now", now);
   const material = control.query("SELECT item_id,material_key,generation FROM control_attention_material WHERE item_id=?");
   const result: AttentionCorrelation[] = [];
   for (const item of items) {

@@ -13,8 +13,8 @@ import { runHandoffCli } from "./handoff";
 import { openMailbox, setBotDisabled, writeHumanAnswer } from "../decision-bot/mailbox";
 import { DecisionBotService } from "../decision-bot/service";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate } from "../decision-bot/policy";
-import { actOnAttention, createWork, getAttention, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, reviseContract } from "../control/store";
-import type { Contract } from "../control/types";
+import { actOnAttention, createWork, getAttention, getAttentionMaterial, getWork, listAttention, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, resolveAttention, reviseContract } from "../control/store";
+import type { AttentionCardSnapshot, Contract } from "../control/types";
 import { getContextPackage } from "../control/context-assembler";
 import { purgeObjectContent } from "../control/context-pin";
 import { fetchOnDemand } from "../control/on-demand-fetcher";
@@ -73,27 +73,56 @@ function controlCommand(args: string[]): boolean {
     const a = clean.filter((_, i) => !drop.has(i));
     const itemId = a[1]; if (!itemId) usage(); const action = a[2]; const input = jsonArg(a[3] ?? "{}"); const control = openControl();
     try {
-      if (!action) { if (verbose) { console.log(renderDecisionCard(control, itemId)); return true; } const item = getAttention(control, itemId); if (!item) throw new Error(`attention not found: ${itemId}`); console.log(JSON.stringify(item)); return true; }
-      const revision = Number(input.expected_revision); if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("expected_revision must be a positive integer");
-      if (action === "feedback") { recordAttentionFeedback(control, itemId, revision, input.useful === true, typeof input.reason === "string" ? input.reason : undefined); publishControl(control); console.log(JSON.stringify(getAttention(control, itemId))); return true; }
-      if (action !== "ack" && action !== "defer" && action !== "resolve") usage();
-      // Context decisions must carry a real identity: --actor takes precedence over
-      // OVERLOAD_ACTOR, and neither may fall back to a hardcoded pseudo-user. Legacy
-      // ack/defer and non-context resolves tolerate an absent actor.
-      const actor: string | undefined = actorFlag ?? (process.env.OVERLOAD_ACTOR || undefined);
-      if (action === "resolve") {
+      if (!action) {
+        if (verbose) { console.log(renderDecisionCard(control, itemId)); return true; }
         const item = getAttention(control, itemId);
-        if (item) {
-          const work = getWork(control, item.work_id);
-          const hasContextEvidence = typeof item.evidence?.object_id === "string" && !!item.evidence.object_id;
-          const hasDecisionOwner = !!work?.contract?.decision_owner?.trim();
-          if ((hasContextEvidence || hasDecisionOwner) && !actor) {
-            console.error("error: context decision requires --actor or OVERLOAD_ACTOR");
-            process.exit(1);
-          }
-        }
+        if (!item) throw new Error(`attention not found: ${itemId}`);
+        const material = getAttentionMaterial(control, itemId);
+        const payload = material ? { ...item, material_fingerprint: material.fingerprint } : item;
+        console.log(JSON.stringify(payload)); return true;
       }
-      const result = actOnAttention(control, itemId, revision, action, { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined }, actor); publishControl(control); console.log(JSON.stringify(result)); return true;
+      if (action === "feedback") {
+        const revision = Number(input.expected_revision);
+        if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("expected_revision must be a positive integer");
+        recordAttentionFeedback(control, itemId, revision, input.useful === true, typeof input.reason === "string" ? input.reason : undefined);
+        publishControl(control); console.log(JSON.stringify(getAttention(control, itemId))); return true;
+      }
+      if (action !== "ack" && action !== "defer" && action !== "resolve") usage();
+      const actor: string | undefined = actorFlag ?? (process.env.OVERLOAD_ACTOR || undefined);
+      if (action === "ack" || action === "defer") {
+        const revision = Number(input.expected_revision);
+        if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("expected_revision must be a positive integer");
+        const result = actOnAttention(control, itemId, revision, action,
+          { defer_until: typeof input.defer_until === "number" ? input.defer_until : undefined, reason: typeof input.reason === "string" ? input.reason : undefined },
+          actor);
+        publishControl(control); console.log(JSON.stringify(result)); return true;
+      }
+      // resolve: must carry real actor identity and explicit decision payload.
+      if (!actor) {
+        console.error("error: attention resolve requires --actor or OVERLOAD_ACTOR");
+        process.exit(1);
+      }
+      const item = getAttention(control, itemId);
+      if (!item) throw new Error(`attention not found: ${itemId}`);
+      // CLI does NOT auto-compute or substitute material_fingerprint; the caller must
+      // have observed it via the `attention <id>` read command and pass it through.
+      const attentionRev = Number(input.attention_revision ?? input.expected_revision);
+      if (!Number.isSafeInteger(attentionRev) || attentionRev < 1) throw new Error("attention_revision or expected_revision must be a positive integer");
+      if (typeof input.selected_option !== "string" || !input.selected_option.trim()) throw new Error("selected_option is required for resolve");
+      const resolveInput = {
+        selected_option: input.selected_option,
+        replacement_contract: typeof input.replacement_contract === "object" && input.replacement_contract ? (input.replacement_contract as Contract) : undefined,
+        reason: typeof input.reason === "string" ? input.reason : undefined,
+        expected_contract_revision: typeof input.expected_contract_revision === "number" ? input.expected_contract_revision : undefined,
+        affected_cards: Array.isArray(input.affected_cards) ? (input.affected_cards as AttentionCardSnapshot[]) : undefined,
+        attention_revision: attentionRev,
+        material_fingerprint: typeof input.material_fingerprint === "string" ? input.material_fingerprint : undefined,
+      };
+      // The caller MUST pass a fresh material_fingerprint they observed via the
+      // read path. CLI deliberately does NOT auto-inject the current fingerprint
+      // — that would silently bypass the store-side staleness guard.
+      const result = resolveAttention(control, itemId, resolveInput, actor);
+      publishControl(control); console.log(JSON.stringify(result)); return true;
     } finally { control.close(); }
   }
   if (command === "context") {

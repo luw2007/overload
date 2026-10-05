@@ -172,13 +172,14 @@ describe("T7 recovery-context", () => {
   test("3. liveness unknown → reconcile, no spawn", () => {
     const cdb = controlFixture();
     const odb = orchFixture();
-    const taskId = insertTask(odb, { state: "blocked" });
+    const work = createWork(cdb, { title: "unknown runner", source: "test", contract: makeContract("alice") }, 1);
+    const taskId = insertTask(odb, { state: "blocked", work_id: work.work_id, contract_revision: work.revision });
     // No runner_dead, no runner_exit, no pid, no stable_id → unknown
 
     const result = determineRecoveryOutcome({
       controlDb: cdb,
       orchestratorDb: odb,
-      work_id: "work-1",
+      work_id: work.work_id,
       task_id: taskId,
       attempt_id: "attempt-1",
       actor: "alice",
@@ -413,7 +414,7 @@ describe("T7 recovery-context", () => {
 
 // ========== 2d: orchestrator.attemptRecovery 入口集成测试 ==========
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { openStore, addTask } from "./store";
 import { SpoolWriter } from "./spool";
@@ -498,7 +499,7 @@ describe("T7 orchestrator.attemptRecovery 入口", () => {
     odb.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
       ["task-entry2", 2000, "running", "running", "session_bound", JSON.stringify({ stable_id: "stable-e2", runner_pid: 9999 })]);
     odb.run("INSERT INTO approvals(approval_id,task_id,gate,question,options,requested_at,expires_at,consumed_at,actor) VALUES(?,?,?,?,?,?,?,?,?)",
-      ["appr-2", "task-entry2", "ready", "?", JSON.stringify(["approve"]), 1, 2, null, null]);
+      ["appr-2", "task-entry2", "ready", "?", JSON.stringify(["approve"]), 1, Date.now()+60000, null, null]);
 
     const oldEnv = process.env.OVERLOAD_ANSWERS_PATH;
     process.env.OVERLOAD_ANSWERS_PATH = cPath;
@@ -537,6 +538,25 @@ describe("T7 orchestrator.attemptRecovery 入口", () => {
       "SELECT event, detail FROM task_events WHERE task_id=? AND event='recovery_reconcile'").get("task-entry3") as { detail: string } | undefined;
     expect(rec).toBeTruthy();
     expect(JSON.parse(rec!.detail).reason).toContain("liveness unknown");
+    process.env.OVERLOAD_ANSWERS_PATH = cPath;
+    try {
+      orch.attemptRecovery("task-entry3");
+      expect(odb.query("SELECT COUNT(*) n FROM task_events WHERE event='recovery_reconcile'").get()).toEqual({ n: 1 });
+      insertEvent(odb, "task-entry3", "session_bound", { stable_id: "later-session" }, 3000, "blocked", "blocked");
+      insertEvent(odb, "task-entry3", "runner_exit", { evidence_complete: true }, 4000, "blocked", "blocked");
+      orch.attemptRecovery("task-entry3");
+      const blocked = odb.query("SELECT detail FROM task_events WHERE event='recovery_blocked'").get() as { detail: string };
+      expect(JSON.parse(blocked.detail).code).toBe("no_checkpoint");
+      insertEvent(odb, "task-entry3", "checkpoint", { checkpoint_reference: "git:/repo@new-facts" }, 5000, "blocked", "blocked");
+      orch.attemptRecovery("task-entry3");
+      orch.attemptRecovery("task-entry3");
+      expect(odb.query("SELECT COUNT(*) n FROM task_events WHERE event='recovery_package_ready'").get()).toEqual({ n: 1 });
+      const ready = odb.query("SELECT detail FROM task_events WHERE event='recovery_package_ready'").get() as { detail: string };
+      expect(JSON.parse(ready.detail).checkpoint_reference).toBe("git:/repo@new-facts");
+    } finally {
+      if (oldEnv === undefined) delete process.env.OVERLOAD_ANSWERS_PATH;
+      else process.env.OVERLOAD_ANSWERS_PATH = oldEnv;
+    }
 
     spool.close(); odb.close(); rmSync(root, { recursive: true, force: true }); rmSync(cPath, { force: true });
   });
@@ -624,7 +644,7 @@ describe("T7 orchestrator.attemptRecovery 入口", () => {
     odb.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
       ["task-entry5b", 2000, "running", "running", "session_bound", JSON.stringify({ stable_id: "stable-live5b" })]);
     odb.run("INSERT INTO approvals(approval_id,task_id,gate,question,options,requested_at,expires_at,consumed_at,actor) VALUES(?,?,?,?,?,?,?,?,?)",
-      ["appr-5b", "task-entry5b", "ready", "?", JSON.stringify(["approve"]), 1, 2, null, null]);
+      ["appr-5b", "task-entry5b", "ready", "?", JSON.stringify(["approve"]), 1, Date.now()+60000, null, null]);
 
     const oldEnv = process.env.OVERLOAD_ANSWERS_PATH;
     process.env.OVERLOAD_ANSWERS_PATH = cPath;
@@ -755,7 +775,7 @@ describe("Fix 5: recovery 事件写入 collector spool", () => {
     odb.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
       ["task-f5jump", 2000, "running", "running", "session_bound", JSON.stringify({ stable_id: "stable-f5j", runner_pid: 9999 })]);
     odb.run("INSERT INTO approvals(approval_id,task_id,gate,question,options,requested_at,expires_at,consumed_at,actor) VALUES(?,?,?,?,?,?,?,?,?)",
-      ["appr-f5", "task-f5jump", "ready", "?", JSON.stringify(["approve"]), 1, 2, null, null]);
+      ["appr-f5", "task-f5jump", "ready", "?", JSON.stringify(["approve"]), 1, Date.now()+60000, null, null]);
 
     const oldEnv = process.env.OVERLOAD_ANSWERS_PATH;
     process.env.OVERLOAD_ANSWERS_PATH = cPath;
@@ -783,4 +803,67 @@ describe("Fix 5: recovery 事件写入 collector spool", () => {
 
     spool.close(); odb.close(); rmSync(root, { recursive: true, force: true }); rmSync(cPath, { force: true });
   });
+});
+
+test("a reopened attempt cannot reuse predecessor termination or checkpoint facts", () => {
+  const control = controlFixture(), tasks = orchFixture();
+  try {
+    const work = createWork(control, { title: "w", source: "test", contract: makeContract("alice") }, 1);
+    const taskId = insertTask(tasks, { state: "blocked", work_id: work.work_id, contract_revision: 1, attempt_id: "new-attempt" });
+    insertEvent(tasks, taskId, "session_bound", { stable_id: "old-session", attempt_id: "old-attempt" }, 1);
+    insertEvent(tasks, taskId, "checkpoint", { checkpoint_reference: "old-checkpoint", attempt_id: "old-attempt" }, 2);
+    insertEvent(tasks, taskId, "runner_exit", { evidence_complete: true, attempt_id: "old-attempt" }, 3);
+    insertEvent(tasks, taskId, "human_reopen", { attempt_id: "old-attempt", next_attempt_id: "new-attempt" }, 4, "blocked", "starting");
+    const input = { controlDb: control, orchestratorDb: tasks, work_id: work.work_id, task_id: taskId, attempt_id: "new-attempt", actor: "alice" };
+    expect(determineRecoveryOutcome(input).type).toBe("reconcile");
+    insertEvent(tasks, taskId, "session_bound", { stable_id: "new-session", attempt_id: "new-attempt" }, 5);
+    insertEvent(tasks, taskId, "runner_exit", { evidence_complete: true, attempt_id: "new-attempt" }, 6);
+    expectBlocked(determineRecoveryOutcome(input), "no_checkpoint");
+    insertEvent(tasks, taskId, "checkpoint", { checkpoint_reference: "new-checkpoint", attempt_id: "new-attempt" }, 7);
+    const outcome = determineRecoveryOutcome(input);
+    expect(outcome.type).toBe("recovery_package");
+    if (outcome.type === "recovery_package") expect(outcome.package.checkpoint_reference).toBe("new-checkpoint");
+    expectBlocked(determineRecoveryOutcome({ ...input, attempt_id: "old-attempt" }), "stale_or_revoked");
+  } finally { control.close(); tasks.close(); }
+});
+test("a live foreign lease suppresses recovery publication until takeover",()=>{
+ const {path:cPath,workId}=setupControlFile("alice"),root=orchRoot(),db=openStore(join(root,"orch.db")),spool=new SpoolWriter(db,root);
+ const orch=new Orchestrator(db,spool,1),oldEnv=process.env.OVERLOAD_ANSWERS_PATH;
+ try{
+   const taskId=insertTask(db,{state:"blocked",work_id:workId,contract_revision:1});
+   db.run("UPDATE tasks SET owner_instance='foreign',lease_expires_at=? WHERE task_id=?",[Date.now()+60000,taskId]);
+   process.env.OVERLOAD_ANSWERS_PATH=cPath;
+   orch.attemptRecovery(taskId);
+   expect(db.query("SELECT event FROM task_events WHERE event LIKE 'recovery_%'").all()).toEqual([]);
+   expect(readdirSync(spool.dir).filter(file=>file.startsWith("active-context-collector")&&file.endsWith(".ndjson"))).toEqual([]);
+   db.run("UPDATE tasks SET lease_expires_at=0 WHERE task_id=?",taskId);
+   orch.attemptRecovery(taskId);
+   expect(db.query("SELECT owner_instance FROM tasks WHERE task_id=?").get(taskId)).toEqual({owner_instance:orch.owner});
+   expect(db.query("SELECT event FROM task_events WHERE event LIKE 'recovery_%'").all()).toEqual([{event:"recovery_reconcile"}]);
+ }finally{if(oldEnv===undefined)delete process.env.OVERLOAD_ANSWERS_PATH;else process.env.OVERLOAD_ANSWERS_PATH=oldEnv;spool.close();db.close();rmSync(root,{recursive:true,force:true});rmSync(cPath,{force:true});}
+});
+test("failed recovery file publication preserves committed identity across restart",()=>{
+ const {path:cPath,workId}=setupControlFile("alice"),root=orchRoot(),dbPath=join(root,"orch.db");
+ let db=openStore(dbPath),spool=new SpoolWriter(db,root),orch=new Orchestrator(db,spool,1);
+ const oldEnv=process.env.OVERLOAD_ANSWERS_PATH;
+ try{
+   const taskId=insertTask(db,{state:"blocked",work_id:workId,contract_revision:1});
+   process.env.OVERLOAD_ANSWERS_PATH=cPath;
+   const blockedFile=join(spool.dir,"active-context-collector.1.ndjson");mkdirSync(blockedFile);
+   orch.attemptRecovery(taskId);
+   const reader=new Database(dbPath,{readonly:true});
+   const pending=reader.query("SELECT id,detail FROM task_events WHERE event='recovery_reconcile'").get() as {id:number;detail:string};
+   reader.close();
+   expect(JSON.parse(pending.detail)).toMatchObject({published:false,sequence:1});
+   spool.close();db.close();rmSync(blockedFile,{recursive:true});
+   db=openStore(dbPath);spool=new SpoolWriter(db,root);orch=new Orchestrator(db,spool,1);
+   db.run("UPDATE tasks SET lease_expires_at=0 WHERE task_id=?",taskId);
+   orch.attemptRecovery(taskId);orch.attemptRecovery(taskId);
+   const events=db.query("SELECT id,detail FROM task_events WHERE event='recovery_reconcile'").all() as {id:number;detail:string}[];
+   expect(events).toHaveLength(1);expect(events[0].id).toBe(pending.id);
+   expect(JSON.parse(events[0].detail)).toMatchObject({published:true,sequence:1});
+   const envelope:unknown=JSON.parse(readFileSync(blockedFile,"utf8"));
+   if(!envelope||typeof envelope!=="object"||!("detail" in envelope))throw Error("invalid envelope");
+   expect(envelope.detail).toMatchObject({work_id:workId,task_id:taskId,recovery_revision:pending.id});
+ }finally{if(oldEnv===undefined)delete process.env.OVERLOAD_ANSWERS_PATH;else process.env.OVERLOAD_ANSWERS_PATH=oldEnv;spool.close();db.close();rmSync(root,{recursive:true,force:true});rmSync(cPath,{force:true});}
 });

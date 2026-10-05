@@ -81,6 +81,23 @@ describe("gcWorktree (mocked executor)", () => {
     db.close();
   });
 
+  test("unconfirmed stop retains a terminal worktree even without a runner PID", async () => {
+    const db=store();
+    try {
+      const task=addTask(db,'held','/repo','a'.repeat(40));
+      const commands:string[][]=[];
+      const exec:CommandExecutor=async(_command,args)=>{commands.push(args);return {ok:true,stdout:'',stderr:''};};
+      for(const state of ['done','failed','abandoned'] as const)for(const stop of ['stop_requested','stop_unconfirmed'] as const){
+        db.run('UPDATE tasks SET state=?,stop_state=?,worktree=?,runner_pid=NULL WHERE task_id=?',[state,stop,'/wt/held',task.task_id]);
+        expect(await gcWorktree(db,task.task_id,false,'/root',exec)).toEqual({deleted:false,reason:'stop_unconfirmed'});
+      }
+      expect(commands).toEqual([]);
+      db.run("UPDATE tasks SET stop_state='stopped_confirmed' WHERE task_id=?",[task.task_id]);
+      expect(await gcWorktree(db,task.task_id,false,'/root',exec)).toEqual({deleted:true});
+      expect(commands.at(-1)).toEqual(['-C','/repo','worktree','remove','/wt/held']);
+    } finally {db.close();}
+  });
+
   test("dryRun never deletes even when clean and terminal", async () => {
     const db = store();
     const task = addTask(db, "t", "/repo", "0000000000000000000000000000000000000000");

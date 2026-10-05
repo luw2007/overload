@@ -3,7 +3,7 @@ import { mkdirSync,mkdtempSync,rmSync,writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStore,addTask,transition,getTask } from "./store";
-import { openAnswersDb,requestApproval,consumeAnswers,replayAppliedReceipts,reconcileApprovalEffects } from "./approval";
+import { openAnswersDb,requestApproval,consumeAnswers,replayAppliedReceipts,reconcileApprovalEffects,expireApprovals } from "./approval";
 import { SpoolWriter } from "./spool";
 import { registerTarget,writeHumanAnswer,getTarget,receipt,consumeDecision } from "../decision-bot/mailbox";
 import { createWork,getAttention } from "../control/store";
@@ -24,3 +24,26 @@ test("a failed effect tells the operator why on the original card",()=>{const ro
  transition(db,task.task_id,"push_fail",{},4);reconcileApprovalEffects(db,answers,5);
  const card=getAttention(answers,`orchestrator:${id}`);expect(card?.effect_state).toBe("failed");expect(card?.effect_detail).toBe("push_failed");
  spool.close();answers.close();db.close();}finally{rmSync(root,{recursive:true,force:true});}});
+test("expired predecessor approval cannot release or expire a reopened attempt",()=>{
+ const root=mkdtempSync(join(tmpdir(),"approval-reopen-"));
+ writeFileSync(join(root,"host"),"local\n");
+ const db=openStore(join(root,"o.db")),answers=openAnswersDb(join(root,"a.db")),spool=new SpoolWriter(db,root);
+ try{
+   const task=addTask(db,"t",root,"a".repeat(40));
+   db.run("UPDATE tasks SET state='awaiting_human',attempt_id='old-attempt' WHERE task_id=?",task.task_id);
+   const oldId=requestApproval(db,spool,task.task_id,"ready","Old?",["approve","reject"],60000,answers);
+   expect(writeHumanAnswer(answers,"orchestrator",oldId,"approve","owner").ok).toBe(true);
+   transition(db,task.task_id,"gate_expire",{},Date.now());
+   const now=Date.now();transition(db,task.task_id,"human_reopen",{},now);
+   transition(db,task.task_id,"spawn_ok",{},now+1);transition(db,task.task_id,"runner_exit",{evidence_complete:true},now+2);
+   consumeAnswers(db,answers,spool,now+3);expireApprovals(db,spool,now+3,answers);
+   expect(getTask(db,task.task_id)?.state).toBe("awaiting_human");
+   expect(receipt(answers,"orchestrator",oldId)).toBeNull();
+   expect(getTarget(answers,"orchestrator",oldId)?.state).toBe("closed");
+   const newId=requestApproval(db,spool,task.task_id,"ready","New?",["approve","reject"],60000,answers);
+   expect(newId).not.toBe(oldId);
+   expect(writeHumanAnswer(answers,"orchestrator",newId,"approve","owner",now+4).ok).toBe(true);
+   consumeAnswers(db,answers,spool,now+5);
+   expect(getTask(db,task.task_id)?.state).toBe("submitted");
+ }finally{spool.close();answers.close();db.close();rmSync(root,{recursive:true,force:true});}
+});

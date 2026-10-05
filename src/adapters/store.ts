@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS channel_progress(
  CHECK (sent_version <= desired_version)
 );
 CREATE INDEX IF NOT EXISTS channel_progress_due ON channel_progress(next_at, turn_id) WHERE degraded=0 AND desired_version > sent_version;
+CREATE INDEX IF NOT EXISTS conversations_created_at_id ON conversations(created_at DESC, id ASC);
 `);
  const columns = new Set(
   (

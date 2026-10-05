@@ -19,11 +19,12 @@ import {
  recordAcceptance,
  requestAcceptance,
 } from "../../src/manage/manifest";
-import { localSourceFs, sshSourceFs } from "../../src/manage/source";
+import { localSourceFs, sshSourceFs, type SourceFs } from "../../src/manage/source";
 import { submitAcceptance } from "../../src/manage/submit";
 import { parseClaudeSession } from "../../src/manage/readers/types";
 import { scanOnce, type ManageConfig } from "../../src/manage/manage";
 import type { CommandExecutor } from "../../src/orchestrator/worktree";
+import {getAttention,getAttentionMaterial} from '../../src/control/store';
 
 const scenario = process.argv[process.argv.indexOf("--scenario") + 1];
 const accountHome = () => {
@@ -284,7 +285,7 @@ async function main() {
     .work_id,
    recompute = (
     database: Database,
-    source: ReturnType<typeof localSourceFs>,
+    source: SourceFs,
     id: string,
    ) => computeManifest(database, source, id, { verification: [] }),
    input = await recompute(db, fs, workId),
@@ -315,6 +316,10 @@ async function main() {
    "accepted",
    "e2e",
    {},
+   {
+    attention_revision: getAttention(db, `mgmt:accept:${workId}:${manifest.manifest_id}`)!.revision,
+    material_fingerprint: getAttentionMaterial(db, `mgmt:accept:${workId}:${manifest.manifest_id}`)!.fingerprint,
+   },
    Date.now(),
   );
   assert.ok(

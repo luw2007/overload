@@ -79,6 +79,8 @@ export interface DecisionViewPackage {
   prior_decisions: PriorDecision[];
   artifacts: ArtifactRef[];
   effect_state: AttentionItem["effect_state"];
+  /** Inspection is not an executable answer or a grant to restart a runtime. */
+  context_review?: { kind: string; task_id: string };
   budget_limited?: boolean;
   /** Advisory-only shadow assessment receipts; never decision options or authority. */
   semantic_assessments?: SemanticAssessment[];
@@ -335,7 +337,13 @@ export function assembleDecisionView(db: Database, input: GetContextPackageInput
   if (!access.ok) return blocked("actor is not decision owner and has no valid share", "forbidden");
   const item = getAttention(db, input.consumer_id);
   if (!item || item.work_id !== input.work_id) return blocked("attention item not found", "needs_context");
-  if (!item.conclusion || !item.trigger || !item.impact || !item.options?.length || !item.owner) return blocked("required decision field unavailable", "needs_context");
+  const contextKind = item.evidence.kind;
+  const contextTask = item.evidence.task_id;
+  const contextReview = item.consumer_owner === "orchestrator" && item.options.length === 0
+    && typeof contextTask === "string" && contextTask.trim()
+    && typeof contextKind === "string" && ["context.pending", "context.recovery_jump", "context.recovery_package", "context.recovery_reconcile", "context.recovery_blocked"].includes(contextKind)
+    ? { kind: contextKind, task_id: contextTask } : null;
+  if (!item.conclusion || !item.trigger || !item.impact || (!item.options?.length && !contextReview) || !item.owner) return blocked("required decision field unavailable", "needs_context");
 
   const purpose: Purpose = (input.purpose ?? input.package_type) as Purpose;
   const entries = selectPoolObjects(db, input.work_id, input.problem_id);
@@ -364,6 +372,7 @@ export function assembleDecisionView(db: Database, input: GetContextPackageInput
     recommendation: item.recommendation, owner: item.owner, expires_at: item.expires_at,
     options, stale_objects: [...staleMap.values()], source_link: item.source_link,
     scene_entry, prior_decisions, artifacts, effect_state: item.effect_state,
+    ...(contextReview ? { context_review: contextReview } : {}),
     ...(semanticAssessments.length ? { semantic_assessments: semanticAssessments } : {}),
   };
   if (budget.max_bytes !== undefined && estimatePackageSize(pkg) > budget.max_bytes) pkg.budget_limited = true;

@@ -360,9 +360,8 @@ export function collectFacts(ctx: CollectorContext): FactObservedEvent[] {
  */
 const SEQ_META_KEY = "__seq__";
 
-function allocateSeq(db: Database): number {
-  db.run("BEGIN IMMEDIATE");
-  try {
+export function reserveContextSpoolSequence(db: Database): number {
+  return db.transaction(() => {
     const row = db
       .query("SELECT observation_revision FROM context_collector_cursor WHERE source_event_id=?")
       .get(SEQ_META_KEY) as { observation_revision: number } | undefined;
@@ -375,12 +374,8 @@ function allocateSeq(db: Database): number {
          last_collected_at=excluded.last_collected_at`,
       [SEQ_META_KEY, next, "", Date.now()],
     );
-    db.exec("COMMIT");
     return next;
-  } catch (err) {
-    try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
-    throw err;
-  }
+  }).immediate();
 }
 
 /** 测试用：读取当前持久序号（不递增）。 */
@@ -427,8 +422,9 @@ export function spoolContextEnvelope(
   kind: string,
   detail: Record<string, unknown>,
   at: number = Date.now(),
+  sequence?: number,
 ): string {
-  const seq = allocateSeq(db);
+  const seq = sequence ?? reserveContextSpoolSequence(db);
   const envelope = { v: 1, at, kind, detail };
   const line = `${JSON.stringify(envelope)}\n`;
   return writeSegmentAtomic(spoolDir, seq, [line]);
@@ -450,7 +446,7 @@ export function collectAndSpool(
   if (process.env.OVERLOAD_CONTEXT_ASSEMBLY_ENABLED === "false") return { events: 0, spooled: 0 };
   const events = collectFacts(ctx);
   if (events.length === 0) return { events: 0, spooled: 0 };
-  const seq = allocateSeq(ctx.orchestratorDb);
+  const seq = reserveContextSpoolSequence(ctx.orchestratorDb);
   const lines = events.map((ev) =>
     `${JSON.stringify({ v: 1, at: Date.now(), kind: "context.fact_observed", detail: ev })}\n`,
   );

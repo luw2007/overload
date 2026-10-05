@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { Handoff } from "../shared/queries";
+import { controlPayloadHash } from "../control/outbox";
 
 type JournalRow = { ingest_seq: number; stable_id: string; at: number; kind: string; detail: string | null };
 type Detail = Record<string, unknown>;
@@ -19,20 +20,53 @@ export type AuditSession = {
   handoff: Handoff | null;
   maxAwaitingHumanMs: number;
 };
+/**
+ * Flow counts applied attention events in the window by the state in their
+ * historical journal payload. The current snapshot retains only the latest
+ * event_id and cannot establish prior lifecycle transitions. Missing historical
+ * evidence is reported as coverageMissing, never counted as a guessed state.
+ * Stock and effects remain SQL aggregates of the current projection.
+ * Feedback counts eligible (item_id, revision) pairs, not feedback event rows.
+ */
 export type AuditControlMetrics = {
+  /** applied business events in window, deduplicated by event_id */
   projectedEvents: number;
-  attentionOpened: number;
-  attentionResolved: number;
-  attentionSuperseded: number;
-  attentionApplying: number;
+  /** applied attention events entering open */
+  openedFlow: number;
+  /** applied attention events entering resolved */
+  resolvedFlow: number;
+  /** applied attention events entering superseded */
+  supersededFlow: number;
+  /** applied attention events entering applying */
+  applyingFlow: number;
+  /** current snapshot stock: state='open' as of now */
+  currentOpen: number;
+  /** current snapshot stock: state='resolved' as of now */
+  currentResolved: number;
+  /** current snapshot stock: state='superseded' as of now */
+  currentSuperseded: number;
+  /** current snapshot stock: state='applying' as of now */
+  currentApplying: number;
+  /** current effect_state='succeeded' */
   effectsSucceeded: number;
+  /** current effect_state='failed' */
   effectsFailed: number;
+  /** current effect_state='unknown' */
   effectsUnknown: number;
+  /** current effect_state='not_started' — effect observation pending */
+  effectsNotStarted: number;
+  /** items acknowledged but still open (interrupted then acknowledged, not resolved) */
   acknowledgedOnly: number;
+  /** distinct eligible (item_id, revision) pairs with useful feedback */
   feedbackUseful: number;
+  /** distinct eligible (item_id, revision) pairs with not-useful feedback */
   feedbackNotUseful: number;
+  /** eligible (item_id, revision) pairs without feedback */
   feedbackUnmeasured: number;
+  /** applied events without enough historical envelope to classify their flow */
+  coverageMissing: number;
 };
+
 export type AuditReport = {
   sample: number;
   sinceMs: number;
@@ -48,6 +82,7 @@ export type AuditReport = {
 
 const TERMINAL_STATES = new Set(["resolved", "cancelled", "timed_out"]);
 const HANDOFF_STATUSES = new Set(["complete", "partial", "blocked", "unknown"]);
+const MAX_HISTORY_IDS = 900; // stay well below SQLite's default 999 variable limit for WHERE stable_id IN (...)
 
 function objectDetail(value: string | null): Detail {
   if (!value) return {};
@@ -82,6 +117,13 @@ function emptyDecisions(): AuditDecisionCounts {
   return { requested: 0, resolved: 0, cancelled: 0, timed_out: 0, orphaned: 0 };
 }
 
+function emptyControlMetrics(): AuditControlMetrics {
+  return { projectedEvents: 0, openedFlow: 0, resolvedFlow: 0, supersededFlow: 0, applyingFlow: 0,
+    currentOpen: 0, currentResolved: 0, currentSuperseded: 0, currentApplying: 0,
+    effectsSucceeded: 0, effectsFailed: 0, effectsUnknown: 0, effectsNotStarted: 0,
+    acknowledgedOnly: 0, feedbackUseful: 0, feedbackNotUseful: 0, feedbackUnmeasured: 0, coverageMissing: 0 };
+}
+
 function uniqueSorted(values: Iterable<string>): string[] {
   return [...new Set(values)].sort();
 }
@@ -90,21 +132,162 @@ function inWindow(at: number, cutoff: number, now: number): boolean {
   return at >= cutoff && at <= now;
 }
 
+/** Flow uses historical applied journal envelopes; stock uses current SQL projection aggregates. */
 function controlMetrics(db: Database, cutoff: number, now: number): AuditControlMetrics {
-  const empty: AuditControlMetrics = { projectedEvents:0,attentionOpened:0,attentionResolved:0,attentionSuperseded:0,attentionApplying:0,effectsSucceeded:0,effectsFailed:0,effectsUnknown:0,acknowledgedOnly:0,feedbackUseful:0,feedbackNotUseful:0,feedbackUnmeasured:0 };
-  const tables = new Set((db.query("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{name:string}>).map(row=>row.name));
+  const empty = emptyControlMetrics();
+  const tables = new Set((db.query("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(row => row.name));
   if (!tables.has("applied_control_events") || !tables.has("control_attention")) return empty;
-  empty.projectedEvents = (db.query("SELECT COUNT(*) AS n FROM applied_control_events WHERE applied_at BETWEEN ? AND ?").get(cutoff,now) as {n:number}).n;
-  const rows = db.query("SELECT state,effect_state,acknowledged_at,evidence FROM control_attention WHERE updated_at BETWEEN ? AND ?").all(cutoff,now) as Array<{state:string;effect_state:string;acknowledged_at:number|null;evidence:string}>;
-  empty.attentionOpened=rows.filter(row=>row.state==="open").length; empty.attentionResolved=rows.filter(row=>row.state==="resolved").length;
-  empty.attentionSuperseded=rows.filter(row=>row.state==="superseded").length; empty.attentionApplying=rows.filter(row=>row.state==="applying").length;
-  empty.effectsSucceeded=rows.filter(row=>row.effect_state==="succeeded").length; empty.effectsFailed=rows.filter(row=>row.effect_state==="failed").length;
-  empty.effectsUnknown=rows.filter(row=>row.effect_state==="unknown").length; empty.acknowledgedOnly=rows.filter(row=>row.acknowledged_at!==null&&row.state==="open").length;
-  if (tables.has("control_attention_feedback")) {
-    const feedback=db.query("SELECT useful,COUNT(*) n FROM control_attention_feedback WHERE created_at BETWEEN ? AND ? GROUP BY useful").all(cutoff,now) as Array<{useful:number;n:number}>;
-    empty.feedbackUseful=feedback.find(row=>row.useful===1)?.n??0;empty.feedbackNotUseful=feedback.find(row=>row.useful===0)?.n??0;
+
+  // Load each applied receipt and retained envelope once. An expression join on
+  // JSON event_id has no index and otherwise scans the journal for every receipt.
+  const receipts = db.query("SELECT event_id,payload_hash,applied_at FROM applied_control_events WHERE applied_at<=? ORDER BY event_id")
+    .all(now) as Array<{ event_id: string; payload_hash: string; applied_at: number }>;
+  const appliedIds = new Set(receipts.map(receipt => receipt.event_id));
+  const envelopes = new Map<string, Detail[]>();
+  if (receipts.length) for (const row of db.query("SELECT detail FROM journal_all WHERE kind='control_event'").all() as Array<{ detail: string | null }>) {
+    const parsed = objectDetail(row.detail);
+    if (typeof parsed.event_id !== "string" || !appliedIds.has(parsed.event_id)) continue;
+    const copies = envelopes.get(parsed.event_id);
+    if (copies) copies.push(parsed); else envelopes.set(parsed.event_id, [parsed]);
   }
-  empty.feedbackUnmeasured=Math.max(0,rows.length-empty.feedbackUseful-empty.feedbackNotUseful);
+  type HistoricalAttention = { itemId: string; revision: number; state: string; kind: string; at: number; eventId: string };
+  const byItem = new Map<string, HistoricalAttention[]>();
+  for (const receipt of receipts) {
+    let detail: Detail | null = null;
+    let conflicting = false;
+    for (const parsed of envelopes.get(receipt.event_id) ?? []) {
+      if (parsed.payload_hash !== receipt.payload_hash) conflicting = true;
+      else if (detail && (detail.event_kind !== parsed.event_kind || JSON.stringify(detail.payload) !== JSON.stringify(parsed.payload))) conflicting = true;
+      else detail = parsed;
+    }
+    const within = inWindow(receipt.applied_at, cutoff, now);
+    if (within) empty.projectedEvents++;
+    if (conflicting || !detail) {
+      if (within) empty.coverageMissing++;
+      continue;
+    }
+    const payload = detail.payload;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)
+      || controlPayloadHash(payload as Detail) !== receipt.payload_hash) {
+      if (within) empty.coverageMissing++;
+      continue;
+    }
+    const attention = "attention" in payload ? payload.attention : undefined;
+    if (attention === undefined) {
+      if (within && typeof detail.event_kind !== "string") empty.coverageMissing++;
+      continue; // Applied work, wait, dependency or feedback event.
+    }
+    if (!attention || typeof attention !== "object" || Array.isArray(attention)) {
+      if (within) empty.coverageMissing++;
+      continue;
+    }
+    const item = attention as Detail;
+    if (typeof item.item_id !== "string" || !item.item_id || !Number.isSafeInteger(item.revision)
+      || (item.revision as number) < 1 || typeof item.state !== "string"
+      || !["open", "applying", "resolved", "superseded"].includes(item.state)
+      || typeof detail.event_kind !== "string") {
+      if (within) empty.coverageMissing++;
+      continue;
+    }
+    const entry: HistoricalAttention = { itemId: item.item_id, revision: item.revision as number,
+      state: item.state, kind: detail.event_kind, at: receipt.applied_at, eventId: receipt.event_id };
+    const events = byItem.get(entry.itemId) ?? [];
+    events.push(entry);
+    byItem.set(entry.itemId, events);
+  }
+  for (const events of byItem.values()) {
+    events.sort((a, b) => a.revision - b.revision || a.at - b.at || a.eventId.localeCompare(b.eventId));
+    let prior: HistoricalAttention | undefined;
+    for (let i = 0; i < events.length;) {
+      let event = events[i]!;
+      let conflicting = false;
+      while (++i < events.length && events[i]!.revision === event.revision) {
+        const duplicate = events[i]!;
+        if (duplicate.state !== event.state) conflicting = true;
+        if (event.kind === "attention.material_projected" && duplicate.kind !== "attention.material_projected") event = duplicate;
+      }
+      const within = inWindow(event.at, cutoff, now);
+      if (conflicting) {
+        if (within) empty.coverageMissing++;
+        prior = undefined;
+        continue;
+      }
+      if (within) {
+        const provenByKind = event.kind === "attention.created" && event.revision === 1 && event.state === "open"
+          || (event.kind === "attention.resolved" || event.kind === "attention.resolve")
+            && (event.state === "resolved" || event.state === "superseded")
+          || event.kind === "attention.superseded" && event.state === "superseded"
+          || event.kind === "attention.applying" && event.state === "applying";
+        const adjacent = prior?.revision === event.revision - 1;
+        if (event.kind === "attention.material_projected") {
+          if (event.revision === 1 && !prior) empty.coverageMissing++;
+        } else if (provenByKind || adjacent && prior?.state !== event.state) {
+          if (event.state === "open") empty.openedFlow++;
+          else if (event.state === "applying") empty.applyingFlow++;
+          else if (event.state === "resolved") empty.resolvedFlow++;
+          else empty.supersededFlow++;
+        } else if (!prior && !provenByKind || prior && !adjacent) {
+          empty.coverageMissing++;
+        }
+      }
+      prior = event;
+    }
+  }
+
+  // --- 3. Current snapshot stock: state of every item as of `now` ---
+  const stock = db.query(`
+    SELECT state, COUNT(*) AS n
+    FROM control_attention
+    WHERE updated_at <= ?
+    GROUP BY state`).all(now) as Array<{ state: string; n: number }>;
+  for (const r of stock) {
+    if (r.state === "open") empty.currentOpen = r.n;
+    else if (r.state === "resolved") empty.currentResolved = r.n;
+    else if (r.state === "superseded") empty.currentSuperseded = r.n;
+    else if (r.state === "applying") empty.currentApplying = r.n;
+  }
+
+  // --- 4. Current effect_state snapshot ---
+  const effects = db.query(`
+    SELECT effect_state, COUNT(*) AS n
+    FROM control_attention
+    WHERE updated_at <= ?
+    GROUP BY effect_state`).all(now) as Array<{ effect_state: string; n: number }>;
+  for (const r of effects) {
+    if (r.effect_state === "succeeded") empty.effectsSucceeded = r.n;
+    else if (r.effect_state === "failed") empty.effectsFailed = r.n;
+    else if (r.effect_state === "unknown") empty.effectsUnknown = r.n;
+    else if (r.effect_state === "not_started") empty.effectsNotStarted = r.n;
+  }
+
+  // --- 5. Acknowledged-only: items that are still open but have been acked ---
+  const ackOnly = db.query(`
+    SELECT COUNT(*) AS n
+    FROM control_attention
+    WHERE state='open' AND acknowledged_at IS NOT NULL AND updated_at <= ?`).get(now) as { n: number };
+  empty.acknowledgedOnly = ackOnly.n;
+
+  // A current snapshot is the item/revision eligible for feedback. Historical
+  // envelopes establish flow, not an obligation to rate superseded revisions.
+  const eligibleRow = db.query("SELECT COUNT(*) AS n FROM control_attention WHERE updated_at <= ?")
+    .get(now) as { n: number };
+  const eligibleFeedback = eligibleRow.n;
+  if (tables.has("control_attention_feedback")) {
+    const feedback = db.query(`SELECT ca.item_id, ca.revision, MIN(fb.useful) AS least, MAX(fb.useful) AS greatest
+      FROM control_attention ca
+      JOIN control_attention_feedback fb ON fb.item_id=ca.item_id AND fb.revision=ca.revision
+      WHERE ca.updated_at <= ? AND fb.created_at <= ?
+      GROUP BY ca.item_id, ca.revision`).all(now, now) as Array<{
+        item_id: string; revision: number; least: number; greatest: number;
+      }>;
+    for (const row of feedback) {
+      if (row.least !== row.greatest) continue; // contradictory evidence is unmeasured
+      if (row.least === 1) empty.feedbackUseful++;
+      else if (row.least === 0) empty.feedbackNotUseful++;
+    }
+  }
+  empty.feedbackUnmeasured = eligibleFeedback - empty.feedbackUseful - empty.feedbackNotUseful;
+
   return empty;
 }
 
@@ -140,11 +323,19 @@ export function audit(db: Database, options: AuditOptions): AuditReport {
   const cwdById = new Map((db.query("SELECT stable_id, cwd FROM sessions").all() as SessionRow[]).map((row) => [row.stable_id, row.cwd]));
   const history = new Map<string, JournalRow[]>();
   if (selectedIds.length) {
-    const allRows = db.query("SELECT ingest_seq, stable_id, at, kind, detail FROM journal_all WHERE at<=? ORDER BY at ASC, ingest_seq ASC").all(options.now) as JournalRow[];
-    for (const row of allRows) {
-      if (!selected.has(row.stable_id)) continue;
-      const rows = history.get(row.stable_id);
-      if (rows) rows.push(row); else history.set(row.stable_id, [row]);
+    // Restrict the history query to only the selected stable_ids. Chunk so we
+    // never exceed SQLite's default 999 variable limit — this guards against
+    // an operator asking for a large --sample on a DB with many qualifying
+    // sessions.
+    for (let i = 0; i < selectedIds.length; i += MAX_HISTORY_IDS) {
+      const chunk = selectedIds.slice(i, i + MAX_HISTORY_IDS);
+      const placeholders = chunk.map(() => "?").join(",");
+      const allRows = db.query(`SELECT ingest_seq, stable_id, at, kind, detail FROM journal_all WHERE stable_id IN (${placeholders}) AND at<=? ORDER BY at ASC, ingest_seq ASC`)
+        .all(...chunk, options.now) as JournalRow[];
+      for (const row of allRows) {
+        const rows = history.get(row.stable_id);
+        if (rows) rows.push(row); else history.set(row.stable_id, [row]);
+      }
     }
   }
   const requestRows = db.query("SELECT request_uid, stable_id, state, created_at, detail FROM requests").all() as RequestRow[];
@@ -290,9 +481,11 @@ export function printAudit(report: AuditReport, output: (line: string) => void =
   output(`PASS_RATE ${(report.passRate * 100).toFixed(1)}% (${report.gatedResolved}/${report.gatedTerminal})`);
   output(`SESSIONS ${report.sessions.length}`);
   const control = report.control;
-  output(`CONTROL events=${control.projectedEvents} open=${control.attentionOpened} applying=${control.attentionApplying} resolved=${control.attentionResolved} superseded=${control.attentionSuperseded}`);
-  output(`EFFECTS succeeded=${control.effectsSucceeded} failed=${control.effectsFailed} unknown=${control.effectsUnknown} ack_only=${control.acknowledgedOnly}`);
-  output(`INTERRUPTIONS useful=${control.feedbackUseful} not_useful=${control.feedbackNotUseful} unmeasured=${control.feedbackUnmeasured}`);
+  output(`CONTROL projected_events=${control.projectedEvents} coverage_missing=${control.coverageMissing}`);
+  output(`CONTROL_FLOW  open=${control.openedFlow} applying=${control.applyingFlow} resolved=${control.resolvedFlow} superseded=${control.supersededFlow}`);
+  output(`CONTROL_STOCK open=${control.currentOpen} applying=${control.currentApplying} resolved=${control.currentResolved} superseded=${control.currentSuperseded}`);
+  output(`EFFECTS succeeded=${control.effectsSucceeded} failed=${control.effectsFailed} unknown=${control.effectsUnknown} not_started=${control.effectsNotStarted} ack_only=${control.acknowledgedOnly}`);
+  output(`FEEDBACK useful=${control.feedbackUseful} not_useful=${control.feedbackNotUseful} unmeasured=${control.feedbackUnmeasured}`);
   for (const session of report.sessions) {
     const d = session.decisions;
     output(`SESSION ${session.stableId} cwd=${session.cwd ?? "-"}`);

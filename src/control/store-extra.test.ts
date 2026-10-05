@@ -14,6 +14,7 @@ import {
   getWork,
   listAttention,
   listAttentionFollowUps,
+  listAttentionPage,
   listWorks,
   projectAttentionEffect,
   projectAttentionMaterial,
@@ -99,11 +100,11 @@ test("A05 a successful defer moves presentation timing only and never the expiry
   // While the deferral is live the card is out of both actionable zones.
   expect(listAttention(d, "now", 2_100).map((x) => x.item_id)).toEqual([]);
   expect(listAttention(d, "inbox", 2_100).map((x) => x.item_id)).toEqual([]);
-  // Current behaviour: between the original expiry and defer_until the card is in no zone — deferral still
-  // outranks expiry for presentation. Pinned deliberately; see the thread report for the open decision.
-  expect(listAttention(d, "now", expiresAt + 1).map((x) => x.item_id)).toEqual([]);
-  expect(listAttention(d, "inbox", expiresAt + 1).map((x) => x.item_id)).toEqual([]);
-  // Once the deferral lapses the original expiry — not the urgency — puts the card in Now.
+  // Expiry overrides a deferral: an invalid decision basis needs attention immediately.
+  expect(listAttention(d, "now", expiresAt).map((x) => x.item_id)).toEqual(["deferred"]);
+  expect(listAttentionPage(d, "now", {}, expiresAt).items.map((x) => x.item_id)).toEqual(["deferred"]);
+  expect(listAttention(d, "inbox", expiresAt).map((x) => x.item_id)).toEqual([]);
+  // Once the deferral lapses the original expiry still puts the card in Now.
   expect(listAttention(d, "now", deferUntil + 1).map((x) => x.item_id)).toEqual(["deferred"]);
   expect(listAttention(d, "inbox", deferUntil + 1).map((x) => x.item_id)).toEqual([]);
   d.close();
@@ -190,13 +191,14 @@ describe("T19 attention resolution CAS（反例）", () => {
     d.close();
   });
 
-  test("rejected → state='superseded', effect_state='unknown'", () => {
+  test("a recorded rejection is superseded and has no unresolved execution follow-up", () => {
     const d = db();
     const w = createWork(d, { title: "w", source: "t", contract }, 1);
     const item = openAttention(d, "res-rej", w.work_id, 1);
     const sup = recordAttentionResolution(d, item.item_id, item.revision, { verdict: "rejected", actor: "owner", evidence: {} }, 2);
     expect(sup.state).toBe("superseded");
-    expect(sup.effect_state).toBe("unknown");
+    expect(sup.evidence.selected_option).toBe("reject");
+    expect(listAttentionFollowUps(d, 3).map(row => row.item.item_id)).not.toContain(item.item_id);
     d.close();
   });
 
@@ -501,6 +503,375 @@ describe("Phase A control foundation", () => {
     // The current revision, with the unchanged fingerprint, is accepted.
     expect(resolveAttention(d, item.item_id, { attention_revision: refreshed.revision, material_fingerprint: material.fingerprint, selected_option: "continue" }, "owner", 5))
       .toMatchObject({ item_id: item.item_id, state: "resolved", effect_state: "succeeded" });
+    d.close();
+  });
+});
+
+function attentionTemplate(overrides: Partial<Parameters<typeof upsertAttention>[1]> = {}): Parameters<typeof upsertAttention>[1] {
+  return {
+     item_id: "any",
+     work_id: "w",
+     state: "open",
+     effect_state: "not_started",
+     urgency: "now",
+     conclusion: "c",
+     trigger: "t",
+     impact: "i",
+     recommendation: null,
+     options: [],
+     owner: "owner",
+     expires_at: null,
+     source_link: null,
+     approval_id: null,
+     consumer_owner: null,
+     contract_revision: 1,
+     decision_mode: "human_only",
+     evidence: {},
+     ...overrides,
+   };
+ }
+
+describe("T21 listAttentionPage keyset pagination", () => {
+  test("paginates identical-timestamp items deterministically without dropping or duplicating", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const now = 1000;
+    // All open, all 'now', same updated_at.
+    const ids = ["a", "b", "c", "d", "e"];
+    for (const id of ids) {
+      upsertAttention(
+        d,
+        attentionTemplate({
+          item_id: id,
+          work_id: w.work_id,
+          urgency: "now",
+          expires_at: now - 10,
+        }),
+        1,
+      );
+    }
+    // Freeze all timestamps so updated_at is identical.
+    d.query("UPDATE control_attention SET updated_at=?").run(now);
+    // Reorder the underlying row ids explicitly so the test relies on pagination, not creation order.
+    d.query("UPDATE control_attention SET item_id='z' WHERE item_id='a'").run();
+    d.query("UPDATE control_attention SET item_id='a' WHERE item_id='z'").run();
+
+    const collected: string[] = [];
+    let cursor: string | null | undefined = undefined;
+    let pages = 0;
+    while (pages < 10) {
+      const page = listAttentionPage(d, "now", { limit: 2, cursor: cursor ?? undefined }, now);
+      for (const it of page.items) collected.push(it.item_id);
+      pages++;
+      if (!page.next_cursor) break;
+      cursor = page.next_cursor;
+    }
+    expect(collected.sort()).toEqual(ids.sort());
+    expect(collected.length).toBe(ids.length);
+    expect(pages).toBe(3); // 2 + 2 + 1
+    expect(new Set(collected).size).toBe(ids.length); // no duplicates
+    d.close();
+  });
+
+  test("total reflects entire zone regardless of cursor", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const now = 5000;
+    const ids: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      const id = `item-${i}`;
+      ids.push(id);
+      upsertAttention(
+        d,
+        attentionTemplate({
+          item_id: id,
+          work_id: w.work_id,
+          urgency: "now",
+          expires_at: now - 10,
+        }),
+        i + 1,
+      );
+    }
+    const first = listAttentionPage(d, "now", { limit: 2 }, now);
+    expect(first.total).toBe(7);
+    let cursor = first.next_cursor!;
+    const second = listAttentionPage(d, "now", { limit: 2, cursor }, now);
+    expect(second.total).toBe(7);
+    const third = listAttentionPage(d, "now", { limit: 2, cursor: second.next_cursor! }, now);
+    expect(third.total).toBe(7);
+    // Final page next_cursor is null.
+    const last = listAttentionPage(d, "now", { limit: 2, cursor: third.next_cursor! }, now);
+    expect(last.next_cursor).toBeNull();
+    expect(last.items.length).toBe(1);
+    expect(last.total).toBe(7);
+    d.close();
+  });
+
+  test("rejects malformed cursors with ControlError(invalid, 'invalid cursor')", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    upsertAttention(
+      d,
+      attentionTemplate({ item_id: "x", work_id: w.work_id, urgency: "now" }),
+      1,
+    );
+    const now = 1;
+    const bad = [
+      "!!!not base64!!!",
+      Buffer.from("not json").toString("base64url"),
+      Buffer.from(JSON.stringify({})).toString("base64url"), // missing u and i
+      Buffer.from(JSON.stringify({ u: "nan", i: "x" })).toString("base64url"), // bad u
+      Buffer.from(JSON.stringify({ u: 1, i: "" })).toString("base64url"), // empty i
+    ];
+    for (const cursor of bad) {
+      let err: unknown;
+      try {
+        listAttentionPage(d, "now", { limit: 10, cursor }, now);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(ControlError);
+      expect((err as ControlError).code).toBe("invalid");
+      expect((err as ControlError).message).toBe("invalid cursor");
+    }
+    d.close();
+  });
+
+  test("rejects limits outside [1,100] or non-integer", () => {
+    const d = db();
+    const cases: Array<number | string | boolean> = [0, -1, 101, 1.5, "5", true];
+    for (const bad of cases) {
+      let err: unknown;
+      try {
+        listAttentionPage(d, "now", { limit: bad as never }, 1);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(ControlError);
+      expect((err as ControlError).code).toBe("invalid");
+    }
+    // Bounds accepted.
+    expect(() => listAttentionPage(d, "now", { limit: 1 }, 1)).not.toThrow();
+    expect(() => listAttentionPage(d, "now", { limit: 100 }, 1)).not.toThrow();
+    d.close();
+  });
+});
+
+describe("T22 attention boundary regressions", () => {
+  test("defer_until > now (active deferral) excludes item from both now and inbox", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const now = 1000;
+    const item = upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "defer-active",
+        work_id: w.work_id,
+        urgency: "now",
+        expires_at: now - 10,
+      }),
+      1,
+    );
+    // upsertAttention strips defer_until; set it directly to exercise the >-boundary
+    d.query("UPDATE control_attention SET defer_until=? WHERE item_id=?").run(now + 1, item.item_id);
+    // Active deferral outranks urgency and expiry → excluded from both zones
+    expect(listAttention(d, "inbox", now).map((x) => x.item_id)).toEqual([]);
+    d.close();
+  });
+
+  test("defer_until exactly equal to now is the lapse boundary — item enters now zone", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const now = 1000;
+    const item = upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "defer-lapsed",
+        work_id: w.work_id,
+        urgency: "now",
+        expires_at: now - 10,
+      }),
+      1,
+    );
+    d.query("UPDATE control_attention SET defer_until=? WHERE item_id=?").run(now, item.item_id);
+    // defer_until <= now → deferral has lapsed; item qualifies via urgency='now'
+    expect(listAttentionPage(d, "now", { limit: 10 }, now).items.map((x) => x.item_id)).toEqual(["defer-lapsed"]);
+    d.close();
+  });
+
+  test("expires_at exactly equal to now is expiry boundary — inbox item promoted to now zone", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const now = 1000;
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "exp-now",
+        work_id: w.work_id,
+        urgency: "inbox",
+        expires_at: now, // expires_at <= now → expiry triggered
+      }),
+      1,
+    );
+    expect(listAttention(d, "now", now).map((x) => x.item_id)).toEqual(["exp-now"]);
+    expect(listAttentionPage(d, "now", { limit: 10 }, now).items.map((x) => x.item_id)).toEqual(["exp-now"]);
+    expect(listAttention(d, "inbox", now).map((x) => x.item_id)).toEqual([]);
+    d.close();
+  });
+
+  test("expires_at > now (not yet expired) — inbox item stays in inbox zone", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    const now = 1000;
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "exp-future",
+        work_id: w.work_id,
+        urgency: "inbox",
+        expires_at: now + 1, // expires_at > now → not yet expired
+      }),
+      1,
+    );
+    expect(listAttention(d, "now", now).map((x) => x.item_id)).toEqual([]);
+    expect(listAttentionPage(d, "now", { limit: 10 }, now).items).toEqual([]);
+    expect(listAttention(d, "inbox", now).map((x) => x.item_id)).toEqual(["exp-future"]);
+    expect(listAttentionPage(d, "inbox", { limit: 10 }, now).items.map((x) => x.item_id)).toEqual(["exp-future"]);
+    d.close();
+  });
+});
+
+describe("T23 listAttentionFollowUps pruning and stage assignment", () => {
+  test("settled succeeded items with numeric effect_verified_at and no receipt are pruned", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "settled",
+        work_id: w.work_id,
+        state: "applying",
+        effect_state: "succeeded",
+        evidence: { effect_verified_at: 42 },
+      }),
+      1,
+    );
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "still-open",
+        work_id: w.work_id,
+        state: "applying",
+        effect_state: "applying",
+      }),
+      2,
+    );
+    const upserted = listAttentionFollowUps(d);
+    expect(upserted.some((f) => f.item.item_id === "settled")).toBe(false);
+    expect(upserted.some((f) => f.item.item_id === "still-open")).toBe(true);
+    d.close();
+  });
+
+  test("non-numeric effect_verified_at (string) with remaining responsibility stays as verification_required", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "nonnum",
+        work_id: w.work_id,
+        state: "applying",
+        effect_state: "succeeded",
+        evidence: { effect_verified_at: "yes" },
+      }),
+      1,
+    );
+    const upserted = listAttentionFollowUps(d);
+    const f = upserted.find((x) => x.item.item_id === "nonnum");
+    expect(f!.stage).toBe("verification_required");
+    d.close();
+  });
+
+  test("failed and unknown effect states remain visible", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "f",
+        work_id: w.work_id,
+        state: "applying",
+        effect_state: "failed",
+      }),
+      1,
+    );
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "u",
+        work_id: w.work_id,
+        state: "applying",
+        effect_state: "unknown",
+      }),
+      2,
+    );
+    const upserted = listAttentionFollowUps(d);
+    expect(upserted.some((x) => x.item.item_id === "u" && x.stage === "unknown")).toBe(true);
+    d.close();
+  });
+
+  test("legacy evidence.occurred_effects preserved when no recent receipt observations", () => {
+    const d = db();
+    const w = createWork(d, { title: "w", source: "t", contract }, 1);
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "legacy",
+        work_id: w.work_id,
+        state: "applying",
+        effect_state: "applying",
+        evidence: {
+          occurred_effects: [
+            { kind: "tool-a", evidence: { result: "ok" } },
+            { kind: "tool-b", evidence: { result: "ok2" } },
+          ],
+        },
+      }),
+      1,
+    );
+    const upserted = listAttentionFollowUps(d);
+    const f = upserted.find((x) => x.item.item_id === "legacy");
+    expect(f).toBeTruthy();
+    expect(f!.occurred_effects[0].kind).toBe("tool-a");
+    d.close();
+  });
+
+  test("succeeded without numeric effect_verified_at stays as verification_required when human acceptance remains", () => {
+    const d = db();
+    const w = createWork(
+      d,
+      { title: "w", source: "t", contract },
+      1,
+    );
+    upsertAttention(
+      d,
+      attentionTemplate({
+        item_id: "acceptance-open",
+        work_id: w.work_id,
+        state: "applying",
+        effect_state: "succeeded",
+        // No numeric effect_verified_at → remaining is computed via
+        // explicitRemainingResponsibility, which sees the human acceptance
+        // criterion as unresolved → stage = verification_required.
+        evidence: {},
+      }),
+      1,
+    );
+    const upserted = listAttentionFollowUps(d);
+    const f = upserted.find((x) => x.item.item_id === "acceptance-open");
+    expect(f).toBeTruthy();
+    expect(f!.stage).toBe("verification_required");
+    expect(f!.remaining_responsibility.length).toBeGreaterThan(0);
     d.close();
   });
 });

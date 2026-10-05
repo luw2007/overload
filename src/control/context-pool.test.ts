@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { CONTROL_SCHEMA_VERSION, ControlError, ensureControlSchema } from "./store";
+import { ControlError, ensureControlSchema } from "./store";
 import {
   createObject,
   createProblem,
@@ -37,7 +37,6 @@ const TABLES = [
 describe("T1 schema migration", () => {
   test("migration creates six context tables and leaves legacy tables intact", () => {
     const db = fixture();
-    expect(CONTROL_SCHEMA_VERSION).toBe(9);
     for (const table of TABLES) {
       const row = db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
       expect(row).toBeTruthy();

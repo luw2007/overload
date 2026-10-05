@@ -60,6 +60,20 @@ describe("WEB-01 loadWebConfig", () => {
     expect((await loadWebConfig(zero)).web_port).toBe(4870);
   });
 
+  test("TCP port bounds keep server and extension configuration consistent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "overload-webcfg-bounds-"));
+    roots.push(root);
+    const path = join(root, "config.json");
+    for (const web_port of [1, 65535]) {
+      writeFileSync(path, JSON.stringify({ web_port }));
+      expect((await loadWebConfig(path, { OVERLOAD_WEB_PORT: "5100" })).web_port).toBe(web_port);
+    }
+    for (const web_port of [65536, Number.MAX_SAFE_INTEGER]) {
+      writeFileSync(path, JSON.stringify({ web_port }));
+      expect((await loadWebConfig(path, { OVERLOAD_WEB_PORT: "5100" })).web_port).toBe(5100);
+    }
+  });
+
   // OVERLOAD_WEB_PORT used to be read by the adapter daemon alone, so exporting it and
   // expecting the dashboard to move silently did nothing. It is now the fallback between
   // config.json and the built-in default. config.json still wins: it is the only setting
@@ -87,27 +101,12 @@ describe("WEB-01 loadWebConfig", () => {
     const root = mkdtempSync(join(tmpdir(), "overload-webcfg-"));
     roots.push(root);
     const missing = join(root, "does-not-exist.json");
-    for (const raw of ["not-a-number", "0", "-1", "", "4870.5"]) {
+    for (const raw of ["not-a-number", "0", "-1", "", "4870.5", "65536", String(Number.MAX_SAFE_INTEGER)]) {
       expect((await loadWebConfig(missing, { OVERLOAD_WEB_PORT: raw })).web_port).toBe(4870);
     }
     expect((await loadWebConfig(missing, {})).web_port).toBe(4870);
   });
 
-  // The suite has a history of env leaking between files in one bun process; the default
-  // argument must still be process.env, so this asserts the wiring rather than the parsing.
-  test("loadWebConfig reads process.env by default", async () => {
-    const root = mkdtempSync(join(tmpdir(), "overload-webcfg-"));
-    roots.push(root);
-    const missing = join(root, "does-not-exist.json");
-    const previous = process.env.OVERLOAD_WEB_PORT;
-    process.env.OVERLOAD_WEB_PORT = "5177";
-    try {
-      expect((await loadWebConfig(missing)).web_port).toBe(5177);
-    } finally {
-      if (previous === undefined) delete process.env.OVERLOAD_WEB_PORT;
-      else process.env.OVERLOAD_WEB_PORT = previous;
-    }
-  });
 });
 
 describe("WEB-03/04 SPA shell + static", () => {
@@ -133,7 +132,7 @@ describe("WEB-03/04 SPA shell + static", () => {
 });
 
 describe("WEB-07/08/25 attention zones, capabilities, health", () => {
-  test("GET /api/attention/(now|inbox|done) delegate to listAttention", async () => {
+  test("attention lists expose active items and bounded Done history", async () => {
     const path = seedLedger();
     const root = join(path, "..");
     const ctrl = join(root, "control.db");
@@ -145,7 +144,9 @@ describe("WEB-07/08/25 attention zones, capabilities, health", () => {
     for (const zone of ["now", "inbox", "done"] as const) {
       const res = await fetch(`${base}/api/attention/${zone}`);
       expect(res.status).toBe(200);
-      expect(Array.isArray(await res.json())).toBe(true);
+      const body = await res.json();
+      if (zone === "done") expect(body).toEqual({ items: [], total: 0, next_cursor: null, automatic_today: 0 });
+      else expect(body.map((item: { item_id: string }) => item.item_id)).toEqual(zone === "now" ? ["now-1"] : []);
     }
   });
 

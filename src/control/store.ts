@@ -10,7 +10,7 @@ import { ensureContextReducerSchema } from "./context-reducer";
 import type { EffectObservation } from "../decision-bot/mailbox";
 import type {
   AffectedAttentionCard, AttentionAuditLink, AttentionCardSnapshot, AttentionDecisionInput,
-  AttentionFollowUp, AttentionItem, AttentionMaterialProjection, AttentionZone, CheckBaseline, ConditionWait, Contract,
+  AttentionFollowUp, AttentionItem, AttentionMaterialProjection, AttentionPage, AttentionPageOptions, AttentionZone, CheckBaseline, ConditionWait, Contract,
   ContractRevisionPreview, CreateWaitInput, DecisionOption, MaterialFingerprintInputs, PrBaseline,
   RecoveryDispatchResult, StaleAttentionBody, WaitBaseline, WaitBaselineSnapshot, WaitCondition, WaitConflictBody,
   WaitDispositionInput, WaitDispositionState, WaitErrorKind, WaitObservation, WaitResumeGrant, WaitState, Work,
@@ -20,7 +20,7 @@ import type {
 export {
   type AffectedAttentionCard, type AttentionAuditLink, type AttentionCardSnapshot,
   type AttentionDecisionInput, type AttentionFollowUp, type AttentionItem,
-  type AttentionMaterialProjection, type AttentionZone, type Contract,
+  type AttentionMaterialProjection, type AttentionPage, type AttentionPageOptions, type AttentionZone, type Contract,
   type ContractRevisionPreview, type DecisionOption, type MaterialFingerprintInputs,
   type StaleAttentionBody, type Work,
 } from "./types";
@@ -36,7 +36,7 @@ export class ControlError extends Error {
   ) { super(message); this.name = "ControlError"; }
 }
 
-export const CONTROL_SCHEMA_VERSION = 9;
+export const CONTROL_SCHEMA_VERSION = 11;
 export const CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS control_schema_meta(
   id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, migrated_at INTEGER NOT NULL
@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS control_attention(
   evidence TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS control_attention_work ON control_attention(work_id,state,updated_at);
+CREATE INDEX IF NOT EXISTS control_attention_state_updated ON control_attention(state,updated_at DESC,item_id ASC);
+CREATE INDEX IF NOT EXISTS control_attention_effect_state ON control_attention(effect_state,updated_at DESC,item_id ASC);
 CREATE TABLE IF NOT EXISTS control_attention_events(
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,item_id TEXT NOT NULL,revision INTEGER NOT NULL,
   kind TEXT NOT NULL,detail TEXT NOT NULL,created_at INTEGER NOT NULL
@@ -401,6 +403,21 @@ const CONTROL_MIGRATIONS:ControlMigration[]=[
   {to:8,destructive:false,apply(db){if(!(db.query("PRAGMA table_info(control_attention)").all() as Array<{name:string}>).some(column=>column.name==="effect_detail"))db.exec("ALTER TABLE control_attention ADD COLUMN effect_detail TEXT");db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(8,Date.now());}},
   // v9 additive only: durable spool-pass ownership prevents concurrent importers from reading or renaming one segment.
   {to:9,destructive:false,apply(db){db.exec(CONTROL_V9_SCHEMA);db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(9,Date.now());}},
+  // v10 additive only: keyset pagination and state/effect filtering indexes
+  {to:10,destructive:false,apply(db){
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS control_attention_state_updated ON control_attention(state,updated_at DESC,item_id ASC);
+      CREATE INDEX IF NOT EXISTS control_attention_effect_state ON control_attention(effect_state,updated_at DESC,item_id ASC);
+      CREATE INDEX IF NOT EXISTS control_attention_unverified_effect ON control_attention(updated_at DESC,item_id ASC)
+        WHERE effect_state='succeeded' AND (json_type(evidence,'$.effect_verified_at') IS NULL OR json_type(evidence,'$.effect_verified_at') NOT IN ('integer','real'));
+      CREATE INDEX IF NOT EXISTS control_attention_approval ON control_attention(consumer_owner,approval_id);
+    `);
+    db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(10,Date.now());
+  }},
+  {to:11,destructive:false,apply(db){
+    db.exec("CREATE INDEX IF NOT EXISTS control_attention_done_updated ON control_attention(updated_at DESC,item_id ASC) WHERE state IN ('resolved','superseded')");
+    db.query("UPDATE control_schema_meta SET version=?,migrated_at=? WHERE id=1").run(11,Date.now());
+  }},
 ];
 export function ensureControlSchema(db: Database): void {
   const version=controlSchemaVersion(db);
@@ -576,7 +593,108 @@ export function upsertAttention(db:Database,input:Omit<AttentionItem,"revision"|
     emitAttention(db,item,row?"attention.updated":"attention.created");return item;});return tx.immediate() as AttentionItem;
 }
 export function getAttention(db:Database,itemId:string):AttentionItem|null {ensureControlSchema(db);const row=db.query("SELECT * FROM control_attention WHERE item_id=?").get(itemId) as Record<string,unknown>|null;return row?attentionFrom(row):null;}
-export function listAttention(db:Database,zone?:AttentionZone,now=Date.now()):AttentionItem[]{ensureControlSchema(db);const rows=(db.query("SELECT * FROM control_attention ORDER BY updated_at DESC,item_id").all() as Record<string,unknown>[]).map(attentionFrom);return rows.filter(item=>{if(!zone)return true;if(zone==="done")return item.state==="resolved"||item.state==="superseded";if(item.state!=="open"||item.defer_until!==null&&item.defer_until>now)return false;return zone==="now"?item.urgency==="now"||item.expires_at!==null&&item.expires_at<=now:item.urgency==="inbox"&&!(item.expires_at!==null&&item.expires_at<=now);});}
+export function listAttention(db: Database, zone?: AttentionZone, now = Date.now(), options: { updated_since?: number; limit?: number } = {}): AttentionItem[] {
+  ensureControlSchema(db);
+  if (options.updated_since !== undefined && (!Number.isSafeInteger(options.updated_since) || options.updated_since < 0)) {
+    throw new ControlError("invalid", "updated_since must be a nonnegative integer");
+  }
+  if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1)) {
+    throw new ControlError("invalid", "limit must be a positive integer");
+  }
+  let sql = zone === "done" ? "SELECT * FROM control_attention INDEXED BY control_attention_done_updated WHERE state IN ('resolved','superseded')" : "SELECT * FROM control_attention WHERE 1=1";
+  const params: unknown[] = [];
+  if (zone === "now") {
+    sql += " AND state='open' AND ((expires_at IS NOT NULL AND expires_at<=?) OR (urgency='now' AND (defer_until IS NULL OR defer_until<=?)))";
+    params.push(now, now);
+  } else if (zone === "inbox") {
+    sql += " AND state='open' AND (defer_until IS NULL OR defer_until<=?) AND urgency='inbox' AND (expires_at IS NULL OR expires_at>?)";
+    params.push(now, now);
+  } else if (zone !== undefined && zone !== "done") return [];
+  if (options.updated_since !== undefined) { sql += " AND updated_at>=?"; params.push(options.updated_since); }
+  sql += " ORDER BY updated_at DESC,item_id ASC";
+  if (options.limit !== undefined) { sql += " LIMIT ?"; params.push(options.limit); }
+  return (db.query(sql).all(...params) as Record<string, unknown>[]).map(attentionFrom);
+}
+export function listAttentionPage(
+  db: Database,
+  zone: AttentionZone,
+  options: AttentionPageOptions = {},
+  now = Date.now()
+): AttentionPage {
+  ensureControlSchema(db);
+  const limit = options.limit ?? 50;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new ControlError("invalid", "limit must be an integer between 1 and 100");
+  }
+  if (options.updated_since !== undefined && (!Number.isSafeInteger(options.updated_since) || options.updated_since < 0)) {
+    throw new ControlError("invalid", "updated_since must be a nonnegative integer");
+  }
+  let cursorTuple: { u: number; i: string } | null = null;
+  if (options.cursor !== undefined) {
+    try {
+      if (typeof options.cursor !== "string" || !/^[A-Za-z0-9_-]{1,4096}$/.test(options.cursor)) throw new Error("invalid cursor encoding");
+      const raw = Buffer.from(options.cursor, "base64url").toString("utf8");
+      const parsed: unknown = JSON.parse(raw);
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        !("u" in parsed) || typeof parsed.u !== "number" || !Number.isSafeInteger(parsed.u) || parsed.u < 0 ||
+        !("i" in parsed) || typeof parsed.i !== "string" || !parsed.i.trim()
+      ) {
+        throw new Error();
+      }
+      cursorTuple = { u: parsed.u, i: parsed.i };
+    } catch {
+      throw new ControlError("invalid", "invalid cursor");
+    }
+  }
+  let totalSql: string;
+  let totalParams: unknown[];
+  let queryBaseSql: string;
+  let baseParams: unknown[];
+  if (zone === "done") {
+    totalSql = "SELECT COUNT(*) AS total FROM control_attention INDEXED BY control_attention_done_updated WHERE state IN ('resolved','superseded')";
+    totalParams = [];
+    queryBaseSql = "SELECT * FROM control_attention INDEXED BY control_attention_done_updated WHERE state IN ('resolved','superseded')";
+    baseParams = [];
+  } else if (zone === "now") {
+    totalSql = "SELECT COUNT(*) AS total FROM control_attention WHERE state='open' AND ((expires_at IS NOT NULL AND expires_at<=?) OR (urgency='now' AND (defer_until IS NULL OR defer_until<=?)))";
+    totalParams = [now, now];
+    queryBaseSql = "SELECT * FROM control_attention WHERE state='open' AND ((expires_at IS NOT NULL AND expires_at<=?) OR (urgency='now' AND (defer_until IS NULL OR defer_until<=?)))";
+    baseParams = [now, now];
+  } else if (zone === "inbox") {
+    totalSql = "SELECT COUNT(*) AS total FROM control_attention WHERE state='open' AND (defer_until IS NULL OR defer_until<=?) AND urgency='inbox' AND (expires_at IS NULL OR expires_at>?)";
+    totalParams = [now, now];
+    queryBaseSql = "SELECT * FROM control_attention WHERE state='open' AND (defer_until IS NULL OR defer_until<=?) AND urgency='inbox' AND (expires_at IS NULL OR expires_at>?)";
+    baseParams = [now, now];
+  } else {
+    throw new ControlError("invalid", `unknown attention zone: ${String(zone)}`);
+  }
+  if (options.updated_since !== undefined) {
+    totalSql += " AND updated_at>=?"; totalParams.push(options.updated_since);
+    queryBaseSql += " AND updated_at>=?"; baseParams.push(options.updated_since);
+  }
+  const totalRow = db.query(totalSql).get(...totalParams) as { total: number } | null;
+  const total = Number(totalRow?.total ?? 0);
+  let pagedSql: string;
+  let pagedParams: unknown[];
+  if (cursorTuple) {
+    pagedSql = `${queryBaseSql} AND (updated_at<? OR (updated_at=? AND item_id>?)) ORDER BY updated_at DESC,item_id ASC LIMIT ?`;
+    pagedParams = [...baseParams, cursorTuple.u, cursorTuple.u, cursorTuple.i, limit + 1];
+  } else {
+    pagedSql = `${queryBaseSql} ORDER BY updated_at DESC,item_id ASC LIMIT ?`;
+    pagedParams = [...baseParams, limit + 1];
+  }
+  const rows = db.query(pagedSql).all(...pagedParams) as Record<string, unknown>[];
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const items = pageRows.map(attentionFrom);
+  const next_cursor = hasMore && pageRows.length > 0
+    ? Buffer.from(JSON.stringify({ u: pageRows[pageRows.length - 1].updated_at, i: pageRows[pageRows.length - 1].item_id })).toString("base64url")
+    : null;
+  return { items, next_cursor, total };
+}
 
 const GENERIC_DECISION_OPTIONS: Record<string, Omit<DecisionOption, "id">> = {
   stop: {
@@ -767,19 +885,36 @@ function tableExists(db: Database, name: string): boolean {
 
 export function listAttentionFollowUps(db: Database, _now = Date.now()): AttentionFollowUp[] {
   ensureControlSchema(db);
-  const items = listAttention(db);
   const hasReceipts = tableExists(db, "decision_receipts") && tableExists(db, "approval_targets");
   const hasObservations = tableExists(db, "receipt_effect_observations");
+
+  const candidates = `SELECT item_id FROM control_attention WHERE state='applying'
+    UNION SELECT item_id FROM control_attention WHERE effect_state IN ('applying','failed','unknown')
+    UNION SELECT item_id FROM control_attention INDEXED BY control_attention_unverified_effect WHERE effect_state='succeeded'
+      AND (json_type(evidence,'$.effect_verified_at') IS NULL OR json_type(evidence,'$.effect_verified_at') NOT IN ('integer','real'))
+    ${hasReceipts ? `UNION SELECT a.item_id FROM decision_receipts r CROSS JOIN control_attention a
+      ON a.consumer_owner=r.consumer_owner AND a.approval_id=r.approval_id WHERE r.applied_at IS NULL` : ''}`;
+  const candidateSql = `SELECT a.* FROM (${candidates}) c CROSS JOIN control_attention a ON a.item_id=c.item_id
+    ORDER BY a.updated_at DESC,a.item_id ASC`;
+
+  const candidateRows = db.query(candidateSql).all() as Record<string, unknown>[];
+
+  const receiptStmt = hasReceipts
+    ? db.query(`SELECT r.receipt_id,r.consumed_at,r.applied_at,r.outcome FROM decision_receipts r
+        WHERE r.consumer_owner=? AND r.approval_id=? ORDER BY r.consumed_at DESC LIMIT 1`)
+    : null;
+  const obsStmt = hasObservations
+    ? db.query("SELECT tool_call_id,state,evidence,observed_at FROM receipt_effect_observations WHERE receipt_id=? ORDER BY observed_at,tool_call_id")
+    : null;
+
   const followUps: AttentionFollowUp[] = [];
-  for (const item of items) {
-    const receipt = hasReceipts && item.approval_id && item.consumer_owner
-      ? db.query(`SELECT r.receipt_id,r.consumed_at,r.applied_at,r.outcome FROM decision_receipts r
-          WHERE r.consumer_owner=? AND r.approval_id=? ORDER BY r.consumed_at DESC LIMIT 1`)
-        .get(item.consumer_owner, item.approval_id) as { receipt_id: string; consumed_at: number; applied_at: number | null; outcome: string | null } | null
+  for (const row of candidateRows) {
+    const item = attentionFrom(row);
+    const receipt = receiptStmt && item.approval_id && item.consumer_owner
+      ? (receiptStmt.get(item.consumer_owner, item.approval_id) as { receipt_id: string; consumed_at: number; applied_at: number | null; outcome: string | null } | null)
       : null;
-    const observations = hasObservations && receipt
-      ? db.query("SELECT tool_call_id,state,evidence,observed_at FROM receipt_effect_observations WHERE receipt_id=? ORDER BY observed_at,tool_call_id")
-        .all(receipt.receipt_id) as Array<{ tool_call_id: string; state: string; evidence: string; observed_at: number }>
+    const observations = obsStmt && receipt
+      ? (obsStmt.all(receipt.receipt_id) as Array<{ tool_call_id: string; state: string; evidence: string; observed_at: number }>)
       : [];
     const occurredEffects = observations.map((observation) => ({
       kind: observation.tool_call_id,
@@ -810,7 +945,7 @@ export function listAttentionFollowUps(db: Database, _now = Date.now()): Attenti
     followUps.push({
       item, stage, receipt_id: receipt?.receipt_id ?? null, consumed_at: receipt?.consumed_at ?? null,
       applied_at: receipt?.applied_at ?? null, outcome, occurred_effects: occurredEffects,
-      remaining_responsibility: remaining || (stage === "failed" ? "Review failure and choose the next action." : stage === "unknown" ? "Confirm the external effect before retrying." : "Verify the recorded effect."),
+      remaining_responsibility: remaining || (stage === "failed" ? "Review failure and choose the next action." : stage === "unknown" ? "Confirm the result; do not replay blindly." : "Verify the recorded effect."),
       next_action: stage === "answer_recorded" ? "Wait for the registered consumer to apply the answer."
         : stage === "failed" ? "Review the failure without creating replacement Work."
         : stage === "unknown" ? "Confirm the result; do not replay blindly."
@@ -820,6 +955,7 @@ export function listAttentionFollowUps(db: Database, _now = Date.now()): Attenti
   }
   return followUps;
 }
+ 
 
 function affectedAttention(db: Database, workId: string, nextRevision: number, excludeItemId?: string): AttentionItem[] {
   const rows = excludeItemId === undefined
@@ -1014,7 +1150,7 @@ export function projectAttentionEffect(
 }
 
 // 权威收口：对一张 attention 卡做一次带 revision CAS 的结论落地。
-// accepted → resolved/succeeded（记录 acknowledged_at）；rejected → superseded/unknown。
+// accepted → resolved/succeeded；rejected → superseded/succeeded（拒绝已生效，不表示提交成功）。
 // 写 control_attention_events + enqueue outbox(attention.resolved)，替代 manage 层裸写。
 export function recordAttentionResolution(
   db: Database,
@@ -1033,13 +1169,16 @@ export function recordAttentionResolution(
     const old = getAttention(db, itemId);
     if (!old) throw new ControlError("not_found", "attention item not found");
     if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
+    if (old.state !== "open" || old.effect_state !== "not_started") throw new ControlError("blocked", "attention decision is already settled");
+    if (old.expires_at !== null && old.expires_at <= now) throw new ControlError("blocked", "attention decision has expired");
     const item: AttentionItem = {
       ...old,
       revision: old.revision + 1,
       state: accepted ? "resolved" : "superseded",
-      effect_state: accepted ? "succeeded" : "unknown",
+      effect_state: "succeeded",
       acknowledged_at: accepted ? now : old.acknowledged_at,
-      evidence: { ...old.evidence, ...input.evidence, resolution: { verdict: input.verdict, actor: input.actor, resolved_at: now } },
+      evidence: { ...old.evidence, ...input.evidence, selected_option: accepted ? "accept" : "reject", decided_at: now,
+        decision_actor: input.actor, effect_verified_at: now, resolution: { verdict: input.verdict, actor: input.actor, resolved_at: now } },
       updated_at: now,
     };
     persistAttention(db, old, item, "resolved", { verdict: input.verdict, actor: input.actor, evidence: input.evidence }, now);
@@ -1115,7 +1254,7 @@ export function supersedeOpenAttentionByWork(
 }
 
 // 外部效果确认式 resolve：open/applying → resolved/succeeded，带 CAS + events(attention.resolved) + outbox。
-// 语义守卫：effect_state=failed 的卡不得写成 succeeded；rejected（superseded/unknown）不得被外部成功复活。
+// 语义守卫：effect_state=failed 的卡不得写成 succeeded；superseded 的卡不得被外部成功复活。
 // 幂等：已 resolved/succeeded 且 revision 匹配 → 返回旧卡；已 superseded → 返回旧卡（不覆盖）。
 // 调用方先用 getAttention 读 expectedRevision；卡缺失由调用方自行 no-op（与原裸 UPDATE 0 行等价）。
 export function resolveAttentionByExternalSuccess(
@@ -1164,7 +1303,11 @@ export function resolveAttentionDecision(db: Database, itemId: string, expectedR
     const old = getAttention(db, itemId);
     if (!old) throw new ControlError("not_found", "attention item not found");
     if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
+    if (input.material_fingerprint !== undefined && getAttentionMaterial(db, itemId)?.fingerprint !== input.material_fingerprint) {
+      throw staleAttentionError(old, expectedRevision);
+    }
     if (old.state !== "open" || old.effect_state !== "not_started") throw new ControlError("blocked", "attention decision is not open");
+    if (old.expires_at !== null && old.expires_at <= now) throw new ControlError("blocked", "attention decision has expired; refresh the decision basis");
     if (old.approval_id) throw new ControlError("blocked", "approval-linked attention must use answer consumer");
     if (!old.options.includes(input.selected_option)) throw new ControlError("invalid", "selected_option is not an available option");
     if (!["stop", "continue", "narrow"].includes(input.selected_option)) throw new ControlError("invalid", "unsupported generic decision option");
@@ -1200,8 +1343,7 @@ export function resolveAttentionDecision(db: Database, itemId: string, expectedR
           throw new ControlError("blocked", "permission_denied: actor not authorized for this work");
         }
       }
-    } else if (isContextDecision) {
-      // actor 为空却消费 context 决策 → 拒绝（不得 fail-open 静默放行）。
+    } else if (decisionOwner || isContextDecision) {
       throw new ControlError("blocked", "permission_denied: actor identity required");
     }
     // context 决策必须有 decision_owner；无 owner 却访问 context 对象 → 拒绝。
@@ -1227,7 +1369,7 @@ export function resolveAttentionDecision(db: Database, itemId: string, expectedR
     assertNoInFlightAttention(db, work.work_id, workRevision);
     const applicable = affectedAttention(db, work.work_id, workRevision, itemId);
     verifyAffectedSnapshot(snapshot, old, applicable);
-    const applying: AttentionItem = { ...old, revision: old.revision + 1, state: "applying", effect_state: "applying", updated_at: now, evidence: { ...old.evidence, selected_option: input.selected_option, decision_reason: input.reason ?? null, decided_at: now } };
+    const applying: AttentionItem = { ...old, revision: old.revision + 1, state: "applying", effect_state: "applying", updated_at: now, evidence: { ...old.evidence, selected_option: input.selected_option, decision_reason: input.reason ?? null, decided_at: now, decision_actor: actor?.trim() ?? null } };
     persistAttention(db, old, applying, "applying", { selected_option: input.selected_option }, now);
     let contract = work.contract;
     let state: Work["state"] = work.state;
@@ -1267,18 +1409,17 @@ export function resolveAttention(
 }
 
 export function actOnAttention(db: Database, itemId: string, expectedRevision: number, action: "ack" | "defer" | "resolve", input: { defer_until?: number; reason?: string; selected_option?: string; replacement_contract?: Contract; expected_contract_revision?: number; affected_cards?: AttentionCardSnapshot[] } = {}, actor?: string, now = Date.now()): AttentionItem {
-  if (action === "resolve" && input.selected_option !== undefined) return resolveAttentionDecision(db, itemId, expectedRevision, input as AttentionDecisionInput, now, actor);
+  if (action === "resolve") return resolveAttentionDecision(db, itemId, expectedRevision, input as AttentionDecisionInput, now, actor);
   ensureControlSchema(db);
   const tx = db.transaction(() => {
     const old = getAttention(db, itemId);
     if (!old) throw new ControlError("not_found", "attention item not found");
     if (old.revision !== expectedRevision) throw new ControlError("conflict", "stale attention revision");
     if (action === "defer" && (!input.defer_until || input.defer_until <= now)) throw new ControlError("invalid", "defer_until must be in future");
-    if (action === "resolve" && old.approval_id && (old.effect_state === "not_started" || old.effect_state === "applying" || old.effect_state === "unknown")) throw new ControlError("blocked", "external effect is not confirmed");
     const item = { ...old, revision: old.revision + 1, updated_at: now };
     if (action === "ack") item.acknowledged_at = now;
     else if (action === "defer") item.defer_until = input.defer_until!;
-    else item.state = "resolved";
+    else throw new ControlError("invalid", "unsupported attention action");
     persistAttention(db, old, item, action, input as Record<string, unknown>, now);
     return item;
   });

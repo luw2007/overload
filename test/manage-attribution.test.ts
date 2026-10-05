@@ -5,7 +5,7 @@ import {rm,readFile,stat,mkdtemp} from "node:fs/promises";
 import {insertManifest,recordAcceptance,requestAcceptance} from "../src/manage/manifest";
 import {collectExecution} from "../src/manage/collect";
 import {parseClaudeSession,type SessionRecord} from "../src/manage/readers/types";
-import {ensureControlSchema} from "../src/control/store";
+import {ensureControlSchema,getAttention,getAttentionMaterial} from "../src/control/store";
 import {ensureMgmtSchema} from "../src/manage/schema";
 import {bindExecution,createDiscoveredWork} from "../src/manage/store";
 import {aliasWork,correctLink} from "../src/manage/relations";
@@ -38,7 +38,8 @@ test("captured replacement invalidates acceptance and stores private real bytes"
   expect(version.snapshot_state).toBe("stored");expect(version.sensitivity).toBe("none");
   expect(await readFile(version.snapshot_path,"utf8")).toBe("first");expect((await stat(version.snapshot_path)).mode&0o777).toBe(0o600);
   const {manifest_id}=insertManifest(db,{work_id:workId,repo_root:null,git_head:null,git_tree_sha:null,base_ref:null,base_sha:null,verification:[],entries:[{artifact_id:version.artifact_id,version_id:version.version_id}]},"owner",21);
-  requestAcceptance(db,manifest_id,22);const accepted=recordAcceptance(db,manifest_id,"accepted","owner",{},23);
+  const review=requestAcceptance(db,manifest_id,22),card=getAttention(db,review.item_id)!,material=getAttentionMaterial(db,review.item_id)!;
+  const accepted=recordAcceptance(db,manifest_id,"accepted","owner",{},{attention_revision:card.revision,material_fingerprint:material.fingerprint},23);
   files["/repo/a.ts"]="second";
   await collectExecution(db,fs,workId,eid,"/sessions/replacement",record("a",[event("/repo/a.ts","modified",5,30)]),{...limits,snapshotRoot},40);
   expect(db.query("SELECT invalidated_at FROM mgmt_acceptances WHERE acceptance_id=?").get(accepted.acceptance_id)).toEqual({invalidated_at:40});

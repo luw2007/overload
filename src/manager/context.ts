@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { digest } from "../decision-bot/mailbox";
-import { listAttention, listAttentionFollowUps, listConditionWaits, listWorks } from "../control/store";
+import { listAttention, listAttentionFollowUps, listAttentionPage, listConditionWaits, listWorks } from "../control/store";
 import type { AttentionFollowUp, AttentionItem, ConditionWait, Work } from "../control/types";
 import { queryHealth, querySessions, SESSION_WINDOW_MS, type SessionSummary } from "../shared/queries";
 import { scrubText } from "../shared/redact";
@@ -107,7 +107,7 @@ function sessionMeta(ledger: Database, stableId: string): SessionMeta {
 }
 
 export type ManagerReadModel = {
-  now: AttentionItem[]; inbox: AttentionItem[]; followUps: AttentionFollowUp[]; done: AttentionItem[];
+  now: AttentionItem[]; inbox: AttentionItem[]; followUps: AttentionFollowUp[]; done: AttentionItem[]; doneTotal: number;
   works: Work[]; waits: ConditionWait[];
   sessions: Array<SessionSummary & SessionMeta>;
   health: ManagerTurnContext["coverage"]["health"];
@@ -119,8 +119,12 @@ function latestAt(ledger: Database, kinds: string[]): number | null {
   return row.at;
 }
 
-/** Load the full (uncapped) read model shared by the snapshot and the paged read views. */
-export function loadManagerReadModel(control: Database, ledger: Database | null, now: number): ManagerReadModel {
+/**
+ * Load the read model shared by the snapshot and the paged read views.
+ * When doneLimit is provided, done is capped at that count but doneTotal remains the full
+ * matching total (inclusive cutoff) for accurate omitted accounting.
+ */
+export function loadManagerReadModel(control: Database, ledger: Database | null, now: number, doneLimit?: number): ManagerReadModel {
   const doneCutoff = now - DONE_WINDOW_DAYS * DAY_MS;
   const works = listWorks(control).filter((w) => w.state !== "completed" || w.updated_at >= doneCutoff);
   const waits = listConditionWaits(control, { limit: 200 }).filter((w) => w.state === "watching" || w.state === "ready" || w.updated_at >= doneCutoff);
@@ -148,8 +152,9 @@ export function loadManagerReadModel(control: Database, ledger: Database | null,
       sources.push({ source_id: "ledger", kind: "ledger", freshness: "unavailable", last_read_at: null, reason: `ledger_read_failed: ${(error as Error).message}` });
     }
   }
-  const done = listAttention(control, "done", now).filter((i) => i.updated_at >= doneCutoff);
-  return { now: attentionNow, inbox, followUps: listAttentionFollowUps(control, now), done, works, waits, sessions, health, sources };
+  const donePage = doneLimit === undefined ? null : listAttentionPage(control, "done", { updated_since: Math.max(0, doneCutoff), limit: doneLimit }, now);
+  const done = donePage?.items ?? listAttention(control, "done", now, { updated_since: Math.max(0, doneCutoff) });
+  return { now: attentionNow, inbox, followUps: listAttentionFollowUps(control, now), done, doneTotal: donePage?.total ?? done.length, works, waits, sessions, health, sources };
 }
 
 export function compactSession(s: SessionSummary & SessionMeta): CompactSession {
@@ -165,7 +170,7 @@ export function handoffTargets(sessions: ManagerReadModel["sessions"]): HandoffT
 
 export function buildManagerContext(control: Database, ledger: Database | null, opts: { now?: number } = {}): ManagerTurnContext {
   const now = opts.now ?? Date.now();
-  const model = loadManagerReadModel(control, ledger, now);
+  const model = loadManagerReadModel(control, ledger, now, DONE_CAP);
   const cap = <T>(rows: T[], n: number) => rows.slice(0, n);
   const attentionTotal = model.now.length + model.inbox.length + model.followUps.length;
   const attention = {
@@ -175,7 +180,7 @@ export function buildManagerContext(control: Database, ledger: Database | null, 
   };
   const attentionIncluded = attention.now.length + attention.inbox.length + attention.follow_up.length;
   const sessions = cap(model.sessions, SESSION_CAP).map(compactSession);
-  const recentDone = cap(model.done, DONE_CAP).map(compactAttention);
+  const recentDone = model.done.map(compactAttention);
   const body = redactDeep({
     version: "manager_turn_context_v1" as const,
     attention,
@@ -186,7 +191,7 @@ export function buildManagerContext(control: Database, ledger: Database | null, 
     targets: handoffTargets(model.sessions),
     coverage: {
       session_window_days: Math.round(SESSION_WINDOW_MS / DAY_MS), sessions_included: sessions.length, sessions_omitted: model.sessions.length - sessions.length,
-      done_window_days: DONE_WINDOW_DAYS, done_included: recentDone.length, done_omitted: model.done.length - recentDone.length,
+      done_window_days: DONE_WINDOW_DAYS, done_included: recentDone.length, done_omitted: Math.max(0, model.doneTotal - recentDone.length),
       attention_included: attentionIncluded, attention_omitted: attentionTotal - attentionIncluded,
       health: model.health, sources: model.sources,
     },

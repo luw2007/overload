@@ -126,10 +126,10 @@ the plist launchd already registered and will not pick up a new environment:
 scripts/install-launchd.sh --install --actor luwei.will
 ```
 
-The CLI takes the same identity from `--actor` or your own shell's `OVERLOAD_ACTOR`:
-`attention … resolve` on a context-bearing or owner-bearing item exits 1 with
-`error: context decision requires --actor or OVERLOAD_ACTOR` (`src/cli/overload.ts:90-93`), and
-`context purge` always requires it (`:113-114`).
+The CLI takes the same identity from `--actor` or your own shell's `OVERLOAD_ACTOR`.
+Every `attention … resolve` requires it, plus an explicit option, observed revision,
+and `material_fingerprint` from `attention <id>`. `context purge` also requires
+the operator identity. Missing identity fails closed before either mutation.
 
 **The web port: `config.json` first, `OVERLOAD_WEB_PORT` second.** `loadWebConfig`
 (`src/web/server.ts`) resolves the dashboard port as `web_port` from

@@ -54,6 +54,7 @@ export async function gcWorktree(db: Database, taskId: string, dryRun: boolean, 
   const task = getTask(db, taskId);
   if (!task) return { deleted: false, reason: "task_not_found" };
   if (!isTerminal(task.state)) return { deleted: false, reason: "not_terminal" };
+  if(task.stop_state==='stop_requested'||task.stop_state==='stop_unconfirmed')return {deleted:false,reason:'stop_unconfirmed'};
   const dir = task.worktree ?? join(root, taskId);
   if (task.runner_pid != null && pidAlive(task.runner_pid)) return { deleted: false, reason: "live_process" };
   const status = await exec("git", ["-C", dir, "status", "--porcelain"]);

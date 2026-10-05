@@ -31,7 +31,7 @@ function sourceFor(control:Database, options:MgmtRouteOptions, workId:string):So
   return source.kind==="ssh"?sshSourceFs(source):localSourceFs(source);
 }
 
-export type MgmtRouteOptions = { controlPath: string; ledgerPath: string; overloadHome?: string };
+export type MgmtRouteOptions = { controlPath: string; ledgerPath: string; overloadHome?: string; actor?: string };
 export async function mgmtRoute(request: Request, url: URL, options: MgmtRouteOptions): Promise<Response | null> {
   if (!url.pathname.startsWith("/api/mgmt/")) return null;
   const path = url.pathname;
@@ -89,6 +89,7 @@ export async function mgmtRoute(request: Request, url: URL, options: MgmtRouteOp
       return json({ ...inserted, ...requested });
     }
     if (acceptance && request.method === "POST") {
+      if (!options.actor?.trim()) return json({ error: "not_implemented", message: "acceptance requires server-side actor identity" }, { status: 501 });
       const manifestId = idOf(acceptance[1]!),
         x = await body(request);
       if (x.verdict !== "accepted" && x.verdict !== "rejected")
@@ -104,8 +105,9 @@ export async function mgmtRoute(request: Request, url: URL, options: MgmtRouteOp
           control,
           manifestId,
           x.verdict,
-          owner.decision_owner,
+          options.actor.trim(),
           (x.evidence ?? {}) as Record<string, unknown>,
+          { attention_revision: x.attention_revision as number, material_fingerprint: x.material_fingerprint as string },
           Date.now(),
         ),
       );
@@ -160,7 +162,7 @@ export async function mgmtRoute(request: Request, url: URL, options: MgmtRouteOp
     if (request.method === "POST" && path === "/api/mgmt/scan") { const cfg = loadManageConfig(options.overloadHome); const result = await scanOnce(control, null, cfg); return json(result); }
     return json({ error: "not found" }, { status: 404 });
   } catch (error) {
-    if (error instanceof ControlError) { const cause = (error as any).cause || error.message; const status = error.code === "conflict" ? 409 : error.code === "invalid" ? 400 : error.code === "not_found" ? 404 : 500; return json({ error: cause,
+    if (error instanceof ControlError) { const cause = (error as any).cause || error.message; const status = error.code === "conflict" || error.code === "blocked" ? 409 : error.code === "invalid" ? 400 : error.code === "not_found" ? 404 : 500; return json({ error: cause,
           ...((error as any).data && typeof (error as any).data === "object"
             ? (error as any).data
             : {}),

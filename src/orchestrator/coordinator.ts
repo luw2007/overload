@@ -367,6 +367,7 @@ export class Coordinator {
 
   review(value: unknown): CoordinatorReview {
     const input = parseReview(value);
+    const apply=():CoordinatorReview=>{
     const { root } = requireRoot(this.orchestratorDb, this.controlDb, input.work_id);
     const childRow = this.orchestratorDb.query("SELECT * FROM coordinator_children WHERE task_id=? AND work_id=?").get(input.task_id, input.work_id) as Record<string, unknown> | null;
     if (!childRow) throw new Error("coordinator_child_not_found");
@@ -384,6 +385,7 @@ export class Coordinator {
     if (input.verdict === "accept" && !["awaiting_human", "submitted", "done"].includes(task.state)) throw new Error("review_state_not_ready");
     if (input.verdict === "rework" && !["awaiting_human", "blocked"].includes(task.state)) throw new Error("rework_state_unsupported");
     if(input.verdict==='rework'&&(child.unknown||task.retry_budget<=0))throw new Error('rework_requires_known_terminal_and_budget');
+    if(input.verdict==='rework'&&(task.stop_state==='stop_requested'||task.stop_state==='stop_unconfirmed'))throw new Error('runner_stop_unconfirmed');
     const now = Date.now();
     const review: CoordinatorReview = { review_id: randomUUID(), task_id: task.task_id, attempt_id: input.attempt_id, contract_revision: root.contract_revision, expected_state: input.state, verdict: input.verdict, reason: input.reason, evidence: input.evidence, evidence_digest: digest(input.evidence), created_at: now };
     this.orchestratorDb.query("INSERT INTO coordinator_reviews(review_id,task_id,attempt_id,contract_revision,expected_state,verdict,reason,evidence,evidence_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run(review.review_id, review.task_id, review.attempt_id, review.contract_revision, review.expected_state, review.verdict, review.reason, JSON.stringify(review.evidence), review.evidence_digest, review.created_at);
@@ -401,6 +403,8 @@ export class Coordinator {
       this.orchestratorDb.transaction(()=>{if(!this.orchestratorDb.run("UPDATE tasks SET state='done',terminal_reason='coordinator_local_reviewed',updated_at=? WHERE task_id=? AND attempt_id=? AND state='awaiting_human'",[now,task.task_id,input.attempt_id]).changes)throw new Error('review_state_changed');this.orchestratorDb.run('INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)',[task.task_id,now,'awaiting_human','done','coordinator_local_reviewed',JSON.stringify({review_id:review.review_id})]);}).immediate();
     }
     return review;
+    };
+    return input.verdict==='rework'?this.orchestratorDb.transaction(apply).immediate():apply();
   }
 
   deliver(value: unknown): CoordinatorDelivery {
@@ -438,9 +442,9 @@ export class Coordinator {
       const item = getAttention(this.controlDb, target);
       if (!current || current.state !== "active" || current.revision !== root.contract_revision) throw new Error("contract_superseded");
       if (!item || item.revision !== revision || item.state !== "open" || item.effect_state !== "not_started") throw new Error("delivery_attention_not_open");
-      const resolved: AttentionItem = { ...item, revision: item.revision + 1, state: "resolved", effect_state: "succeeded", updated_at: now, evidence: { ...item.evidence, accepted_by: owner, accepted_at: now } };
-      if (!this.controlDb.run("UPDATE control_attention SET revision=?,state=?,effect_state=?,evidence=?,updated_at=? WHERE item_id=? AND revision=?", [resolved.revision, resolved.state, resolved.effect_state, JSON.stringify(resolved.evidence), now, target, item.revision]).changes) throw new Error("delivery_attention_conflict");
-      this.controlDb.run("INSERT INTO control_attention_events(item_id,revision,kind,detail,created_at) VALUES(?,?,?,?,?)", [target, resolved.revision, "resolved", JSON.stringify({ selected_option: "accept", actor: owner }), now]);
+      const { revision: previousRevision, created_at, updated_at, defer_until, acknowledged_at, ...values } = item;
+      const resolved = upsertAttention(this.controlDb, { ...values, expected_revision: previousRevision, state: "resolved", effect_state: "succeeded",
+        evidence: { ...item.evidence, accepted_by: owner, accepted_at: now, selected_option: "accept", decision_actor: owner, decided_at: now, effect_verified_at: now } }, now);
       const completed: Work = { ...current, state: "completed", updated_at: now };
       if (!this.controlDb.run("UPDATE control_works SET state='completed',updated_at=? WHERE work_id=? AND revision=? AND state='active'", [now, id, root.contract_revision]).changes) throw new Error("work_completion_conflict");
       enqueueControlEvent(this.controlDb, { entity_id: id, entity_version: completed.revision, kind: "work.completed", work_id: id, payload: { work: completed } }, now);
@@ -451,7 +455,8 @@ export class Coordinator {
   rejectDelivery(workId:string,itemId:string,revision:number,actor:string):AttentionItem{
     const {root,work}=requireRoot(this.orchestratorDb,this.controlDb,workId);const item=getAttention(this.controlDb,itemId);if(!item||item.work_id!==workId||item.evidence.kind!=='coordinator_delivery'||item.revision!==revision||item.state!=='open'||actor!==work.contract?.decision_owner)throw new Error('delivery_rejection_conflict');
     const {revision:oldRevision,created_at,updated_at,defer_until,acknowledged_at,...values}=item;
-    const rejected=upsertAttention(this.controlDb,{...values,expected_revision:oldRevision,state:'resolved',effect_state:'succeeded',evidence:{...item.evidence,rejected_by:actor,rejected_at:Date.now()}});
+    const now=Date.now();
+    const rejected=upsertAttention(this.controlDb,{...values,expected_revision:oldRevision,state:'resolved',effect_state:'succeeded',evidence:{...item.evidence,rejected_by:actor,rejected_at:now,selected_option:'reject',decision_actor:actor,decided_at:now,effect_verified_at:now}},now);
     const child=this.orchestratorDb.query('SELECT task_id FROM coordinator_children WHERE work_id=? LIMIT 1').get(workId) as {task_id:string}|null;
     if(child){const task=getTask(this.orchestratorDb,child.task_id)!;this.orchestratorDb.run('INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)',[task.task_id,Date.now(),task.state,task.state,'operator_delivery_rejected',JSON.stringify({work_id:workId,contract_revision:root.contract_revision,item_id:itemId})]);}
     return rejected;

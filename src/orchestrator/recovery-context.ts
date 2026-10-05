@@ -42,10 +42,21 @@ type TaskEventRow = {
   detail: string | null;
 };
 
-function taskEventRows(db: Database, taskId: string): TaskEventRow[] {
-  return db
-    .query("SELECT id, task_id, at, from_state, to_state, event, detail FROM task_events WHERE task_id=? ORDER BY id")
-    .all(taskId) as TaskEventRow[];
+function taskEventRows(db: Database, task: Task): TaskEventRow[] {
+  const rows = db.query("SELECT id, task_id, at, from_state, to_state, event, detail FROM task_events WHERE task_id=? ORDER BY id")
+    .all(task.task_id) as TaskEventRow[];
+  // A new attempt must not borrow a dead predecessor's checkpoint or exit evidence.
+  let start = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.event === "claim") start = i;
+    else if (["human_reopen", "runner_dead", "runner_exit"].includes(row.event)
+      && parseDetail(row.detail).next_attempt_id === task.attempt_id) start = i + 1;
+  }
+  return rows.slice(start).filter(row => {
+    const attempt = parseDetail(row.detail).attempt_id;
+    return typeof attempt !== "string" || attempt === task.attempt_id;
+  });
 }
 
 function parseDetail(raw: string | null): Record<string, unknown> {
@@ -63,18 +74,19 @@ function hasEvent(rows: TaskEventRow[], eventName: string): boolean {
 
 function hasUnconsumedApproval(db: Database, taskId: string): boolean {
   const row = db
-    .query("SELECT 1 FROM approvals WHERE task_id=? AND consumed_at IS NULL LIMIT 1")
-    .get(taskId) as { 1?: number } | null;
+    .query("SELECT 1 FROM approvals WHERE task_id=? AND consumed_at IS NULL AND expires_at>? LIMIT 1")
+    .get(taskId, Date.now()) as { 1?: number } | null;
   return !!row;
 }
 
 function determineRuntimeState(task: Task, rows: TaskEventRow[]): RuntimeState {
+  if (task.stop_state === "stop_unconfirmed" || task.stop_state === "stop_requested") return "unknown";
   // queued: 新排队，尚未启动
   if (task.state === "queued") return "queued";
 
-  // done/failed/abandoned: 终态（编排层面已终态，无论事件）
+  // A terminal state string alone is not proof that the current runner exited.
   if (task.state === "done" || task.state === "failed" || task.state === "abandoned") {
-    return "terminated";
+    return hasEvent(rows, "runner_exit") || hasEvent(rows, "runner_dead") ? "terminated" : "unknown";
   }
 
   // awaiting_human: 不能仅凭 state 判定 terminated。
@@ -260,8 +272,11 @@ export function determineRecoveryOutcome(input: RecoveryInput): RecoveryOutcome 
   if (!task) {
     return { type: "blocked", reason: "task not found", code: "not_found" };
   }
+  if (task.work_id !== input.work_id || task.attempt_id !== input.attempt_id) {
+    return { type: "blocked", reason: "task attempt or work binding changed", code: "stale_or_revoked" };
+  }
 
-  const rows = taskEventRows(input.orchestratorDb, input.task_id);
+  const rows = taskEventRows(input.orchestratorDb, task);
 
   // 1. runtime state 判定
   const runtimeState = determineRuntimeState(task, rows);
@@ -293,7 +308,9 @@ export function determineRecoveryOutcome(input: RecoveryInput): RecoveryOutcome 
   if (runtimeState === "unknown") {
     return {
       type: "reconcile",
-      reason: "liveness unknown: reconcile four sources first",
+      reason: task.stop_state === "stop_unconfirmed" || task.stop_state === "stop_requested"
+        ? `managed runtime stop unconfirmed (${task.stop_state}): ${task.stop_reason ?? task.blocked_reason ?? "runtime ownership unverified"}; retain repo occupancy and review task events`
+        : "liveness unknown: reconcile four sources first",
     };
   }
 

@@ -10,7 +10,7 @@
     mgmtHtml: "",
     taskManifests: [],
     taskDrift: null,
-    attention: { now: [], inbox: [], done: [], followUps: [], followUpsError: null },
+    attention: { now: [], inbox: [], done: [], doneTotal: 0, doneCursor: null, automaticToday: 0, followUps: [], followUpsError: null },
     rules: null,
     ledger: null,
     works: [],
@@ -26,6 +26,11 @@
     range: "week",
     conversationId: null,
     conversations: [],
+    conversationCursor: null,
+    conversationListExpanded: false,
+    conversationListBusy: false,
+    conversationDetail: null,
+    conversationHistoryCursor: null,
     conversationDraft: "",
     conversationDrafts: {},
     conversationPosting: false,
@@ -43,8 +48,9 @@
   // endpoint delays only its own section. A slice result is dropped only when a newer refresh already applied that
   // slice or the view it was fetched for (page, range, session) is gone — never merely because a newer refresh started.
   // Polls reuse a slice's still-pending request instead of stacking another one behind a slow endpoint.
-  let refreshSeq = 0, renderFrame = 0;
+  let refreshSeq = 0, renderFrame = 0, routeGeneration = 0;
   const applied = new Map(), failures = new Map(), inflight = new Map(), packages = new Map();
+  let packageLoadTail=Promise.resolve();
   const PAGE_SLICES = {ledger:['ledger'],works:['works'],candidates:['works'],conversations:['conversations'],manager:['managerContext','managerTurns']};
   const formatTime = value => value == null ? '—' : new Date(value).toLocaleString();
   const humanDuration = ms => ms == null ? '—' : ms < 60000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`;
@@ -85,14 +91,25 @@
   function decisionRow(item) {
     const pkg=item.decision_package;
     if(!pkg)return `<div class="row" data-item-id="${e(item.item_id)}"><div>${dot(pkg===undefined?'yellow':'red')}</div><div><div class="row-title">${e(item.conclusion)}</div><div class="row-note" role="status">${pkg===undefined?'Loading decision context…':e(packageNote(item.decision_package_error))}</div>${waitNote(item)}</div></div>`;
-    const red=item.decision_mode==='human_only'||(pkg.expires_at!=null&&pkg.expires_at<=Date.now()),decided=effectNote[item.effect_state];
-    const options=pkg.options.map(o=>`<button data-action="resolve" data-id="${e(item.item_id)}" data-option="${e(o.id)}" title="${e(o.consequence)}">${e(o.label)}</button>`).join('');
+    const expired=pkg.expires_at!=null&&pkg.expires_at<=Date.now();
+    const red=item.decision_mode==='human_only'||expired,decided=effectNote[item.effect_state];
+    const options=pkg.context_review
+      ? button('Review original task','context-review',item.item_id)
+      : expired
+        ? '<span class="row-note" role="status">Decision expired. Review Details and renew the decision basis before answering.</span>'
+        : pkg.options.map(o=>`<button data-action="resolve" data-id="${e(item.item_id)}" data-option="${e(o.id)}" title="${e(o.consequence)}">${e(o.label)}</button>`).join('');
     const draft=decisionDrafts.get(item.item_id);
     return `<div class="row" data-item-id="${e(item.item_id)}"><div>${dot(red?'red':'yellow')}</div><div><div class="row-title"><button class="text-button" data-action="expand" data-id="${e(item.item_id)}" aria-expanded="${expanded.has(item.item_id)}">${e(pkg.conclusion)}</button><span class="mono muted">${e(pkg.owner)} · r${pkg.contract_revision}</span></div><div class="row-note"><b>Trigger</b> ${e(pkg.trigger)} · <b>Evidence</b> ${e(pkg.trigger_evidence.map(x=>x.summary).join('; ')||'none')} · <b>Impact</b> ${e(pkg.impact)} · <b>Recommendation</b> ${e(pkg.recommendation)} · <b>Expires</b> ${e(formatTime(pkg.expires_at))}</div>${decided?`<div class="row-note mono">${e(decided)}${item.effect_detail?` · ${e(item.effect_detail)}`:''} · ${stamp(item.updated_at)}</div>`:''}${draft?`<div role="status">Draft answer retained: ${e(draft)}. Refresh the current package before retrying.</div>`:''}${waitNote(item)}${expanded.has(item.item_id)?`<div class="facts"><b>Conclusion</b><span>${e(pkg.conclusion)}</span><b>Trigger evidence</b>${pkg.trigger_evidence.map(x=>`<span>${e(x.summary)} · <code>${e(x.reference)}</code>${x.stale?' · stale':''}</span>`).join('')||'<span>None</span>'}<b>Impact</b><span>${e(pkg.impact)}</span><b>Recommendation</b><span>${e(pkg.recommendation)}</span><b>Owner / expiry</b><span>${e(pkg.owner)} · ${e(formatTime(pkg.expires_at))}</span><b>Option effects</b><span>${pkg.options.map(o=>`<strong>${e(o.label)}</strong>: ${e(o.effect)} — ${e(o.consequence)}`).join('<br>')}</span>${sourceLink(pkg.source_link)}</div>`:''}</div><div class="actions">${options}${button('Details','attention-evidence',item.item_id)}${waitsSettled()&&state.waits&&item.state==='open'&&!watchingWait(item.item_id)?(waitsDisabled()?'<span class="muted wait-create-disabled" role="note">Condition waits are disabled on this server</span>':button('Wait for condition…','wait-create',item.item_id)):''}</div></div>`;
   }
   function receipt(item) {const verified=item.effect_state==='succeeded',failed=['failed','unknown'].includes(item.effect_state);return `<div class="row receipt"><div>${verified?'✓':failed?'!':'…'}</div><div><div class="row-title">${e(item.conclusion)}</div><span class="mono muted">${e(item.owner)} · ${stamp(item.updated_at)} · ${verified?'effect verified':failed?`effect ${e(item.effect_state)} — not successful`:'answer recorded · applying in Inbox'}</span></div></div>`;}
   function followUpRow(entry) {const item=entry.item,effects=entry.occurred_effects.length?entry.occurred_effects.map(effect=>`${effect.kind}: ${JSON.stringify(effect.evidence)}`).join('; '):'None recorded yet';return `<div class="row follow-up" data-item-id="${e(item.item_id)}"><div>${dot(entry.stage==='failed'||entry.stage==='unknown'?'red':'yellow')}</div><div><div class="row-title">${e(item.conclusion)} <span class="mono muted">${e(entry.stage.replaceAll('_',' '))}</span></div><div class="row-note"><b>Occurred effects</b> ${e(effects)} · <b>Remaining responsibility</b> ${e(entry.remaining_responsibility)} · <b>Next action</b> ${e(entry.next_action)}</div></div></div>`;}
-  function renderDecide() {if(!applied.has('attention'))return `<h1>Decide</h1>${sliceView('attention')}${waitSection()}`;const waitsLoading=!waitsSettled(),nowIds=new Set(state.attention.now.map(x=>x.item_id)),items=[...state.attention.now,...state.attention.inbox].filter(x=>nowIds.has(x.item_id)||revealed.has(x.item_id)||!watchingWait(x.item_id)),followUps=state.attention.followUps,asks=agentAsks(),automatic=state.attention.done.filter(x=>x.decision_mode==='scoped_auto'&&x.state==='resolved'&&x.updated_at>=Date.now()-86400000);return `<h1>Decide</h1><div class="summary">${waitsLoading?'Loading decisions owed…':decideTopLine(items,asks,automatic.length)}</div>${askSection(asks)}${waitsLoading?`<div class="section-heading"><h2>Owed to the system</h2></div>${empty('Loading…')}`:items.length||receipts.size?`<div class="section-heading"><h2>Owed to the system</h2><small>Now · ${items.length} decisions · expand for evidence</small></div><div class="list">${items.map(x=>receipts.get(x.item_id)||decisionRow(x)).join('')}${[...receipts].filter(([id])=>!items.some(x=>x.item_id===id)&&!followUps.some(x=>x.item.item_id===id)).map(([,html])=>html).join('')}</div>`:asks.length?'':empty(`Nothing owed. Agents self-resolved ${automatic.length} decisions today.`)}${state.attention.followUpsError?`<div class="section-heading"><h2>Work</h2></div>${empty(`Follow-ups unavailable: ${state.attention.followUpsError}`)}`:followUps.length?`<div class="section-heading"><h2>Work</h2><small>Answers recorded · effects still applying or awaiting verification</small></div><div class="list">${followUps.map(followUpRow).join('')}</div>`:''}${waitSection()}<div class="section-heading"><h2>Within contract</h2><small>Automatic · no decision required</small></div><div class="list auto">${dot('blue')}<span><strong class="mono">${automatic.length}</strong> handled without you</span><button class="text-button" data-done="automatic">Inspect Done ↗</button></div><div class="section-heading"><h2>Done <span class="muted mono">${state.attention.done.length}</span></h2><button data-done="all">Show receipts</button></div>`;}
+  function renderDecide() {
+    if(!applied.has('attention'))return `<h1>Decide</h1>${sliceView('attention')}${waitSection()}`;
+    const waitsLoading=!waitsSettled(),nowIds=new Set(state.attention.now.map(x=>x.item_id));
+    const items=[...state.attention.now,...state.attention.inbox].filter(x=>nowIds.has(x.item_id)||revealed.has(x.item_id)||!watchingWait(x.item_id));
+    const followUps=state.attention.followUps,asks=agentAsks(),automatic=state.attention.automaticToday;
+    return `<h1>Decide</h1><div class="summary">${waitsLoading?'Loading decisions owed…':decideTopLine(items,asks,automatic)}</div>${askSection(asks)}${waitsLoading?`<div class="section-heading"><h2>Owed to the system</h2></div>${empty('Loading…')}`:items.length||receipts.size?`<div class="section-heading"><h2>Owed to the system</h2><small>Now · ${items.length} decisions · expand for evidence</small></div><div class="list">${items.map(x=>receipts.get(x.item_id)||decisionRow(x)).join('')}${[...receipts].filter(([id])=>!items.some(x=>x.item_id===id)&&!followUps.some(x=>x.item.item_id===id)).map(([,html])=>html).join('')}</div>`:asks.length?'':empty(`Nothing owed. Agents self-resolved ${automatic} decisions today.`)}${state.attention.followUpsError?`<div class="section-heading"><h2>Work</h2></div>${empty(`Follow-ups unavailable: ${state.attention.followUpsError}`)}`:followUps.length?`<div class="section-heading"><h2>Work</h2><small>Answers recorded · effects still applying or awaiting verification</small></div><div class="list">${followUps.map(followUpRow).join('')}</div>`:''}${waitSection()}<div class="section-heading"><h2>Within contract</h2><small>Automatic · no decision required</small></div><div class="list auto">${dot('blue')}<span><strong class="mono">${automatic}</strong> handled without you</span><button class="text-button" data-done="automatic">Inspect Done ↗</button></div><div class="section-heading"><h2>Done <span class="muted mono">${state.attention.doneTotal}</span></h2><button data-done="all">Show receipts</button></div>`;
+  }
   // Condition waits (Phase B §10.2). Every state, fact and action comes from the server read model; the page
   // never infers Answer/Resume from runtime strings. Watching is quiet: one row per wait, updated in place.
   const WAIT_STATE = {watching:['Watching','blue'],ready:['Condition met','green'],unavailable:['Source unavailable','red'],expired:['Stopped watching','red'],cancelled:['Cancelled','blue']};
@@ -389,8 +406,8 @@
   }
   function conversationChoice(conversation) {
     const selected = String(conversation.id) === String(state.conversationId);
-    const turns = Array.isArray(conversation.turns) ? conversation.turns.length : 0;
-    return `<button type="button" class="conversation-choice${selected ? ' selected' : ''}" data-action="select-conversation" data-id="${e(conversation.id)}" aria-current="${selected ? 'true' : 'false'}"><span class="conversation-choice-title">${e(conversationAddress(conversation))}</span><span class="conversation-choice-meta">${e(conversation.owner_id ?? 'unknown owner')} · ${turns} turn${turns === 1 ? '' : 's'} · ${e(formatTime(conversation.created_at))}</span></button>`;
+    const last = Number(conversation.last_sequence ?? 0);
+    return `<button type="button" class="conversation-choice${selected ? ' selected' : ''}" data-action="select-conversation" data-id="${e(conversation.id)}" aria-current="${selected ? 'true' : 'false'}"><span class="conversation-choice-title">${e(conversationAddress(conversation))}</span><span class="conversation-choice-meta">${e(conversation.owner_id ?? 'unknown owner')} · ${last ? 'last turn #'+last : 'no turns'} · ${e(formatTime(conversation.created_at))}</span></button>`;
   }
   function conversationTurn(turn) {
     const sequence = turn.sequence == null ? turn.id : `#${turn.sequence}`;
@@ -409,17 +426,39 @@
     return `<form id="conversation-message" class="conversation-composer"><label for="conversation-text">Message</label><textarea id="conversation-text" name="text" rows="4" placeholder="Send a message to this conversation" ${state.conversationPosting ? 'disabled' : ''}>${e(state.conversationDraft)}</textarea><div class="conversation-composer-actions"><span class="conversation-compose-status" aria-live="polite">${state.conversationPosting ? 'submitting…' : 'Messages queue a turn; they do not approve or steer execution.'}</span><button type="submit" class="primary" ${canSend ? '' : 'disabled'}>${state.conversationPosting ? 'Submitting…' : 'Queue message'}</button></div></form>`;
   }
   function renderConversations() {
-    const selected = state.conversations.find(conversation => String(conversation.id) === String(state.conversationId));
-    const list = state.conversations.length ? state.conversations.map(conversationChoice).join('') : empty('No conversations yet. Receive an authorized channel message first; this page cannot create one.');
-    if (!selected) return `${head('Conversations','Read-only conversation context and explicit queued messages.') }<section class="conversations-page"><section class="conversation-list" aria-label="Conversations"><h2>Choose a conversation</h2>${list}</section>${state.conversationId ? `<p class="conversation-unavailable" role="status">Conversation ${e(state.conversationId)} is not available in the authorized response.</p>` : `<p class="conversation-empty-hint">Choose a conversation above. New conversations arrive from an authorized channel.</p>`}</section>`;
-    const turns = Array.isArray(selected.turns) ? [...selected.turns].sort((a,b) => Number(a.sequence ?? 0) - Number(b.sequence ?? 0)) : [];
+    const detail=state.conversationDetail,selected=detail?.conversation?.id===state.conversationId?detail.conversation:null;
+    const list=(state.conversations.length?state.conversations.map(conversationChoice).join(''):empty('No conversations yet. Receive an authorized channel message first; this page cannot create one.'))
+      +(state.conversationCursor?button('Load older conversations','conversations-more',state.conversationCursor,state.conversationListBusy?'disabled':''):'');
+    const sidebar=`<section class="conversation-list" aria-label="Conversations"><h2>Choose a conversation</h2>${list}</section>`;
+    if (!selected) return `${head('Conversations','Read-only conversation context and explicit queued messages.')}<section class="conversations-page">${sidebar}${state.conversationId?sliceView('conversationDetail',()=>empty('Conversation unavailable.')):'<p class="conversation-empty-hint">Choose a conversation above. New conversations arrive from an authorized channel.</p>'}</section>`;
+    const turns=detail.turns,first=turns[0]?.sequence,last=turns.at(-1)?.sequence;
+    const older=detail.next_before??(state.conversationHistoryCursor?.after!==undefined&&first>1?first:null);
+    const historyActions=(older?button('Older messages','conversation-history',String(older),'data-direction="before"'):'')
+      +(last<selected.last_sequence?button('Newer messages','conversation-history',String(last),'data-direction="after"'):'')
+      +(state.conversationHistoryCursor?button('Latest messages','conversation-latest'):'');
     const binding = `<dl class="conversation-binding"><dt>Owner</dt><dd>${e(selected.owner_id ?? 'unknown')}</dd><dt>Address</dt><dd>${e(conversationAddress(selected))}</dd><dt>Session reference</dt><dd>${e(conversationValue(selected.session_reference))}</dd><dt>Created</dt><dd>${e(formatTime(selected.created_at))}</dd></dl>`;
-    return `${head('Conversations','Read-only conversation context and explicit queued messages.') }<section class="conversations-page"><section class="conversation-list" aria-label="Conversations"><h2>Choose a conversation</h2>${list}</section><article class="conversation-panel"><div class="conversation-panel-head"><h2>${e(conversationAddress(selected))}</h2><p class="conversation-id mono">${e(selected.id)}</p></div>${binding}${conversationRelated(selected)}<section class="conversation-turns" aria-label="Conversation messages">${turns.map(conversationTurn).join('') || empty('No turns received yet.')}<div id="conversation-pending">${conversationPendingMarkup()}</div></section>${conversationComposerMarkup()}</article></section>`;
+    return `${head('Conversations','Read-only conversation context and explicit queued messages.')}<section class="conversations-page">${sidebar}<article class="conversation-panel"><div class="conversation-panel-head"><h2>${e(conversationAddress(selected))}</h2><p class="conversation-id mono">${e(selected.id)}</p></div>${binding}${conversationRelated(selected)}<section class="conversation-turns" aria-label="Conversation messages">${historyActions}${turns.map(conversationTurn).join('')||empty('No turns received yet.')}<div id="conversation-pending">${conversationPendingMarkup()}</div></section>${conversationComposerMarkup()}</article></section>`;
   }
-  function conversationPayload(data) {
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data?.conversations)) return data.conversations;
-    throw new Error('Conversation response was not a list.');
+  function mergeConversationSummaries(existing,items) {
+    const rows=new Map(existing.map(item=>[item.id,item]));
+    for(const item of items)rows.set(item.id,item);
+    return [...rows.values()].sort((a,b)=>b.created_at-a.created_at||String(a.id).localeCompare(String(b.id)));
+  }
+  async function loadConversations() {
+    const page=await fetchJson('/api/conversations?limit=50');
+    return {conversations:state.conversationListExpanded?mergeConversationSummaries(state.conversations,page.items):page.items,
+      conversationCursor:state.conversationListExpanded?state.conversationCursor:page.next_cursor};
+  }
+  async function loadOlderConversations(cursor) {
+    if(state.conversationListBusy||state.conversationCursor!==cursor)return;
+    const generation=routeGeneration;
+    state.conversationListBusy=true;render();
+    try {
+      const page=await fetchJson(`/api/conversations?limit=50&cursor=${encodeURIComponent(cursor)}`);
+      if(state.page!=='conversations'||generation!==routeGeneration)return;
+      state.conversations=mergeConversationSummaries(state.conversations,page.items);
+      state.conversationCursor=page.next_cursor;state.conversationListExpanded=true;
+    } finally {if(generation===routeGeneration){state.conversationListBusy=false;if(state.page==='conversations')render();}}
   }
   // ── Manager (docs/plans/overload-20260928-manager-chat.md §3): read-only attention steward. ──
   const TRIAGE_GROUPS=[['user_gate','你要拍板'],['user_action','你要动手'],['agent_work','Agent 可继续']];
@@ -470,7 +509,7 @@
   /** The current view's sections. `scope` names the exact view (page, range, session) a result is fetched for. */
   function slices() {
     const page=state.page,list=[];
-    const slice=(key,load,{param='',after}={})=>list.push({key,scope:`${page}|${key}|${param}`,load,after});
+    const slice=(key,load,{param='',after}={})=>list.push({key,scope:`${routeGeneration}|${page}|${key}|${param}`,load,after});
     const get=(key,path)=>()=>fetchJson(path).then(value=>({[key]:value}));
     slice('rules',get('rules','/api/rules'));
     if(page==='decide') {slice('attention',loadAttention,{after:loadPackages});slice('today',()=>fetchJson(`/api/ledger?since=${Date.now()-86400000}`).then(today=>({today})));slice('ledger',()=>fetchJson(`/api/ledger?since=${Date.now()-7*86400000}`).then(ledger=>({ledger})));slice('waits',loadWaits);slice('q1',get('q1','/api/q1'));}
@@ -478,7 +517,14 @@
     if(page==='works') {slice('works',get('works','/api/works'));slice('waits',loadWaits);}
     if(page==='candidates') slice('works',get('works','/api/works'));
     if(page==='manager') {slice('managerContext',get('managerContext','/api/manager/context'));slice('managerTurns',()=>fetchJson('/api/manager/turns?limit=20').then(data=>({managerTurns:data.turns})));}
-    if(page==='conversations') slice('conversations',()=>fetchJson('/api/conversations').then(data=>({conversations:conversationPayload(data)})),{after:settleConversationPending});
+    if(page==='conversations') {
+      slice('conversations',loadConversations);
+      if(state.conversationId) {
+        const id=state.conversationId,cursor=state.conversationHistoryCursor;
+        const suffix=cursor?`&${cursor.before!==undefined?'before='+cursor.before:'after='+cursor.after}`:'';
+        slice('conversationDetail',()=>fetchJson(`/api/conversations/${encodeURIComponent(id)}/turns?limit=50${suffix}`).then(detail=>({conversationDetail:detail})),{param:`${id}|${suffix}`,after:settleConversationPending});
+      }
+    }
     if(page==='agents') {for(const key of ['q1','hung','zombie','sessions','health','archive'])slice(key,get(key,`/api/${key}`));if(state.session)slice('detail',get('detail',`/api/sessions/${encodeURIComponent(state.session)}`),{param:state.session});}
     return list;
   }
@@ -486,27 +532,36 @@
     // Follow-ups degrade to their own section: a failure (or an older server without the route) must not blank Decide.
     const [now,inbox,done,followUpResult]=await Promise.all(['now','inbox','done'].map(z=>fetchJson(`/api/attention/${z}`)).concat(fetchJson('/api/control/attention?zone=follow_up').then(response=>({items:response.items}),error=>({error:error.message||String(error)}))));
     const followUps=followUpResult.items??[],followUpIds=new Set(followUps.map(entry=>entry.item.item_id));
-    return {attention:{now:now.filter(item=>!followUpIds.has(item.item_id)),inbox:inbox.filter(item=>!followUpIds.has(item.item_id)),done,followUps,followUpsError:followUpResult.error??null}};
+    return {attention:{now:now.filter(item=>!followUpIds.has(item.item_id)),inbox:inbox.filter(item=>!followUpIds.has(item.item_id)),done:done.items,doneTotal:done.total,doneCursor:done.next_cursor,automaticToday:done.automatic_today,followUps,followUpsError:followUpResult.error??null}};
   }
-  // Decision packages load per displayed item revision once the lists have rendered. A row keeps the package it already
-  // showed for the same revision until the fresh one arrives; `undefined` means still loading, `null` unavailable.
+  // Decision packages stay fresh on every list refresh: context evidence can change without an item revision.
+  // Bound the request burst to eight; a superseded refresh never launches its remaining batches.
   const packageKey=item=>`${item.item_id}#${item.revision}`;
   function decoratePackages() {for(const item of [...state.attention.now,...state.attention.inbox]){const entry=packages.get(packageKey(item));item.decision_package=entry?.pkg;item.decision_package_error=entry?.error??null;}}
-  async function loadPackages(seq) {
+  function loadPackages(seq) {
+    const load=packageLoadTail.then(()=>fetchPackages(seq));
+    packageLoadTail=load.catch(()=>{});
+    return load;
+  }
+  async function fetchPackages(seq) {
+    if(state.page!=='decide'||applied.get('attention')!==seq)return;
     const active=[...state.attention.now,...state.attention.inbox],shown=new Set(active.map(packageKey));
     for(const key of packages.keys())if(!shown.has(key))packages.delete(key);
     decoratePackages();
-    await Promise.all(active.map(async item=>{
-      let pkg=null,error=null;
-      try{pkg=await fetchJson(`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`);}
-      catch(failure){error={status:failure.status??0,detail:failure.data?.reason||failure.message||String(failure)};}
-      const key=packageKey(item);
-      if((packages.get(key)?.seq??0)>seq)return;
-      packages.set(key,{seq,pkg,error});decoratePackages();scheduleRender();
-    }));
+    for(let offset=0;offset<active.length;offset+=8) {
+      if(state.page!=='decide'||applied.get('attention')!==seq)return;
+      await Promise.all(active.slice(offset,offset+8).map(async item=>{
+        let pkg=null,error=null;
+        try{pkg=await fetchJson(`/api/context/decision-package?item_id=${encodeURIComponent(item.item_id)}&work_id=${encodeURIComponent(item.work_id)}`);}
+        catch(failure){error={status:failure.status??0,detail:failure.data?.reason||failure.message||String(failure)};}
+        const key=packageKey(item);
+        if(state.page!=='decide'||applied.get('attention')!==seq||(packages.get(key)?.seq??0)>seq)return;
+        packages.set(key,{seq,pkg,error});decoratePackages();scheduleRender();
+      }));
+    }
   }
-  function settleConversationPending() {if(!state.conversationPending)return;const selected=state.conversations.find(row=>String(row.id)===String(state.conversationPending.conversationId));if(selected?.turns?.some(turn=>String(turn.id)===String(state.conversationPending.turnId)))state.conversationPending=null;}
-  function resetSlices() {applied.clear();failures.clear();packages.clear();state.detail=null;}
+  function settleConversationPending() {if(!state.conversationPending)return;const detail=state.conversationDetail;if(detail?.conversation.id===state.conversationPending.conversationId&&detail.turns.some(turn=>turn.id===state.conversationPending.turnId))state.conversationPending=null;}
+  function resetSlices() {routeGeneration++;applied.clear();failures.clear();packages.clear();state.detail=null;state.conversationListBusy=false;}
   async function runSlice(slice,seq,poll) {
     const isCurrent=()=>seq>(applied.get(slice.key)??0)&&slices().find(live=>live.key===slice.key)?.scope===slice.scope;
     try {
@@ -539,6 +594,7 @@
       const turnId=result?.turn_id;
       if(turnId==null) throw new Error('Message accepted without a turn_id.');
       state.conversationPending={conversationId,text,turnId,state:'queued'};state.conversationDraft='';state.conversationDrafts[conversationId]='';
+      state.conversationHistoryCursor=null;
       await refresh();
     } catch(error) { state.conversationPending=null;showError(error);render(); }
     finally { state.conversationPosting=false;render(); }
@@ -582,6 +638,7 @@
       state.page === "conversations" && parts[1]
         ? decodeURIComponent(parts[1])
         : null;
+    state.conversationDetail=null;state.conversationHistoryCursor=null;
     state.conversationDraft = state.conversationId
       ? state.conversationDrafts[state.conversationId] || ""
       : "";
@@ -608,7 +665,56 @@
   }
   async function navigate(page,session=null) {editor=null;$('drawer').close();$('modal').close();state.selected.clear();history.pushState(null,'',`/${page}${session?'/'+encodeURIComponent(session):''}`);await restoreRoute();}
   function findAttention(id) { return [...state.attention.now,...state.attention.inbox,...state.attention.done].find(x=>x.item_id===id); }
-  function showDone() { dialog('drawer','Done',state.attention.done.map(x=>`<article class="receipt"><h3>${e(x.conclusion)}</h3><p>${e(x.state)} · ${e(x.effect_state)}</p>${sourceLink(x.source_link)}${json(x.evidence)}</article>`).join('')||empty('Nothing done yet.')); }
+  let doneView=null;
+  async function showDone() {
+    const view={items:[...state.attention.done],cursor:state.attention.doneCursor,total:state.attention.doneTotal,html:new Map(),busy:false};
+    doneView=view;
+    dialog('drawer','Done',view.items.length?'<p role="status">Loading recorded decision receipts…</p>':empty('Nothing done yet.'));
+    await loadDoneReceipts(view,view.items);
+    renderDone(view);
+  }
+  async function loadDoneReceipts(view,items) {
+    // Fetch each loaded receipt once per view; even a large page has at most eight requests in flight.
+    for(let offset=0;offset<items.length;offset+=8) {
+      if(doneView!==view||!$('drawer').open||$('drawer-title')?.textContent!=='Done')return;
+      await Promise.all(items.slice(offset,offset+8).map(async item=>{
+        let html;
+        try {
+          const result=await fetchJson(`/api/context/decision-receipt?item_id=${encodeURIComponent(item.item_id)}`),decision=result.decision,summary=decision.summary;
+        const effects=result.effects.map(effect=>{
+          let evidence;try{evidence=JSON.parse(effect.evidence);}catch{evidence=null;}
+          return `<p><code>${e(effect.tool_call_id)}</code> · ${e(effect.state)} · ${e(formatTime(effect.observed_at))}${evidence?`<br>${e(evidence.summary||evidence.reason||'Recorded effect evidence')}<details><summary>Effect evidence</summary>${json(evidence)}</details>`:'<br>Effect evidence unavailable.'}</p>`;
+        }).join('');
+        html=`<article class="receipt"><h3>${e(result.conclusion)}</h3><dl><dt>Decision</dt><dd>${e(decision.selected_option||'No selected answer recorded')} · ${e(decision.actor||result.owner)} · ${e(formatTime(decision.decided_at))}</dd>${decision.reason?`<dt>Reason</dt><dd>${e(decision.reason)}</dd>`:''}<dt>Result</dt><dd>${e(result.state)} · ${e(result.effect_state)}${result.effect_detail?` · ${e(result.effect_detail)}`:''}</dd><dt>Last update</dt><dd>${e(formatTime(result.updated_at))}</dd>${summary?`<dt>Decision basis</dt><dd>${e(summary.trigger)}</dd><dt>Impact accepted</dt><dd>${e(summary.impact)}</dd><dt>Contract at decision</dt><dd>r${e(summary.contract_revision)}</dd>`:'<dt>Decision basis</dt><dd>Historical context unavailable; the current contract is not a substitute.</dd>'}${result.receipt?`<dt>Consumption receipt</dt><dd><code>${e(result.receipt.receipt_id)}</code> · ${e(result.receipt.outcome||'awaiting effect')}</dd>`:''}</dl>${effects?`<h4>Observed effects</h4>${effects}`:''}${sourceLink(summary?.source_link||result.source_link)}<details><summary>Recorded evidence</summary>${json(result.evidence)}</details></article>`;
+        } catch(error) { html=`<article class="receipt"><h3>${e(item.conclusion)}</h3><p role="status">Receipt unavailable: ${e(error.message)}. No historical context was inferred.</p></article>`; }
+        view.html.set(item.item_id,html);
+      }));
+    }
+  }
+  function renderDone(view) {
+    if(doneView===view&&$('drawer').open&&$('drawer-title')?.textContent==='Done')dialog('drawer','Done',`<p>${view.items.length} of ${view.total} recorded items</p>${view.items.map(item=>view.html.get(item.item_id)||'').join('')||empty('Nothing done yet.')}${view.cursor?button('Load older receipts','done-more',view.cursor,view.busy?'disabled':''):''}`);
+  }
+  async function loadOlderDone(cursor) {
+    const view=doneView;
+    if(!view||view.busy||view.cursor!==cursor)return;
+    view.busy=true;renderDone(view);
+    try {
+      const page=await fetchJson(`/api/attention/done?limit=50&cursor=${encodeURIComponent(cursor)}`);
+      if(doneView!==view)return;
+      const known=new Set(view.items.map(item=>item.item_id)),added=page.items.filter(item=>!known.has(item.item_id));
+      await loadDoneReceipts(view,added);
+      view.items.push(...added);view.cursor=page.next_cursor;view.total=page.total;
+    } finally { view.busy=false;renderDone(view); }
+  }
+  async function reviewContext(item) {
+    const review=await fetchJson(`/api/context/recovery-review?item_id=${encodeURIComponent(item.item_id)}&attention_revision=${item.revision}`);
+    const task=review.task,outcome=review.outcome;
+    const jump=task.stable_id?button('Return to session','jump',task.stable_id,`data-route="jump-session" data-binding="${e(task.stable_id)}"`):'';
+    const facts=`<dl><dt>Task / attempt</dt><dd>${e(task.title)} · <code>${e(task.task_id)}</code> · <code>${e(task.attempt_id)}</code></dd><dt>Runtime state</dt><dd>${e(task.state)} · ${e(task.blocked_reason||task.terminal_reason||'No terminal reason recorded')}</dd><dt>Repository / worktree</dt><dd><code>${e(task.repo)}</code> · <code>${e(task.worktree)}</code></dd><dt>Branch</dt><dd>${e(task.branch)}</dd></dl>`;
+    const pkg=outcome.type==='recovery_package'?outcome.package:null;
+    const recovery=pkg?`<h3>Checkpoint recovery review</h3><p><code>${e(pkg.checkpoint_reference)}</code></p><p><b>Recommended next step</b> ${e(pkg.recommended_action)}</p><h4>Confirmed effects</h4>${pkg.confirmed_effects.map(x=>`<p>${e(x.description)}</p>`).join('')||'<p>None recorded.</p>'}<h4>Incomplete / unknown</h4>${[...pkg.incomplete_steps,...pkg.unknown_items].map(x=>`<p>${e(x.description)} · ${e(x.reason)}</p>`).join('')||'<p>None recorded.</p>'}<p>Retry budget remaining: ${e(pkg.recovery_budget.retry_budget_remaining)}</p>`:`<p><b>Next step</b> ${e(outcome.reason)}</p>${outcome.type==='reconcile'?'<p>Verify ledger, process incarnation, runtime history and terminal surface. Unknown liveness is not permission to restart.</p>':''}`;
+    dialog('drawer',item.conclusion,`${facts}${recovery}<p role="note">Inspection only. No answer was consumed and no process was started. Live sessions must be handled in their original terminal; checkpoint recovery remains subject to the existing owner and termination checks.</p><p>${jump}<span class="jump-status" role="status"></span></p>${button('Inspect work contract','work',item.work_id)}`);
+  }
   async function openWork(id) {const w=await fetchJson(`/api/works/${encodeURIComponent(id)}`);dialog('drawer',w.title,`<p class="mono">r${w.revision}</p>${contractFacts(w)}`);}
   let editor=null;
   async function openNarrow(item) {
@@ -760,6 +866,9 @@
       state.conversationDraft = state.conversationDrafts[id] || "";
       return navigate("conversations", id);
     }
+    if(action==='conversations-more')return loadOlderConversations(id);
+    if(action==='conversation-history'){state.conversationHistoryCursor={[target.dataset.direction]:Number(id)};resetSlices();return refresh();}
+    if(action==='conversation-latest'){state.conversationHistoryCursor=null;resetSlices();return refresh();}
     if (action === "refresh-conversations") return refresh();
     if (action === "conversation-message")
       return submitConversationMessage(target);
@@ -773,6 +882,8 @@
       return refresh();
     }
     if (action === "resolve") return resolveItem(id, target.dataset.option);
+    if (action === "done-more") return loadOlderDone(id);
+    if (action === "context-review") return reviewContext(findAttention(id));
     if (action === "attention-evidence") {
       const item = findAttention(id), pkg=item.decision_package;
       if(!pkg)return showError(new Error('Decision context is unavailable. Refresh the current package.'));

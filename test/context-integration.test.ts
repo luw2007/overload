@@ -217,7 +217,7 @@ describe("场景 B：live blocked-on-ask → recovery_jump + 决策卡", () => {
     odb.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
       ["task-b", 1000, "running", "awaiting_human", "session_bound", JSON.stringify({ stable_id: "stable-live-b", runner_pid: 99999 })]);
     odb.run("INSERT INTO approvals(approval_id,task_id,gate,question,options,requested_at,expires_at,consumed_at,actor) VALUES(?,?,?,?,?,?,?,?,?)",
-      ["appr-b", "task-b", "ready", "approve?", JSON.stringify(["approve", "reject"]), 1, 2, null, null]);
+      ["appr-b", "task-b", "ready", "approve?", JSON.stringify(["approve", "reject"]), 1, Date.now()+60000, null, null]);
 
     const spool = new SpoolWriter(odb, env.root);
     const orch = new Orchestrator(odb, spool, 1);

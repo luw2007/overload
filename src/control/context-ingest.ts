@@ -10,6 +10,7 @@
  *        - context.recovery_jump
  *        - context.recovery_package
  *        - context.recovery_reconcile
+ *        - context.recovery_blocked
  *
  * 架构红线：
  *  - 本模块属于 control 侧，由 web server 的 publish loop 定时调用。
@@ -24,11 +25,12 @@ import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { ControlError, upsertAttention, getWork } from "./store";
+import { ControlError, upsertAttention, getAttention, getWork, supersedeAttentionById } from "./store";
 import { ingestFactObservedOrThrow } from "./context-reducer";
 import { ingestExternalObservation } from "./external-observations";
 import { validateFactObservedPayload, type FactObservedPayload } from "../shared/context-contract";
 import { validateExternalObservationInput, type ExternalObservationInput } from "../shared/external-observation-contract";
+import { canonicalJson } from "./outbox";
 
 export interface IngestStats {
   /** 从 spool 文件读取的非空行数 */
@@ -75,7 +77,8 @@ type AttentionKind =
   | "context.pending"
   | "context.recovery_jump"
   | "context.recovery_package"
-  | "context.recovery_reconcile";
+  | "context.recovery_reconcile"
+  | "context.recovery_blocked";
 
 const ATTENTION_KIND_META: Record<AttentionKind, {
   conclusion: string;
@@ -106,6 +109,12 @@ const ATTENTION_KIND_META: Record<AttentionKind, {
     conclusion: "现场对账：liveness 未知，需要人核对",
     urgency: "inbox",
     recommendation: "对账 ledger/incarnation/jsonl/surface 后决定 spawn 或恢复",
+    triggerField: "reason",
+  },
+  "context.recovery_blocked": {
+    conclusion: "恢复受阻：需要核对原任务的恢复条件",
+    urgency: "inbox",
+    recommendation: "审阅具体阻塞原因与原现场；补齐恢复条件前不要重跑",
     triggerField: "reason",
   },
 };
@@ -147,14 +156,39 @@ function ingestAttentionEvent(
   const meta = ATTENTION_KIND_META[kind];
   const trigger = asNonEmptyString(d[meta.triggerField]) ?? "(unspecified)";
 
+  return db.transaction(() => {
   // work 必须已存在（upsertAttention 校验 contract_revision === work.revision）。
   const work = getWork(db, workId);
   if (!work) throw new ControlError("not_found", `${kind}: work not found: ${workId}`);
 
   const itemId = `ctx:${kind}:${workId}:${taskId}`;
-  const existing = db.query("SELECT revision FROM control_attention WHERE item_id=?").get(itemId) as { revision: number } | null;
+  const existing = getAttention(db, itemId);
+  const recoveryRevision = typeof d.recovery_revision === "number" && Number.isSafeInteger(d.recovery_revision) && d.recovery_revision > 0
+    ? d.recovery_revision : null;
+  const recovery = kind !== "context.pending";
+  const siblings = recovery ? db.query(`SELECT item_id FROM control_attention
+    WHERE work_id=? AND consumer_owner='orchestrator' AND json_extract(evidence,'$.task_id')=?
+      AND json_extract(evidence,'$.kind') IN ('context.recovery_jump','context.recovery_package','context.recovery_reconcile','context.recovery_blocked')`)
+    .all(workId, taskId) as { item_id: string }[] : [];
+  for (const sibling of siblings) {
+    const prior = getAttention(db, sibling.item_id);
+    const priorRevision = prior?.evidence.recovery_revision;
+    if (recoveryRevision !== null && typeof priorRevision === "number" && priorRevision >= recoveryRevision) return false;
+  }
+  if (typeof d.contract_revision === "number" && d.contract_revision !== work.revision) return false;
+  const contractOwner = work.contract?.decision_owner;
+  if (contractOwner && contractOwner !== owner) throw new ControlError("blocked", "context attention owner does not match work owner");
+  if (existing && existing.evidence.kind === kind && canonicalJson(existing.evidence) === canonicalJson({ kind, task_id: taskId, deep_link: deepLink, ...d })) return false;
+  if (existing?.state === "superseded" && recoveryRevision === null) return false;
 
-  upsertAttention(db, {
+    if (recoveryRevision !== null) for (const sibling of siblings) {
+      if (sibling.item_id === itemId) continue;
+      const prior = getAttention(db, sibling.item_id);
+      if (prior?.state === "open" && prior.effect_state === "not_started") supersedeAttentionById(db, prior.item_id, prior.revision, {
+        actor: owner, reason: "newer recovery facts replace this review", evidence: { recovery_revision: recoveryRevision, replaced_by_item_id: itemId },
+      }, now);
+    }
+    upsertAttention(db, {
     item_id: itemId,
     work_id: workId,
     state: "open",
@@ -181,11 +215,11 @@ function ingestAttentionEvent(
       deep_link: deepLink,
       ...d,
     },
-    // upsertAttention 更新既有卡要求 CAS：传入当前 revision。
     ...(existing ? { expected_revision: existing.revision } : {}),
-  }, now);
+    }, now);
 
   return !existing;
+  }).immediate();
 }
 
 /** 扫描 spoolDir 下所有待处理的 collector seg 文件，按 mtime 排序。 */

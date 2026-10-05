@@ -2,11 +2,10 @@ import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import {
  getAttention,
- actOnAttention,
  getAttentionMaterial,
  createWork,
  getWork,
- projectAttentionEffect,
+
  resolveAttention,
  upsertAttention,
 } from "../control/store";
@@ -16,7 +15,7 @@ import {
  registerTarget,
  getTarget,
  consumeDecision,
- observeReceiptEffect,
+ observeAndProjectReceiptEffect,
 } from "../decision-bot/mailbox";
 import {
  ensureAdapterSchema,
@@ -131,10 +130,11 @@ export class AdapterService {
  async start(): Promise<void> {
   this.stopping = false;
   const now = Date.now();
-  this.db.run(
-   "UPDATE conversation_turns SET state='unknown',reason='owner_lost_before_receipt' WHERE state IN ('submitting','running','cancelling') AND conversation_id IN (SELECT c.id FROM conversations c LEFT JOIN runtime_ownership o ON o.session_id=json_extract(c.session_reference,'$.sessionId') WHERE o.session_id IS NULL OR o.expires_at<?)",
-   [now],
-  );
+  const lostRows = this.db.query(
+   "SELECT c.id AS conversation_id, json_extract(c.session_reference,'$.sessionId') AS expected_session_id FROM conversations c JOIN conversation_turns t ON t.conversation_id=c.id WHERE t.state IN ('submitting','running','cancelling') AND (c.session_reference IS NULL OR json_extract(c.session_reference,'$.sessionId') NOT IN (SELECT session_id FROM runtime_ownership WHERE expires_at>?))",
+  ).all(now) as Array<{ conversation_id: string; expected_session_id: string | null }>;
+  for (const row of lostRows)
+   this.finalizeLostRuntime(row.conversation_id, row.expected_session_id, "owner_lost_before_receipt", true);
   this.db.run(
    "UPDATE channel_deliveries SET state='unknown',reason='delivery_receipt_lost' WHERE state='sending'",
   );
@@ -285,19 +285,13 @@ export class AdapterService {
      // equal item.owner. Revision and material fingerprint are trusted
      // server-side tokens; channel payloads never supply either value.
      const material = getAttentionMaterial(this.db, item.item_id);
-     if (material) {
-      resolveAttention(this.db, item.item_id, {
-       selected_option: event.answer,
-       reason: "channel operator decision",
-       attention_revision: item.revision,
-       material_fingerprint: material.fingerprint,
-      }, owner);
-     } else {
-      actOnAttention(this.db, item.item_id, item.revision, "resolve", {
-       reason: "channel operator decision",
-       selected_option: event.answer,
-      }, owner);
-     }
+     if (!material) throw new Error("decision_material_unavailable");
+     resolveAttention(this.db, item.item_id, {
+      selected_option: event.answer,
+      reason: "channel operator decision",
+      attention_revision: item.revision,
+      material_fingerprint: material.fingerprint,
+     }, owner);
     }
     if (
      this.db
@@ -656,14 +650,14 @@ export class AdapterService {
      queueMicrotask(() => void this.pump(conversationId));
    }
   } catch (error) {
-   if (!this.stopping)
-    this.db.run(
-     "UPDATE conversation_turns SET state='unknown',reason=? WHERE conversation_id=? AND state IN ('submitting','running')",
-     [
-      error instanceof Error ? error.message : "event_stream_lost",
-      conversationId,
-     ],
+   if (!this.stopping) {
+    this.finalizeLostRuntime(
+     conversationId,
+     handle.reference.sessionId,
+     error instanceof Error ? error.message : "event_stream_lost",
     );
+    queueMicrotask(() => void this.pump(conversationId));
+   }
   }
  }
  recordRuntimeEvent(conversationId: string, event: RuntimeEvent): void {
@@ -903,23 +897,100 @@ export class AdapterService {
        },
        observedAt: Date.now(),
       } as const;
-      if (!observeReceiptEffect(this.db, observation))
+      // Atomic observe + project; mailbox owns source/outbox lookup.
+      if (!observeAndProjectReceiptEffect(this.db, observation))
        throw new Error(`runtime effect observation rejected: ${decision.request_id}`);
-      const source = this.db.query(`SELECT event_id FROM control_outbox
-       WHERE item_id=? AND entity_version<=? AND kind IN ('attention.created','attention.updated')
-       ORDER BY entity_version DESC LIMIT 1`).get(item.item_id, item.revision);
-      if (!source || typeof source !== "object" || !("event_id" in source)
-       || typeof source.event_id !== "string" || !source.event_id)
-       throw new Error(`runtime effect source event missing: ${decision.request_id}`);
-      projectAttentionEffect(this.db, {
-       work_id: item.work_id,
-       item_id: item.item_id,
-       item_revision: item.revision,
-       approval_id: item.approval_id,
-       receipt_id: decision.receipt_id,
-       outbox_event_id: source.event_id,
-      }, observation, observation.observedAt);
      }
+    }
+   })
+   .immediate();
+ }
+ /**
+  * Finalize a runtime that is lost: mark all in-flight turns unknown, enqueue
+  * one terminal result delivery per turn (business_key UNIQUE prevents
+  * duplicates across restart/tick), close any open approval bindings.
+  *
+  * Fencing inside the same IMMEDIATE transaction prevents stale old observers
+  * from poisoning a conversation that has moved on (e.g. /new creates a new
+  * session after the old observe() crashed; old observe's handle still holds
+  * the OLD sessionId so we compare it against the CURRENT conversation's
+  * session_reference).
+  *
+  * @param expectedSessionId sessionId the caller believes it owns; must equal
+  *   the CURRENT conversation's sessionId for non-start paths. Pass null from
+  *   start() for orphan (session_reference IS NULL) rows — the lease check
+  *   handles that case differently.
+  */
+ private finalizeLostRuntime(
+  conversationId: string,
+  expectedSessionId: string | null,
+  reason: string,
+  fromStart = false,
+ ): void {
+  const now = Date.now();
+  this.db
+   .transaction(() => {
+    // 1. Load conversation (single authoritative row for this conversation_id).
+    const c = this.db
+     .query("SELECT * FROM conversations WHERE id=?")
+     .get(conversationId) as Conversation | null;
+    if (!c) return;
+    const currentReference: unknown = c.session_reference ? JSON.parse(c.session_reference) : null;
+    const currentId = currentReference && typeof currentReference === "object" && "sessionId" in currentReference
+      && typeof currentReference.sessionId === "string" ? currentReference.sessionId : null;
+    if (currentId !== expectedSessionId) return;
+    // 3. Lease fence: only an owner we still consider ours may touch turns.
+    //    fromStart=true: accept if NO unexpired owner exists — that's the
+    //                    canonical "ownerless lost" scenario.
+    //    fromStart=false: require THIS token owns an unexpired lease.
+    if (expectedSessionId) {
+     const lease = this.db
+      .query(
+       "SELECT owner_token,expires_at FROM runtime_ownership WHERE session_id=?",
+      )
+      .get(expectedSessionId) as { owner_token: string; expires_at: number } | null;
+     if (fromStart) {
+      // start() path: bail if a fresh owner already claimed this session.
+      if (lease && lease.expires_at > now) return;
+     } else {
+      // observe().catch() path: bail if wrong owner OR no lease (race with
+      // pump() which already moved on).
+      if (!lease || lease.owner_token !== this.token) return;
+      if (lease.expires_at <= now) return;
+     }
+    }
+    // 4. Select + update in same tx — CAS on state IN filter means duplicate
+    //    calls across restart are safe (already-'unknown' rows silently drop).
+    const turns = this.db
+     .query(
+      "SELECT * FROM conversation_turns WHERE conversation_id=? AND state IN ('submitting','running','cancelling')",
+     )
+     .all(conversationId) as StoredTurn[];
+    for (const turn of turns) {
+     const finalReason =
+      turn.state === "cancelling" ? "cancelled_effects_unconfirmed" : reason;
+     this.db.run(
+      "UPDATE conversation_turns SET state='unknown',reason=?,reaction_state=CASE WHEN received_reaction_id IS NULL THEN reaction_state ELSE 'done_pending' END WHERE id=? AND state IN ('submitting','running','cancelling')",
+      [finalReason, turn.id],
+     );
+     enqueueDelivery(
+      this.db,
+      c.id,
+      "result:" + turn.id + ":unknown",
+      JSON.parse(c.address) as ChannelAddress,
+      turn.state === "cancelling"
+       ? "运行时已返回终态；取消前及后台副作用未确认，现场保持隔离。"
+       : "结果未知，保留现场，不自动重跑。",
+      {
+       replyTo: turn.source_message_id ?? undefined,
+       importance: "important",
+       terminal: true,
+      },
+     );
+     this.db.run(
+      "UPDATE approval_channel_bindings SET state='closed' WHERE turn_id=? AND state='active'",
+      [turn.id],
+     );
     }
    })
    .immediate();

@@ -8,7 +8,7 @@ On runtimes exposing an abort signal to extensions, cancelling an approval wait 
 
 ## Status
 
-The supported v0 surface is the Bun/SQLite ingest pipeline, CLI, recon, pull, and loopback dashboard. The operator works Now / Inbox / Done Attention items. Pending decisions are read from the dashboard; when the Now zone goes from empty to non-empty, the maintenance job emits one aggregated macOS notification (`osascript`), never per-event. The automatic Decision Bot and the Orchestrator are optional advanced features, off by default.
+The supported v0 surface is the Bun/SQLite ingest pipeline, CLI, recon, pull, and loopback dashboard. The operator works Now / Inbox / Done Attention items. Pending decisions are read from the dashboard; the default maintenance sender emits one aggregated macOS notification (`osascript`) when a new pending-request or hung-session subject appears, not once per event. The automatic Decision Bot and the Orchestrator are optional advanced features, off by default.
 ## Requirements
 
 - macOS 13+ for the supported launchd workflow
@@ -61,7 +61,8 @@ bun src/cli/overload.ts now                 # items needing a decision now
 bun src/cli/overload.ts inbox               # items that can wait; batch later
 bun src/cli/overload.ts done                # decided or archived
 bun src/cli/overload.ts attention <id>                 # inspect one card
-bun src/cli/overload.ts attention <id> ack|defer|resolve
+bun src/cli/overload.ts attention <id> ack|defer <json>
+bun src/cli/overload.ts attention <id> resolve <decision-json> --actor <owner> # explicit option, revision, observed material_fingerprint
 bun src/cli/overload.ts attention <id> feedback <json>  # rate a card's usefulness
 bun src/cli/overload.ts works
 bun src/cli/overload.ts candidates

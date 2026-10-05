@@ -375,9 +375,9 @@ describe("T12 场景 1：完整重构场景（§7 步骤 1–7，两条分支）
     const s = buildScenario();
     // orchestrator: live task + 未消费 approval
     s.orchestratorDb.run(
-      `INSERT INTO tasks(task_id,title,repo,base_ref,state,work_id,runner_pid,stable_id,created_at,updated_at,ci_observation_failures,retry_budget)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-      ["live-task-1", "live", "myrepo", "main", "running", s.work.work_id, 99999, "pi-sess-abc", Date.now(), Date.now(), 0, 2],
+      `INSERT INTO tasks(task_id,title,repo,base_ref,state,work_id,runner_pid,stable_id,attempt_id,created_at,updated_at,ci_observation_failures,retry_budget)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ["live-task-1", "live", "myrepo", "main", "running", s.work.work_id, 99999, "pi-sess-abc", "att-live-1", Date.now(), Date.now(), 0, 2],
     );
     s.orchestratorDb.run(
       `INSERT INTO approvals(approval_id,task_id,gate,question,options,requested_at,expires_at,consumed_at,actor)
@@ -415,9 +415,9 @@ describe("T12 场景 1：完整重构场景（§7 步骤 1–7，两条分支）
 
     // orchestrator: terminated task + session_bound（runner 支持恢复）+ checkpoint
     s.orchestratorDb.run(
-      `INSERT INTO tasks(task_id,title,repo,base_ref,state,work_id,stable_id,created_at,updated_at,ci_observation_failures,retry_budget,contract_revision)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-      ["dead-task-1", "dead", "myrepo", "main", "done", s.work.work_id, "pi-sess-xyz", Date.now(), Date.now(), 0, 2, 2],
+      `INSERT INTO tasks(task_id,title,repo,base_ref,state,work_id,stable_id,attempt_id,created_at,updated_at,ci_observation_failures,retry_budget,contract_revision)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ["dead-task-1", "dead", "myrepo", "main", "done", s.work.work_id, "pi-sess-xyz", "att-dead-1", Date.now(), Date.now(), 0, 2, 2],
     );
     s.orchestratorDb.run(
       `INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)`,

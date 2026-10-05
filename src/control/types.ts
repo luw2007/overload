@@ -77,6 +77,18 @@ export type DecisionOption = {
 
 export type AttentionZone = "now" | "inbox" | "done";
 
+export type AttentionPage = {
+  items: AttentionItem[];
+  next_cursor: string | null;
+  total: number;
+};
+
+export type AttentionPageOptions = {
+  limit?: number;
+  cursor?: string;
+  updated_since?: number;
+};
+
 export type FollowUpStage =
   | "answer_recorded"
   | "applying"

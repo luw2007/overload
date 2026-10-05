@@ -90,12 +90,20 @@ export function openStore(path?: string | null): Database {
   try {
     // busy_timeout (also set by schema.sql) must precede the migration's write lock so concurrent
     // openers wait instead of failing; the migration must precede every schema write.
-    db.exec("PRAGMA busy_timeout = 5000"); migrateCheckResultsKey(db); db.exec(schema);
-    // Existing M0 databases predate contract/budget observability. SQLite does
-    // not support ADD COLUMN IF NOT EXISTS, so make this migration idempotent.
-    const columns=db.query("PRAGMA table_info(tasks)").all() as {name:string}[];
-    for(const [name,sql] of [["work_id","TEXT"],["contract_revision","INTEGER"],["budget_deadline_at","INTEGER"],["ci_observation_failures","INTEGER NOT NULL DEFAULT 0"],["stop_state","TEXT"],["stop_requested_at","INTEGER"],["stop_deadline_at","INTEGER"],["stop_reason","TEXT"]] as const)
-      if(!columns.some(column=>column.name===name))db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
+    db.exec("PRAGMA busy_timeout = 5000"); migrateCheckResultsKey(db);
+    db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL");
+    // Old databases lack stop_state: migrate columns before creating the revised partial index.
+    db.transaction(()=>{
+      const oldTasks=db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get();
+      if(oldTasks){
+        const columns=db.query("PRAGMA table_info(tasks)").all() as {name:string}[];
+        for(const [name,sql] of [["work_id","TEXT"],["contract_revision","INTEGER"],["budget_deadline_at","INTEGER"],["ci_observation_failures","INTEGER NOT NULL DEFAULT 0"],["stop_state","TEXT"],["stop_requested_at","INTEGER"],["stop_deadline_at","INTEGER"],["stop_reason","TEXT"]] as const)
+          if(!columns.some(column=>column.name===name))db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
+        const repoIndex=db.query("SELECT sql FROM sqlite_master WHERE type='index' AND name='tasks_repo_active'").get() as {sql:string}|null;
+        if(repoIndex&&!repoIndex.sql.includes("stop_state IN ('stop_requested','stop_unconfirmed')"))db.exec("DROP INDEX tasks_repo_active");
+      }
+      db.exec(schema.replace(/^PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;\s*/,'').trimStart());
+    }).immediate();
     chmodSync(resolved, 0o600);
     db.run("INSERT OR IGNORE INTO spool_seq(id,seq,segment) VALUES(1,0,0)"); return db;
   } catch (error) { db.close(); throw error; }
@@ -122,6 +130,7 @@ function targetFor(task:Task,event:string,detail:TransitionDetail):TaskState|nul
   return rules[task.state][event]??null;
 }
 export function transition(db:Database,id:string,event:string,detail:TransitionDetail={},now=Date.now(),expectOwner?:string):Task {
+  return db.transaction(()=>{
   const task=getTask(db,id); if(!task)throw new Error(`Task not found: ${id}`); const to=targetFor(task,event,detail); if(!to)throw new Error(`Illegal transition: ${task.state} + ${event}`);
   let budget=task.retry_budget; if((event==="runner_dead"||(event==="runner_exit"&&detail.evidence_complete===false)||event==="bind_timeout")&&budget>0)budget--;
   if(event==="human_reopen")budget=2;
@@ -131,37 +140,41 @@ export function transition(db:Database,id:string,event:string,detail:TransitionD
   // M2 §3.7: session-binding fields are optionally supplied via detail and persisted verbatim; absent keys keep the existing column value.
   const worktree=typeof detail.worktree==="string"?detail.worktree:task.worktree;
   const branch=typeof detail.branch==="string"?detail.branch:task.branch;
-  // §3.1-3: rewinding to "starting" on a real attempt failure rotates attempt_id and clears the pid/binding
-  // columns so the next spawn can't be confused with the dead one's ledger origin (plan §0-3/§3.1-3).
-  const rotateAttempt=to==="starting"&&(event==="runner_dead"||(event==="runner_exit"&&detail.evidence_complete===false));
+  // Reopening is a new attempt too; never reuse the old runner's PID or checkpoint identity.
+  const rotateAttempt=to==="starting"&&(event==="human_reopen"||event==="runner_dead"||(event==="runner_exit"&&detail.evidence_complete===false));
+  if(rotateAttempt&&(task.stop_state==='stop_requested'||task.stop_state==='stop_unconfirmed'))throw new Error('runner_stop_unconfirmed');
   const stableId=rotateAttempt?null:(typeof detail.stable_id==="string"?detail.stable_id:task.stable_id);
   const runnerPid=rotateAttempt?null:(typeof detail.runner_pid==="number"?detail.runner_pid:task.runner_pid);
   const runnerBootId=rotateAttempt?null:(typeof detail.runner_boot_id==="string"?detail.runner_boot_id:task.runner_boot_id);
   const attemptId=rotateAttempt?randomUUID():task.attempt_id;
   const prUrl=typeof detail.pr_url==="string"?detail.pr_url:task.pr_url;
   let applied=false;
-  db.transaction(()=>{
     let sql="UPDATE tasks SET state=?,retry_budget=?,blocked_reason=?,terminal_reason=?,worktree=?,branch=?,stable_id=?,runner_pid=?,runner_boot_id=?,pr_url=?,attempt_id=?,updated_at=? WHERE task_id=?";
     const params:unknown[]=[to,budget,blocked,terminal,worktree,branch,stableId,runnerPid,runnerBootId,prUrl,attemptId,now,id];
     if(expectOwner!==undefined){sql+=" AND (owner_instance IS NULL OR owner_instance=?)";params.push(expectOwner);}
     const result=db.run(sql,params);
     applied=result.changes>0;
     if(applied){
-      db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[id,now,task.state,to,event,Object.keys(detail).length?JSON.stringify(detail):null]);
-      if(rotateAttempt)db.run("DELETE FROM task_recovery WHERE task_id=?",[id]);
+      const eventDetail={...detail,attempt_id:task.attempt_id,...(rotateAttempt?{next_attempt_id:attemptId}:{})};
+      db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[id,now,task.state,to,event,JSON.stringify(eventDetail)]);
+      if(rotateAttempt){
+        db.run("DELETE FROM task_recovery WHERE task_id=?",[id]);
+        // Retain audit rows; the normal expiry pass closes their mailbox targets and cards.
+        db.run("UPDATE approvals SET expires_at=MIN(expires_at,?) WHERE task_id=? AND consumed_at IS NULL",[now,id]);
+      }
     } else {
       // §1.3-4: CAS lost to another owner. Don't touch tasks; leave an audit trail for a human.
       const currentOwner=(db.query("SELECT owner_instance FROM tasks WHERE task_id=?").get(id) as {owner_instance:string|null}).owner_instance;
       db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",[id,now,task.state,task.state,"fence_lost",JSON.stringify({event,detail,owner:expectOwner,current_owner:currentOwner})]);
     }
-  })();
   return getTask(db,id)!;
+  }).immediate();
 }
 export function claim(db:Database,owner:string,concurrency=2,now=Date.now()):Task[] {
   if(concurrency<1||concurrency>4)throw new Error("concurrency must be between 1 and 4"); const claimed:Task[]=[];
   db.exec("BEGIN IMMEDIATE");
   try {
-    let active=(db.query("SELECT count(*) n FROM tasks WHERE state IN ('starting','running')").get() as {n:number}).n;
+    let active=(db.query("SELECT count(*) n FROM tasks WHERE state IN ('starting','running') OR stop_state IN ('stop_requested','stop_unconfirmed')").get() as {n:number}).n;
     const candidates=db.query("SELECT task_id FROM tasks WHERE state='queued' ORDER BY created_at,task_id").all() as {task_id:string}[];
     for(const c of candidates){if(active>=concurrency)break;db.exec("SAVEPOINT candidate");try{const attempt=randomUUID();const result=db.run("UPDATE tasks SET state='starting',attempt_id=?,owner_instance=?,lease_expires_at=?,updated_at=? WHERE task_id=? AND state='queued'",[attempt,owner,now+60_000,now,c.task_id]);if(result.changes){db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event) VALUES(?,?,?,?,?)",[c.task_id,now,"queued","starting","claim"]);claimed.push(getTask(db,c.task_id)!);active++;}db.exec("RELEASE candidate");}catch(error){db.exec("ROLLBACK TO candidate");db.exec("RELEASE candidate");if(!String(error).includes("UNIQUE constraint failed"))throw error;}}
     db.exec("COMMIT"); return claimed;

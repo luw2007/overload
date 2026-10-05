@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Database } from "bun:sqlite";
-import { ControlError, getWork, upsertAttention, recordAttentionResolution, supersedeAttentionById } from "../control/store";
+import { ControlError, getWork, getAttention, getAttentionMaterial, upsertAttention, recordAttentionResolution, supersedeAttentionById } from "../control/store";
 import { projectArtifactVersions } from "../control/artifact-projection";
 import { ensureMgmtSchema } from "./schema";
 import { canonicalWorkId, workScope } from "./relations";
@@ -248,12 +248,15 @@ export function requestAcceptance(
   return { item_id: itemId };
 }
 
+export interface ManifestDecisionBasis { attention_revision: number; material_fingerprint: string }
+
 export function recordAcceptance(
   db: Database,
   manifestId: string,
   verdict: "accepted" | "rejected",
   actor: string,
   evidence: Record<string, unknown>,
+  basis: ManifestDecisionBasis,
   now: number,
 ): { acceptance_id: string } {
   ensureMgmtSchema(db);
@@ -263,28 +266,35 @@ export function recordAcceptance(
     manifestId,
   );
   if (!manifest) throw new ControlError("not_found", "manifest not found");
-  const acceptanceId = id("acceptance", manifestId, verdict, actor);
+  const trustedActor = actor.trim();
   const itemId = `mgmt:accept:${manifest.work_id}:${manifestId}`;
+  const acceptanceId = id("acceptance", manifestId, verdict, trustedActor);
   return db
     .transaction(() => {
-      db.query(
+      const work = getWork(db, manifest.work_id);
+      const profile = one<{ decision_owner: string }>(db, "SELECT decision_owner FROM mgmt_work_profile WHERE work_id=?", manifest.work_id);
+      const owner = work?.contract?.decision_owner ?? profile?.decision_owner;
+      if (!owner || trustedActor !== owner) throw new ControlError("blocked", "permission_denied: acceptance requires the decision owner");
+      const card = getAttention(db, itemId);
+      if (!work || !card) throw new ControlError("blocked", "acceptance requires a current decision card");
+      if (card.owner !== trustedActor || card.contract_revision !== work.revision) throw new ControlError("blocked", "acceptance decision basis is no longer current");
+      if (!basis || !Number.isSafeInteger(basis.attention_revision) || basis.attention_revision < 1 || typeof basis.material_fingerprint !== "string" || !basis.material_fingerprint.trim()) throw new ControlError("invalid", "observed attention revision and material fingerprint are required");
+      const material = getAttentionMaterial(db, itemId);
+      if (card.revision !== basis.attention_revision || !material || material.fingerprint !== basis.material_fingerprint) throw new ControlError("conflict", "stale acceptance decision basis");
+      if (card.state !== "open" || card.effect_state !== "not_started" || (card.expires_at !== null && card.expires_at <= now)) throw new ControlError("blocked", "acceptance decision is not open");
+      if (!card.options.includes(verdict === "accepted" ? "accept" : "reject")) throw new ControlError("invalid", "acceptance option is not available");
+      const inserted = db.query(
         "INSERT OR IGNORE INTO mgmt_acceptances(acceptance_id,work_id,manifest_id,verdict,actor,evidence) VALUES(?,?,?,?,?,?)",
       ).run(
         acceptanceId,
         manifest.work_id,
         manifestId,
         verdict,
-        actor,
+        trustedActor,
         JSON.stringify(evidence),
       );
-      const card = one<{ revision: number }>(
-        db,
-        "SELECT revision FROM control_attention WHERE item_id=?",
-        itemId,
-      );
-      if (card) {
-        recordAttentionResolution(db, itemId, card.revision, { verdict, actor, evidence }, now);
-      }
+      if (!inserted.changes) throw new ControlError("conflict", "acceptance already recorded for this manifest and verdict");
+      recordAttentionResolution(db, itemId, basis.attention_revision, { verdict, actor: trustedActor, evidence }, now);
       return { acceptance_id: acceptanceId };
     })
     .immediate();

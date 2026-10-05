@@ -24,6 +24,23 @@ test('coordinator rework consumes budget and queues a fresh attempt',()=>{const 
  const task=getTask(f.tasks,f.child.task_id)!;expect(task.state).toBe('queued');expect(task.attempt_id).toBeNull();expect(task.retry_budget).toBe(0);
 }finally{f.tasks.close();f.control.close();rmSync(f.root,{recursive:true,force:true});}});
 
+test('failed rework rotation rolls back review and retains the old attempt',()=>{
+ const f=fixture();
+ try{
+  const before=getTask(f.tasks,f.child.task_id);
+  f.tasks.exec("CREATE TRIGGER reject_rework BEFORE UPDATE ON tasks WHEN OLD.state='blocked' AND NEW.state='starting' BEGIN SELECT RAISE(ABORT,'rework_storage_failure'); END;");
+  const input={work_id:f.work.work_id,task_id:f.child.task_id,attempt_id:'attempt-1',state:'awaiting_human',verdict:'rework',reason:'revise',evidence:f.evidence()};
+  expect(()=>f.coordinator.review(input)).toThrow();
+  expect(getTask(f.tasks,f.child.task_id)).toEqual(before);
+  expect(f.tasks.query('SELECT task_id FROM coordinator_reviews').all()).toEqual([]);
+  expect(f.tasks.query("SELECT event FROM task_events WHERE event IN ('answer=reject','human_reopen')").all()).toEqual([]);
+  f.tasks.exec('DROP TRIGGER reject_rework');
+  f.coordinator.review(input);
+  expect(getTask(f.tasks,f.child.task_id)).toMatchObject({state:'queued',attempt_id:null,retry_budget:0});
+  expect(f.tasks.query('SELECT task_id FROM coordinator_reviews').all()).toEqual([{task_id:f.child.task_id}]);
+ }finally{f.tasks.close();f.control.close();rmSync(f.root,{recursive:true,force:true});}
+});
+
 test('final acceptance rechecks evidence and completed status remains readable',()=>{const f=fixture();try{
  f.coordinator.review({work_id:f.work.work_id,task_id:f.child.task_id,attempt_id:'attempt-1',state:'awaiting_human',verdict:'accept',reason:'verified',evidence:f.evidence()});
  const delivery=f.coordinator.deliver({work_id:f.work.work_id,summary:'ready'});writeFileSync(f.report,'mutated');

@@ -16,14 +16,16 @@ import { submitTask } from "./submit";
 import { checkPr } from "./pr";
 import { consumeAnswers, expireApprovals, openAnswersDb, requestApproval, repairApprovalIntents, reconcileApprovalEffects } from "./approval";
 import { buildAgentTaskContext } from "./agent-task-context";
-import { collectAndSpool, spoolContextEnvelope } from "./context-collector";
+import { collectAndSpool, reserveContextSpoolSequence, spoolContextEnvelope } from "./context-collector";
 import { determineRecoveryOutcome } from "./recovery-context";
+import { controlPayloadHash } from "../control/outbox";
 import { AnomalyMonitor, repairAnomalyIntents } from "./anomaly-monitor";
 import { getAnomalyBudget } from "./anomaly-store";
 import type { Database } from "bun:sqlite";
 import {coordinatorChild,coordinatorChildPrompt} from './coordinator';
 import {existsSync,readFileSync} from 'node:fs';
-export type ManagedRunner={owns(task:Task):boolean;start(task:Task,worktree:string,attempt:string,prompt:string):Promise<{ok:boolean;error?:string}>;probe(task:Task):Promise<'running'|'ended'|'unknown'>};
+import type {ManagedStartResult} from '../adapters/worker-runtime';
+export type ManagedRunner={owns(task:Task):boolean;start(task:Task,worktree:string,attempt:string,prompt:string):Promise<ManagedStartResult>;probe(task:Task):Promise<'running'|'ended'|'unknown'>;cleanupCreated?(task:Task):Promise<'confirmed'|'unknown'>};
 
 const BIND_TIMEOUT_TICKS = 12; // ~60s at the 5s tick interval, plan §3.3 bind_timeout.
 
@@ -50,8 +52,16 @@ export class Orchestrator {
   }
   // §2.2/§3.2: unknown_ticks lives in task_recovery so the 12-tick bound survives an orchestrator restart.
   private bumpUnknownAndMaybeBlock(task:Task,now:number,reason:"spawn_unverified"|"liveness_unknown"):void{
+    const current=getTask(this.db,task.task_id);
+    if(!current||current.attempt_id!==task.attempt_id||!this.mine(current,now))return;
+    // A restarted instance may inherit an expired lease; acquire it before post-await writes.
+    if(current.owner_instance!==this.owner){
+      this.db.run("UPDATE tasks SET owner_instance=?,lease_expires_at=? WHERE task_id=? AND attempt_id=? AND (owner_instance IS NULL OR lease_expires_at IS NULL OR lease_expires_at<=?)",[this.owner,now+60_000,task.task_id,task.attempt_id,now]);
+      if(getTask(this.db,task.task_id)?.owner_instance!==this.owner)return;
+    }
+    if(this.managedRunner?.owns(task))this.db.run("UPDATE tasks SET stop_state='stop_unconfirmed',stop_reason=COALESCE(stop_reason,?) WHERE task_id=? AND attempt_id=? AND owner_instance=?",[reason,task.task_id,task.attempt_id,this.owner]);
     if(!getRecovery(this.db,task.task_id)&&task.attempt_id)setRecovery(this.db,task.task_id,task.attempt_id,"intent",now);
-    if(bumpUnknown(this.db,task.task_id)>=BIND_TIMEOUT_TICKS)this.casTransition(task.task_id,reason,{},now);
+    if(bumpUnknown(this.db,task.task_id)>=BIND_TIMEOUT_TICKS)this.casTransition(task.task_id,reason,{reason:current.stop_reason??reason},now);
   }
   private controlValid(task:Task):boolean{
     if(!task.work_id)return true;
@@ -100,7 +110,25 @@ export class Orchestrator {
   // §3.3 rows #1-#6: a "starting" task never seen by pollBinding yet. Anything but a genuinely
   // fresh row (no recovery, no pid, no stable_id) must be probed, never blind-spawned again.
   private async reconcileStarting(task:Task,now:number):Promise<void>{
-    if(this.managedRunner?.owns(task)&&getRecovery(this.db,task.task_id)){const state=await this.managedRunner.probe(task);if(state==='ended'){this.casTransition(task.task_id,'session_bound',{},now);await this.collectAndResolve(getTask(this.db,task.task_id)!,now);}else if(state==='running')this.casTransition(task.task_id,'session_bound',{},now);else this.bumpUnknownAndMaybeBlock(task,now,'spawn_unverified');return;}
+    if(this.managedRunner?.owns(task)&&getRecovery(this.db,task.task_id)){
+      if(task.stop_state==='stopped_confirmed'){this.casTransition(task.task_id,'spawn_fail',{reason:task.stop_reason??'managed_start_failed'},now);return;}
+      if(task.stop_state==='stop_unconfirmed'||task.stop_state==='stop_requested'){
+        const current=getTask(this.db,task.task_id);
+        if(current?.attempt_id===task.attempt_id&&current.owner_instance!==this.owner&&this.mine(current,now)){
+          this.db.run("UPDATE tasks SET owner_instance=?,lease_expires_at=? WHERE task_id=? AND attempt_id=? AND (owner_instance IS NULL OR lease_expires_at IS NULL OR lease_expires_at<=?)",[this.owner,now+60_000,task.task_id,task.attempt_id,now]);
+        }
+        const acquired=getTask(this.db,task.task_id);
+        if(acquired?.owner_instance===this.owner&&acquired.attempt_id===task.attempt_id&&(!this.started.has(task.task_id)||current?.owner_instance!==this.owner)&&await this.managedRunner.cleanupCreated?.(acquired)==='confirmed'){
+          this.casTransition(task.task_id,'spawn_fail',{reason:acquired.stop_reason??'managed_start_failed'},now);return;
+        }
+        this.bumpUnknownAndMaybeBlock(task,now,'spawn_unverified');return;
+      }
+      const state=await this.managedRunner.probe(task);
+      if(state==='ended'){this.casTransition(task.task_id,'session_bound',{},now);await this.collectAndResolve(getTask(this.db,task.task_id)!,now);}
+      else if(state==='running')this.casTransition(task.task_id,'session_bound',{},now);
+      else this.bumpUnknownAndMaybeBlock(task,now,'spawn_unverified');
+      return;
+    }
     const recovery=getRecovery(this.db,task.task_id);
     if(!recovery){ if(task.runner_pid==null&&task.stable_id==null)return; /* row #1: fresh, leave it to startRunner */ }
     else if(recovery.spawn_state==="failed")return; // row #4: startRunner already routes this to spawn_fail
@@ -141,6 +169,11 @@ export class Orchestrator {
       if(!this.mine(task,now))continue;
       if(task.state==="starting")await this.reconcileStarting(task,now);
       else if(task.state==="running")await this.reconcileRunning(task,now);
+      else if(task.state==='blocked'&&task.stop_state==='stop_unconfirmed'&&task.attempt_id&&this.managedRunner?.owns(task)){
+        if(task.owner_instance!==this.owner)this.db.run("UPDATE tasks SET owner_instance=?,lease_expires_at=? WHERE task_id=? AND attempt_id=? AND state='blocked' AND stop_state='stop_unconfirmed' AND (owner_instance IS NULL OR lease_expires_at IS NULL OR lease_expires_at<=?)",[this.owner,now+60_000,task.task_id,task.attempt_id,now]);
+        const held=getTask(this.db,task.task_id);
+        if(held?.owner_instance===this.owner&&held.attempt_id===task.attempt_id)await this.managedRunner.cleanupCreated?.(held);
+      }
     }
   }
   async tick(now=Date.now()):Promise<Task[]> {
@@ -248,8 +281,17 @@ export class Orchestrator {
       }
     }
     setRecovery(this.db,task.task_id,attemptId,"intent");
-    const spawned=this.managedRunner?.owns(task)?await this.managedRunner.start(task,dir,attemptId,promptText):await spawnRunner(task,dir,attemptId,promptText,this.runnerExec,this.artifactsDir);setRecovery(this.db,task.task_id,attemptId,spawned.ok?"spawned":"failed");
-    if(!spawned.ok){ this.casTransition(task.task_id,"spawn_fail",{worktree:dir,branch,reason:"tool_missing",detail:spawned.error},Date.now()); return; }
+    const managed=!!this.managedRunner?.owns(task);
+    const spawned=managed?await this.managedRunner!.start(task,dir,attemptId,promptText):await spawnRunner(task,dir,attemptId,promptText,this.runnerExec,this.artifactsDir);
+    const current=getTask(this.db,task.task_id);
+    if(!current||current.attempt_id!==attemptId||current.state!=='starting')return;
+    if(current.owner_instance!=null&&current.owner_instance!==this.owner){
+      this.casTransition(task.task_id,spawned.ok?'spawn_ok':'spawn_fail',{worktree:dir,branch,reason:spawned.error??'tool_missing'},Date.now());
+      return;
+    }
+    if(managed&&!spawned.ok&&spawned.uncertain){this.db.run("INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,'starting','starting','managed_spawn_unverified',?)",[task.task_id,Date.now(),JSON.stringify({attempt_id:attemptId,reason:spawned.error})]);return;}
+    setRecovery(this.db,task.task_id,attemptId,spawned.ok?"spawned":"failed");
+    if(!spawned.ok){ this.casTransition(task.task_id,"spawn_fail",{worktree:dir,branch,reason:spawned.error??"tool_missing"},Date.now()); return; }
     this.casTransition(task.task_id,"spawn_ok",{worktree:dir,branch},Date.now());
     this.bindAttempts.set(task.task_id,0);
   }
@@ -373,20 +415,22 @@ export class Orchestrator {
   /**
    * Fix 5: 把 context.pending / recovery_* 事件写入 collector 同款 spool。
    * 与 fact_observed 共用 seg 文件机制（spoolContextEnvelope 分配全局序号 + 原子 rename）。
-   * ingest 侧按 kind 分发。写 spool 失败不阻断主流程（task_events 已落库），但记录错误事件。
+   * Recovery callers retain their event as a durable publish intent until this succeeds.
    */
-  private emitContextSpool(kind: string, detail: Record<string, unknown>): void {
+  private emitContextSpool(kind: string, detail: Record<string, unknown>, sequence?: number): boolean {
     try {
-      spoolContextEnvelope(this.db, this.spool.dir, kind, detail, Date.now());
+      spoolContextEnvelope(this.db, this.spool.dir, kind, detail, Date.now(), sequence);
+      return true;
     } catch (error) {
       console.error(`context spool ${kind} failed:`, error);
+      return false;
     }
   }
 
   /**
    * T7: 对单个 task 尝试恢复决策。调用 determineRecoveryOutcome，将结果记录为 task_events。
    * 不自动 spawn——恢复包/跳转/对账结果供人或上层决策。
-   * 幂等：已记录过 recovery_* 事件的 task 跳过。
+   * 幂等范围是当前 attempt、工作版本和恢复事实；新证据允许重新评估。
    *
    * Fix 2: liveness 必须证据驱动。删除"有未消费 approval → 直接 jump"的短路。
    * awaiting_human 不再自己判 jump，统一交给 determineRecoveryOutcome，由它依据
@@ -399,16 +443,18 @@ export class Orchestrator {
    * Core/Surface 可见。
    */
   attemptRecovery(taskId: string): void {
+    const emission=this.db.transaction(() => {
     const task = getTask(this.db, taskId);
     if (!task || !task.work_id || !task.attempt_id) return;
-    // 幂等：已处理过 recovery_* 事件的 task 跳过。
-    const done = this.db.query(
-      "SELECT 1 FROM task_events WHERE task_id=? AND event IN ('recovery_package_ready','recovery_jump','recovery_reconcile','recovery_blocked') LIMIT 1"
-    ).get(taskId);
-    if (done) return;
+    // A previous blocked/reconcile result is not permanent authority over newer facts.
 
     // done 正常完成：不产恢复噪声。
     if (task.state === "done") return;
+    const leaseNow=Date.now();
+    const claimed=this.db.run(`UPDATE tasks SET owner_instance=?,lease_expires_at=? WHERE task_id=?
+      AND (owner_instance IS NULL OR owner_instance=? OR lease_expires_at IS NULL OR lease_expires_at<=?)`,
+      [this.owner,leaseNow+60000,taskId,this.owner,leaseNow]).changes;
+    if(!claimed)return;
 
     // terminated 判定必须基于事件证据：runner_exit 或 runner_dead。
     const hasExitEvent = !!this.db.query(
@@ -443,58 +489,49 @@ export class Orchestrator {
         actor,
       });
       const evNow = Date.now();
-      const deepLink = this.deepLink(task.work_id, task.task_id);
-      if (outcome.type === "recovery_package") {
-        this.db.run(
-          "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
-          [taskId, evNow, task.state, task.state, "recovery_package_ready", JSON.stringify({
-            checkpoint_reference: outcome.package.checkpoint_reference,
-            session_reference: outcome.package.session_reference,
-            recommended_action: outcome.package.recommended_action,
-          })]
-        );
-        // Fix 5: spool 给 Core/Surface。
-        this.emitContextSpool("context.recovery_package", {
-          work_id: task.work_id,
-          task_id: task.task_id,
-          checkpoint_reference: outcome.package.checkpoint_reference,
-          incomplete_steps: outcome.package.incomplete_steps,
-          owner,
-          deep_link: deepLink,
-        });
-      } else if (outcome.type === "jump") {
-        this.db.run(
-          "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
-          [taskId, evNow, task.state, task.state, "recovery_jump", JSON.stringify({
-            reason: outcome.reason,
-            jump_target: outcome.jump_target,
-          })]
-        );
-        this.emitContextSpool("context.recovery_jump", {
-          work_id: task.work_id,
-          task_id: task.task_id,
-          jump_target: outcome.jump_target,
-          owner,
-          deep_link: deepLink,
-        });
-      } else if (outcome.type === "reconcile") {
-        this.db.run(
-          "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
-          [taskId, evNow, task.state, task.state, "recovery_reconcile", JSON.stringify({ reason: outcome.reason })]
-        );
-        this.emitContextSpool("context.recovery_reconcile", {
-          work_id: task.work_id,
-          task_id: task.task_id,
-          reason: outcome.reason,
-          owner,
-          deep_link: deepLink,
-        });
-      } else {
-        this.db.run(
-          "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
-          [taskId, evNow, task.state, task.state, "recovery_blocked", JSON.stringify({ reason: outcome.reason, code: outcome.code })]
-        );
-      }
+      const work = getWork(control, task.work_id);
+      const fingerprint = controlPayloadHash({
+        attempt_id: task.attempt_id, state: task.state, stable_id: task.stable_id,
+        runner_pid: task.runner_pid, runner_boot_id: task.runner_boot_id,
+        work_revision: work?.revision ?? null, work_state: work?.state ?? null, owner, outcome,
+      });
+      const prior = this.db.query(`SELECT id,event,detail FROM task_events WHERE task_id=?
+        AND event IN ('recovery_package_ready','recovery_jump','recovery_reconcile','recovery_blocked')
+        ORDER BY id DESC LIMIT 1`).get(taskId) as { id: number; event: string; detail: string | null } | null;
+      let priorDetail: Record<string, unknown> | null = null;
+      try {
+        const parsed: unknown = JSON.parse(prior?.detail ?? "null");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) priorDetail = parsed as Record<string, unknown>;
+      } catch { /* Legacy events have no fingerprint and are re-evaluated once. */ }
+      const event = outcome.type === "recovery_package" ? "recovery_package_ready"
+        : outcome.type === "jump" ? "recovery_jump"
+        : outcome.type === "reconcile" ? "recovery_reconcile" : "recovery_blocked";
+      const detail: Record<string, unknown> = outcome.type === "recovery_package"
+        ? { checkpoint_reference: outcome.package.checkpoint_reference, session_reference: outcome.package.session_reference,
+            recommended_action: outcome.package.recommended_action }
+        : outcome.type === "jump" ? { reason: outcome.reason, jump_target: outcome.jump_target }
+        : outcome.type === "blocked" ? { reason: outcome.reason, code: outcome.code } : { reason: outcome.reason };
+      const sameFacts = priorDetail?.fingerprint === fingerprint;
+      if (sameFacts && priorDetail?.published === true) return;
+      const sequence=sameFacts&&typeof priorDetail?.sequence==="number"?priorDetail.sequence:reserveContextSpoolSequence(this.db);
+      const eventId = sameFacts && prior ? prior.id : Number(this.db.query(
+        "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)"
+      ).run(taskId, evNow, task.state, task.state, event, JSON.stringify({ ...detail, fingerprint, sequence, published: false })).lastInsertRowid);
+      if(sameFacts)this.db.query("UPDATE task_events SET detail=? WHERE id=?")
+        .run(JSON.stringify({...detail,fingerprint,sequence,published:false}),eventId);
+      const kind = outcome.type === "recovery_package" ? "context.recovery_package"
+        : outcome.type === "jump" ? "context.recovery_jump"
+        : outcome.type === "reconcile" ? "context.recovery_reconcile" : "context.recovery_blocked";
+      return {eventId,detail,fingerprint,sequence,attemptId:task.attempt_id,kind,envelope:{
+        work_id: task.work_id, task_id: task.task_id, attempt_id: task.attempt_id,
+        contract_revision: task.contract_revision, recovery_revision: eventId,
+        stable_id: task.stable_id, owner, deep_link: this.deepLink(task.work_id, task.task_id),
+        ...detail,
+        ...(outcome.type === "recovery_package" ? {
+          incomplete_steps: outcome.package.incomplete_steps, confirmed_effects: outcome.package.confirmed_effects,
+          unknown_items: outcome.package.unknown_items, recovery_budget: outcome.package.recovery_budget,
+        } : {}),
+      }};
     } catch (error) {
       this.db.run(
         "INSERT INTO task_events(task_id,at,from_state,to_state,event,detail) VALUES(?,?,?,?,?,?)",
@@ -503,6 +540,18 @@ export class Orchestrator {
     } finally {
       control?.close();
     }
+    }).immediate();
+    if(!emission)return;
+    // Intent and sequence are committed before the file becomes visible. The
+    // second lock fences takeover; a crash retry reuses the same file identity.
+    this.db.transaction(()=>{
+      const current=getTask(this.db,taskId);
+      if(!current||current.owner_instance!==this.owner||current.attempt_id!==emission.attemptId
+        ||current.lease_expires_at===null||current.lease_expires_at<=Date.now())return;
+      const published=this.emitContextSpool(emission.kind,emission.envelope,emission.sequence);
+      if(published)this.db.query("UPDATE task_events SET detail=? WHERE id=? AND task_id=?")
+        .run(JSON.stringify({...emission.detail,fingerprint:emission.fingerprint,sequence:emission.sequence,published:true}),emission.eventId,taskId);
+    }).immediate();
   }
 
 }

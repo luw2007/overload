@@ -19,7 +19,7 @@ const parse=(text:string)=>JSON.parse(text) as Record<string,unknown>;
 /** Rebuild mailbox/control projections from the durable source intent. This is
  * content-idempotent: existing target/card identity must agree or it fails. */
 export function repairApprovalIntents(db:Database,answers:Database,now=Date.now()):number{
- let repaired=0; const rows=db.query("SELECT i.*,a.consumed_at FROM approval_intents i JOIN approvals a ON a.approval_id=i.approval_id WHERE i.repaired_at IS NULL").all() as any[];
+ let repaired=0; const rows=db.query("SELECT i.*,a.consumed_at FROM approval_intents i JOIN approvals a ON a.approval_id=i.approval_id WHERE i.repaired_at IS NULL AND a.expires_at>?").all(now) as any[];
  for(const row of rows){const task=getTask(db,row.task_id);if(!task)throw new Error(`intent task missing: ${row.task_id}`);const options=JSON.parse(row.options) as string[],evidence=parse(row.evidence);const work=task.work_id?getWork(answers,task.work_id):null;
    if(task.work_id&&(!work||work.revision!==task.contract_revision||work.state!=="active"))throw new Error("contract_revision_invalid");
    const expected={consumerOwner:"orchestrator" as const,approvalId:row.approval_id,stableId:task.stable_id??task.task_id,question:row.question,options,effect:effectFor(row.gate),scope:{gate:row.gate,task_id:task.task_id,repo:task.repo,base:task.base_ref,branch:task.branch,work_id:task.work_id,contract_revision:task.contract_revision},evidence,expiresAt:row.expires_at,workId:task.work_id??undefined,contractRevision:task.contract_revision??undefined,decisionMode:"human_only" as const,toolCallId:`orchestrator:${row.approval_id}:task`,attemptId:task.attempt_id??undefined};
@@ -34,7 +34,7 @@ export function repairApprovalIntents(db:Database,answers:Database,now=Date.now(
  return repaired;
 }
 export function requestApproval(db:Database,_spool:SpoolWriter,taskId:string,gate:ApprovalGate,question:string,options:string[],expiresInMs=24*3600*1000,answers=openMailbox()):string{
- const task=getTask(db,taskId);if(!task)throw new Error(`Task not found: ${taskId}`);const existing=db.query("SELECT approval_id FROM approvals WHERE task_id=? AND gate=? AND consumed_at IS NULL").get(taskId,gate) as any;if(existing){repairApprovalIntents(db,answers);return existing.approval_id;}
+ const task=getTask(db,taskId);if(!task)throw new Error(`Task not found: ${taskId}`);const existing=db.query("SELECT approval_id FROM approvals WHERE task_id=? AND gate=? AND consumed_at IS NULL AND expires_at>?").get(taskId,gate,Date.now()) as {approval_id:string}|null;if(existing){repairApprovalIntents(db,answers);return existing.approval_id;}
  const now=Date.now(),approvalId=randomUUID(),expires=now+expiresInMs,path=join(homedir(),".overload","artifacts",taskId);const file=(n:string)=>{const p=join(path,n);return existsSync(p)?readFileSync(p,"utf8"):""};const evidence={diff:file("diff.patch"),commits:file("commits.txt"),status:file("status.txt"),checks:file("checks.txt"),runner:file("runner.log")};
  db.transaction(()=>{db.run("INSERT INTO approvals(approval_id,task_id,gate,question,options,requested_at,expires_at) VALUES(?,?,?,?,?,?,?)",[approvalId,taskId,gate,question,JSON.stringify(options),now,expires]);db.run("INSERT INTO approval_intents(approval_id,task_id,gate,question,options,expires_at,evidence,created_at) VALUES(?,?,?,?,?,?,?,?)",[approvalId,taskId,gate,question,JSON.stringify(options),expires,JSON.stringify(evidence),now]);})();repairApprovalIntents(db,answers,now);return approvalId;
 }
@@ -70,7 +70,7 @@ export function replayAppliedReceipts(db:Database,answers:Database,now=Date.now(
 export function consumeAnswers(db:Database,answers:Database,spool:SpoolWriter,now=Date.now()):void{
  repairApprovalIntents(db,answers,now);const policy=loadPolicy(undefined,answers);
  replayAppliedReceipts(db,answers,now);reconcileApprovalEffects(db,answers,now);
- for(const approval of db.query("SELECT * FROM approvals WHERE consumed_at IS NULL").all() as any[]){const target=getTarget(answers,"orchestrator",approval.approval_id);if(!target)continue;let r=receipt(answers,"orchestrator",approval.approval_id);if(!r)r=consumeDecision(answers,{consumerOwner:"orchestrator",approvalId:approval.approval_id,targetVersion:target.targetVersion,policyHash:policy.hash,now,liveValid:()=>getTask(db,approval.task_id)?.state==="awaiting_human",policyValid:(t,p)=>!!p&&t.decisionMode!=="human_only"&&policyAuthorizes(policy,t,p.answer,p.policyHash)});if(!r)continue;const task=getTask(db,approval.task_id);if(!task)continue;
+ for(const approval of db.query("SELECT * FROM approvals WHERE consumed_at IS NULL AND expires_at>?").all(now) as any[]){const target=getTarget(answers,"orchestrator",approval.approval_id);if(!target)continue;let r=receipt(answers,"orchestrator",approval.approval_id);if(!r)r=consumeDecision(answers,{consumerOwner:"orchestrator",approvalId:approval.approval_id,targetVersion:target.targetVersion,policyHash:policy.hash,now,liveValid:()=>getTask(db,approval.task_id)?.state==="awaiting_human",policyValid:(t,p)=>!!p&&t.decisionMode!=="human_only"&&policyAuthorizes(policy,t,p.answer,p.policyHash)});if(!r)continue;const task=getTask(db,approval.task_id);if(!task)continue;
    // The task can leave awaiting_human before a recorded answer is applied (human
    // abandon, gate expiry, crash recovery). Applying it would be an illegal
    // transition that aborts the whole pass, stranding every other decision.
@@ -79,4 +79,16 @@ export function consumeAnswers(db:Database,answers:Database,spool:SpoolWriter,no
    updateAttention(answers,approval.approval_id,"applying","applying",now);if(!terminalOutcome(answers,r.receiptId))markReceipt(answers,r.receiptId,"unknown",now);spool.emit(task.stable_id??task.task_id,"decision_resolved",{request_id:approval.approval_id,state:"applying",receipt_id:r.receiptId});
  }
 }
-export function expireApprovals(db:Database,_spool:SpoolWriter,now=Date.now(),answers=openMailbox()):void{for(const a of db.query("SELECT * FROM approvals WHERE consumed_at IS NULL AND expires_at<=?").all(now) as {approval_id:string;task_id:string}[]){const task=getTask(db,a.task_id);if(task?.state==="awaiting_human")transition(db,a.task_id,"gate_expire",{reason:"gate_expired"},now);closeTarget(answers,"orchestrator",a.approval_id,"expired");const attn=getAttention(answers,`orchestrator:${a.approval_id}`);if(attn&&(attn.state==="open"||attn.state==="applying"))supersedeAttentionById(answers,attn.item_id,attn.revision,{reason:"gate_expired",actor:"orchestrator-expire"},now);}expireActiveTargets(answers,now);}
+export function expireApprovals(db:Database,_spool:SpoolWriter,now=Date.now(),answers=openMailbox()):void{
+ for(const a of db.query("SELECT * FROM approvals WHERE consumed_at IS NULL AND expires_at<=?").all(now) as {approval_id:string;task_id:string;expires_at:number}[]){
+   const task=getTask(db,a.task_id);
+   const oldAttempt=!!task?.attempt_id&&!!db.query(`SELECT 1 FROM task_events WHERE task_id=?
+     AND event IN ('human_reopen','runner_dead','runner_exit') AND json_valid(detail)
+     AND json_extract(detail,'$.next_attempt_id')=? AND at>=? LIMIT 1`).get(a.task_id,task.attempt_id,a.expires_at);
+   if(task?.state==="awaiting_human"&&!oldAttempt)transition(db,a.task_id,"gate_expire",{reason:"gate_expired"},now);
+   closeTarget(answers,"orchestrator",a.approval_id,"expired");
+   const attn=getAttention(answers,`orchestrator:${a.approval_id}`);
+   if(attn&&(attn.state==="open"||attn.state==="applying"))supersedeAttentionById(answers,attn.item_id,attn.revision,{reason:"gate_expired",actor:"orchestrator-expire"},now);
+ }
+ expireActiveTargets(answers,now);
+}

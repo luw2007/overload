@@ -246,7 +246,7 @@ describe("Fix5 用户可见 attention 摄入", () => {
     }) + "\n";
     writeFileSync(join(dir, "active-context-collector.1.ndjson"), line);
     ingestContextSpool(db, dir);
-    // 第二个文件携带更新后的 owner
+    // A producer cannot transfer decision ownership away from the work owner.
     const dir2 = mkdtempSync(join(tmpdir(), "ingest-attn-idem2-"));
     dirs.push(dir2);
     writeFileSync(join(dir2, "active-context-collector.1.ndjson"),
@@ -259,8 +259,29 @@ describe("Fix5 用户可见 attention 摄入", () => {
     const rows = db.query("SELECT COUNT(*) AS n FROM control_attention WHERE item_id=?").get("ctx:context.recovery_jump:W1:task-2") as { n: number };
     expect(rows.n).toBe(1);
     const row = db.query("SELECT revision, owner FROM control_attention WHERE item_id=?").get("ctx:context.recovery_jump:W1:task-2") as { revision: number; owner: string };
-    expect(row.revision).toBe(2);
-    expect(row.owner).toBe("owner2");
+    expect(stats2.failed).toBe(1);
+    expect(row.revision).toBe(1);
+    expect(row.owner).toBe("owner");
+    db.close();
+  });
+
+  test("new recovery facts supersede old reviews and late or duplicate delivery cannot reopen them", () => {
+    const db = controlFixture();
+    seedWork(db);
+    const dir = mkdtempSync(join(tmpdir(), "ingest-recovery-order-")); dirs.push(dir);
+    const messages = [
+      { kind: "context.recovery_reconcile", detail: { work_id: "W1", task_id: "t", owner: "owner", reason: "unknown", recovery_revision: 10, contract_revision: 1 } },
+      { kind: "context.recovery_package", detail: { work_id: "W1", task_id: "t", owner: "owner", checkpoint_reference: "new-cp", recovery_revision: 20, contract_revision: 1 } },
+    ];
+    for (const [index, message] of [...messages, messages[0], messages[1]].entries()) {
+      writeFileSync(join(dir, `active-context-collector.${index}.ndjson`), JSON.stringify({ v: 1, at: index, ...message }) + "\n");
+      expect(ingestContextSpool(db, dir).failed).toBe(0);
+    }
+    const old = db.query("SELECT state,revision FROM control_attention WHERE item_id=?").get("ctx:context.recovery_reconcile:W1:t");
+    expect(old).toEqual({ state: "superseded", revision: 2 });
+    const current = db.query("SELECT state,revision,evidence FROM control_attention WHERE item_id=?").get("ctx:context.recovery_package:W1:t") as { state: string; revision: number; evidence: string };
+    expect(current.state).toBe("open"); expect(current.revision).toBe(1);
+    expect(JSON.parse(current.evidence).checkpoint_reference).toBe("new-cp");
     db.close();
   });
 

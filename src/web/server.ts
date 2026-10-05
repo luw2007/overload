@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
 import { cancelTarget, closeTarget, consumeConflictBody, consumeDecisionResult, expireActiveTargets,
-  isConsumeConflict, observeReceiptEffect, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
+  isConsumeConflict, observeAndProjectReceiptEffect, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
 import type { ConsumerOwner } from "../decision-bot/mailbox";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate, loadPolicy, matchingRule, policyAuthorizes, rulesReport } from "../decision-bot/policy";
 import { disablePolicyRule, enablePolicyRule, proposeRuleFromAttention } from "../decision-bot/policy";
@@ -18,11 +18,12 @@ import { listingSnapshotProbe } from "../shared/checkpoint";
 import type { LaunchLeases } from "../shared/launch-lease";
 import { mgmtRoute } from "./mgmt-routes";
 import { contextRoute } from "./context-routes";
+import { conversationRoute } from "./conversation-routes";
 import { managerRoute, type ManagerRouteDeps } from "../manager/routes";
 import { recordAcceptance } from "../manage/manifest";
 import { acknowledgeHandoff, createHandoffRequest, expireStaleHandoffs, listHandoffReturns, listHandoffs, listPendingHandoffs, markHandoffRead, recordHandoffConclusion } from "../control/handoff";
 import type { HandoffAckDecision, HandoffConclusionKind, HandoffSourceKind, HandoffState } from "../control/handoff-types";
-import { actOnAttention, projectAttentionEffect, cancelConditionWait, ControlError, createWork, getAttention, getAttentionMaterial, getConditionWait, getWork, listAttention, listAttentionFollowUps, listConditionWaits, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, resolveAttention, reviseContract, promoteWork } from "../control/store";
+import { actOnAttention, cancelConditionWait, ControlError, createWork, getAttention, getAttentionMaterial, getConditionWait, getWork, listAttention, listAttentionPage, listAttentionFollowUps, listConditionWaits, listWorks, openControl, recordAttentionFeedback, recordStopCondition, redirectWork, resolveAttention, reviseContract, promoteWork } from "../control/store";
 import { previewContractRevision } from "../control/store";
 import type { AttentionDecisionInput, AttentionItem, ConditionWait, Contract, CreateWaitInput, StaleAttentionBody, WaitBaseline, WaitCondition, WaitDispositionInput, WaitErrorKind, WaitSourceAdapters, WaitState } from "../control/types";
 import { cancelTarget } from "../decision-bot/mailbox";
@@ -72,8 +73,8 @@ export async function loadWebConfig(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") warnInvalidConfig(path);
   }
-  if (value.web_port !== undefined && !positiveInteger(value.web_port)) warnInvalidConfig(path);
-  if (positiveInteger(value.web_port)) return { web_port: value.web_port };
+  if (value.web_port !== undefined && !validPort(value.web_port)) warnInvalidConfig(path);
+  if (validPort(value.web_port)) return { web_port: value.web_port };
   return { web_port: envPort(env.OVERLOAD_WEB_PORT) ?? DEFAULT_WEB_PORT };
 }
 
@@ -82,7 +83,7 @@ export async function loadWebConfig(
 function envPort(raw: string | undefined): number | null {
   if (raw === undefined) return null;
   const parsed = Number(raw);
-  if (raw.trim() !== "" && positiveInteger(parsed)) return parsed;
+  if (raw.trim() !== "" && validPort(parsed)) return parsed;
   if (!warnedInvalidWebPort) {
     warnedInvalidWebPort = true;
     console.error(`overload web: ignoring invalid OVERLOAD_WEB_PORT ${JSON.stringify(raw)}`);
@@ -90,8 +91,8 @@ function envPort(raw: string | undefined): number | null {
   return null;
 }
 
-function positiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+function validPort(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 65535;
 }
 
 function warnInvalidConfig(path: string): void {
@@ -642,9 +643,9 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         }
         const originError = checkOrigin(request, port === 0 ? server.port : port);
         if (originError) return originError;
-        const management = await mgmtRoute(request, url, { controlPath, ledgerPath, overloadHome: join(homedir(), ".overload") });
+        const management = await mgmtRoute(request, url, { controlPath, ledgerPath, overloadHome: join(homedir(), ".overload"), actor });
         if (management) return management;
-        const context = await contextRoute(request, url, { controlPath, actor });
+        const context = await contextRoute(request, url, { controlPath, orchestratorPath, actor });
         if (context) return context;
         const manager = await managerRoute(request, url, { ...options.manager, controlPath, ledgerPath, configPath: options.manager?.configPath ?? options.policyPath });
         if (manager) return manager;
@@ -660,8 +661,20 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
           finally { control.close(); }
         }));
         if (request.method === "GET" && /^\/api\/attention\/(now|inbox|done)$/.test(url.pathname)) {
-          const control = openControl(controlPath); try { return json(listAttention(control, url.pathname.slice("/api/attention/".length) as
-                  | "now" | "inbox" | "done")); } finally { control.close(); }
+          const control = openControl(controlPath);
+          try {
+            if (url.pathname.endsWith("/done")) {
+              const now = Date.now();
+              const page = listAttentionPage(control, "done", {
+                limit: url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : 50,
+                cursor: url.searchParams.get("cursor") ?? undefined,
+              }, now);
+              const automatic = control.query(`SELECT COUNT(*) n FROM control_attention
+                WHERE state='resolved' AND decision_mode='scoped_auto' AND updated_at>=?`).get(now - 86400000) as { n: number };
+              return json({ ...page, automatic_today: automatic.n });
+            }
+            return json(listAttention(control, url.pathname.slice("/api/attention/".length) as "now" | "inbox"));
+          } catch (error) { return controlError(error); } finally { control.close(); }
         }
         if (request.method === "GET" && url.pathname === "/api/control/attention" && url.searchParams.get("zone") === "follow_up") {
           const control = openControl(controlPath); try { return json({ items: listAttentionFollowUps(control, Date.now()) }); } finally { control.close(); }
@@ -670,7 +683,8 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
           return await waitRoute(request, url, { controlPath, ledgerPath, actor, adapters: waitAdapters, processAlive: options.processAlive, checkpointProbe: options.checkpointProbe, conditionWaits });
         }
         if (request.method === "GET" && url.pathname === "/api/capabilities") return json({ notifications: notificationCapability(), web: { available: true, bind: "127.0.0.1", port: server.port } });
-        if(request.method==='GET'&&url.pathname==='/api/conversations'){const db=openControl(controlPath);try{ensureAdapterSchema(db);const rows=db.query('SELECT * FROM conversations ORDER BY created_at DESC').all() as Conversation[];return json(rows.map(c=>({...c,address:JSON.parse(c.address),session_reference:c.session_reference?JSON.parse(c.session_reference):null,turns:db.query('SELECT * FROM conversation_turns WHERE conversation_id=? ORDER BY sequence').all(c.id)})));}finally{db.close();}}
+        const conversationsResponse = await conversationRoute(request, url, { controlPath });
+        if (conversationsResponse) return conversationsResponse;
         const conversationMessage=url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
         if(request.method==='POST'&&conversationMessage){const db=openControl(controlPath);try{ensureAdapterSchema(db);const input=await bodyObject(request);if(typeof input.text!=='string'||!input.text.trim()||input.text.length>100000)return json({error:'invalid message'},{status:400});const id=routeParameter(conversationMessage[1]);const c=db.query('SELECT * FROM conversations WHERE id=?').get(id) as Conversation|null;if(!c)return json({error:'not_found'},{status:404});const turnId=randomUUID();db.transaction(()=>{const row=db.query('SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_turns WHERE conversation_id=?').get(id) as {n:number};db.run('INSERT INTO conversation_turns(id,conversation_id,sequence,text,state,created_at) VALUES(?,?,?,?,?,?)',[turnId,id,row.n,input.text as string,'queued',Date.now()]);}).immediate();return json({turn_id:turnId},{status:201});}finally{db.close();}}
         if (request.method === "GET" && url.pathname === "/api/ledger") {
@@ -810,10 +824,17 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
               return json(getAttention(control, itemId));
             }
             const current = getAttention(control, itemId);
+            if (action === "resolve" && current) {
+              if (current.owner !== actor!.trim()) throw new ControlError("blocked", "permission_denied: actor is not the decision owner");
+            }
             const suppliedFingerprint = typeof input.material_fingerprint === "string" ? input.material_fingerprint : "";
             const material = action === "resolve" && current ? getAttentionMaterial(control, itemId) : null;
-            if (current && material && (current.revision !== revision || material.fingerprint !== suppliedFingerprint)) {
+            if (action === "resolve" && current && (!material || current.revision !== revision || material.fingerprint !== suppliedFingerprint)) {
               return json(staleAttentionBody(current, revision), { status: 409 });
+            }
+            if (action === "resolve" && current) {
+              if (current.state !== "open" || current.effect_state !== "not_started") throw new ControlError("blocked", "attention decision is not open");
+              if (current.expires_at !== null && current.expires_at <= Date.now()) throw new ControlError("blocked", "attention decision has expired");
             }
             if (itemId.startsWith("mgmt:accept:") && action === "resolve") {
               if (current && current.revision !== revision) return json(staleAttentionBody(current, revision), { status: 409 });
@@ -826,21 +847,22 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
                 control,
                 manifestId,
                 input.selected_option === "accept" ? "accepted" : "rejected",
-                current?.owner || "operator",
+                actor!.trim(),
                 typeof input.reason === "string" ? { reason: input.reason } : {},
+                { attention_revision: revision, material_fingerprint: suppliedFingerprint },
                 Date.now(),
               ));
             }
             if (action === "resolve") {
               if (!actor || !actor.trim()) return json({ error: "not_implemented", message: "decision action requires server-side actor identity" }, { status: 501 });
               if (current?.evidence.kind === "coordinator_delivery") {
-                const tasks = openStore(options.orchestratorPath);
+                const tasks = openStore(orchestratorPath);
                 try {
                   const coordinator = new Coordinator(tasks, control);
                   if (input.selected_option === "accept")
-                    return json(coordinator.acceptDelivery(current.work_id, itemId, revision!, current.owner).attention);
+                    return json(coordinator.acceptDelivery(current.work_id, itemId, revision!, actor!.trim()).attention);
                   if (input.selected_option === "reject")
-                    return json(coordinator.rejectDelivery(current.work_id, itemId, revision!, current.owner));
+                    return json(coordinator.rejectDelivery(current.work_id, itemId, revision!, actor!.trim()));
                   throw new ControlError("invalid", "invalid coordinator decision");
                 } finally {
                   tasks.close();
@@ -1004,56 +1026,36 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
         if(request.method=== "POST" &&
           url.pathname === "/api/decision/effect"
         ) {
-          if (
-            !request.headers.get("sec-fetch-site") &&
-            !request.headers.get("sec-fetch-mode")
-          )
-            return json({ error: "forbidden" }, { status: 403 });
-          let body: any;
+          let body: Record<string, unknown>;
           try {
-            body = await request.json();
+            body = await bodyObject(request);
           } catch {
             return json({ error: "invalid JSON" }, { status: 400 });
           }
           if (
-            typeof body?.receipt_id !== "string" ||
+            typeof body.receipt_id !== "string" ||
             typeof body.toolCallId !== "string" ||
-            !["succeeded", "failed", "unknown"].includes(body.effect_state)
+            (body.effect_state !== "succeeded" && body.effect_state !== "failed" && body.effect_state !== "unknown") ||
+            (body.evidence !== undefined && (!body.evidence || typeof body.evidence !== "object" || Array.isArray(body.evidence)))
           )
             return json({ error: "invalid effect" }, { status: 400 });
           const mailbox = openAnswersDb(controlPath);
           try {
             const observation = {
-              receiptId: body.receipt_id as string,
-              toolCallId: body.toolCallId as string,
+              receiptId: body.receipt_id,
+              toolCallId: body.toolCallId,
               attemptId:
                 typeof body.attempt_id === "string"
                   ? body.attempt_id
                   : undefined,
-              state: body.effect_state as "succeeded" | "failed" | "unknown",
-              evidence: body.evidence ?? {},
+              state: body.effect_state,
+              evidence: (body.evidence ?? {}) as Record<string, unknown>,
               observedAt: Date.now(),
             };
-            if (!observeReceiptEffect(mailbox, observation)) return json({ observed: false });
-            // Close the loop: the accepted observation is projected onto the card that asked for the decision.
-            const linked = mailbox.query(`SELECT a.item_id FROM decision_receipts r JOIN control_attention a
-              ON a.approval_id=r.approval_id AND a.consumer_owner=r.consumer_owner WHERE r.receipt_id=?`).get(observation.receiptId) as { item_id: string } | null;
-            const item = linked ? getAttention(mailbox, linked.item_id) : null;
-            if (item && item.effect_state !== "succeeded" && item.effect_state !== "failed") {
-              const source = mailbox.query(`SELECT event_id FROM control_outbox
-                WHERE item_id=? AND entity_version<=? AND kind IN ('attention.created','attention.updated')
-                ORDER BY entity_version DESC LIMIT 1`).get(item.item_id, item.revision) as { event_id: string } | null;
-              if (!source?.event_id) throw new Error(`effect source event missing: ${item.item_id}`);
-              projectAttentionEffect(mailbox, {
-                work_id: item.work_id,
-                item_id: item.item_id,
-                item_revision: item.revision,
-                approval_id: item.approval_id,
-                receipt_id: observation.receiptId,
-                outbox_event_id: source.event_id,
-              }, observation, observation.observedAt);
-            }
-            return json({ observed: true });
+            return json({ observed: observeAndProjectReceiptEffect(mailbox, observation) });
+          } catch (error) {
+            if (error instanceof Error && error.message === "conflicting_effect_observation") return json({ error: "conflicting_effect_observation" }, { status: 409 });
+            throw error;
           } finally {
             mailbox.close();
           }

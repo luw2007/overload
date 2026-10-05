@@ -184,7 +184,7 @@ export class PiRuntime implements AgentRuntime {
     if (!metadata) throw new Error("runtime_metadata_missing");
     if (metadata.ownerId !== reference.ownerId || metadata.cwd !== reference.cwd) throw new Error("runtime_ownership_mismatch");
     const broker=metadata.brokerIdentity,child=metadata.childIdentity;
-    if(broker&&child&&processLiveness(broker.pid,broker.startIdentity,broker.bootIdentity)==='dead'&&processLiveness(child.pid,child.startIdentity,child.bootIdentity)==='dead')return this.restore(reference);
+    if(broker&&child&&processLiveness(broker.pid,broker.startIdentity,broker.bootIdentity)==='dead'&&processLiveness(child.pid,child.startIdentity,child.bootIdentity)==='dead')throw new Error('runtime_not_live');
     if (metadata.state !== "running" && metadata.state !== "starting") throw new Error("runtime_not_live");
     if (!existsSync(metadata.socketPath) || !processAlive(metadata.pid)) throw new Error("runtime_not_live");
     return this.connectFromMetadata(metadata, reference.sessionId, reference);
@@ -222,18 +222,26 @@ export class PiRuntime implements AgentRuntime {
   async shutdown(reference: SessionReference): Promise<CommandReceipt> {
     if (reference.runtimeKind !== this.kind) throw new Error("runtime_kind_mismatch");
     const metadata = metadataFor(this.runtimeRoot, reference.sessionId);
-    if (!metadata) return { state: "rejected", commandId: `cmd-${randomUUID()}`, reason: "runtime_metadata_missing" };
+    if (!metadata) return { state: "unknown", commandId: `cmd-${randomUUID()}`, reason: "runtime_metadata_missing" };
     if (metadata.ownerId !== reference.ownerId || metadata.cwd !== reference.cwd) throw new Error("runtime_ownership_mismatch");
-    const receipt = await stopPiBroker(metadata.socketPath, metadata.ownerToken, this.commandTimeoutMs);
-    if (receipt.state === "accepted") {
-      const deadline = Date.now() + this.commandTimeoutMs;
-      while (Date.now() < deadline) {
-        const current = metadataFor(this.runtimeRoot, reference.sessionId);
-        if (current?.state === "stopped") break;
-        await new Promise(resolve => setTimeout(resolve, 25));
-      }
-    }
-    return receipt;
+    const broker=metadata.brokerIdentity,child=metadata.childIdentity;
+    if(!broker||!child)return {state:"unknown",commandId:`cmd-${randomUUID()}`,reason:"runtime_process_identity_missing"};
+    const stopped=()=>{
+      const current=metadataFor(this.runtimeRoot,reference.sessionId);
+      return current?.ownerId===reference.ownerId&&current.cwd===reference.cwd&&current.ownerToken===metadata.ownerToken&&current.brokerIdentity?.startIdentity===broker.startIdentity&&current.brokerIdentity.bootIdentity===broker.bootIdentity&&current.childIdentity?.startIdentity===child.startIdentity&&current.childIdentity.bootIdentity===child.bootIdentity&&current.state==='stopped'&&processLiveness(child.pid,child.startIdentity,child.bootIdentity)==='dead';
+    };
+    if(stopped())return {state:'accepted',commandId:`cmd-${randomUUID()}`};
+    const deadline=Date.now()+this.commandTimeoutMs;
+    let receipt:CommandReceipt;
+    try{receipt=await stopPiBroker(metadata.socketPath,metadata.ownerToken,this.commandTimeoutMs);}
+    catch(error){receipt={state:'unknown',commandId:`cmd-${randomUUID()}`,reason:error instanceof Error?error.message:String(error)};}
+    do{
+      if(stopped())return {state:'accepted',commandId:receipt.commandId};
+      const remaining=deadline-Date.now();
+      if(remaining<=0)break;
+      const pause=Promise.withResolvers<void>();setTimeout(pause.resolve,Math.min(remaining,25));await pause.promise;
+    }while(true);
+    return {state:'unknown',commandId:receipt.commandId,reason:receipt.reason??'runtime_shutdown_unconfirmed'};
   }
 
   private async connectFromMetadata(metadata: { socketPath: string; ownerToken: string } & Record<string, unknown>, sessionId: string, expected?: SessionReference): Promise<SessionHandle> {
