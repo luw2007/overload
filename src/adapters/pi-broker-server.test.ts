@@ -98,3 +98,32 @@ test("ADP-15 PiBroker listens, enforces ownerToken on hello and commands, persis
     rmSync(root, { recursive: true, force: true });
   }
 }, 15000);
+
+test("broker injects required authority only from config and persists it", async () => {
+  const inherited = process.env.OVERLOAD_REQUIRED_APPROVAL_GATE;
+  process.env.OVERLOAD_REQUIRED_APPROVAL_GATE = "1";
+  try {
+    for (const required of [true, false]) {
+      const root = mkdtempSync(join(tmpdir(), "pi-broker-required-"));
+      const config = { ...buildConfig(root, "required-token"), requiredApprovalGate: required, configPath: join(root, "gate.json"), approvalRoot: root };
+      try {
+        writeFileSync(config.command, FAKE_PI.replace('const decoder =', 'await Bun.write("env.json", JSON.stringify({ required: process.env.OVERLOAD_REQUIRED_APPROVAL_GATE ?? null, path: process.env.OVERLOAD_CONFIG_PATH, root: process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT ?? null }));\nconst decoder ='));
+        chmodSync(config.command, 0o755);
+        const done = runPiBroker(config);
+        // Real child/socket integration requires the platform event loop, not fake timers.
+        const deadline = Date.now() + 5000;
+        while (!existsSync(join(root, "env.json")) && Date.now() < deadline) {
+          const pause = Promise.withResolvers<void>();
+          setTimeout(pause.resolve, 25);
+          await pause.promise;
+        }
+        expect(JSON.parse(readFileSync(join(root, "env.json"), "utf8"))).toEqual({ required: required ? "1" : null, path: config.configPath, root: required ? root : null });
+        const client = await connectPiBroker(config.socketPath, config.ownerToken, 0, 2000);
+        expect(readBrokerMetadata(config.metadataPath)?.requiredApprovalGate).toBe(required);
+        await client.command({ type: "shutdown" });
+        client.close();
+        await done;
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    }
+  } finally { if (inherited === undefined) delete process.env.OVERLOAD_REQUIRED_APPROVAL_GATE; else process.env.OVERLOAD_REQUIRED_APPROVAL_GATE = inherited; }
+}, 15000);

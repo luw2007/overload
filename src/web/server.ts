@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openAnswersDb, defaultAnswersPath } from "../orchestrator/approval";
-import { cancelTarget, closeTarget, consumeConflictBody, consumeDecisionResult, expireActiveTargets,
+import { cancelTarget, closeTarget, consumeConflictBody, consumeDecisionResult, reconcileExtensionGateClosures,
   isConsumeConflict, observeAndProjectReceiptEffect, reconcileEffectEvents, registerTarget, writeHumanAnswer, setBotDisabled } from "../decision-bot/mailbox";
 import type { ConsumerOwner } from "../decision-bot/mailbox";
 import { approvePolicyCandidate, enablePolicyCandidate, getPolicyCandidate, loadPolicy, matchingRule, policyAuthorizes, rulesReport } from "../decision-bot/policy";
@@ -579,7 +579,7 @@ export function startWebServer(options: { ledgerPath?: string; controlPath?: str
     if (publishing) return;
     publishing = true;
     const control = openAnswersDb(controlPath); const orchestrator = openStore(orchestratorPath); const spool = new SpoolWriter(orchestrator, spoolRoot);
-    try { reconcileEffectEvents(control, ledgerPath); publishControlEvents(control, ledgerPath, (detail) => spool.emit(`control:${String(detail.event_id)}`, "control_event", detail)); }
+    try { reconcileEffectEvents(control, ledgerPath); reconcileExtensionGateClosures(control); publishControlEvents(control, ledgerPath, (detail) => spool.emit(`control:${String(detail.event_id)}`, "control_event", detail)); }
     finally { spool.close(); orchestrator.close(); control.close(); publishing = false; }
   };
   publish();

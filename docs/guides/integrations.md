@@ -1,5 +1,50 @@
 # Integrations
 
+## Channel startup safety
+
+Managed channel deployment must opt in explicitly; ordinary authorization entries do not acquire a strict approval policy implicitly. Set `OVERLOAD_REQUIRED_RUNTIME_CONFIG_CHATS` to a comma-separated list of chat IDs and `OVERLOAD_RUNTIME_APPROVAL_ROOT` to an absolute, existing server-owned directory. There is no historical `/tmp` root fallback. Startup validates configuration before opening a channel or starting a runtime.
+
+Every authorization entry for a required chat must supply `runtimeConfigPath`. Its JSON must enable `approval_gate`, provide nonempty `require_approval_write_paths` and `allowed_write_roots`, and include the exact `.*` rule in `block_bash_patterns` (all bash is banned). Both root lists must name canonical absolute existing directories inside the server approval root, using directory boundaries rather than string prefixes. Approval write roots must cover every allowed write root. Missing, malformed, disabled, escaping, or conflicting per-chat configurations fail startup closed. Config file aliases are resolved to their canonical file path; two entries for a chat must agree on that path. Non-required chats retain general approval-gate semantics, including absent/disabled gates and optional rules; strict deployment constraints are not imposed on them.
+
+When a stopped conversation is restored, the daemon passes its current per-chat policy through the runtime restore interface. Required sessions restore only when persisted strict metadata matches the current canonical config path and approval root, and the current config passes strict validation before any replacement spawn. Legacy metadata missing the required flag/config/root and policy rotations are rejected, with queued messages retained and a runtime-unavailable response. There is no automatic authority migration: after safely resolving the old process, explicitly start a new session under the current policy instead of editing broker metadata. Ordinary non-required runtime restore behavior is unchanged.
+
+The daemon acquires an OS `flock` lock for the case-sensitive, trimmed Feishu app ID before starting work. App IDs accept ASCII letters, digits, `_`, and `-`. Locks require Linux and use the fixed OS per-UID namespace `/run/user/<uid>/overload-channel-locks`, not `userInfo().homedir` or any deployment directory. `HOME`, `XDG_RUNTIME_DIR`, `TMPDIR`, database paths, and instance overrides cannot select another lock namespace; there is no public lock-root override or fallback to `/tmp`. Non-Linux platforms fail closed explicitly.
+
+Before creating the lock directory, the daemon validates each ancestor (`/run`, `/run/user`, and `/run/user/<uid>`): each must be a directory, not a symbolic link (`lstat`), canonical (`realpath(path) === path`), owned by the expected user (`root` for `/run` and `/run/user`, the daemon's UID for `/run/user/<uid>`), and must not be group- or world-writable (`(mode & 0o022) === 0`). A canonical mount at `/run` or `/run/user` is permitted, but symbolic links or path aliases fail closed. The lock directory `/run/user/<uid>/overload-channel-locks` is created private with mode `0700` owned by the user, and lock files (`<app_id>.lock`) are created regular, single-link, mode `0600`, opened with `O_NOFOLLOW`.
+
+The lock directory is managed under the systemd-logind user runtime directory lifecycle (`/run/user/<uid>`). Because logind tears down this runtime directory when user sessions end, headless or unattended boot services must have systemd user lingering enabled (`loginctl enable-linger <user>`). The `flock` lock exists only for the lifetime of the daemon process: parent exit or pipe close releases the lock, and locks are not durable across reboot. Lock files are never unlinked on release because replacing an inode would allow concurrent holders. Competing consumers fail startup nonblockingly.
+
+Verify prerequisites with preflight commands before starting the daemon:
+
+```bash
+# Check systemd user linger and runtime path
+loginctl show-user $(id -u) -p Linger -p RuntimePath -p State
+
+# Validate ancestor ownership, permissions, and symlink status
+stat -c '%F %u %a %n' /run /run/user /run/user/$(id -u)
+test "$(readlink -f /run)" = "/run"
+test "$(readlink -f /run/user)" = "/run/user"
+test "$(readlink -f /run/user/$(id -u))" = "/run/user/$(id -u)"
+```
+
+Consumers of the same app must share the OS runtime directory: do not isolate them in unshared mount namespaces where `/run/user/<uid>` diverges. Never remove the namespace directory or replace/delete its lock inodes while any holder exists. Cut over all consumers together to this fixed namespace; old home-based or `/tmp`-based locking code does not contend with it, and protection is not retroactive.
+
+For a fresh independent deployment, provision a new private runtime JSON and authorization file; do not overwrite a legacy deployment's files. Use canonical paths obtained from the deployment filesystem, not the example path verbatim:
+
+```json
+{
+  "web_port": 14870,
+  "approval_gate": {
+    "enabled": true,
+    "allowed_write_roots": ["/absolute/canonical/deployment/acceptance-repo"],
+    "require_approval_write_paths": ["/absolute/canonical/deployment/acceptance-repo"],
+    "block_bash_patterns": [".*"]
+  }
+}
+```
+
+Set `OVERLOAD_RUNTIME_APPROVAL_ROOT` to that canonical repository directory, `OVERLOAD_REQUIRED_RUNTIME_CONFIG_CHATS` to the explicitly authorized chat, and that authorization row's `runtimeConfigPath` to the new JSON file. Keep the daemon and runtime extension release consistent; the required policy is server-injected and persisted on new sessions/restores. Existing live legacy sessions are not upgraded by editing configuration. Keep this deployment stopped until the operator has reconciled every known app consumer and any unidentifiable consumer; the lock does not retroactively exclude old code.
+
 ## Contract-bound multi-agent coordinator
 
 Add `workId` only to the authorized conversation entry that shall coordinate an existing active, operator-approved Work. The contract must identify the runtime repository, explicit allowed effects (`read` for scout, `write` for ship), a retry limit, and acceptance criteria. `OVERLOAD_COORDINATOR_PORT` defaults to loopback `4891`. Entries without `workId` remain ordinary private tasks in the same conversation database; an existing conversation cannot be rebound to a different Work. Run one channel daemon/websocket consumer for the app, routing the dedicated test group and production private conversations through their explicit `appId`/`instanceId`/`tenantId`/`userId`/`chatId` entries.

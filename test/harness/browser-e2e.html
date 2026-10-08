@@ -1,0 +1,1259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overload Browser Channel Acceptance Harness</title>
+  <style>
+    :root {
+      --bg: #0b1120;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --sub-bg: #0f172a;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #0284c7;
+      --primary-hover: #0369a1;
+      --warning: #d97706;
+      --warning-hover: #b45309;
+      --danger: #dc2626;
+      --danger-hover: #b91c1c;
+      --success: #16a34a;
+      --success-hover: #15803d;
+      --purple: #7c3aed;
+      --purple-hover: #6d28d9;
+      --mono: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.5;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 1320px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* Isolated Banner */
+    .banner {
+      background: linear-gradient(135deg, #0c4a6e 0%, #082f49 100%);
+      border: 2px solid #0284c7;
+      border-radius: 8px;
+      padding: 16px 20px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+    .banner-badge {
+      display: inline-block;
+      background: #f59e0b;
+      color: #0f172a;
+      font-weight: 800;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+    .banner-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: #38bdf8;
+      margin-bottom: 4px;
+    }
+    .banner-notice {
+      color: #e0f2fe;
+      font-size: 13px;
+    }
+    .banner-notice strong {
+      color: #fef08a;
+    }
+
+    /* Meta Bar */
+    .meta-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 12px 18px;
+      align-items: center;
+      font-size: 13px;
+    }
+    .meta-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .meta-item strong {
+      color: var(--text-muted);
+    }
+    .meta-item code {
+      font-family: var(--mono);
+      color: #38bdf8;
+      background: var(--sub-bg);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .dashboard-link {
+      margin-left: auto;
+      color: #38bdf8;
+      text-decoration: none;
+      font-weight: 600;
+      padding: 4px 10px;
+      background: #0369a1;
+      border-radius: 4px;
+      transition: background 0.15s ease;
+    }
+    .dashboard-link:hover {
+      background: #0284c7;
+      text-decoration: underline;
+    }
+
+    /* Error Panel */
+    .error-panel {
+      background: #450a0a;
+      border: 1px solid #ef4444;
+      color: #fecaca;
+      border-radius: 8px;
+      padding: 14px 18px;
+      font-family: var(--mono);
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* Controls Panel */
+    .controls-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 18px 20px;
+    }
+    .controls-panel h2 {
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+    }
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    /* Buttons */
+    .btn {
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 8px 16px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: background-color 0.15s ease, opacity 0.15s ease;
+      color: #ffffff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+    .btn-approve {
+      background-color: var(--primary);
+    }
+    .btn-approve:hover:not(:disabled) {
+      background-color: var(--primary-hover);
+    }
+    .btn-deny {
+      background-color: var(--warning);
+    }
+    .btn-deny:hover:not(:disabled) {
+      background-color: var(--warning-hover);
+    }
+    .btn-expire {
+      background-color: #475569;
+    }
+    .btn-expire:hover:not(:disabled) {
+      background-color: #334155;
+    }
+    .btn-replay {
+      background-color: var(--purple);
+      margin-left: auto;
+    }
+    .btn-replay:hover:not(:disabled) {
+      background-color: var(--purple-hover);
+    }
+    .btn-option {
+      padding: 6px 14px;
+      font-size: 12px;
+      text-transform: capitalize;
+    }
+    .btn-option.opt-approve {
+      background-color: var(--success);
+    }
+    .btn-option.opt-approve:hover:not(:disabled) {
+      background-color: var(--success-hover);
+    }
+    .btn-option.opt-deny {
+      background-color: var(--danger);
+    }
+    .btn-option.opt-deny:hover:not(:disabled) {
+      background-color: var(--danger-hover);
+    }
+    .btn-option.opt-other {
+      background-color: #475569;
+    }
+    .btn-option.opt-other:hover:not(:disabled) {
+      background-color: #334155;
+    }
+
+    /* Main Sections */
+    .section-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 18px 20px;
+    }
+    .section-panel h2 {
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .empty-state {
+      color: var(--text-muted);
+      font-style: italic;
+      padding: 16px 0;
+    }
+
+    /* Scenario Articles */
+    .scenarios-list {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .scenario-article {
+      background: var(--sub-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      padding: 16px;
+    }
+    .article-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    .article-header h3 {
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .badge {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 4px;
+      text-transform: uppercase;
+    }
+    .kind-approve { background: #064e3b; color: #6ee7b7; border: 1px solid #047857; }
+    .kind-deny { background: #78350f; color: #fde68a; border: 1px solid #b45309; }
+    .kind-expire { background: #4c1d95; color: #ddd6fe; border: 1px solid #6d28d9; }
+
+    .status-200 { background: #064e3b; color: #6ee7b7; border: 1px solid #047857; }
+    .status-409 { background: #7f1d1d; color: #fca5a5; border: 1px solid #b91c1c; }
+    .status-other { background: #374151; color: #d1d5db; border: 1px solid #4b5563; }
+
+    .exists-true { background: #064e3b; color: #6ee7b7; border: 1px solid #047857; }
+    .exists-false { background: #334155; color: #94a3b8; border: 1px solid #475569; }
+
+    .state-open { background: #1e3a8a; color: #93c5fd; border: 1px solid #1d4ed8; }
+    .state-completed { background: #064e3b; color: #6ee7b7; border: 1px solid #047857; }
+    .state-failed { background: #7f1d1d; color: #fca5a5; border: 1px solid #b91c1c; }
+    .state-running { background: #075985; color: #7dd3fc; border: 1px solid #0284c7; }
+    .state-none { background: #334155; color: #94a3b8; border: 1px solid #475569; }
+
+    .grid-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 6px;
+      font-size: 13px;
+      align-items: baseline;
+    }
+    .grid-row strong {
+      color: var(--text-muted);
+      min-width: 140px;
+    }
+    .grid-row code {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: #020617;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #38bdf8;
+      word-break: break-all;
+    }
+
+    .code-block {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: #020617;
+      border: 1px solid var(--card-border);
+      border-radius: 4px;
+      padding: 8px 12px;
+      color: #e2e8f0;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 180px;
+      overflow-y: auto;
+      margin-top: 4px;
+    }
+
+    .sub-section {
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 6px;
+      padding: 12px;
+      margin-top: 12px;
+    }
+    .sub-section h4 {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #38bdf8;
+      margin-bottom: 8px;
+    }
+
+    /* Sub Tables */
+    .sub-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-top: 6px;
+    }
+    .sub-table th {
+      background: #090d16;
+      color: var(--text-muted);
+      text-align: left;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--card-border);
+      font-weight: 600;
+    }
+    .sub-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #1f2937;
+      color: #e2e8f0;
+    }
+    .sub-table code {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: #38bdf8;
+    }
+
+    /* Messages & Cards */
+    .messages-list {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .message-article {
+      background: var(--sub-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      padding: 16px;
+    }
+    .card-box {
+      background: #172554;
+      border: 1px solid #1d4ed8;
+      border-radius: 6px;
+      padding: 14px;
+      margin-top: 12px;
+    }
+    .card-box h4 {
+      font-size: 14px;
+      color: #60a5fa;
+      margin-bottom: 10px;
+    }
+    .decision-options {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .history-details {
+      margin-top: 12px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .history-details summary {
+      cursor: pointer;
+      font-weight: 600;
+      color: #38bdf8;
+    }
+    .history-list {
+      list-style: none;
+      margin-top: 8px;
+      padding-left: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .history-list li {
+      font-family: var(--mono);
+      background: #090d16;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      color: #cbd5e1;
+    }
+
+    /* Actions Table */
+    .actions-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .actions-table th {
+      background: #090d16;
+      color: var(--text-muted);
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--card-border);
+      font-weight: 600;
+    }
+    .actions-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--card-border);
+      color: #e2e8f0;
+    }
+    .actions-table code {
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Explicit Banner -->
+    <header class="banner">
+      <div class="banner-badge">ACCEPTANCE TEST HARNESS</div>
+      <div class="banner-title">ISOLATED BROWSER CHANNEL + REAL PI RUNTIME</div>
+      <div class="banner-notice">
+        This browser channel simulates user I/O with <strong>real AdapterService, real Pi broker, real approval gates, and SQLite ledger</strong>.
+        It is <strong>NOT actual Feishu channel</strong> and <strong>NOT production</strong>.
+      </div>
+    </header>
+
+    <!-- Meta Information -->
+    <div class="meta-bar">
+      <div class="meta-item"><strong>Root:</strong> <code id="meta-root">loading...</code></div>
+      <div class="meta-item"><strong>Provider:</strong> <code id="meta-provider">loading...</code></div>
+      <div class="meta-item"><strong>Model:</strong> <code id="meta-model">loading...</code></div>
+      <div class="meta-item"><strong>Scope:</strong> <code id="meta-scope">loading...</code></div>
+      <a id="dashboard-link" class="dashboard-link" href="#" target="_blank" rel="noreferrer">Open Overload Dashboard</a>
+    </div>
+
+    <!-- Error Box -->
+    <div id="error" class="error-panel" role="alert" style="display: none;"></div>
+
+    <!-- Action Controls -->
+    <section class="controls-panel">
+      <h2>Scenario Actions</h2>
+      <div class="button-row">
+        <button type="button" class="btn btn-approve" data-scenario="approve">Start approve case</button>
+        <button type="button" class="btn btn-deny" data-scenario="deny">Start deny case</button>
+        <button type="button" class="btn btn-expire" data-scenario="expire">Start expiry case</button>
+        <button type="button" class="btn btn-replay" id="replay-decision" disabled>Replay last click</button>
+      </div>
+    </section>
+
+    <!-- Scenarios Section -->
+    <section class="section-panel">
+      <h2>
+        <span>Active Scenarios</span>
+        <span id="scenarios-count" class="badge">0</span>
+      </h2>
+      <div id="scenarios-container">
+        <p class="empty-state">No scenarios started yet. Click one of the buttons above to start a case.</p>
+      </div>
+    </section>
+
+    <!-- Messages Section -->
+    <section class="section-panel">
+      <h2>
+        <span>Channel Messages &amp; Approval Cards</span>
+        <span id="messages-count" class="badge">0</span>
+      </h2>
+      <div id="messages-container">
+        <p class="empty-state">No messages delivered yet.</p>
+      </div>
+    </section>
+
+    <!-- Actions Section -->
+    <section class="section-panel">
+      <h2>
+        <span>Decision &amp; Action Feed</span>
+        <span id="actions-count" class="badge">0</span>
+      </h2>
+      <div id="actions">
+        <p class="empty-state">No actions recorded yet.</p>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      'use strict';
+
+      // State tracking
+      let inFlightPoll = false;
+      let pendingImmediatePoll = false;
+      let pollSeq = 0;
+      let lastAppliedSeq = 0;
+      let serverError = null;
+      let localError = null;
+      let actionGeneration = 0;
+
+      // Retained decision packet for replay testing
+      let lastDecisionPacket = null;
+
+      // Element caches for DOM identity preservation across 500ms polling
+      const scenarioElementMap = new Map();
+      const messageElementMap = new Map();
+      const actionElementMap = new Map();
+
+      function formatTime(timestamp) {
+        if (!timestamp) return 'none';
+        const d = new Date(timestamp);
+        return d.toTimeString().split(' ')[0] + '.' + String(d.getMilliseconds()).padStart(3, '0');
+      }
+
+      function setFieldText(parent, selector, text) {
+        const el = parent.querySelector(selector);
+        if (el) el.textContent = text !== null && text !== undefined ? String(text) : '';
+      }
+
+      function renderError() {
+        const errEl = document.getElementById('error');
+        if (!errEl) return;
+        const activeErr = localError || serverError;
+        if (activeErr) {
+          errEl.textContent = activeErr;
+          errEl.style.display = 'block';
+        } else {
+          errEl.textContent = '';
+          errEl.style.display = 'none';
+        }
+      }
+
+      function showError(msg) {
+        localError = msg;
+        renderError();
+      }
+
+      function clearActionError() {
+        localError = null;
+        renderError();
+      }
+
+      function updateReplayButton() {
+        const btn = document.getElementById('replay-decision');
+        if (!btn) return;
+        if (!lastDecisionPacket) {
+          btn.disabled = true;
+          btn.title = 'No decision click recorded yet to replay';
+        } else {
+          btn.disabled = false;
+          btn.title = 'Replay last click: ' + lastDecisionPacket.answer + ' (item ' + lastDecisionPacket.itemId + ', rev ' + lastDecisionPacket.revision + ')';
+        }
+      }
+
+      function updateHeaderMeta(state) {
+        setFieldText(document, '#meta-root', state.root || '');
+        setFieldText(document, '#meta-provider', state.provider || '');
+        setFieldText(document, '#meta-model', state.model || '');
+        setFieldText(document, '#meta-scope', state.scope || '');
+
+        const link = document.getElementById('dashboard-link');
+        if (link && state.dashboardUrl) {
+          link.href = state.dashboardUrl;
+          link.textContent = 'Open Overload Dashboard';
+        }
+      }
+
+      // --- Scenario DOM reconciliation ---
+
+      function createScenarioArticle(sc) {
+        const art = document.createElement('article');
+        art.className = 'scenario-article';
+        art.setAttribute('data-scenario-id', sc.id);
+
+        art.innerHTML = [
+          '<div class="article-header">',
+          '  <h3>Scenario: <span class="badge" data-field="kind"></span></h3>',
+          '  <div class="grid-row" style="margin-left:auto;"><strong>ID:</strong> <code data-field="id"></code></div>',
+          '</div>',
+          '<div class="grid-row">',
+          '  <strong>Prompt:</strong> <span data-field="prompt" style="color:#e2e8f0;"></span>',
+          '</div>',
+          '<div class="sub-section">',
+          '  <h4>Marker Verification</h4>',
+          '  <div class="grid-row"><strong>Path:</strong> <code data-field="marker-path"></code></div>',
+          '  <div class="grid-row"><strong>Exists:</strong> <span class="badge" data-field="marker-exists"></span></div>',
+          '  <div class="grid-row"><strong>SHA256:</strong> <code data-field="marker-sha256"></code></div>',
+          '  <div class="grid-row"><strong>Expected Content:</strong> <code data-field="expected-content"></code></div>',
+          '  <div><strong>Actual Content:</strong><pre class="code-block" data-field="marker-content"></pre></div>',
+          '</div>',
+          '<div class="sub-section">',
+          '  <h4>Turn &amp; Execution Outcome</h4>',
+          '  <div class="grid-row"><strong>Conversation ID:</strong> <code data-field="conversation-id"></code></div>',
+          '  <div class="grid-row"><strong>Turn ID:</strong> <code data-field="turn-id"></code></div>',
+          '  <div class="grid-row"><strong>Turn State:</strong> <span class="badge" data-field="turn-state"></span></div>',
+          '  <div><strong>Turn Output:</strong><pre class="code-block" data-field="turn-output"></pre></div>',
+          '</div>',
+          '<div class="sub-section">',
+          '  <h4>Runtime Process &amp; Identity Proof</h4>',
+          '  <div data-field="runtime-content"></div>',
+          '</div>',
+          '<div class="sub-section">',
+          '  <h4>Attention Items</h4>',
+          '  <div data-field="attention-content"></div>',
+          '</div>',
+          '<div class="sub-section">',
+          '  <h4>Decision Receipts</h4>',
+          '  <div data-field="receipt-content"></div>',
+          '</div>'
+        ].join('\n');
+
+        updateScenarioArticle(art, sc);
+        return art;
+      }
+
+      function updateScenarioArticle(art, sc) {
+        // Scenario header
+        const kindBadge = art.querySelector('[data-field="kind"]');
+        if (kindBadge) {
+          kindBadge.textContent = sc.kind;
+          kindBadge.className = 'badge kind-' + sc.kind;
+        }
+        setFieldText(art, '[data-field="id"]', sc.id);
+        setFieldText(art, '[data-field="prompt"]', sc.prompt);
+
+        // Marker details
+        setFieldText(art, '[data-field="marker-path"]', sc.markerPath);
+        const existsBadge = art.querySelector('[data-field="marker-exists"]');
+        if (existsBadge) {
+          existsBadge.textContent = String(sc.marker.exists);
+          existsBadge.className = 'badge exists-' + String(sc.marker.exists);
+        }
+        setFieldText(art, '[data-field="marker-sha256"]', sc.marker.sha256 || 'none');
+        setFieldText(art, '[data-field="expected-content"]', sc.expectedContent);
+        setFieldText(art, '[data-field="marker-content"]', sc.marker.content !== null ? sc.marker.content : '(file absent / not created)');
+
+        // Turn details
+        setFieldText(art, '[data-field="conversation-id"]', sc.conversationId || 'none');
+        setFieldText(art, '[data-field="turn-id"]', sc.turnId || 'none');
+        const turnBadge = art.querySelector('[data-field="turn-state"]');
+        if (turnBadge) {
+          turnBadge.textContent = sc.turnState || 'none';
+          turnBadge.className = 'badge state-' + (sc.turnState || 'none');
+        }
+        setFieldText(art, '[data-field="turn-output"]', sc.turnOutput !== null ? sc.turnOutput : '(no output yet)');
+
+        // Strict Runtime metadata
+        const rtContent = art.querySelector('[data-field="runtime-content"]');
+        if (rtContent) {
+          if (sc.runtime) {
+            let sessionEl = rtContent.querySelector('[data-field="rt-session"]');
+            if (!sessionEl) {
+              rtContent.innerHTML = [
+                '<div class="grid-row"><strong>Session ID:</strong> <code data-field="rt-session"></code></div>',
+                '<div class="grid-row"><strong>State:</strong> <span class="badge" data-field="rt-state"></span></div>',
+                '<div class="grid-row"><strong>Approval Gate Required:</strong> <span data-field="rt-gate"></span></div>',
+                '<div class="grid-row"><strong>Config Path:</strong> <code data-field="rt-config"></code></div>',
+                '<div class="grid-row"><strong>Approval Root:</strong> <code data-field="rt-root"></code></div>',
+                '<div class="grid-row"><strong>Broker PID:</strong> <span data-field="rt-broker"></span></div>',
+                '<div class="grid-row"><strong>Child PID:</strong> <span data-field="rt-child"></span></div>'
+              ].join('\n');
+            }
+            setFieldText(rtContent, '[data-field="rt-session"]', sc.runtime.sessionId);
+            const stateEl = rtContent.querySelector('[data-field="rt-state"]');
+            if (stateEl) {
+              stateEl.textContent = sc.runtime.state;
+              stateEl.className = 'badge state-' + sc.runtime.state;
+            }
+            setFieldText(rtContent, '[data-field="rt-gate"]', String(sc.runtime.requiredApprovalGate));
+            setFieldText(rtContent, '[data-field="rt-config"]', sc.runtime.configPath || 'none');
+            setFieldText(rtContent, '[data-field="rt-root"]', sc.runtime.approvalRoot || 'none');
+            setFieldText(rtContent, '[data-field="rt-broker"]', String(sc.runtime.brokerPid ?? 'none'));
+            setFieldText(rtContent, '[data-field="rt-child"]', String(sc.runtime.childPid ?? 'none'));
+          } else {
+            rtContent.textContent = 'Runtime process not started yet.';
+          }
+        }
+
+        // Attention items
+        const attContent = art.querySelector('[data-field="attention-content"]');
+        if (attContent) {
+          if (sc.attention && sc.attention.length > 0) {
+            let table = attContent.querySelector('table');
+            if (!table) {
+              table = document.createElement('table');
+              table.className = 'sub-table';
+              table.innerHTML = '<thead><tr><th>Item ID</th><th>Rev</th><th>State</th><th>Effect State</th><th>Expires At</th></tr></thead><tbody></tbody>';
+              attContent.textContent = '';
+              attContent.appendChild(table);
+            }
+            const tbody = table.querySelector('tbody');
+            const existingRows = new Map();
+            for (const tr of tbody.querySelectorAll('tr[data-item-id]')) {
+              existingRows.set(tr.getAttribute('data-item-id'), tr);
+            }
+            const seen = new Set();
+            for (const item of sc.attention) {
+              seen.add(item.itemId);
+              let tr = existingRows.get(item.itemId);
+              if (!tr) {
+                tr = document.createElement('tr');
+                tr.setAttribute('data-item-id', item.itemId);
+                tr.innerHTML = '<td><code></code></td><td></td><td><span class="badge"></span></td><td></td><td></td>';
+                tbody.appendChild(tr);
+              }
+              const cells = tr.children;
+              cells[0].querySelector('code').textContent = item.itemId;
+              cells[1].textContent = String(item.revision);
+              const badge = cells[2].querySelector('.badge');
+              badge.textContent = item.state;
+              badge.className = 'badge state-' + item.state;
+              cells[3].textContent = item.effectState || 'none';
+              cells[4].textContent = item.expiresAt ? formatTime(item.expiresAt) : 'none';
+            }
+            for (const [id, tr] of existingRows.entries()) {
+              if (!seen.has(id)) tr.remove();
+            }
+          } else {
+            attContent.textContent = 'No attention items registered yet.';
+          }
+        }
+
+        // Receipts
+        const recContent = art.querySelector('[data-field="receipt-content"]');
+        if (recContent) {
+          if (sc.receipts && sc.receipts.length > 0) {
+            let table = recContent.querySelector('table');
+            if (!table) {
+              table = document.createElement('table');
+              table.className = 'sub-table';
+              table.innerHTML = '<thead><tr><th>Receipt ID</th><th>Answer</th><th>Actor</th><th>Outcome</th><th>Consumed At</th><th>Applied At</th></tr></thead><tbody></tbody>';
+              recContent.textContent = '';
+              recContent.appendChild(table);
+            }
+            const tbody = table.querySelector('tbody');
+            const existingRows = new Map();
+            for (const tr of tbody.querySelectorAll('tr[data-receipt-id]')) {
+              existingRows.set(tr.getAttribute('data-receipt-id'), tr);
+            }
+            const seen = new Set();
+            for (const r of sc.receipts) {
+              seen.add(r.receiptId);
+              let tr = existingRows.get(r.receiptId);
+              if (!tr) {
+                tr = document.createElement('tr');
+                tr.setAttribute('data-receipt-id', r.receiptId);
+                tr.innerHTML = '<td><code></code></td><td><span class="badge"></span></td><td></td><td></td><td></td><td></td>';
+                tbody.appendChild(tr);
+              }
+              const cells = tr.children;
+              cells[0].querySelector('code').textContent = r.receiptId;
+              const badge = cells[1].querySelector('.badge');
+              badge.textContent = r.answer;
+              badge.className = 'badge ' + (r.answer === 'approve' ? 'status-200' : 'status-409');
+              cells[2].textContent = r.actor;
+              cells[3].textContent = r.outcome || 'none';
+              cells[4].textContent = r.consumedAt ? formatTime(r.consumedAt) : 'none';
+              cells[5].textContent = r.appliedAt ? formatTime(r.appliedAt) : 'none';
+            }
+            for (const [id, tr] of existingRows.entries()) {
+              if (!seen.has(id)) tr.remove();
+            }
+          } else {
+            recContent.textContent = 'No decision receipts recorded yet.';
+          }
+        }
+      }
+
+      function updateScenarios(scenarios) {
+        const container = document.getElementById('scenarios-container');
+        const countBadge = document.getElementById('scenarios-count');
+        if (countBadge) countBadge.textContent = String(scenarios.length);
+
+        if (!scenarios || scenarios.length === 0) {
+          container.innerHTML = '<p class="empty-state">No scenarios started yet. Click one of the buttons above to start a case.</p>';
+          scenarioElementMap.clear();
+          return;
+        }
+
+        const emptyP = container.querySelector('.empty-state');
+        if (emptyP) emptyP.remove();
+
+        const seenIds = new Set();
+        for (const sc of scenarios) {
+          seenIds.add(sc.id);
+          let art = scenarioElementMap.get(sc.id);
+          if (!art) {
+            art = createScenarioArticle(sc);
+            scenarioElementMap.set(sc.id, art);
+            container.appendChild(art);
+          } else {
+            updateScenarioArticle(art, sc);
+          }
+        }
+
+        for (const [id, art] of scenarioElementMap.entries()) {
+          if (!seenIds.has(id)) {
+            art.remove();
+            scenarioElementMap.delete(id);
+          }
+        }
+      }
+
+      // --- Message DOM reconciliation ---
+
+      function createMessageArticle(msg) {
+        const art = document.createElement('article');
+        art.className = 'message-article';
+        art.setAttribute('data-message-id', msg.messageId);
+
+        art.innerHTML = [
+          '<div class="article-header">',
+          '  <h3>Message: <code data-field="msg-id"></code> (v<span data-field="msg-version"></span>)</h3>',
+          '  <span class="badge" data-field="card-state" style="margin-left:auto;"></span>',
+          '</div>',
+          '<div class="grid-row"><strong>Delivery ID:</strong> <code data-field="delivery-id"></code></div>',
+          '<div class="grid-row"><strong>Replace ID:</strong> <code data-field="replace-id"></code></div>',
+          '<div class="grid-row"><strong>Address:</strong> <code data-field="address"></code></div>',
+          '<div style="margin-top:8px;">',
+          '  <strong>Message Text:</strong>',
+          '  <pre class="code-block" data-field="text"></pre>',
+          '</div>',
+          '<div class="card-box" data-field="decision-box" style="display:none;">',
+          '  <h4>Approval Card: <span data-field="decision-title" style="color:#ffffff;"></span></h4>',
+          '  <div class="grid-row"><strong>Item ID:</strong> <code data-field="decision-item"></code></div>',
+          '  <div class="grid-row"><strong>Owner:</strong> <span data-field="decision-owner"></span></div>',
+          '  <div class="grid-row"><strong>Card State:</strong> <span class="badge" data-field="decision-state"></span></div>',
+          '  <div class="grid-row"><strong>Expires At:</strong> <span data-field="decision-expires"></span></div>',
+          '  <div class="decision-options" data-field="options-container"></div>',
+          '</div>',
+          '<details class="history-details" data-field="history-details">',
+          '  <summary>Message History (<span data-field="history-count">1</span> versions)</summary>',
+          '  <ul class="history-list" data-field="history-list"></ul>',
+          '</details>'
+        ].join('\n');
+
+        updateMessageArticle(art, msg);
+        return art;
+      }
+
+      function updateMessageArticle(art, msg) {
+        const decision = msg.message && msg.message.decision;
+        const cardState = decision ? decision.state : 'none';
+
+        art.setAttribute('data-card-state', cardState);
+
+        setFieldText(art, '[data-field="msg-id"]', msg.messageId);
+        setFieldText(art, '[data-field="msg-version"]', String(msg.version));
+
+        const cardStateBadge = art.querySelector('[data-field="card-state"]');
+        if (cardStateBadge) {
+          cardStateBadge.textContent = 'Card State: ' + cardState;
+          cardStateBadge.className = 'badge state-' + cardState;
+        }
+
+        setFieldText(art, '[data-field="delivery-id"]', msg.message.deliveryId || 'none');
+        setFieldText(art, '[data-field="replace-id"]', msg.message.replaceMessageId || 'none');
+        setFieldText(art, '[data-field="address"]', JSON.stringify(msg.message.address || {}));
+        setFieldText(art, '[data-field="text"]', msg.message.text || '');
+
+        // Decision Card Box
+        const decisionBox = art.querySelector('[data-field="decision-box"]');
+        if (decisionBox) {
+          if (decision) {
+            decisionBox.style.display = 'block';
+            setFieldText(decisionBox, '[data-field="decision-title"]', decision.title || 'Decision Required');
+            setFieldText(decisionBox, '[data-field="decision-item"]', (decision.itemId || 'none') + ' (rev ' + (decision.revision ?? 0) + ')');
+            setFieldText(decisionBox, '[data-field="decision-owner"]', decision.owner || 'none');
+
+            const stateBadge = decisionBox.querySelector('[data-field="decision-state"]');
+            if (stateBadge) {
+              stateBadge.textContent = decision.state;
+              stateBadge.className = 'badge state-' + decision.state;
+            }
+
+            const expiresEl = decisionBox.querySelector('[data-field="decision-expires"]');
+            if (expiresEl) {
+              if (decision.expiresAt) {
+                const remainingMs = decision.expiresAt - Date.now();
+                const remainingSec = Math.ceil(remainingMs / 1000);
+                if (remainingSec > 0) {
+                  expiresEl.textContent = formatTime(decision.expiresAt) + ' (' + remainingSec + 's remaining)';
+                } else {
+                  expiresEl.textContent = formatTime(decision.expiresAt) + ' (EXPIRED)';
+                }
+              } else {
+                expiresEl.textContent = 'none (no expiry)';
+              }
+            }
+
+            // Options buttons reconciliation (preserving DOM elements)
+            const optionsContainer = decisionBox.querySelector('[data-field="options-container"]');
+            if (optionsContainer) {
+              const isActionable = decision.state === 'Awaiting decision' && (!decision.expiresAt || decision.expiresAt > Date.now());
+              const existingBtns = new Map();
+              for (const btn of optionsContainer.querySelectorAll('button[data-answer]')) {
+                existingBtns.set(btn.getAttribute('data-answer'), btn);
+              }
+              const seenAnswers = new Set();
+              if (Array.isArray(decision.options)) {
+                for (const opt of decision.options) {
+                  seenAnswers.add(opt);
+                  let btn = existingBtns.get(opt);
+                  if (!btn) {
+                    btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.setAttribute('data-answer', opt);
+                    btn.className = 'btn btn-option opt-' + opt;
+                    btn.textContent = opt;
+                    optionsContainer.appendChild(btn);
+                  }
+                  btn.setAttribute('data-message-id', msg.messageId);
+                  btn.setAttribute('data-item-id', decision.itemId);
+                  btn.setAttribute('data-revision', String(decision.revision));
+                  btn.disabled = !isActionable;
+                }
+              }
+              for (const [opt, btn] of existingBtns.entries()) {
+                if (!seenAnswers.has(opt)) btn.remove();
+              }
+            }
+          } else {
+            decisionBox.style.display = 'none';
+            const optionsContainer = decisionBox.querySelector('[data-field="options-container"]');
+            if (optionsContainer) optionsContainer.textContent = '';
+          }
+        }
+
+        // Message History
+        const historyDetails = art.querySelector('[data-field="history-details"]');
+        if (historyDetails) {
+          const history = msg.history || [];
+          setFieldText(historyDetails, '[data-field="history-count"]', String(history.length));
+          const list = historyDetails.querySelector('[data-field="history-list"]');
+          if (list) {
+            const existingLis = new Map();
+            for (const li of list.querySelectorAll('li[data-history-idx]')) {
+              existingLis.set(li.getAttribute('data-history-idx'), li);
+            }
+            const seenIdxs = new Set();
+            history.forEach((h, idx) => {
+              const key = String(idx);
+              seenIdxs.add(key);
+              let li = existingLis.get(key);
+              if (!li) {
+                li = document.createElement('li');
+                li.setAttribute('data-history-idx', key);
+                list.appendChild(li);
+              }
+              const cardSt = h.message && h.message.decision ? h.message.decision.state : 'none';
+              li.textContent = '[' + formatTime(h.at) + '] rev ' + (idx + 1) + ' | cardState: ' + cardSt + ' | text: ' + (h.message && h.message.text ? h.message.text.slice(0, 80) : '');
+            });
+            for (const [key, li] of existingLis.entries()) {
+              if (!seenIdxs.has(key)) li.remove();
+            }
+          }
+        }
+      }
+
+      function updateMessages(messages) {
+        const container = document.getElementById('messages-container');
+        const countBadge = document.getElementById('messages-count');
+        if (countBadge) countBadge.textContent = String(messages.length);
+
+        if (!messages || messages.length === 0) {
+          container.innerHTML = '<p class="empty-state">No messages delivered yet.</p>';
+          messageElementMap.clear();
+          return;
+        }
+
+        const emptyP = container.querySelector('.empty-state');
+        if (emptyP) emptyP.remove();
+
+        const seenIds = new Set();
+        for (const msg of messages) {
+          seenIds.add(msg.messageId);
+          let art = messageElementMap.get(msg.messageId);
+          if (!art) {
+            art = createMessageArticle(msg);
+            messageElementMap.set(msg.messageId, art);
+            container.appendChild(art);
+          } else {
+            updateMessageArticle(art, msg);
+          }
+        }
+
+        for (const [id, art] of messageElementMap.entries()) {
+          if (!seenIds.has(id)) {
+            art.remove();
+            messageElementMap.delete(id);
+          }
+        }
+      }
+
+      // --- Actions DOM reconciliation ---
+
+      function updateActions(actions) {
+        const container = document.getElementById('actions');
+        const countBadge = document.getElementById('actions-count');
+        if (countBadge) countBadge.textContent = String(actions.length);
+
+        if (!actions || actions.length === 0) {
+          container.innerHTML = '<p class="empty-state">No actions recorded yet.</p>';
+          actionElementMap.clear();
+          return;
+        }
+
+        const emptyP = container.querySelector('.empty-state');
+        if (emptyP) emptyP.remove();
+
+        let table = container.querySelector('table');
+        let tbody;
+        if (!table) {
+          table = document.createElement('table');
+          table.className = 'actions-table';
+          table.innerHTML = '<thead><tr><th>Time</th><th>Event ID</th><th>Message ID</th><th>Item ID</th><th>Rev</th><th>Answer</th><th>Status</th><th>Error</th></tr></thead><tbody></tbody>';
+          container.appendChild(table);
+          tbody = table.querySelector('tbody');
+        } else {
+          tbody = table.querySelector('tbody');
+        }
+
+        // Render newest actions first
+        for (const act of actions) {
+          let tr = actionElementMap.get(act.eventId);
+          if (!tr) {
+            tr = document.createElement('tr');
+            tr.setAttribute('data-event-id', act.eventId);
+            tr.innerHTML = '<td></td><td><code></code></td><td><code></code></td><td><code></code></td><td><code></code></td><td><span class="badge"></span></td><td><span class="badge"></span></td><td><code></code></td>';
+            tbody.prepend(tr);
+            actionElementMap.set(act.eventId, tr);
+          }
+          const cells = tr.children;
+          cells[0].textContent = formatTime(act.at);
+          cells[1].querySelector('code').textContent = act.eventId.slice(0, 8);
+          cells[1].title = act.eventId;
+          cells[2].querySelector('code').textContent = act.messageId;
+          cells[3].querySelector('code').textContent = act.itemId;
+          cells[4].querySelector('code').textContent = String(act.revision ?? '');
+
+          const ansBadge = cells[5].querySelector('.badge');
+          ansBadge.textContent = act.answer;
+          ansBadge.className = 'badge ' + (act.answer === 'approve' ? 'kind-approve' : 'kind-deny');
+
+          const statusBadge = cells[6].querySelector('.badge');
+          statusBadge.textContent = String(act.status);
+          statusBadge.className = 'badge status-' + act.status;
+
+          cells[7].querySelector('code').textContent = act.error || 'none';
+        }
+      }
+
+      // --- Network state poll ---
+
+      function applyState(state) {
+        if (!state || typeof state !== 'object') return;
+
+        serverError = state.error || null;
+        renderError();
+
+        updateHeaderMeta(state);
+        updateScenarios(state.scenarios || []);
+        updateMessages(state.messages || []);
+        updateActions(state.actions || []);
+      }
+
+      async function pollState() {
+        if (inFlightPoll) {
+          pendingImmediatePoll = true;
+          return;
+        }
+        inFlightPoll = true;
+        const currentSeq = ++pollSeq;
+        const generation = actionGeneration;
+
+        try {
+          const res = await fetch('/api/e2e/state', { cache: 'no-store' });
+          if (!res.ok) {
+            showError('Failed to fetch state: HTTP ' + res.status);
+            return;
+          }
+          const state = await res.json();
+          if (currentSeq < lastAppliedSeq || generation !== actionGeneration) {
+            return; // Discard stale out-of-order response
+          }
+          lastAppliedSeq = currentSeq;
+          applyState(state);
+        } catch (err) {
+          showError('Network error polling state: ' + (err && err.message ? err.message : String(err)));
+        } finally {
+          inFlightPoll = false;
+          if (pendingImmediatePoll) {
+            pendingImmediatePoll = false;
+            setTimeout(pollState, 10);
+          }
+        }
+      }
+
+      // --- Actions handlers ---
+
+      async function startScenario(kind) {
+        const btn = document.querySelector('button[data-scenario="' + kind + '"]');
+        if (btn) btn.disabled = true;
+        actionGeneration++;
+
+        try {
+          const res = await fetch('/api/e2e/scenarios', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind })
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            showError('Failed to start scenario ' + kind + ': ' + (data.error || ('HTTP ' + res.status)));
+          } else {
+            clearActionError();
+          }
+        } catch (err) {
+          showError('Start scenario request failed: ' + (err && err.message ? err.message : String(err)));
+        } finally {
+          if (btn) btn.disabled = false;
+          pollState();
+        }
+      }
+
+      async function submitDecision(packet) {
+        lastDecisionPacket = { ...packet };
+        updateReplayButton();
+        actionGeneration++;
+
+        try {
+          const res = await fetch('/api/e2e/decision', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(packet)
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            showError('Decision rejected: ' + (data.error || ('HTTP ' + res.status)));
+          } else {
+            clearActionError();
+          }
+        } catch (err) {
+          showError('Decision request failed: ' + (err && err.message ? err.message : String(err)));
+        } finally {
+          pollState();
+        }
+      }
+
+      async function replayLastDecision() {
+        if (!lastDecisionPacket) return;
+        const replayBtn = document.getElementById('replay-decision');
+        if (replayBtn) replayBtn.disabled = true;
+        actionGeneration++;
+
+        try {
+          const res = await fetch('/api/e2e/decision', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(lastDecisionPacket)
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            showError('Replay conflict (expected HTTP ' + res.status + '): ' + (data.error || 'Conflict rejected'));
+          } else {
+            showError('Replay unexpectedly succeeded');
+          }
+        } catch (err) {
+          showError('Replay request failed: ' + (err && err.message ? err.message : String(err)));
+        } finally {
+          if (replayBtn) replayBtn.disabled = false;
+          pollState();
+        }
+      }
+
+      // Delegated event listening
+      document.addEventListener('click', function (e) {
+        const target = e.target;
+        if (!target || !target.tagName) return;
+
+        const scenarioBtn = target.closest('button[data-scenario]');
+        if (scenarioBtn) {
+          const kind = scenarioBtn.getAttribute('data-scenario');
+          if (kind) startScenario(kind);
+          return;
+        }
+
+        const answerBtn = target.closest('button[data-answer]');
+        if (answerBtn) {
+          if (answerBtn.disabled) return;
+          const answer = answerBtn.getAttribute('data-answer');
+          const messageId = answerBtn.getAttribute('data-message-id');
+          const itemId = answerBtn.getAttribute('data-item-id');
+          const revStr = answerBtn.getAttribute('data-revision');
+          const revision = parseInt(revStr, 10);
+          if (!messageId || !itemId || isNaN(revision) || !answer) return;
+          submitDecision({ messageId, itemId, revision, answer });
+          return;
+        }
+
+        if (target.id === 'replay-decision' || target.closest('#replay-decision')) {
+          const replayBtn = document.getElementById('replay-decision');
+          if (replayBtn && !replayBtn.disabled) {
+            replayLastDecision();
+          }
+          return;
+        }
+      });
+
+      // Initial poll immediately, then every 500ms
+      pollState();
+      setInterval(pollState, 500);
+    })();
+  </script>
+</body>
+</html>

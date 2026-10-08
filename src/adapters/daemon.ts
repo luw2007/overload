@@ -1,5 +1,8 @@
 #!/usr/bin/env bun
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import type { Database } from "bun:sqlite";
+import { acquireAppLock } from "./app-lock";
+import { loadRuntimeConfigs } from "./runtime-config";
 import { openMailbox } from "../decision-bot/mailbox";
 import { AdapterService } from "./service";
 import { FeishuChannel, type FeishuChannelConfig } from "./feishu";
@@ -146,6 +149,35 @@ export async function startAdapterDaemon(options?: {
 }) {
  const entries = authorizationEntries();
  const app = credentials();
+ const runtimeConfigs = loadRuntimeConfigs(entries,
+  process.env.OVERLOAD_REQUIRED_RUNTIME_CONFIG_CHATS,
+  process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT);
+ const requiredChats = new Set((process.env.OVERLOAD_REQUIRED_RUNTIME_CONFIG_CHATS ?? "").split(",").map((chat) => chat.trim()).filter(Boolean));
+ const approvalRoot = process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT;
+ const lock = await acquireAppLock(app.app_id);
+ try {
+  const daemon = await startLockedDaemon(entries, app, runtimeConfigs, requiredChats, approvalRoot, options);
+  return {
+   service: daemon.service,
+   async stop() {
+    await daemon.stop();
+    await lock.release();
+   },
+  };
+ } catch (error) {
+  if (!(error instanceof Error && "retainAppLock" in error && error.retainAppLock === true)) await lock.release();
+  throw error;
+ }
+}
+
+async function startLockedDaemon(
+ entries: AuthorizationEntry[],
+ app: FeishuCredentials,
+ runtimeConfigs: Map<string, string>,
+ requiredChats: ReadonlySet<string>,
+ approvalRoot: string | undefined,
+ options: Parameters<typeof startAdapterDaemon>[0],
+) {
  const channelRegistry = options?.channelFactories ?? defaultChannelFactories;
  const runtimeRegistry = options?.runtimeFactories ?? defaultRuntimeFactories;
  const channel = selectFactory(
@@ -162,13 +194,22 @@ export async function startAdapterDaemon(options?: {
   process.env.OVERLOAD_RUNTIME ?? "pi",
   "runtime",
  )();
- const db = openMailbox(process.env.OVERLOAD_ANSWERS_PATH);
- const web = await hostControlPlane(options?.webConfigPath);
- const coordinatorDb = entries.some((entry) => entry.workId) ? openStore() : null;
- const bridge = coordinatorDb ? new CoordinatorBridge(db, coordinatorDb) : null;
+ const cwd = required("OVERLOAD_RUNTIME_CWD");
+ let db: Database | undefined;
+ let web: { stop(closeActiveConnections?: boolean): unknown } | null | undefined;
+ let coordinatorDb: Database | null = null;
+ let bridge: CoordinatorBridge | null = null;
+ let workers: CoordinatorWorkers | null = null;
+ let service: AdapterService | undefined;
+ let timer: NodeJS.Timeout | undefined;
+ try {
+ db = openMailbox(process.env.OVERLOAD_ANSWERS_PATH);
+ web = await hostControlPlane(options?.webConfigPath);
+ coordinatorDb = entries.some((entry) => entry.workId) ? openStore() : null;
+ bridge = coordinatorDb ? new CoordinatorBridge(db, coordinatorDb) : null;
  bridge?.start(Number(process.env.OVERLOAD_COORDINATOR_PORT ?? 4891));
  const artifactsRoot = join(homedir(), ".overload", "artifacts");
- const workers = coordinatorDb
+ workers = coordinatorDb
   ? new CoordinatorWorkers(
      coordinatorDb,
      runtime,
@@ -190,42 +231,15 @@ export async function startAdapterDaemon(options?: {
      workers ?? undefined,
     )
   : null;
- const requiredRuntimeChats = new Set(
-  (process.env.OVERLOAD_REQUIRED_RUNTIME_CONFIG_CHATS ?? "")
-   .split(",")
-   .filter(Boolean),
- );
- for (const chatId of requiredRuntimeChats)
-  if (!entries.some((entry) => entry.chatId === chatId && entry.runtimeConfigPath))
-   throw new Error("required_runtime_config_missing:" + chatId);
- const runtimeConfigs = new Map(
-  entries
-   .filter((entry) => entry.runtimeConfigPath)
-   .map((entry) => {
-    const path = realpathSync(entry.runtimeConfigPath!);
-    if (!statSync(path).isFile()) throw new Error("runtime_config_not_file");
-    const value = JSON.parse(readFileSync(path, "utf8"));
-    if (
-     value?.approval_gate?.enabled !== true ||
-     !Array.isArray(value.approval_gate.require_approval_write_paths) ||
-     value.approval_gate.require_approval_write_paths.some(
-      (root: unknown) =>
-       typeof root !== "string" ||
-       !realpathSync(root).startsWith("/tmp/overload-botmux-gate-acceptance/repo"),
-     )
-    )
-     throw new Error("invalid_runtime_gate_config");
-    return [entry.chatId, path] as const;
-   }),
- );
- const service = new AdapterService(db, {
+ service = new AdapterService(db, {
   runtime,
   channels: [channel],
-  cwd: required("OVERLOAD_RUNTIME_CWD"),
+  cwd,
   runtimeConfig: (conversation) => {
    const chatId = (JSON.parse(conversation.address) as { chatId: string }).chatId,
     path = runtimeConfigs.get(chatId);
-   return path ? { configPath: path } : undefined;
+   if (requiredChats.has(chatId) && !path) throw new Error("runtime_approval_gate_missing");
+   return path ? { configPath: path, requiredApprovalGate: requiredChats.has(chatId), approvalRoot: requiredChats.has(chatId) ? approvalRoot : undefined } : undefined;
   },
   coordinator: bridge
    ? (conversation, reference) =>
@@ -262,7 +276,7 @@ export async function startAdapterDaemon(options?: {
   try {
    await orchestrator?.tick();
    bridge?.tick();
-   await service.tick();
+   await service!.tick();
   } catch (error) {
    console.error(
     "adapter tick failed:",
@@ -272,30 +286,44 @@ export async function startAdapterDaemon(options?: {
    ticking = false;
   }
  };
- try {
-  await service.start();
- } catch (error) {
-  await service.stop();
-  web?.stop(true);
-  bridge?.stop();
-  await workers?.close();
-  coordinatorDb?.close();
-  db.close();
-  throw error;
- }
- const timer = setInterval(() => void tick(), 1000);
+ await service.start();
+ timer = setInterval(() => void tick(), 1000);
  await tick();
+ let stopped = false;
+ let stopping: Promise<void> | undefined;
  return {
   service,
-  async stop() {
-   clearInterval(timer);
-   await service.stop();
-   web?.stop(true);
-   await workers?.close();
-   bridge?.stop();
-   coordinatorDb?.close();
+  stop() {
+   if (stopped) return Promise.resolve();
+   if (stopping) return stopping;
+   stopping = (async () => {
+    clearInterval(timer);
+    await service!.stop();
+    web?.stop(true);
+    await workers?.close();
+    bridge?.stop();
+    coordinatorDb?.close();
+    db!.close();
+    stopped = true;
+   })();
+   stopping.catch(() => { stopping = undefined; });
+   return stopping;
   },
  };
+ } catch (error) {
+  clearInterval(timer);
+  const failures: unknown[] = [];
+  try { await service?.stop(); } catch (failure) { failures.push(failure); }
+  try { web?.stop(true); } catch (failure) { failures.push(failure); }
+  try { bridge?.stop(); } catch (failure) { failures.push(failure); }
+  try { await workers?.close(); } catch (failure) { failures.push(failure); }
+  try { coordinatorDb?.close(); } catch (failure) { failures.push(failure); }
+  try { db?.close(); } catch (failure) { failures.push(failure); }
+  if (failures.length) {
+   throw Object.assign(new AggregateError([error, ...failures], "Adapter startup and cleanup failed"), { retainAppLock: true });
+  }
+  throw error;
+ }
 }
 if (import.meta.main) {
  const daemon = await startAdapterDaemon();

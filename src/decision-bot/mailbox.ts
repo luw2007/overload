@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { ensureControlSchema, getAttention, projectAttentionEffect } from "../control/store";
+import { ensureControlSchema, getAttention, getWork, projectAttentionEffect, supersedeAttentionById } from "../control/store";
 import type { AttentionItem } from "../control/types";
 import { controlPayloadHash } from "../control/outbox";
 
@@ -61,8 +61,9 @@ export function cancelTarget(db: Database, owner: ConsumerOwner, id: string, ver
     if (!target || target.targetVersion !== version) return false;
     if (target.state === "consumed") return false;
     db.query("UPDATE approval_targets SET state='closed',outcome='cancelled' WHERE consumer_owner=? AND approval_id=? AND target_version=? AND state='active'").run(owner, id, version);
+    if (owner === "extension" && target.scope.gate === "action") reconcileExtensionGateClosures(db);
     return true;
-  })();
+  }).immediate();
 }
 export function writeHumanAnswer(db:Database, owner:ConsumerOwner,id:string,answer:string,actor="ui",now=Date.now()):{ok:true}|{ok:false;reason:string}{
   return db.transaction(()=>{const target=getTarget(db,owner,id);if(!target||target.state!=="active")return {ok:false,reason:target?.state==="consumed"?"already_consumed":"unknown_target"} as const;if(now>=target.expiresAt){closeTarget(db,owner,id,"expired");return {ok:false,reason:"expired"} as const;}if(!target.options.includes(answer))return {ok:false,reason:"invalid_option"} as const;const prior=db.query("SELECT consumer_owner FROM answer_metadata WHERE approval_id=?").get(id) as any;if(prior&&prior.consumer_owner&&prior.consumer_owner!==owner)return {ok:false,reason:"owner_conflict"} as const;db.run("INSERT INTO answers(approval_id,answer,actor,at) VALUES(?,?,?,?) ON CONFLICT(approval_id) DO UPDATE SET answer=excluded.answer,actor=excluded.actor,at=excluded.at",[id,answer,actor,now]);db.run("INSERT INTO answer_metadata(approval_id,consumer_owner,provenance) VALUES(?,?,'human') ON CONFLICT(approval_id) DO UPDATE SET consumer_owner=excluded.consumer_owner,provenance='human'",[id,owner]);db.run("UPDATE bot_proposals SET invalidated_at=? WHERE consumer_owner=? AND approval_id=? AND invalidated_at IS NULL",[now,owner,id]);return {ok:true} as const;}).immediate();
@@ -170,9 +171,30 @@ export function observeReceiptEffect(db: Database, observation: EffectObservatio
   })();
 }
 
+/** Only the original action-gate card can be retired; work acceptance is a separate responsibility. */
+function matchingActionGate(db: Database, target: ApprovalTarget, item: AttentionItem): boolean {
+  if (target.consumerOwner !== "extension" || target.scope.gate !== "action"
+    || item.item_id !== target.approvalId || item.approval_id !== target.approvalId
+    || item.consumer_owner !== "extension" || item.evidence.target_version !== target.targetVersion
+    || (target.workId && target.workId !== item.work_id)
+    || (target.contractRevision !== undefined && target.contractRevision !== item.contract_revision)) return false;
+  const work = getWork(db, item.work_id);
+  return !!work && work.revision === item.contract_revision;
+}
+
 /** Channel/HTTP/ledger consumers share one atomic observation-to-card path; wait dispatches keep their own transaction. */
 export function observeAndProjectReceiptEffect(db: Database, observation: EffectObservation): boolean {
   return db.transaction(() => {
+    const denial = observation.evidence.gate_outcome === "denied";
+    const decision = db.query("SELECT consumer_owner,approval_id,target_version,answer,actor FROM decision_receipts WHERE receipt_id=?")
+      .get(observation.receiptId) as { consumer_owner: ConsumerOwner; approval_id: string; target_version: string; answer: string; actor: string } | null;
+    const target = decision ? getTarget(db, decision.consumer_owner, decision.approval_id) : null;
+    if (denial && (!decision || !target || decision.answer !== "deny" || target.state !== "consumed"
+      || target.consumerOwner !== "extension" || target.scope.gate !== "action"
+      || decision.target_version !== target.targetVersion || observation.state !== "succeeded"
+      || observation.evidence.tool_executed !== false || observation.evidence.reason !== "denied_by_owner"
+      || observation.evidence.actor !== decision.actor
+      || observation.toolCallId !== (target.toolCallId ?? target.evidence.toolCallId))) return false;
     if (!observeReceiptEffect(db, observation)) return false;
     const stored = db.query("SELECT observed_at FROM receipt_effect_observations WHERE receipt_id=? AND tool_call_id=?")
       .get(observation.receiptId, observation.toolCallId) as { observed_at: number };
@@ -184,13 +206,21 @@ export function observeAndProjectReceiptEffect(db: Database, observation: Effect
     for (const row of linked) {
       const item = getAttention(db, row.item_id);
       if (!item || item.state === "superseded") continue;
+      if (denial && (!target || !matchingActionGate(db, target, item))) continue;
       const source = sourceQuery.get(item.item_id, item.revision) as { event_id: string } | null;
       if (!source) throw new Error(`effect source event missing: ${item.item_id}`);
-      projectAttentionEffect(db, { work_id: item.work_id, item_id: item.item_id, item_revision: item.revision,
+      const projected = projectAttentionEffect(db, { work_id: item.work_id, item_id: item.item_id, item_revision: item.revision,
         approval_id: item.approval_id, receipt_id: observation.receiptId, outbox_event_id: source.event_id }, accepted, accepted.observedAt);
+      if (denial) supersedeAttentionById(db, projected.item_id, projected.revision, {
+        reason: "gate_denied", actor: decision!.actor,
+        evidence: { gate_outcome: "denied", tool_executed: false, gate_closure: {
+          receipt_id: observation.receiptId, tool_call_id: observation.toolCallId,
+          target_version: target!.targetVersion, observed_at: accepted.observedAt, evidence: accepted.evidence,
+        } },
+      }, accepted.observedAt);
     }
     return true;
-  })();
+  }).immediate();
 }
 export function reconcileOutstandingReceipts(db:Database,deadline:number,now=Date.now()):number{return db.run("UPDATE decision_receipts SET applied_at=?,outcome='unknown' WHERE applied_at IS NULL AND consumed_at<=?",[now,deadline]).changes;}
 /**
@@ -240,6 +270,34 @@ export function closeTarget(db:Database,owner:ConsumerOwner,id:string,outcome:st
 // 扫所有 owner（extension + orchestrator）已过期的 active target，幂等关闭为 expired。
 // orchestrator tick 不常驻 web server，web 启动/定时清扫也靠它兜底 extension target。
 export function expireActiveTargets(db:Database,now:number):number{return db.run("UPDATE approval_targets SET state='closed',outcome='expired' WHERE state='active' AND expires_at<=?",[now]).changes;}
+
+/** Close unconsumed extension action gates from authoritative target state, atomically with card CAS/outbox. */
+export function reconcileExtensionGateClosures(db: Database, now = Date.now()): number {
+  return db.transaction(() => {
+    expireActiveTargets(db, now);
+    const rows = db.query(`SELECT approval_id,outcome FROM approval_targets
+      WHERE consumer_owner='extension' AND state='closed' AND outcome IN ('expired','cancelled')`)
+      .all() as { approval_id: string; outcome: "expired" | "cancelled" }[];
+    let count = 0;
+    for (const row of rows) {
+      const target = getTarget(db, "extension", row.approval_id)!;
+      const item = getAttention(db, row.approval_id);
+      if (!item || item.state !== "open" || item.effect_state !== "not_started"
+        || !matchingActionGate(db, target, item)
+        || (row.outcome === "expired" && target.expiresAt > now)
+        || db.query("SELECT 1 FROM decision_receipts WHERE consumer_owner='extension' AND approval_id=? AND target_version=?")
+          .get(target.approvalId, target.targetVersion)) continue;
+      supersedeAttentionById(db, item.item_id, item.revision, {
+        reason: `gate_${row.outcome}`, actor: "extension_gate_reconciler",
+        evidence: { gate_outcome: row.outcome, tool_executed: false, gate_closure: {
+          target_version: target.targetVersion, expires_at: target.expiresAt, closed_at: now,
+        } },
+      }, now);
+      count++;
+    }
+    return count;
+  }).immediate();
+}
 export function setBotDisabled(db:Database,disabled:boolean,reason:string,now=Date.now()):void{db.transaction(()=>{db.run("INSERT INTO bot_control(id,disabled,changed_at,reason) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET disabled=excluded.disabled,changed_at=excluded.changed_at,reason=excluded.reason",[disabled?1:0,now,reason]);if(disabled)db.run("UPDATE bot_proposals SET invalidated_at=? WHERE invalidated_at IS NULL",now);})();}
 export function botDisabled(db:Database):boolean{return !!(db.query("SELECT disabled FROM bot_control WHERE id=1").get() as any)?.disabled;}
 

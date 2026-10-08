@@ -187,6 +187,8 @@ export type PiBrokerConfig = {
   coordinator?:{endpoint:string;token:string;workId:string};
   readOnly?:boolean;
   configPath?:string;
+  requiredApprovalGate?:boolean;
+  approvalRoot?:string;
 };
 
 type BrokerMetadata = PiBrokerConfig & { pid: number; brokerIdentity?:ProcessIdentity;childIdentity?:ProcessIdentity;state: "starting" | "running" | "stopped"; stderrTail?: string; exitCode?: number; updatedAt: number };
@@ -283,7 +285,14 @@ class PiBroker {
   private spawnChild(): void {
     const argv = buildPiBrokerInvocation(this.config);
     const coordinator=this.config.coordinator;
-    const proc = Bun.spawn(argv, { cwd: this.config.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe",env:{...process.env,OVERLOAD_RUNTIME_SESSION_ID:this.config.sessionId,...(this.config.configPath?{OVERLOAD_CONFIG_PATH:this.config.configPath}:{}),...(coordinator?{OVERLOAD_COORDINATOR_ENDPOINT:coordinator.endpoint,OVERLOAD_COORDINATOR_TOKEN:coordinator.token,OVERLOAD_COORDINATOR_WORK_ID:coordinator.workId}:{})} }) as unknown as PiProcess & { pid: number };
+    const env: Record<string, string | undefined> = { ...process.env, OVERLOAD_RUNTIME_SESSION_ID: this.config.sessionId };
+    delete env.OVERLOAD_REQUIRED_APPROVAL_GATE;
+    delete env.OVERLOAD_RUNTIME_APPROVAL_ROOT;
+    if (this.config.requiredApprovalGate === true && this.config.approvalRoot) env.OVERLOAD_RUNTIME_APPROVAL_ROOT = this.config.approvalRoot;
+    if (this.config.requiredApprovalGate === true) env.OVERLOAD_REQUIRED_APPROVAL_GATE = "1";
+    if (this.config.configPath) env.OVERLOAD_CONFIG_PATH = this.config.configPath;
+    if (coordinator) Object.assign(env, { OVERLOAD_COORDINATOR_ENDPOINT: coordinator.endpoint, OVERLOAD_COORDINATOR_TOKEN: coordinator.token, OVERLOAD_COORDINATOR_WORK_ID: coordinator.workId });
+    const proc = Bun.spawn(argv, { cwd: this.config.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe", env }) as unknown as PiProcess & { pid: number };
     this.childIdentity=captureProcessIdentity(proc.pid)??undefined;
     this.child = proc;
     this.writeMetadata("running");

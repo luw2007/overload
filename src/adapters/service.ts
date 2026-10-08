@@ -16,6 +16,7 @@ import {
  getTarget,
  consumeDecision,
  observeAndProjectReceiptEffect,
+ reconcileExtensionGateClosures,
 } from "../decision-bot/mailbox";
 import {
  ensureAdapterSchema,
@@ -69,7 +70,7 @@ export type AdapterServiceConfig = {
   identity: ChannelIdentity,
   address: ChannelAddress,
  ) => string | ChannelAuthorization | null;
- runtimeConfig?: (conversation: Conversation) => { configPath: string } | undefined;
+ runtimeConfig?: (conversation: Conversation) => { configPath: string; requiredApprovalGate?: boolean; approvalRoot?: string } | undefined;
  provider?: string;
  model?: string;
  allowedModels?: string[];
@@ -548,7 +549,7 @@ export class AdapterService {
       handle = await this.config.runtime.connect(reference);
      } catch (error) {
       if (!turn || waiting || !this.config.runtime.capabilities.restore || !this.config.runtime.restore || !(error instanceof Error) || error.message !== "runtime_not_live") throw error;
-      handle = await this.config.runtime.restore(reference);
+      handle = await this.config.runtime.restore(reference, this.config.runtimeConfig?.(c) ?? {});
      }
     } else {
      const sessionId = reference.sessionId;
@@ -1059,6 +1060,7 @@ export class AdapterService {
   }[];
   await Promise.all(conversations.map((c) => this.pump(c.id)));
   await this.consumeAnswers();
+  reconcileExtensionGateClosures(this.db, this.clock());
   this.projectGateTargets();
   this.projectCards();
   await this.flush();
@@ -1423,12 +1425,16 @@ export class AdapterService {
    );
   }
  }
- private decisionState(state: string, effectState: string): string {
+ private decisionState(state: string, effectState: string, evidence: Record<string, unknown>): string {
+  if (state === "superseded" && evidence.tool_executed === false) {
+   if (evidence.gate_outcome === "denied" && evidence.superseded_reason === "gate_denied" && effectState === "succeeded") return "Denied";
+   if (evidence.gate_outcome === "expired" && evidence.superseded_reason === "gate_expired" && effectState === "not_started") return "Expired";
+   if (evidence.gate_outcome === "cancelled" && evidence.superseded_reason === "gate_cancelled" && effectState === "not_started") return "Cancelled";
+  }
   if (state === "applying" || effectState === "applying") return "Applying";
   if (effectState === "unknown") return "Decision received; outcome unknown";
   if (effectState === "succeeded") return "Applied";
   if (effectState === "failed") return "Failed";
-  if (state === "expired") return "Expired";
   return state === "open" ? "Awaiting decision" : state;
  }
  private projectCards(): void {
@@ -1448,7 +1454,7 @@ export class AdapterService {
    const item = getAttention(this.db, row.item_id);
    if (!item) continue;
    // last_state stores what the card last showed, so compare in the same display vocabulary.
-   const state = this.decisionState(item.state, item.effect_state);
+   const state = this.decisionState(item.state, item.effect_state, item.evidence);
    if (row.last_revision === item.revision && row.last_state === state)
     continue;
    const id = randomUUID();

@@ -1,6 +1,12 @@
 # Configuration
 
 All configuration is optional JSON at `~/.overload/config.json`. Invalid or missing values fall back to the implementation defaults and are reported by the relevant process.
+An explicitly injected `OVERLOAD_CONFIG_PATH` must remain readable: a missing file seals the extension's bash/write/edit gate rather than reverting to optional default configuration. Only an absent default `~/.overload/config.json` is inert.
+
+Required channel sessions carry server-selected `requiredApprovalGate: true` and a canonical `approvalRoot` through start, broker metadata, and restore. The broker injects `OVERLOAD_REQUIRED_APPROVAL_GATE=1` and `OVERLOAD_RUNTIME_APPROVAL_ROOT` only for these sessions, clearing inherited authority for ordinary sessions. Required starts reject existing metadata with a different config path, root, or missing required flag. At session load the extension independently revalidates the file: missing, malformed, absent or disabled gates seal all bash/write/edit calls. Required gates need nonempty canonical `allowed_write_roots` and `require_approval_write_paths` contained in the server root, approval paths covering every allowed root, and the literal `.*` in `block_bash_patterns` to deny all bash. A bash approval-only rule is insufficient. This catches a file weakened after daemon validation; ordinary unmarked legacy configurations retain their optional gate behavior.
+
+Restore receives the current server-selected policy for the conversation, not authorization inferred from old broker metadata. Before spawning a replacement, required metadata must have `requiredApprovalGate: true` and exactly match the current canonical config file and approval root; the current strict config is revalidated. Legacy metadata without these fields, missing current authority, or config/root rotation is refused rather than silently migrated or downgraded. Resolve the previous process safely, then explicitly start a fresh session under the current policy when needed; do not hand-edit historical metadata to grant authority. Ordinary sessions without a required gate retain their existing restore semantics.
+
 
 | Key | Consumer | Meaning |
 | --- | --- | --- |
@@ -17,6 +23,7 @@ All configuration is optional JSON at `~/.overload/config.json`. Invalid or miss
 | `approval_gate.block_write_paths` | extension | Path prefixes that always deny write/edit; optional, and win over approval rules. |
 | `approval_gate.require_approval_bash_patterns` | extension | Regex patterns requiring human approve/deny via loopback mailbox; optional. |
 | `approval_gate.require_approval_write_paths` | extension | Path prefixes requiring human approve/deny; optional. |
+| `approval_gate.allowed_write_roots` | extension | Optional array of absolute, existing canonical directory paths. When present, write/edit paths resolve relative to the tool context cwd, including missing targets via their nearest existing ancestor. Outside roots (including symlink and sibling-prefix escapes) or unresolvable paths are denied; every inside write/edit requires approval regardless of `require_approval_write_paths`. An empty array denies all writes. Invalid enabled configuration fails closed for bash/write/edit. Omission preserves legacy prefix semantics. |
 | `approval_gate.timeout_ms` | extension | Human approval timeout; default `1800000`. Timeout denies. |
 | `recon_interval_ms` | recon | Reconciliation interval. |
 | `drain_grace_ms` | recon | Delay before orphaning a dead emitter's pending requests. |

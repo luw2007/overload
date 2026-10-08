@@ -3,10 +3,10 @@
 // for bash/write/edit calls while still warning once during session startup.
 // Intentionally has no package imports: pi, omp, and prime-agent expose compatible
 // extension APIs under different package names.
-import { constants, readFileSync, statSync } from "node:fs"
+import { constants, readFileSync, statSync, lstatSync, realpathSync } from "node:fs"
 import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { join, resolve, dirname, isAbsolute, relative, sep } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { execFile, execFileSync } from "node:child_process"
 
@@ -122,9 +122,57 @@ type ApprovalGate = {
   requireBash: Array<{ source: string; pattern: RegExp }>
   writePaths: string[]
   requireWritePaths: string[]
+  allowedWriteRoots?: string[]
   timeoutMs: number
   webPort: number
   misconfigured?: string
+}
+
+/** Opt-in write boundary: roots must already be canonical existing directories. */
+export function parseAllowedWriteRoots(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || !value.every((root) => typeof root === "string" && isAbsolute(root))) {
+    throw new Error("allowed_write_roots must be an array of absolute directory paths")
+  }
+  return value.map((root: string) => {
+    const canonical = realpathSync(root)
+    if (!statSync(canonical).isDirectory() || resolve(root) !== canonical) throw new Error("allowed_write_roots must contain canonical existing directories")
+    return canonical
+  })
+}
+
+export function isWithinWriteRoot(path: string, root: string): boolean {
+  const suffix = relative(root, path)
+  return suffix === "" || (suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix))
+}
+
+/** Resolve components in filesystem order: symlink/.. is not lexical normalization. */
+export function canonicalWriteTarget(path: string, cwd: string): string {
+  if (!path || !isAbsolute(cwd)) throw new Error("write path and absolute cwd are required")
+  let target = isAbsolute(path) ? sep : realpathSync(cwd)
+  let missing = false
+  for (const component of path.split(sep)) {
+    if (!component || component === ".") continue
+    if (component === "..") {
+      // A missing ancestor cannot be traversed by the actual tool's filesystem call.
+      if (missing) throw new Error("cannot traverse missing write ancestor")
+      target = dirname(target)
+      continue
+    }
+    const candidate = join(target, component)
+    if (missing) { target = candidate; continue }
+    try {
+      lstatSync(candidate)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      missing = true
+      target = candidate
+      continue
+    }
+    // Existing dangling symlinks fail here rather than becoming missing leaves.
+    target = realpathSync(candidate)
+  }
+  return target
 }
 
 function processName(value: unknown): string {
@@ -638,23 +686,24 @@ export default function overload(pi: ExtensionApi): void {
 
   async function loadApprovalGate(): Promise<void> {
     approvalGate = null
+    const required = process.env.OVERLOAD_REQUIRED_APPROVAL_GATE === "1"
     try {
       let raw: string
       try {
         raw = await readFile(process.env.OVERLOAD_CONFIG_PATH??join(homedir(), ".overload", "config.json"), "utf8")
-      } catch (error: any) {
-        if (error?.code === "ENOENT") return
+      } catch (error: unknown) {
+        if (!required && (error as NodeJS.ErrnoException)?.code === "ENOENT" && process.env.OVERLOAD_CONFIG_PATH === undefined) return
         throw error
       }
       const config = JSON.parse(raw)
       // The answerable ask talks to the control plane even with the gate off.
       if (Number.isSafeInteger(config?.web_port) && config.web_port > 0 && config.web_port <= 65535) controlPlanePort = config.web_port
       const gate = config?.approval_gate
-      if (gate === undefined) return
+      if (gate === undefined) { if (required) throw new Error("required approval_gate is absent"); return }
       if (!gate || typeof gate !== "object" || typeof gate.enabled !== "boolean") {
         throw new Error("approval_gate must contain a boolean enabled field")
       }
-      if (!gate.enabled) return
+      if (!gate.enabled) { if (required) throw new Error("required approval_gate is disabled"); return }
       const stringArray = (key: string): string[] => {
         const value = gate[key]
         if (value === undefined) return []
@@ -671,11 +720,23 @@ export default function overload(pi: ExtensionApi): void {
       const requireBash = stringArray("require_approval_bash_patterns")
       const writePaths = stringArray("block_write_paths")
       const requireWritePaths = stringArray("require_approval_write_paths")
+      const allowedWriteRoots = parseAllowedWriteRoots(gate.allowed_write_roots)
+      if (required && (!allowedWriteRoots?.length || !requireWritePaths.length || !blockBash.includes(".*"))) {
+        throw new Error("required approval_gate needs allowed_write_roots, require_approval_write_paths, and bash .* denial")
+      }
+      if (required) {
+        const authorityRoots = parseAllowedWriteRoots([process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT])
+        const authorityRoot = authorityRoots?.[0]
+        if (!authorityRoot || !allowedWriteRoots?.every(root => isWithinWriteRoot(root, authorityRoot))) throw new Error("required approval_gate roots exceed server authority")
+        const approvalRoots = parseAllowedWriteRoots(requireWritePaths)
+        if (!approvalRoots?.length || !approvalRoots.every(root => isWithinWriteRoot(root, authorityRoot)) || !allowedWriteRoots?.every(root => approvalRoots.some(approvalRoot => isWithinWriteRoot(root, approvalRoot)))) throw new Error("required approval_gate approval paths exceed authority or omit allowed roots")
+      }
       approvalGate = {
         bash: blockBash.map((source) => ({ source, pattern: new RegExp(source) })),
         requireBash: requireBash.map((source) => ({ source, pattern: new RegExp(source) })),
         writePaths,
         requireWritePaths,
+        allowedWriteRoots,
         timeoutMs,
         webPort,
       }
@@ -683,11 +744,11 @@ export default function overload(pi: ExtensionApi): void {
       warnAndSealGate(error)
     }
   }
-  function gateRule(event: any): GateRule | undefined {
+  function gateRule(event: { toolName?: string; input?: { command?: string; path?: string } }, cwd?: string): GateRule | undefined {
     const gate = approvalGate
     if (!gate || !/^(bash|write|edit)$/i.test(String(event?.toolName || ""))) return undefined
     if (gate.misconfigured) return { kind: "block", rule: "misconfigured" }
-    if (event?.toolName === "bash" && typeof event?.input?.command === "string") {
+    if (String(event?.toolName || "").toLowerCase() === "bash" && typeof event?.input?.command === "string") {
       for (const rule of gate.bash) {
         rule.pattern.lastIndex = 0
         if (rule.pattern.test(event.input.command)) return { kind: "block", rule: rule.source }
@@ -697,6 +758,16 @@ export default function overload(pi: ExtensionApi): void {
         if (rule.pattern.test(event.input.command)) return { kind: "require", rule: rule.source }
       }
       return undefined
+    }
+    if (/^(write|edit)$/i.test(String(event?.toolName || "")) && gate.allowedWriteRoots !== undefined) {
+      try {
+        const target = canonicalWriteTarget(event.input?.path || "", cwd || "")
+        if (!gate.allowedWriteRoots.some((root) => isWithinWriteRoot(target, root))) return { kind: "block", rule: "outside allowed_write_roots" }
+        if (gate.writePaths.some((path) => (event.input?.path || "").startsWith(path) || target.startsWith(path))) return { kind: "block", rule: "block_write_paths" }
+        return { kind: "require", rule: "allowed_write_roots" }
+      } catch {
+        return { kind: "block", rule: "unresolvable write path" }
+      }
     }
     if ((event?.toolName === "write" || event?.toolName === "edit") && typeof event?.input?.path === "string") {
       for (const path of gate.writePaths) {
@@ -1216,10 +1287,15 @@ export default function overload(pi: ExtensionApi): void {
       if (target) askTargets.set(event.toolCallId, target)
       emit("decision_requested", { request_id: event.toolCallId, ...questionPayload(event.input), ...(target ? { approval_id: target.approvalId, consumer_owner: "extension", target_version: target.targetVersion } : {}) })
     }
-    const rule = gateRule(event)
+    const rule = gateRule(event, ctx?.cwd)
     if (rule) {
       const decision = await waitForApproval(event, rule, ctx?.signal)
       if (decision) return decision
+      // Approval is not permission to follow a boundary changed while waiting.
+      if (approvalGate?.allowedWriteRoots !== undefined && /^(write|edit)$/i.test(tool)) {
+        const currentRule = gateRule(event, ctx?.cwd)
+        if (currentRule?.kind === "block") return { block: true, reason: `overload approval gate: ${currentRule.rule}` }
+      }
     }
     if (event?.toolName !== "bash" || !command) return
     // Shared guard: never rewrite compound commands (quoting hazards); the

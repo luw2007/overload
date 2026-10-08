@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,7 +11,7 @@ type EventRecord = { kind: string; detail?: Record<string, unknown> };
 let importCounter = 0;
 const homes: string[] = [];
 
-async function harness(config: unknown) {
+async function harness(config: unknown, beforeStart?: (home: string) => void) {
   const home = mkdtempSync(join(tmpdir(), "overload-ext-approval-"));
   homes.push(home);
   currentHome = home;
@@ -26,6 +26,7 @@ async function harness(config: unknown) {
   } as never);
   const dispatch = (name: string, event: unknown, ctx: unknown = {}) =>
     (handlers.get(name) ?? []).map((handler) => handler(event, ctx));
+  beforeStart?.(home);
   await Promise.all(dispatch("session_start", { reason: "startup" }, {
     cwd: home,
     sessionManager: { getSessionId: () => `approval-session-${importCounter}` },
@@ -172,10 +173,176 @@ describe("approval gate", () => {
     await h.close();
   });
 
+  test("confined writes wait for approval before effect, including missing relative targets", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "overload-write-root-")));
+    homes.push(root);
+    const oldFetch = globalThis.fetch;
+    let release: (() => void) | undefined;
+    let polling: (() => void) | undefined;
+    const polled = new Promise<void>((resolve) => { polling = resolve; });
+    const approved = new Promise<void>((resolve) => { release = resolve; });
+    globalThis.fetch = (async (input) => {
+      if (String(input).endsWith("/api/decision/target")) return new Response(JSON.stringify({ targetVersion: "v1" }));
+      polling?.();
+      await approved;
+      return new Response(JSON.stringify({ answer: "approve", actor: "ui", receiptId: "write-receipt" }));
+    }) as typeof fetch;
+    try {
+      const h = await harness({ approval_gate: { enabled: true, allowed_write_roots: [root], require_approval_write_paths: ["/unrelated"] } });
+      const target = join(root, "new", "file.txt");
+      const effect = Promise.all(h.dispatch("tool_call", { toolName: "write", toolCallId: "confined-write", input: { path: "new/file.txt" } }, { cwd: root })).then((results) => {
+        if (!results.some((result) => result && typeof result === "object" && "block" in result && result.block)) {
+          mkdirSync(join(root, "new"));
+          writeFileSync(target, "approved");
+        }
+      });
+      await polled;
+      expect(existsSync(target)).toBe(false);
+      release?.();
+      await effect;
+      expect(readFileSync(target, "utf8")).toBe("approved");
+      const events = await h.close();
+      expect(events.find((event) => event.kind === "decision_requested")?.detail).toMatchObject({ rule: "allowed_write_roots", gated: true });
+    } finally { globalThis.fetch = oldFetch; }
+  });
+
+  test("confined write/edit deny traversal, prefix siblings, escaping and dangling symlinks without approval", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "overload-write-boundary-")));
+    homes.push(base);
+    const root = join(base, "repo");
+    mkdirSync(root);
+    mkdirSync(join(base, "repo-other"));
+    symlinkSync(join(base, "repo-other"), join(root, "escape"));
+    symlinkSync(join(base, "missing"), join(root, "dangling"));
+    const h = await harness({ approval_gate: { enabled: true, allowed_write_roots: [root] } });
+    const oldFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => { calls++; throw new Error("outside paths must not request approval"); }) as typeof fetch;
+    try {
+      for (const toolName of ["write", "edit"]) {
+        for (const path of ["../repo-other/new", join(base, "repo-other/new"), "escape/new", "escape/../escaped.txt", "dangling/new", "../../outside"]) {
+          const result = await Promise.all(h.dispatch("tool_call", { toolName, toolCallId: `${toolName}-${path}`, input: { path } }, { cwd: root }));
+          expect(result[0]).toMatchObject({ block: true });
+          if (!result.some((entry) => entry && typeof entry === "object" && "block" in entry && entry.block)) writeFileSync(path.startsWith("/") ? path : `${root}/${path}`, "escaped");
+        }
+      }
+      expect(calls).toBe(0);
+      expect(existsSync(join(base, "repo-other/new"))).toBe(false);
+      expect(existsSync(join(base, "escaped.txt"))).toBe(false);
+      await h.close();
+    } finally { globalThis.fetch = oldFetch; }
+  });
+
+  test("invalid roots fail closed and omitted roots preserve legacy write behavior", async () => {
+    for (const roots of [["relative"], [join(tmpdir(), "overload-nonexistent-root")], "not-an-array"]) {
+      const h = await harness({ approval_gate: { enabled: true, allowed_write_roots: roots } });
+      expect((await Promise.all(h.dispatch("tool_call", { toolName: "write", toolCallId: "invalid-root", input: { path: "file" } }, { cwd: h.home })))[0]).toMatchObject({ block: true });
+      await h.close();
+    }
+    const h = await harness({ approval_gate: { enabled: true } });
+    expect((await Promise.all(h.dispatch("tool_call", { toolName: "write", input: { path: "/outside/legacy" } }, { cwd: h.home })))[0]).toBeUndefined();
+    await h.close();
+  });
+
+  test("existing inside edits require approval and denial prevents the effect", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "overload-edit-root-")));
+    homes.push(root);
+    const target = join(root, "file.txt");
+    writeFileSync(target, "original");
+    const oldFetch = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = (async (input) => {
+      requests++;
+      return new Response(JSON.stringify(String(input).endsWith("/api/decision/target") ? { targetVersion: "v1" } : { answer: "deny", actor: "ui", receiptId: "denied-edit" }));
+    }) as typeof fetch;
+    try {
+      const h = await harness({ approval_gate: { enabled: true, allowed_write_roots: [root] } });
+      const results = await Promise.all(h.dispatch("tool_call", { toolName: "edit", toolCallId: "inside-edit", input: { path: target } }, { cwd: root }));
+      if (!results.some((result) => result && typeof result === "object" && "block" in result && result.block)) writeFileSync(target, "changed");
+      expect(results[0]).toMatchObject({ block: true });
+      expect(requests).toBeGreaterThan(0);
+      expect(readFileSync(target, "utf8")).toBe("original");
+      await h.close();
+    } finally { globalThis.fetch = oldFetch; }
+  });
+
+  test("missing explicit configuration fails closed for all change tools", async () => {
+    const original = process.env.OVERLOAD_CONFIG_PATH;
+    process.env.OVERLOAD_CONFIG_PATH = join(tmpdir(), `overload-missing-config-${Date.now()}.json`);
+    try {
+      const h = await harness({ approval_gate: { enabled: false } });
+      for (const toolName of ["bash", "write", "edit"]) {
+        expect((await Promise.all(h.dispatch("tool_call", { toolName, toolCallId: `missing-${toolName}`, input: { command: "echo hi", path: "file" } }, { cwd: h.home })))[0]).toMatchObject({ block: true });
+      }
+      await h.close();
+    } finally {
+      if (original === undefined) delete process.env.OVERLOAD_CONFIG_PATH;
+      else process.env.OVERLOAD_CONFIG_PATH = original;
+    }
+  });
+
+  test("uppercase bash cannot bypass deny rules", async () => {
+    const h = await harness({ approval_gate: { enabled: true, block_bash_patterns: [".*"] } });
+    expect((await Promise.all(h.dispatch("tool_call", { toolName: "BASH", toolCallId: "uppercase-bash", input: { command: "echo hi" } })))[0]).toMatchObject({ block: true });
+    await h.close();
+  });
+
   test("git push emits consequential tool activity", async () => {
     const h = await harness({ approval_gate: { enabled: false } });
     await Promise.all(h.dispatch("tool_call", { toolName: "bash", toolCallId: "push-call", input: { command: "git push origin main" } }));
     const events = await h.close();
     expect(events.some((item) => item.kind === "tool_activity" && item.detail?.consequential === true && item.detail?.class === "push")).toBe(true);
   });
+});
+
+test("required session seals configuration removed or weakened before extension load", async () => {
+  const oldRequired = process.env.OVERLOAD_REQUIRED_APPROVAL_GATE;
+  const oldPath = process.env.OVERLOAD_CONFIG_PATH;
+  const oldRoot = process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT;
+  process.env.OVERLOAD_REQUIRED_APPROVAL_GATE = "1";
+  delete process.env.OVERLOAD_CONFIG_PATH;
+  try {
+    for (const replacement of [undefined, {}, { approval_gate: { enabled: false } }, { approval_gate: { enabled: true } }, "malformed", { approval_gate: { enabled: true, allowed_write_roots: [], require_approval_write_paths: ["/"], require_approval_bash_patterns: [".*"] } }]) {
+      const h = await harness({}, home => {
+        const path = join(home, ".overload", "config.json");
+        process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT = realpathSync(home);
+        if (replacement === undefined) rmSync(path);
+        else writeFileSync(path, replacement === "malformed" ? "{" : JSON.stringify(replacement));
+      });
+      for (const toolName of ["bash", "write", "edit"]) {
+        expect((await Promise.all(h.dispatch("tool_call", { toolName, toolCallId: toolName, input: { command: "echo safe", path: join(h.home, "file") } })))[0]).toMatchObject({ block: true });
+      }
+      await h.close();
+    }
+    for (const weakness of ["outside", "missing-bash", "missing-write", "outside-approval", "uncovered"]) {
+      const h = await harness({}, home => {
+        process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT = realpathSync(home);
+        writeFileSync(join(home, ".overload", "config.json"), JSON.stringify({ approval_gate: {
+          enabled: true, allowed_write_roots: [weakness === "outside" ? realpathSync(tmpdir()) : realpathSync(home)],
+          require_approval_write_paths: weakness === "missing-write" ? [] : [weakness === "outside-approval" ? realpathSync(tmpdir()) : weakness === "uncovered" ? realpathSync(join(home, ".overload")) : realpathSync(home)],
+          block_bash_patterns: weakness === "missing-bash" ? [] : [".*"], require_approval_bash_patterns: [".*"],
+        } }));
+      });
+      expect((await Promise.all(h.dispatch("tool_call", { toolName: "bash", toolCallId: weakness, input: { command: "echo hi" } })))[0]).toMatchObject({ block: true });
+      await h.close();
+    }
+    const valid = await harness({}, home => {
+      process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT = realpathSync(home);
+      writeFileSync(join(home, ".overload", "config.json"), JSON.stringify({ approval_gate: {
+        enabled: true, allowed_write_roots: [realpathSync(home)], require_approval_write_paths: [realpathSync(home)],
+        block_bash_patterns: [".*"],
+      } }));
+    });
+    const validResult = (await Promise.all(valid.dispatch("tool_call", { toolName: "bash", toolCallId: "valid", input: { command: "blocked" } })))[0];
+    expect(validResult).toMatchObject({ block: true, reason: "overload approval gate: .*" });
+    await valid.close();
+    delete process.env.OVERLOAD_REQUIRED_APPROVAL_GATE;
+    const legacy = await harness({ approval_gate: { enabled: false } });
+    expect((await Promise.all(legacy.dispatch("tool_call", { toolName: "bash", input: { command: "echo hi" } })))[0]).toBeUndefined();
+    await legacy.close();
+  } finally {
+    if (oldRequired === undefined) delete process.env.OVERLOAD_REQUIRED_APPROVAL_GATE; else process.env.OVERLOAD_REQUIRED_APPROVAL_GATE = oldRequired;
+    if (oldPath === undefined) delete process.env.OVERLOAD_CONFIG_PATH; else process.env.OVERLOAD_CONFIG_PATH = oldPath;
+    if (oldRoot === undefined) delete process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT; else process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT = oldRoot;
+  }
 });

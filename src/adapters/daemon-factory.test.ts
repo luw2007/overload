@@ -168,6 +168,28 @@ describe("ADP-01 startAdapterDaemon factory injection", () => {
     const origStop = failingChannel.stop.bind(failingChannel);
     failingChannel.stop = async () => { stopped = true; await origStop(); };
     await expect(startAdapterDaemon(fakeFactories(failingChannel, root))).rejects.toThrow("connect failed");
+    const succeeding = await startAdapterDaemon(fakeFactories(new FakeChannel(), root));
+    await succeeding.stop();
     expect(stopped).toBe(true);
   }, 20_000);
+  test("same app cannot start with a different database until owner stops", async () => {
+    const { root, channel } = setupEnv();
+    const first = await startAdapterDaemon(fakeFactories(channel, root));
+    try {
+      process.env.OVERLOAD_ANSWERS_PATH = join(root, "other.db");
+      const competing = new FakeChannel();
+      await expect(startAdapterDaemon(fakeFactories(competing, root))).rejects.toThrow(/already running/);
+      expect(competing.started).toBe(0);
+    } finally { await first.stop(); }
+    const next = await startAdapterDaemon(fakeFactories(new FakeChannel(), root));
+    await next.stop();
+  }, 20_000);
+  test("invalid required policy fails before any channel effect", async () => {
+    const { root, channel } = setupEnv();
+    saveEnv(["OVERLOAD_REQUIRED_RUNTIME_CONFIG_CHATS", "OVERLOAD_RUNTIME_APPROVAL_ROOT"]);
+    process.env.OVERLOAD_REQUIRED_RUNTIME_CONFIG_CHATS = "chat-1";
+    process.env.OVERLOAD_RUNTIME_APPROVAL_ROOT = root;
+    await expect(startAdapterDaemon(fakeFactories(channel, root))).rejects.toThrow(/runtimeConfigPath/);
+    expect(channel.started).toBe(0);
+  });
 });

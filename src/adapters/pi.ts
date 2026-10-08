@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, chmodSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentRuntime, CommandReceipt, RuntimeEvent, SessionHandle, SessionReference, StartRequest, TurnRequest } from "./types";
+import type { AgentRuntime, CommandReceipt, RuntimeEvent, RuntimePolicy, SessionHandle, SessionReference, StartRequest, TurnRequest } from "./types";
+import { validateRequiredRuntimePolicy } from "./runtime-config";
 import { brokerMetadataPath, brokerSocketPath, connectPiBroker, readBrokerMetadata, runPiBroker, stopPiBroker, type PiBrokerClient, type PiBrokerConfig } from "./pi-broker";
 import {processLiveness} from './pi-broker';
 
@@ -156,6 +157,7 @@ export class PiRuntime implements AgentRuntime {
     const existing = metadataFor(this.runtimeRoot, request.sessionId);
     if (existing) {
       if (existing.ownerId !== request.ownerId || existing.cwd !== request.cwd) throw new Error("runtime_ownership_mismatch");
+      if (request.requiredApprovalGate === true && (existing.requiredApprovalGate !== true || existing.configPath !== request.configPath || existing.approvalRoot !== request.approvalRoot)) throw new Error("runtime_approval_gate_mismatch");
       if (existing.state === "running" || existing.state === "starting") return this.connectFromMetadata(existing, request.sessionId);
       throw new Error("runtime_session_exists_stopped");
     }
@@ -170,7 +172,7 @@ export class PiRuntime implements AgentRuntime {
       cwd: request.cwd,
       command: this.command,
       stderrLimit: this.stderrLimit,
-      coordinator:request.coordinator,readOnly:request.readOnly,configPath:request.configPath??process.env.OVERLOAD_CONFIG_PATH,
+      coordinator:request.coordinator,readOnly:request.readOnly,configPath:request.configPath??process.env.OVERLOAD_CONFIG_PATH,requiredApprovalGate:request.requiredApprovalGate===true,approvalRoot:request.approvalRoot,
       ...(request.provider ? { provider: request.provider } : {}),
       ...(request.model ? { model: request.model } : {}),
     };
@@ -190,9 +192,15 @@ export class PiRuntime implements AgentRuntime {
     return this.connectFromMetadata(metadata, reference.sessionId, reference);
   }
 
-  async restore(reference: SessionReference): Promise<SessionHandle> {
+  async restore(reference: SessionReference, policy: RuntimePolicy): Promise<SessionHandle> {
     if (reference.runtimeKind !== this.kind) throw new Error("runtime_kind_mismatch");
     const metadata = metadataFor(this.runtimeRoot, reference.sessionId);
+    // Historical metadata is continuity evidence, never current authorization.
+    // Reject strict legacy/rotated authority instead of silently migrating it.
+    if (metadata?.requiredApprovalGate === true || policy?.requiredApprovalGate === true) {
+      if (metadata?.requiredApprovalGate !== true || policy?.requiredApprovalGate !== true || !metadata.configPath || !metadata.approvalRoot || metadata.configPath !== policy.configPath || metadata.approvalRoot !== policy.approvalRoot) throw new Error("runtime_approval_gate_mismatch");
+      validateRequiredRuntimePolicy(policy);
+    }
     if (metadata?.state === "running" || metadata?.state === "starting") {
       if (metadata.ownerId !== reference.ownerId || metadata.cwd !== reference.cwd) throw new Error("runtime_ownership_mismatch");
       const broker=metadata.brokerIdentity,child=metadata.childIdentity;
@@ -213,7 +221,7 @@ export class PiRuntime implements AgentRuntime {
       command: this.command,
       stderrLimit: this.stderrLimit,
       sessionFile,
-      coordinator:metadata.coordinator,readOnly:metadata.readOnly,provider:metadata.provider,model:metadata.model,configPath:metadata.configPath,
+      coordinator:metadata.coordinator,readOnly:metadata.readOnly,provider:metadata.provider,model:metadata.model,configPath:metadata.configPath,requiredApprovalGate:metadata.requiredApprovalGate,approvalRoot:metadata.approvalRoot,
     };
     await this.spawnBroker(config);
     return this.connectFromMetadata({ ...config }, reference.sessionId, reference);

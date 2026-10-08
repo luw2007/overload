@@ -5,7 +5,6 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AdapterService } from "./service";
-import { createWork, upsertAttention } from "../control/store";
 import { Database } from "bun:sqlite";
 import { startWebServer } from "../web/server";
 import type {
@@ -15,6 +14,7 @@ import type {
  ChannelEvent,
  ChannelMessage,
  SessionReference,
+ RuntimePolicy,
 } from "./types";
 function harness() {
  const root = mkdtempSync(join(tmpdir(), "adapter-core-")),
@@ -172,7 +172,7 @@ test("queued turns restore a stopped runtime and submit only once", async () => 
   Object.assign(h.runtime, {
    capabilities: { restore: true, answer: true, steer: false },
    async connect() { throw new Error("runtime_not_live"); },
-   async restore() { restores++; return await this.start(reference); },
+   async restore(_reference: SessionReference, _policy: RuntimePolicy) { restores++; return await this.start(reference); },
   });
   await resumed.start();
   await resumed.tick();
@@ -931,6 +931,139 @@ test("A09 the web entry that loses the race gets 409 carrying current state and 
   expect(raced.receipts()).toEqual({ n: 1 });
  } finally {
   raced?.server.stop(true);
+  await f.close();
+ }
+});
+
+test("current per-conversation policy reaches restore and rejection prevents submitting queued work with meaningful error delivery", async () => {
+ const f = harness();
+ try {
+  const policies: Record<string, RuntimePolicy> = {
+   "chat-strict": {
+    configPath: "/tmp/strict-gate.json",
+    requiredApprovalGate: true,
+    approvalRoot: "/tmp/strict-root",
+   },
+   "chat-ordinary": {
+    configPath: "/tmp/ordinary-gate.json",
+    requiredApprovalGate: false,
+   },
+  };
+
+  const restoreCalls: { reference: SessionReference; policy: RuntimePolicy }[] = [];
+  let rejectRestore = true;
+
+  f.runtime = {
+   ...f.runtime,
+   capabilities: { restore: true, answer: true, steer: false },
+   async connect() {
+    throw new Error("runtime_not_live");
+   },
+   async restore(reference, policy) {
+    restoreCalls.push({ reference, policy });
+    if (rejectRestore) {
+     throw new Error("runtime_approval_gate_mismatch");
+    }
+    return f.runtime.start(reference);
+   },
+  };
+
+  const service = new AdapterService(f.db, {
+   runtime: f.runtime,
+   channels: [f.channel],
+   cwd: f.root,
+   authorize: () => ({ ownerId: "operator", workId: null }),
+   runtimeConfig: (c) => {
+    const address = JSON.parse(c.address) as { chatId: string };
+    return policies[address.chatId];
+   },
+  });
+
+  await service.start();
+
+  // 1. Initial message starts conversation and completes turn 1
+  await service.accept(f.event("first-msg", "chat-strict"));
+  await service.tick();
+
+  const conv = f.db.query("SELECT id,session_reference FROM conversations WHERE binding_key LIKE '%chat-strict%'").get() as { id: string; session_reference: string };
+  const reference = JSON.parse(conv.session_reference) as SessionReference;
+
+  service.recordRuntimeEvent(conv.id, {
+   eventId: "ev-done",
+   sessionId: reference.sessionId,
+   turnId: f.submitted[0],
+   kind: "completed",
+   text: "done",
+  });
+  await service.tick();
+
+  // Stop service to clear active handles, simulating runtime disconnected
+  await service.stop();
+
+  // Create resumed service instance with the same database and runtimeConfig
+  const resumed = new AdapterService(f.db, {
+   runtime: f.runtime,
+   channels: [f.channel],
+   cwd: f.root,
+   authorize: () => ({ ownerId: "operator", workId: null }),
+   runtimeConfig: (c) => {
+    const address = JSON.parse(c.address) as { chatId: string };
+    return policies[address.chatId];
+   },
+  });
+
+  await resumed.start();
+
+  // 2. Queue second message while runtime is disconnected
+  await resumed.accept(f.event("second-msg", "chat-strict"));
+  await resumed.tick();
+  await resumed.flush();
+
+  // Assertions for rejected restore:
+  // a) Current per-conversation policy reached restore
+  expect(restoreCalls).toHaveLength(1);
+  expect(restoreCalls[0].policy).toEqual({
+   configPath: "/tmp/strict-gate.json",
+   requiredApprovalGate: true,
+   approvalRoot: "/tmp/strict-root",
+  });
+  expect(restoreCalls[0].reference.sessionId).toBe(reference.sessionId);
+
+  // b) Queued work was NOT submitted to runtime
+  expect(f.submitted).toHaveLength(1); // turn 2 was not submitted
+
+  // c) Queued turn state is preserved as 'queued'
+  const turnRows = f.db.query("SELECT sequence,state FROM conversation_turns WHERE conversation_id=? ORDER BY sequence").all(conv.id) as { sequence: number; state: string }[];
+  expect(turnRows).toEqual([
+   { sequence: 1, state: "completed" },
+   { sequence: 2, state: "queued" },
+  ]);
+
+  // d) Meaningful error delivery enqueued and sent to channel
+  const delivery = f.sent.find((m) => m.text?.includes("runtime_approval_gate_mismatch"));
+  expect(delivery).toBeDefined();
+  expect(delivery?.text).toContain("现场不可连接；已保留排队消息。runtime_approval_gate_mismatch");
+
+  const dbDelivery = f.db.query("SELECT state FROM channel_deliveries WHERE business_key=?").get("runtime-unavailable:" + conv.id) as { state: string } | null;
+  expect(dbDelivery).toBeTruthy();
+  expect(dbDelivery?.state).toBe("sent");
+
+  // 3. When restore succeeds, policy still reaches restore and queued work is submitted
+  rejectRestore = false;
+  await resumed.tick();
+  await resumed.flush();
+
+  expect(restoreCalls).toHaveLength(2);
+  expect(restoreCalls[1].policy).toEqual(policies["chat-strict"]);
+  expect(f.submitted).toHaveLength(2);
+  const updatedTurnRows = f.db.query("SELECT sequence,state FROM conversation_turns WHERE conversation_id=? ORDER BY sequence").all(conv.id) as { sequence: number; state: string }[];
+  expect(updatedTurnRows).toEqual([
+   { sequence: 1, state: "completed" },
+   { sequence: 2, state: "running" },
+  ]);
+
+  await resumed.stop();
+ } finally {
   await f.close();
  }
 });
