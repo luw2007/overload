@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentRuntime, CommandReceipt, RuntimeEvent, RuntimePolicy, SessionHandle, SessionReference, StartRequest, TurnRequest } from "./types";
 import { validateRequiredRuntimePolicy } from "./runtime-config";
-import { brokerMetadataPath, brokerSocketPath, connectPiBroker, readBrokerMetadata, runPiBroker, stopPiBroker, type PiBrokerClient, type PiBrokerConfig } from "./pi-broker";
+import { brokerMetadataPath, brokerSocketPath, connectPiBroker, readBrokerMetadata, runPiBroker, stopPiBroker, type BrokerMetadata, type PiBrokerClient, type PiBrokerConfig } from "./pi-broker";
 import {processLiveness} from './pi-broker';
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
@@ -39,8 +39,17 @@ type BrokerProcess = { unref?: () => void; exited?: Promise<number> };
 
 const defaultRuntimeRoot = join(homedir(), ".overload", "runtime");
 const defaultBrokerScript = join(import.meta.dir, "pi-broker.ts");
-function metadataFor(root: string, sessionId: string): ReturnType<typeof readBrokerMetadata> {
+function metadataFor(root: string, sessionId: string): BrokerMetadata | null {
   return readBrokerMetadata(brokerMetadataPath(root, sessionId));
+}
+
+function validateMetadataPolicy(metadata: BrokerMetadata | null, policy: RuntimePolicy): void {
+  // Historical metadata proves continuity, never current authorization.
+  // Reject legacy/rotated strict authority instead of silently migrating it.
+  if (metadata?.requiredApprovalGate === true || policy.requiredApprovalGate === true) {
+    if (metadata?.requiredApprovalGate !== true || policy.requiredApprovalGate !== true || !metadata.configPath || !metadata.approvalRoot || metadata.configPath !== policy.configPath || metadata.approvalRoot !== policy.approvalRoot) throw new Error("runtime_approval_gate_mismatch");
+    validateRequiredRuntimePolicy(policy);
+  }
 }
 
 function sameReference(left: SessionReference, right: SessionReference): boolean {
@@ -192,15 +201,18 @@ export class PiRuntime implements AgentRuntime {
     return this.connectFromMetadata(metadata, reference.sessionId, reference);
   }
 
+  validatePolicy(reference: SessionReference, policy: RuntimePolicy): void {
+    if (reference.runtimeKind !== this.kind) throw new Error("runtime_kind_mismatch");
+    const metadata = metadataFor(this.runtimeRoot, reference.sessionId);
+    if (!metadata) throw new Error("runtime_metadata_missing");
+    if (metadata.ownerId !== reference.ownerId || metadata.cwd !== reference.cwd) throw new Error("runtime_ownership_mismatch");
+    validateMetadataPolicy(metadata, policy);
+  }
+
   async restore(reference: SessionReference, policy: RuntimePolicy): Promise<SessionHandle> {
     if (reference.runtimeKind !== this.kind) throw new Error("runtime_kind_mismatch");
     const metadata = metadataFor(this.runtimeRoot, reference.sessionId);
-    // Historical metadata is continuity evidence, never current authorization.
-    // Reject strict legacy/rotated authority instead of silently migrating it.
-    if (metadata?.requiredApprovalGate === true || policy?.requiredApprovalGate === true) {
-      if (metadata?.requiredApprovalGate !== true || policy?.requiredApprovalGate !== true || !metadata.configPath || !metadata.approvalRoot || metadata.configPath !== policy.configPath || metadata.approvalRoot !== policy.approvalRoot) throw new Error("runtime_approval_gate_mismatch");
-      validateRequiredRuntimePolicy(policy);
-    }
+    validateMetadataPolicy(metadata, policy);
     if (metadata?.state === "running" || metadata?.state === "starting") {
       if (metadata.ownerId !== reference.ownerId || metadata.cwd !== reference.cwd) throw new Error("runtime_ownership_mismatch");
       const broker=metadata.brokerIdentity,child=metadata.childIdentity;

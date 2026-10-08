@@ -191,7 +191,7 @@ export type PiBrokerConfig = {
   approvalRoot?:string;
 };
 
-type BrokerMetadata = PiBrokerConfig & { pid: number; brokerIdentity?:ProcessIdentity;childIdentity?:ProcessIdentity;state: "starting" | "running" | "stopped"; stderrTail?: string; exitCode?: number; updatedAt: number };
+export type BrokerMetadata = PiBrokerConfig & { pid: number; brokerIdentity?:ProcessIdentity;childIdentity?:ProcessIdentity;state: "starting" | "running" | "stopped"; stderrTail?: string; exitCode?: number; updatedAt: number };
 type ClientState = { socket: Socket; framer: JsonlFramer; hello: boolean };
 type PendingCommand = { socket: Socket; commandId: string; turnId?: string; type: string };
 type JournalRow = { seq: number; event: RuntimeEvent };

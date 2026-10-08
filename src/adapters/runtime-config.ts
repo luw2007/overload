@@ -57,7 +57,7 @@ function validateConfig(path: string, strict: boolean, root?: string): void {
   }
 }
 
-/** Revalidate current strict authority before creating a replacement runtime. */
+/** Revalidate current strict authority before reconnect submission or replacement. */
 export function validateRequiredRuntimePolicy(policy: { configPath?: string; approvalRoot?: string }): void {
   if (!policy.configPath || !policy.approvalRoot) throw new Error("runtime_approval_gate_missing");
   const root = directory(policy.approvalRoot, "OVERLOAD_RUNTIME_APPROVAL_ROOT");

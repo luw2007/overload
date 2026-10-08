@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { ChannelAdapter, ChannelEvent, ChannelMessage, ChannelAddress, SessionReference } from '../../src/adapters/types';
 import type { Conversation, StoredTurn } from '../../src/adapters/store';
+import type { Subprocess } from 'bun';
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type JsonObject = { [key: string]: Json };
@@ -71,13 +72,37 @@ const copiedProvider = await selectedConfig();
 function collectSecrets(value: unknown) { if (typeof value === 'string' && value.length > 3) secrets.add(value); else if (value && typeof value === 'object') for (const [k, v] of Object.entries(value)) if (k !== 'type') collectSecrets(v); }
 if (auth) collectSecrets(auth);
 const root = realpathSync(mkdtempSync(join(tmpdir(), 'overload-browser-e2e-')));
-chmodSync(root, 0o700);
+const copiedCredentialPaths = new Set<string>();
+const resourceCleanup: (() => unknown | Promise<unknown>)[] = [];
+const spawnedBrokers: { sessionId: string; process: Subprocess; brokerOnly: boolean }[] = [];
+let cleanupFailure: Error | undefined, stopping = false, error: string | null = null;
+let runtimeCleanup: (() => Promise<unknown[]>) | undefined;
+let takeSnapshot: (() => unknown) | undefined;
+let drain: (() => Promise<void>) | undefined;
+let stopRequested!: () => void;
+const lifetime = new Promise<void>(resolve => { stopRequested = resolve; });
+const cleanupCredentials = () => { for (const path of copiedCredentialPaths) try { if (existsSync(path)) unlinkSync(path); } catch (e) { cleanupFailure ??= new Error(`credential cleanup failed: ${String(e)}`); } };
+const requestStop = () => { stopping = true; stopRequested(); };
+const onFailure = (failure: unknown) => { const detail = String(failure instanceof Error ? failure.message : failure); error = error ? `${error}; ${detail}` : detail; process.exitCode = 1; requestStop(); };
+const onSignal = () => requestStop();
+console.log(JSON.stringify({ root }));
+process.on('SIGINT', onSignal); process.on('SIGTERM', onSignal);
+process.on('uncaughtException', onFailure); process.on('unhandledRejection', onFailure);
+const failAt = (phase: string) => { if (originalEnv.OVERLOAD_BROWSER_E2E_FAIL_AT === phase) throw new Error(`Injected startup failure: ${phase}`); if (stopping) throw new Error('Startup interrupted'); };
 const home = join(root, 'home'), agent = join(home, '.pi', 'agent'), overload = join(home, '.overload');
 const repo = join(root, 'repo'), runtimeRoot = join(root, 'runtime');
+function sanitized<T>(value: T): T {
+  let text = JSON.stringify(value);
+  for (const secret of secrets) if (secret.length > 3) text = text.replaceAll(JSON.stringify(secret).slice(1, -1), '[redacted]');
+  return JSON.parse(text);
+}
+try {
+chmodSync(root, 0o700);
 for (const dir of [home, agent, overload, repo, runtimeRoot, join(overload, 'spool')]) mkdirSync(dir, { recursive: true, mode: 0o700 });
 const privateJson = (path: string, value: unknown) => { writeFileSync(path, JSON.stringify(value, null, 2), { mode: 0o600 }); chmodSync(path, 0o600); };
-if (copiedProvider) privateJson(join(agent, 'models.json'), { providers: { [provider]: copiedProvider } });
-if (auth) privateJson(join(agent, 'auth.json'), { [provider]: auth });
+if (copiedProvider) { const path = join(agent, 'models.json'); copiedCredentialPaths.add(path); privateJson(path, { providers: { [provider]: copiedProvider } }); }
+if (auth) { const path = join(agent, 'auth.json'); copiedCredentialPaths.add(path); privateJson(path, { [provider]: auth }); }
+failAt('credentials');
 privateJson(join(agent, 'settings.json'), { defaultProvider: provider, defaultModel: model, defaultThinkingLevel: 'off', enableSkills: false });
 writeFileSync(join(overload, 'host'), 'browser-e2e\n', { mode: 0o600 });
 // A narrow inherited environment prevents accidental access to other credentials or production roots.
@@ -92,18 +117,16 @@ if (!copiedProvider && !auth) {
 }
 const ledgerPath = join(overload, 'ledger.db'), controlPath = join(overload, 'orchestrator-answers.db'), orchestratorPath = join(overload, 'orchestrator.db');
 Object.assign(process.env, { OVERLOAD_LEDGER_PATH: ledgerPath, OVERLOAD_ANSWERS_PATH: controlPath, OVERLOAD_ORCHESTRATOR_PATH: orchestratorPath, OVERLOAD_SPOOL_ROOT: overload });
+failAt('import');
 const [{ PiRuntime }, { AdapterService }, { startWebServer }, { initializeLedger, scanOnce }, { openMailbox, expireActiveTargets, reconcileEffectEvents }, broker] = await Promise.all([
   import('../../src/adapters/pi'), import('../../src/adapters/service'), import('../../src/web/server'), import('../../src/ingest/ingest'), import('../../src/decision-bot/mailbox'), import('../../src/adapters/pi-broker'),
 ]);
-const db = openMailbox(controlPath), ledger = new Database(ledgerPath);
+const db = openMailbox(controlPath); resourceCleanup.push(() => db.close());
+failAt('database');
+const ledger = new Database(ledgerPath); resourceCleanup.push(() => ledger.close());
 initializeLedger(ledger);
 const scope = randomUUID(), instanceId = `browser-${scope}`, tenantId = 'local-browser', actor = 'local-e2e-operator';
 const identity = { instanceId, tenantId, userId: actor };
-function sanitized<T>(value: T): T {
-  let text = JSON.stringify(value);
-  for (const secret of secrets) if (secret.length > 3) text = text.replaceAll(JSON.stringify(secret).slice(1, -1), '[redacted]');
-  return JSON.parse(text);
-}
 type Projection = { messageId: string; version: number; message: ChannelMessage; history: { at: number; message: ChannelMessage }[] };
 const channelOperations = new Set<Promise<void>>();
 class BrowserChannel implements ChannelAdapter {
@@ -136,27 +159,88 @@ const channel = new BrowserChannel(), runtime = new PiRuntime({
     const configDir = join(runtimeRoot, 'config');
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const configPath = join(configDir, `${config.sessionId}-${randomUUID()}.json`);
+    // Register before any write: failed spawn and early broker exit cannot
+    // delegate token removal to the broker's one-shot handoff unlink.
+    copiedCredentialPaths.add(configPath);
+    copiedCredentialPaths.add(config.metadataPath);
+    copiedCredentialPaths.add(broker.ownershipLockPath(config.metadataPath));
+    copiedCredentialPaths.add(broker.brokerLockPath(config.metadataPath));
+    collectSecrets(config.ownerToken);
+    if (config.coordinator) collectSecrets(config.coordinator.token);
     privateJson(configPath, config);
-    const child = Bun.spawn([process.execPath, 'run', join(import.meta.dir, '../../src/adapters/pi-broker.ts'), '--pi-broker-file', configPath], {
+    failAt('spawn');
+    // Exercise the actual broker entrypoint's pre-config failure: without a
+    // handoff argument it exits before config read or Pi child creation.
+    const brokerOnly = originalEnv.OVERLOAD_BROWSER_E2E_FAIL_AT === 'broker-early-exit';
+    const argv = [process.execPath, 'run', join(import.meta.dir, '../../src/adapters/pi-broker.ts'), '--pi-broker-file', ...(brokerOnly ? [] : [configPath])];
+    const child = Bun.spawn(argv, {
       cwd: config.cwd, env: { ...process.env }, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', detached: true,
     });
+    spawnedBrokers.push({ sessionId: config.sessionId, process: child, brokerOnly });
     child.unref();
+    if (brokerOnly) { await child.exited; failAt('broker-early-exit'); }
   },
 });
+const references = new Map<string, SessionReference>();
+runtimeCleanup = async () => {
+  // Track spawns even before AdapterService binds a conversation.
+  for (const spawned of spawnedBrokers) {
+    let metadata = broker.readBrokerMetadata(broker.brokerMetadataPath(runtimeRoot, spawned.sessionId));
+    for (let i = 0; i < 50 && !metadata?.childIdentity && spawned.process.exitCode === null; i++) {
+      await Bun.sleep(100);
+      metadata = broker.readBrokerMetadata(broker.brokerMetadataPath(runtimeRoot, spawned.sessionId));
+    }
+    if (metadata) references.set(metadata.sessionId, { runtimeKind: 'pi', sessionId: metadata.sessionId, ownerId: metadata.ownerId, cwd: metadata.cwd });
+  }
+  const shutdowns = [];
+  for (const spawned of spawnedBrokers) {
+    if (spawned.brokerOnly) {
+      // This owned broker exited before config read; no runtime child exists.
+      await spawned.process.exited;
+      shutdowns.push({ sessionId: spawned.sessionId, result: { exitedBeforeRuntime: true }, childIdentity: null, brokerIdentity: null, childState: 'dead', brokerState: 'dead', spawnedBrokerPid: spawned.process.pid });
+      continue;
+    }
+    const ref = references.get(spawned.sessionId);
+    const metadata = broker.readBrokerMetadata(broker.brokerMetadataPath(runtimeRoot, spawned.sessionId));
+    let result: unknown = { error: 'Owned spawn lacks identity metadata; retained for manual reconciliation' };
+    if (originalEnv.OVERLOAD_BROWSER_E2E_FAIL_AT === 'shutdown-uncertain') result = { error: 'Injected shutdown uncertainty' };
+    else if (ref) try { result = await runtime.shutdown(ref); } catch (e) { result = { error: String(e instanceof Error ? e.message : e) }; }
+    const child = metadata?.childIdentity, parent = metadata?.brokerIdentity;
+    let childState = child ? broker.processLiveness(child.pid, child.startIdentity, child.bootIdentity) : 'unknown';
+    let brokerState = parent ? broker.processLiveness(parent.pid, parent.startIdentity, parent.bootIdentity) : 'unknown';
+    for (let i = 0; i < 50 && (childState === 'alive' || brokerState === 'alive'); i++) {
+      await Bun.sleep(100);
+      childState = child ? broker.processLiveness(child.pid, child.startIdentity, child.bootIdentity) : 'unknown';
+      brokerState = parent ? broker.processLiveness(parent.pid, parent.startIdentity, parent.bootIdentity) : 'unknown';
+    }
+    shutdowns.push({ sessionId: spawned.sessionId, result, childIdentity: child ?? null, brokerIdentity: parent ?? null, childState, brokerState, spawnedBrokerPid: spawned.process.pid });
+  }
+  return shutdowns;
+};
+if (['before-spawn', 'spawn', 'broker-early-exit', 'after-spawn', 'shutdown-uncertain'].includes(originalEnv.OVERLOAD_BROWSER_E2E_FAIL_AT ?? '') || originalEnv.OVERLOAD_BROWSER_E2E_SMOKE_START === '1') {
+  failAt('before-spawn');
+  await runtime.start({ sessionId: 'cleanup-smoke', ownerId: 'cleanup-smoke', cwd: repo, provider, model });
+  const metadata = broker.readBrokerMetadata(broker.brokerMetadataPath(runtimeRoot, 'cleanup-smoke'));
+  if (!metadata?.childIdentity) throw new Error('Startup smoke requires actual child identity');
+  failAt('after-spawn');
+  failAt('shutdown-uncertain');
+}
+failAt('server');
 const dashboard = startWebServer({ ledgerPath, controlPath, orchestratorPath, spoolRoot: overload, port: 0, actor });
+resourceCleanup.push(() => dashboard.stop(true));
 const dashboardUrl = `http://127.0.0.1:${dashboard.port}`;
 type Kind = 'approve' | 'deny' | 'expire';
 type Scenario = { id: string; kind: Kind; prompt: string; markerPath: string; expectedContent: string; address: ChannelAddress; configPath: string };
 type Action = { eventId: string; messageId: string; itemId: string; revision: Json | undefined; answer: string; status: number; error: string | null; at: number };
 const scenarios: Scenario[] = [], actions: Action[] = [];
-let error: string | null = null, stopping = false, pending: Promise<void> = Promise.resolve();
+let pending: Promise<void> = Promise.resolve();
 const service = new AdapterService(db, {
   runtime, channels: [channel], cwd: repo, provider, model,
   authorize: (i, a) => i.instanceId === instanceId && i.tenantId === tenantId && i.userId === actor && a.instanceId === instanceId && a.tenantId === tenantId && scenarios.some(s => s.address.chatId === a.chatId && s.address.rootMessageId === a.rootMessageId) ? actor : null,
   runtimeConfig: c => { const a = JSON.parse(c.address); const s = scenarios.find(s => s.address.chatId === a.chatId && s.address.rootMessageId === a.rootMessageId); if (!s) throw new Error('scenario_runtime_policy_missing'); return { configPath: s.configPath, requiredApprovalGate: true, approvalRoot: repo }; },
 });
+resourceCleanup.push(() => service.stop());
 await service.start();
-const references = new Map<string, SessionReference>();
 function conversation(s: Scenario): Conversation | null {
   // Schema-owned rows from ensureAdapterSchema; Bun SQLite cannot infer result types.
   return db.query('SELECT * FROM conversations WHERE binding_key=?').get(JSON.stringify([instanceId, tenantId, s.address.chatId, s.address.rootMessageId])) as Conversation | null;
@@ -187,6 +271,7 @@ const interval = setInterval(() => {
   ticking = true;
   pending = tick().catch(e => { error = String(e instanceof Error ? e.message : e); }).finally(() => { ticking = false; });
 }, 500);
+drain = async () => { clearInterval(interval); await pending; await Promise.allSettled([...channelOperations]); };
 function forbidden(request: Request, actualPort: number): boolean {
   if (request.headers.get('host') !== `127.0.0.1:${actualPort}`) return true;
   if (request.method === 'GET') return false;
@@ -225,40 +310,35 @@ const ui = Bun.serve({ hostname: '127.0.0.1', port, async fetch(request, server)
   }
   return Response.json({ error: 'not_found' }, { status: 404 });
 } });
+resourceCleanup.push(() => ui.stop(true));
+takeSnapshot = snapshot;
 console.log(JSON.stringify({ root, browserUrl: `http://127.0.0.1:${ui.port}`, dashboardUrl, provider, model }));
-let shutdownPromise: Promise<void> | undefined;
-async function shutdown() {
-  if (shutdownPromise) return shutdownPromise;
-  shutdownPromise = (async () => {
-    stopping = true; clearInterval(interval); await pending;
-    await Promise.allSettled([...channelOperations]);
-    snapshot();
-    // Failed startup can persist an owned child before AdapterService binds a conversation.
-    const metadataDir = join(runtimeRoot, 'metadata');
-    if (existsSync(metadataDir)) for (const name of readdirSync(metadataDir)) {
-      if (!name.endsWith('.json')) continue;
-      const metadata = broker.readBrokerMetadata(join(metadataDir, name));
-      if (metadata) references.set(metadata.sessionId, { runtimeKind: 'pi', sessionId: metadata.sessionId, ownerId: metadata.ownerId, cwd: metadata.cwd });
-    }
-    const identities = [...references.values()].map(ref => ({ ref, metadata: broker.readBrokerMetadata(broker.brokerMetadataPath(runtimeRoot, ref.sessionId)) }));
-    const shutdowns = [];
-    for (const { ref, metadata } of identities) {
-      let result: unknown; try { result = await runtime.shutdown(ref); } catch (e) { result = { error: String(e instanceof Error ? e.message : e) }; }
-      const child = metadata?.childIdentity, parent = metadata?.brokerIdentity;
-      const liveness = (identity: typeof child) => identity ? broker.processLiveness(identity.pid, identity.startIdentity, identity.bootIdentity) : 'unknown';
-      let childState = liveness(child), brokerState = liveness(parent);
-      for (let i = 0; i < 50 && (childState === 'alive' || brokerState === 'alive'); i++) { await Bun.sleep(100); childState = liveness(child); brokerState = liveness(parent); }
-      shutdowns.push({ sessionId: ref.sessionId, result, childIdentity: child ?? null, brokerIdentity: parent ?? null, childState, brokerState });
-    }
-    await service.stop(); await scanOnce(ledger, join(overload, 'spool')); reconcileEffectEvents(db, ledgerPath);
-    const safe = shutdowns.every(s => s.childState === 'dead' && s.brokerState === 'dead');
-    if (!safe) error = 'Shutdown identity not proven dead; copied credentials retained privately.';
-    if (safe) for (const name of ['auth.json', 'models.json']) { const path = join(agent, name); if (existsSync(path)) unlinkSync(path); }
-    privateJson(join(root, 'evidence.json'), sanitized({ ...snapshot(), shutdown: shutdowns, credentialsRemoved: safe, savedAt: Date.now() }));
-    await ui.stop(true); await dashboard.stop(true); ledger.close(); db.close();
-    console.log(JSON.stringify({ root, evidence: join(root, 'evidence.json'), credentialsRemoved: safe, error }));
-    if (!safe) process.exitCode = 1;
-  })();
-  return shutdownPromise;
+await lifetime;
+} catch (failure) {
+  onFailure(failure);
+} finally {
+  stopping = true;
+  let shutdowns: unknown[] = [], safe = spawnedBrokers.length === 0;
+  try { await drain?.(); } catch (failure) { onFailure(failure); }
+  try {
+    if (runtimeCleanup) shutdowns = await runtimeCleanup();
+    safe = shutdowns.length === spawnedBrokers.length && shutdowns.every(s => object(s) && s.childState === 'dead' && s.brokerState === 'dead');
+  } catch (failure) { onFailure(failure); safe = false; }
+  if (!safe) { error = (error ? error + '; ' : '') + 'Shutdown identity not proven dead; private credentials and evidence retained for reconciliation.'; process.exitCode = 1; }
+  if (safe) cleanupCredentials();
+  if (cleanupFailure) onFailure(cleanupFailure);
+  let snapshot: unknown;
+  try { snapshot = takeSnapshot?.(); } catch (failure) { onFailure(failure); }
+  for (const close of resourceCleanup.reverse()) try { await close(); } catch (failure) { onFailure(failure); }
+  const credentialsRemoved = safe && [...copiedCredentialPaths].every(path => !existsSync(path));
+  const evidence = join(root, 'evidence.json');
+  try {
+    writeFileSync(evidence, JSON.stringify(sanitized({ ...(object(snapshot) ? snapshot : {}), root, provider, model, error, shutdown: shutdowns, credentialsRemoved, savedAt: Date.now() }), null, 2), { mode: 0o600 });
+  } catch (failure) { onFailure(failure); }
+  console.log(JSON.stringify(sanitized({ root, evidence, credentialsRemoved, error })));
+  process.off('SIGINT', onSignal); process.off('SIGTERM', onSignal);
+  process.off('uncaughtException', onFailure); process.off('unhandledRejection', onFailure);
+  // A live broker connection may keep Bun alive after ambiguous shutdown.
+  // All owned identities and retained private evidence are reported first.
+  if (!safe) process.exit(1);
 }
-for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => { void shutdown().catch(e => { console.error('Shutdown failed; private credentials retained:', sanitized(String(e))); process.exitCode = 1; }); });

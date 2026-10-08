@@ -574,6 +574,15 @@ export class AdapterService {
    this.projectCards();
    await this.flush();
    if (waiting || !turn) return;
+   // Socket liveness (or a cached handle) does not authorize another turn.
+   // Re-read server-selected policy at the submission boundary, sharing the
+   // runtime's strict metadata/config check with restore.
+   const policy = this.config.runtimeConfig?.(c) ?? {};
+   if (this.config.runtime.validatePolicy) {
+    await this.config.runtime.validatePolicy(handle.reference, policy);
+   } else if (policy.requiredApprovalGate === true) {
+    throw new Error("runtime_policy_validation_unavailable");
+   }
    if (
     !this.db.run(
      "UPDATE conversation_turns SET state='submitting' WHERE id=? AND state='queued'",

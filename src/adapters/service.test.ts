@@ -956,6 +956,7 @@ test("current per-conversation policy reaches restore and rejection prevents sub
   f.runtime = {
    ...f.runtime,
    capabilities: { restore: true, answer: true, steer: false },
+   validatePolicy() {},
    async connect() {
     throw new Error("runtime_not_live");
    },
@@ -1048,6 +1049,16 @@ test("current per-conversation policy reaches restore and rejection prevents sub
   expect(dbDelivery).toBeTruthy();
   expect(dbDelivery?.state).toBe("sent");
 
+  // Runtimes lacking the validation seam remain ordinary-only, even with a
+  // cached session handle: a required policy may not silently bypass checking.
+  const validatePolicy = f.runtime.validatePolicy;
+  delete f.runtime.validatePolicy;
+  rejectRestore = false;
+  await resumed.tick();
+  await resumed.flush();
+  expect(f.submitted).toHaveLength(1);
+  expect(f.db.query("SELECT state FROM conversation_turns WHERE conversation_id=? AND sequence=2").get(conv.id)).toEqual({ state: "queued" });
+  f.runtime.validatePolicy = validatePolicy;
   // 3. When restore succeeds, policy still reaches restore and queued work is submitted
   rejectRestore = false;
   await resumed.tick();
